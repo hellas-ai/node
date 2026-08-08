@@ -897,6 +897,7 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
         );
     }
 
+    let network_id = validator_config.network_id()?;
     let private_key = validator_config.decode_private_key()?;
     let me = private_key.public_key();
     let threshold_share = validator_config.decode_threshold_share()?;
@@ -933,6 +934,7 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
             .map(|public_key| hex::encode(public_key.encode()))
             .collect(),
         threshold_identity: scheme.identity().encode().to_vec(),
+        network_id: validator_config.genesis.network_id.clone(),
     };
 
     // Configure tokio runtime
@@ -1029,6 +1031,7 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
             .unwrap_or_else(|| me.clone());
         let application = Application::new(
             context.child("app"),
+            network_id,
             genesis_leader,
             genesis_allocations.clone(),
             &partition_prefix,

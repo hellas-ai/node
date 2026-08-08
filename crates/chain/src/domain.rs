@@ -28,7 +28,7 @@ pub use commonware_cryptography::Signer;
 use commonware_cryptography::{Hasher, Sha256, ed25519, secp256r1};
 use hellas_kernel::{
     Coin as KernelCoin, Decode as KernelDecode, Edge as KernelEdge, Encode as KernelEncode, Fees,
-    Key as KernelKey, Tx as KernelTx,
+    Key as KernelKey, NetworkId, Tx as KernelTx,
 };
 use p256::ecdsa::signature::Verifier as _;
 use serde_json::Value as JsonValue;
@@ -372,8 +372,6 @@ pub type Activity = commonware_consensus::simplex::types::Activity<Scheme, Diges
 
 /// `WebAuthn` policy version.
 pub const WEBAUTHN_POLICY_VERSION: u8 = 1;
-/// Chain identifier committed into `WebAuthn` challenges.
-pub const WEBAUTHN_CHAIN_ID: &[u8] = hellas_genesis::DEFAULT_NETWORK_ID.as_bytes();
 /// Whether `WebAuthn` user presence is required.
 pub const WEBAUTHN_REQUIRE_UP: bool = true;
 /// Whether `WebAuthn` user verification is required.
@@ -466,41 +464,47 @@ pub(crate) fn edge_object_id(id: hellas_kernel::EdgeId) -> ObjectId {
     ObjectId::from(id.to_bytes())
 }
 
-fn challenge_prefix(buf: &mut BytesMut, tag: u8) {
-    // Length-prefix the chain id so the domain encoding is unambiguous.
-    // Derived, not hard-coded: a wrong literal here silently corrupts
-    // every challenge's domain separation.
-    const WEBAUTHN_CHAIN_ID_LEN: u8 = {
-        assert!(WEBAUTHN_CHAIN_ID.len() <= u8::MAX as usize);
-        #[allow(clippy::cast_possible_truncation)]
-        {
-            WEBAUTHN_CHAIN_ID.len() as u8
-        }
-    };
-
+/// Writes the network-scoped domain prefix every `WebAuthn` challenge
+/// starts with.
+///
+/// The network is a runtime value, not a constant: a passkey signature
+/// says "I authorize this transfer *on this network*", and a compiled-in
+/// chain id would silently re-domain every signature in the tree the
+/// moment that constant moved. [`NetworkId`]'s own encoding is
+/// length-prefixed, which is what keeps the prefix unambiguous when a
+/// variable-width id sits next to the tag.
+fn challenge_prefix(buf: &mut BytesMut, network: NetworkId, tag: u8) {
     buf.extend_from_slice(CHALLENGE_DOMAIN);
     WEBAUTHN_POLICY_VERSION.write(buf);
-    WEBAUTHN_CHAIN_ID_LEN.write(buf);
-    buf.extend_from_slice(WEBAUTHN_CHAIN_ID);
+    let mut encoded = [0_u8; NetworkId::MAX_ENCODED_SIZE];
+    let len = network.write_to(&mut encoded);
+    buf.extend_from_slice(&encoded[..len]);
     tag.write(buf);
 }
 
-/// Returns the `WebAuthn` challenge for a transfer transaction.
+/// Returns the `WebAuthn` challenge for a transfer transaction on
+/// `network`.
 #[must_use]
-pub fn transfer_challenge(input: &ObjectId, recipient: &Address, amount: u64) -> Digest {
+pub fn transfer_challenge(
+    network: NetworkId,
+    input: &ObjectId,
+    recipient: &Address,
+    amount: u64,
+) -> Digest {
     let mut buf = BytesMut::new();
-    challenge_prefix(&mut buf, TRANSFER_TAG);
+    challenge_prefix(&mut buf, network, TRANSFER_TAG);
     input.write(&mut buf);
     recipient.write(&mut buf);
     amount.write(&mut buf);
     Sha256::hash(&buf)
 }
 
-/// Returns the `WebAuthn` challenge for a merge transaction.
+/// Returns the `WebAuthn` challenge for a merge transaction on
+/// `network`.
 #[must_use]
-pub fn merge_challenge(sorted_inputs: &[ObjectId]) -> Digest {
+pub fn merge_challenge(network: NetworkId, sorted_inputs: &[ObjectId]) -> Digest {
     let mut buf = BytesMut::new();
-    challenge_prefix(&mut buf, MERGE_TAG);
+    challenge_prefix(&mut buf, network, MERGE_TAG);
     sorted_inputs.write(&mut buf);
     Sha256::hash(&buf)
 }
@@ -958,13 +962,18 @@ fn verify_webauthn_signature(
 }
 
 impl Transaction {
-    /// Verifies a legacy transaction `WebAuthn` signature against `owner`.
+    /// Verifies a legacy transaction `WebAuthn` signature against
+    /// `owner`, as authorized for `network`.
+    ///
+    /// A signature made for one network fails here under any other: the
+    /// challenge it was produced over is not the challenge this
+    /// recomputes.
     ///
     /// Kernel transactions deliberately return `false`: they authenticate
     /// inside kernel [`hellas_kernel::State::apply`] beginning in M4, never at
     /// this chain-domain signature layer.
     #[must_use]
-    pub fn verify_signature(&self, owner: &Address) -> bool {
+    pub fn verify_signature(&self, network: NetworkId, owner: &Address) -> bool {
         match self {
             Self::Transfer {
                 input,
@@ -972,11 +981,11 @@ impl Transaction {
                 amount,
                 signature,
             } => {
-                let expected = transfer_challenge(input, recipient, *amount);
+                let expected = transfer_challenge(network, input, recipient, *amount);
                 verify_webauthn_signature(expected.as_ref(), signature, owner.public_key())
             }
             Self::MergeCoin { inputs, signature } => {
-                let expected = merge_challenge(inputs.as_slice());
+                let expected = merge_challenge(network, inputs.as_slice());
                 verify_webauthn_signature(expected.as_ref(), signature, owner.public_key())
             }
             Self::Kernel(_) => false,
@@ -992,18 +1001,32 @@ impl From<ed25519::PublicKey> for Address {
     }
 }
 
+/// The network every in-crate test signs under.
+///
+/// One definition: a test that built its signature under a different
+/// network than the one its verifier runs on would fail for the right
+/// reason but the wrong cause, and the failure would read as a broken
+/// signature rather than a mismatched fixture.
+#[cfg(test)]
+pub(crate) const TEST_NETWORK: NetworkId = match NetworkId::new("hellas-chain-test") {
+    Some(network) => network,
+    None => panic!("literal is a legal network id"),
+};
+
 #[cfg(test)]
 impl Transaction {
-    /// Builds a signed transfer transaction for tests.
+    /// Builds a signed transfer transaction for tests, authorized for
+    /// `network`.
     #[must_use]
     pub fn transfer(
+        network: NetworkId,
         key: &PrivateKey,
         input: ObjectId,
         recipient: Address,
         amount: u64,
     ) -> Option<Self> {
         let secp_key = secp256r1_key_from_material(key.public_key().as_ref());
-        let challenge = transfer_challenge(&input, &recipient, amount);
+        let challenge = transfer_challenge(network, &input, &recipient, amount);
         Some(Self::Transfer {
             input,
             recipient,
@@ -1012,9 +1035,10 @@ impl Transaction {
         })
     }
 
-    /// Builds a signed merge transaction for tests.
+    /// Builds a signed merge transaction for tests, authorized for
+    /// `network`.
     #[must_use]
-    pub fn merge(key: &PrivateKey, inputs: &[ObjectId]) -> Option<Self> {
+    pub fn merge(network: NetworkId, key: &PrivateKey, inputs: &[ObjectId]) -> Option<Self> {
         let mut items = [ObjectId::from([0; 32]); MAX_MERGE_INPUTS];
         if inputs.len() > items.len() {
             return None;
@@ -1023,7 +1047,7 @@ impl Transaction {
         items[..inputs.len()].sort();
         let inputs = MergeInputs::new(items, inputs.len())?;
         let secp_key = secp256r1_key_from_material(key.public_key().as_ref());
-        let challenge = merge_challenge(inputs.as_slice());
+        let challenge = merge_challenge(network, inputs.as_slice());
         Some(Self::MergeCoin {
             inputs,
             signature: mock_webauthn_sign(&secp_key, &challenge)?,
@@ -1229,7 +1253,7 @@ mod tests {
         let sender_addr = addr_from_signing_key(key);
         let recipient = addr_from_signing_key(&secp256r1_key_from_seed(2));
         let input = Digest::from([7; 32]);
-        let challenge = transfer_challenge(&input, &recipient, 5);
+        let challenge = transfer_challenge(TEST_NETWORK, &input, &recipient, 5);
         let signature = mock_webauthn_sign(key, &challenge).expect("mock signature");
         (
             sender_addr,
@@ -1393,7 +1417,7 @@ mod tests {
     fn kernel_signature_verification_stays_inside_the_kernel() {
         let owner = addr_from_signing_key(&secp256r1_key_from_seed(1));
         let tx = Transaction::Kernel(valid_open_tx().expect("valid kernel open fixture"));
-        assert!(!tx.verify_signature(&owner));
+        assert!(!tx.verify_signature(TEST_NETWORK, &owner));
     }
 
     #[test]
@@ -1437,12 +1461,12 @@ mod tests {
     }
 
     #[test]
-    fn transfer_codec_matches_pre_kernel_golden_bytes() {
+    fn transfer_codec_matches_golden_bytes() {
         let key = secp256r1_key_from_seed(1);
         let (_, tx) = sample_transfer(&key);
         assert_eq!(
             hex(&tx.encode()),
-            "00070707070707070707070707070707070707070707070707070707070707070703e57aa4ea4cd5ed2c6e5b23a5c9895b2ef185df9a63876b948e53179a90727870000000000000000521cf7b0e78dd070f5f3544058cf2b38ea7c2aa724b94d1619ba6123c59c7caa71e37e39da015281fe180e026fefdbafb9bd622d488bdd73659991f0b2afd665325d6200140e870713dad50719cecb0abe5d8444155b8ab423f64c4358a412dcd52050000000089017b2274797065223a22776562617574686e2e676574222c226368616c6c656e6765223a226d525768386b6537576541564962714e5171777a2d486771462d554c5a6575697a756c7078584653453541222c226f726967696e223a2268747470733a2f2f77616c6c65742e68656c6c61732e6169222c2263726f73734f726967696e223a66616c73657d"
+            "00070707070707070707070707070707070707070707070707070707070707070703e57aa4ea4cd5ed2c6e5b23a5c9895b2ef185df9a63876b948e53179a9072787000000000000000055515839a903a3667bfd81cb8a112a4c33d392b489741d8caa5b0aca0a27678071efbd051540628bd0039b747a2e75c325f4dc01361241806d94112d327b8817125d6200140e870713dad50719cecb0abe5d8444155b8ab423f64c4358a412dcd52050000000089017b2274797065223a22776562617574686e2e676574222c226368616c6c656e6765223a2276764f315f77344373763270344c4d4e68485964766275733465743748486d4a7a316e316f465f58544a63222c226f726967696e223a2268747470733a2f2f77616c6c65742e68656c6c61732e6169222c2263726f73734f726967696e223a66616c73657d"
         );
     }
 
@@ -1456,7 +1480,7 @@ mod tests {
         ];
         values.sort();
         let inputs = test_merge_inputs(&values);
-        let challenge = merge_challenge(inputs.as_slice());
+        let challenge = merge_challenge(TEST_NETWORK, inputs.as_slice());
         let tx = Transaction::MergeCoin {
             inputs,
             signature: mock_webauthn_sign(&key, &challenge).expect("mock signature"),
@@ -1467,7 +1491,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_codec_matches_pre_kernel_golden_bytes() {
+    fn merge_codec_matches_golden_bytes() {
         let key = secp256r1_key_from_seed(1);
         let mut values = [
             Digest::from([3; 32]),
@@ -1476,14 +1500,14 @@ mod tests {
         ];
         values.sort();
         let inputs = test_merge_inputs(&values);
-        let challenge = merge_challenge(inputs.as_slice());
+        let challenge = merge_challenge(TEST_NETWORK, inputs.as_slice());
         let tx = Transaction::MergeCoin {
             inputs,
             signature: mock_webauthn_sign(&key, &challenge).expect("mock signature"),
         };
         assert_eq!(
             hex(&tx.encode()),
-            "0103010101010101010101010101010101010101010101010101010101010101010102020202020202020202020202020202020202020202020202020202020202020303030303030303030303030303030303030303030303030303030303030303a3305f6d5207a36d266e8484ede313ab69280255c7f4b9d10993fc817854acb20707085312612146dedbc66714321677ab71cdc262963b3291571849a127147325d6200140e870713dad50719cecb0abe5d8444155b8ab423f64c4358a412dcd52050000000089017b2274797065223a22776562617574686e2e676574222c226368616c6c656e6765223a225363797061444e395263715a615372513164445236753248315346397039524c4e6e4a44746b32376a4b67222c226f726967696e223a2268747470733a2f2f77616c6c65742e68656c6c61732e6169222c2263726f73734f726967696e223a66616c73657d"
+            "010301010101010101010101010101010101010101010101010101010101010101010202020202020202020202020202020202020202020202020202020202020202030303030303030303030303030303030303030303030303030303030303030359c01cf0a9db59d8ed0dd411537f2386cca8faf41f3d577fe2432f2482f3cc517de9a527c492d08b5454b5680903b28530a6b9af0a882a00ef60dbf570593c7925d6200140e870713dad50719cecb0abe5d8444155b8ab423f64c4358a412dcd52050000000089017b2274797065223a22776562617574686e2e676574222c226368616c6c656e6765223a227a3075326c4f53546c78305038334844387946734c37745f422d6a5f4b79326e62516a5f325558756d3149222c226f726967696e223a2268747470733a2f2f77616c6c65742e68656c6c61732e6169222c2263726f73734f726967696e223a66616c73657d"
         );
     }
 
@@ -1491,7 +1515,7 @@ mod tests {
     fn signature_verification_succeeds_with_correct_key() {
         let key = secp256r1_key_from_seed(1);
         let (sender, tx) = sample_transfer(&key);
-        assert!(tx.verify_signature(&sender));
+        assert!(tx.verify_signature(TEST_NETWORK, &sender));
     }
 
     #[test]
@@ -1499,7 +1523,7 @@ mod tests {
         let key = secp256r1_key_from_seed(1);
         let wrong = addr_from_signing_key(&secp256r1_key_from_seed(2));
         let (_, tx) = sample_transfer(&key);
-        assert!(!tx.verify_signature(&wrong));
+        assert!(!tx.verify_signature(TEST_NETWORK, &wrong));
     }
 
     #[test]
@@ -1515,10 +1539,10 @@ mod tests {
         else {
             panic!("expected transfer")
         };
-        let challenge = transfer_challenge(input, recipient, *amount);
+        let challenge = transfer_challenge(TEST_NETWORK, input, recipient, *amount);
         signature.client_data_json =
             client_data_json_for_origin(&challenge, "https://evil.example").expect("client data");
-        assert!(!tx.verify_signature(&sender));
+        assert!(!tx.verify_signature(TEST_NETWORK, &sender));
     }
 
     #[test]
@@ -1530,16 +1554,52 @@ mod tests {
     }
 
     #[test]
-    fn challenge_prefix_length_matches_chain_id() {
+    fn challenge_prefix_declares_the_runtime_network_length() {
         let mut buf = BytesMut::new();
-        challenge_prefix(&mut buf, TRANSFER_TAG);
+        challenge_prefix(&mut buf, TEST_NETWORK, TRANSFER_TAG);
 
         let after_domain = &buf[CHALLENGE_DOMAIN.len()..];
         assert_eq!(after_domain[0], WEBAUTHN_POLICY_VERSION);
         let declared_len = after_domain[1] as usize;
-        assert_eq!(declared_len, WEBAUTHN_CHAIN_ID.len());
-        assert_eq!(&after_domain[2..2 + declared_len], WEBAUTHN_CHAIN_ID);
+        assert_eq!(declared_len, TEST_NETWORK.as_bytes().len());
+        assert_eq!(&after_domain[2..2 + declared_len], TEST_NETWORK.as_bytes());
         assert_eq!(after_domain[2 + declared_len], TRANSFER_TAG);
+    }
+
+    /// The whole point of making the network a runtime value: two
+    /// networks must not produce the same challenge, and a passkey
+    /// signature made for one must not verify under the other.
+    #[test]
+    fn a_challenge_is_bound_to_one_network() {
+        let other = NetworkId::new("hellas-chain-other").expect("legal id");
+        let key = PrivateKey::from_seed(3);
+        let sender = Address::from(key.public_key());
+        let input = ObjectId::from([9; 32]);
+        let recipient = Address::from(PrivateKey::from_seed(4).public_key());
+
+        assert_ne!(
+            transfer_challenge(TEST_NETWORK, &input, &recipient, 5),
+            transfer_challenge(other, &input, &recipient, 5),
+        );
+        assert_ne!(
+            merge_challenge(TEST_NETWORK, &[input]),
+            merge_challenge(other, &[input]),
+        );
+
+        let tx = Transaction::transfer(TEST_NETWORK, &key, input, recipient, 5)
+            .expect("test transfer signs");
+        assert!(tx.verify_signature(TEST_NETWORK, &sender));
+        assert!(
+            !tx.verify_signature(other, &sender),
+            "a transfer authorized on one network must not settle on another",
+        );
+
+        let merge = Transaction::merge(TEST_NETWORK, &key, &[input]).expect("test merge signs");
+        assert!(merge.verify_signature(TEST_NETWORK, &sender));
+        assert!(
+            !merge.verify_signature(other, &sender),
+            "a merge authorized on one network must not settle on another",
+        );
     }
 
     #[test]

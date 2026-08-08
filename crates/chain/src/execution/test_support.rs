@@ -63,6 +63,7 @@ pub(crate) fn consensus_fixture(seed: u64) -> ConsensusFixture {
         .collect::<Vec<_>>();
     let assembler = Scheme::verifier(CONSENSUS_NAMESPACE, participants, polynomial);
     let info = ConsensusInfo {
+        network_id: crate::domain::TEST_NETWORK.as_str().to_string(),
         validators: leaders
             .iter()
             .map(|public_key| hex::encode(public_key.encode()))
@@ -170,8 +171,9 @@ impl KernelFixture {
     }
 
     pub(crate) fn bad_auth_open(&self) -> Result<Tx, SoftPasskeyError> {
-        let hash = Tx::open_hash(&self.funding, &self.terms);
+        let hash = Tx::open_hash(crate::domain::TEST_NETWORK, &self.funding, &self.terms);
         let wrong_hash = Tx::payload_hash(
+            crate::domain::TEST_NETWORK,
             self.edge,
             CloseKind::Mutual,
             self.terms.hash(),
@@ -231,14 +233,20 @@ pub(crate) fn kernel_fixture_at(
         outputs.clone(),
     );
     let edge = Tx::edge_id_of(&funding, &terms);
-    let open_hash = Tx::open_hash(&funding, &terms);
+    let open_hash = Tx::open_hash(crate::domain::TEST_NETWORK, &funding, &terms);
     let open = Tx::open(
         funding.clone(),
         terms.clone(),
         Auth::webauthn(maker_passkey.sign(open_hash)?),
         Auth::webauthn(taker_passkey.sign(open_hash)?),
     );
-    let close_hash = Tx::payload_hash(edge, CloseKind::Mutual, terms.hash(), &outputs);
+    let close_hash = Tx::payload_hash(
+        crate::domain::TEST_NETWORK,
+        edge,
+        CloseKind::Mutual,
+        terms.hash(),
+        &outputs,
+    );
     let mutual_close = Tx::close(
         edge,
         Proof::mutual(

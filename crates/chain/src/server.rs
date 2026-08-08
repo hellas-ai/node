@@ -376,6 +376,7 @@ fn consensus_info_response(info: ConsensusInfo) -> GetConsensusInfoResponse {
     GetConsensusInfoResponse {
         validators: info.validators,
         threshold_identity: info.threshold_identity,
+        network_id: info.network_id,
     }
 }
 
@@ -988,7 +989,11 @@ mod tests {
 
         let genesis = index_genesis();
         let fixture = kernel_fixture(10).expect("kernel fixture");
-        let index = crate::OwnerIndex::new(&genesis, fixture.allocations.clone());
+        let index = crate::OwnerIndex::new(
+            crate::domain::TEST_NETWORK,
+            &genesis,
+            fixture.allocations.clone(),
+        );
         let finalization = vec![0xfa, 0xce];
         let request = pb::GetEdgesByOwnerRequest {
             owner: fixture.maker.to_bytes().to_vec(),

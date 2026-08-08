@@ -26,6 +26,7 @@ use commonware_runtime::{Spawner, telemetry::metrics::Registered};
 use commonware_storage::{Context as StorageContext, mmr::Location, qmdb::sync::Target};
 use commonware_utils::{SystemTimeExt, non_empty_range};
 use futures::{Stream, StreamExt};
+use hellas_kernel::NetworkId;
 use prometheus_client::metrics::gauge::Gauge;
 use rand::Rng;
 use std::{collections::VecDeque, sync::Arc};
@@ -75,6 +76,9 @@ impl Mempool {
 
 #[derive(Clone)]
 pub struct Application {
+    /// The network this node validates. Every kernel context it builds
+    /// names it, so every authorization it accepts was made for it.
+    network: NetworkId,
     genesis: HellasBlock,
     genesis_allocations: Arc<Vec<(SettlementKey, u64)>>,
     finalized_height: Registered<Gauge>,
@@ -94,6 +98,7 @@ impl Application {
 
     pub async fn new<E>(
         context: E,
+        network: NetworkId,
         genesis_leader: PublicKey,
         genesis_allocations: Vec<(SettlementKey, u64)>,
         partition_prefix: &str,
@@ -115,8 +120,9 @@ impl Application {
         )
         .await;
         let genesis = HellasBlock::genesis(genesis_leader, state_root, sync_target);
-        let owner_index = OwnerIndex::new(&genesis, genesis_allocations.clone());
+        let owner_index = OwnerIndex::new(network, &genesis, genesis_allocations.clone());
         Self {
+            network,
             genesis,
             genesis_allocations: Arc::new(genesis_allocations),
             finalized_height,
@@ -141,8 +147,13 @@ where
 }
 
 #[cfg(feature = "validator")]
-fn kernel_context(height: Height, previous_hash: Digest) -> hellas_kernel::Context {
+fn kernel_context(
+    network: NetworkId,
+    height: Height,
+    previous_hash: Digest,
+) -> hellas_kernel::Context {
     hellas_kernel::Context::with_fees(
+        network,
         hellas_kernel::BlockHeight::new(height.get()),
         hellas_kernel::BlockHash::from_bytes(previous_hash.0),
         KERNEL_FEES,
@@ -183,7 +194,7 @@ where
         let block_height = Height::new(parent.height().get() + 1);
         let block_parent = parent.digest();
         let (batches, txs, retained) = match execute_proposal(
-            kernel_context(block_height, block_parent),
+            kernel_context(self.network, block_height, block_parent),
             self.verifier.as_ref(),
             candidates,
             &self.genesis_allocations,
@@ -240,7 +251,7 @@ where
             // `previous_hash` is currently inert in kernel apply. Source it
             // from the block field so verify and certified replay cannot
             // diverge when the kernel begins consuming it.
-            kernel_context(block.height(), block.parent()),
+            kernel_context(self.network, block.height(), block.parent()),
             self.verifier.as_ref(),
             block.txs(),
             &self.genesis_allocations,
@@ -275,7 +286,7 @@ where
         batches: <Self::Databases as DatabaseSet<E>>::Unmerkleized,
     ) -> <Self::Databases as DatabaseSet<E>>::Merkleized {
         let batches = execute_all(
-            kernel_context(block.height(), block.parent()),
+            kernel_context(self.network, block.height(), block.parent()),
             self.verifier.as_ref(),
             block.txs(),
             &self.genesis_allocations,
@@ -472,7 +483,7 @@ mod tests {
     #[test]
     fn kernel_context_binds_block_height_parent_hash_and_consensus_fees() {
         let parent = Digest::from([0x42; 32]);
-        let context = kernel_context(Height::new(17), parent);
+        let context = kernel_context(crate::domain::TEST_NETWORK, Height::new(17), parent);
         assert_eq!(context.block_height(), hellas_kernel::BlockHeight::new(17));
         assert_eq!(
             context.previous_hash(),
@@ -487,6 +498,7 @@ mod tests {
             let fixture = kernel_fixture(3).expect("kernel fixture");
             let mut app = Application::new(
                 runtime.child("app"),
+                crate::domain::TEST_NETWORK,
                 validator_key(0).public_key(),
                 fixture.allocations.clone(),
                 "context_boundary_app",

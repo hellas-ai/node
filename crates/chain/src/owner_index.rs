@@ -1,12 +1,12 @@
 use crate::HellasBlock;
 use crate::domain::{
-    MergeInputFault, merge_input_fault,
-    Address, Coin, ObjectId, ObjectKind, SettlementKey, Transaction, coin_object_id,
-    edge_object_id, genesis_object_id, output_object_id,
+    Address, Coin, MergeInputFault, ObjectId, ObjectKind, SettlementKey, Transaction,
+    coin_object_id, edge_object_id, genesis_object_id, merge_input_fault, output_object_id,
 };
 use commonware_codec::Encode;
 use commonware_consensus::{Block as _, Heightable};
 use commonware_cryptography::{Digestible, Hasher, Sha256, sha256::Digest};
+use hellas_kernel::NetworkId;
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{Arc, RwLock},
@@ -82,9 +82,17 @@ pub struct OwnerIndex {
 }
 
 impl OwnerIndex {
-    pub fn new(genesis: &HellasBlock, genesis_allocations: Vec<(SettlementKey, u64)>) -> Self {
+    pub fn new(
+        network: NetworkId,
+        genesis: &HellasBlock,
+        genesis_allocations: Vec<(SettlementKey, u64)>,
+    ) -> Self {
         Self {
-            inner: Arc::new(RwLock::new(State::new(genesis, genesis_allocations))),
+            inner: Arc::new(RwLock::new(State::new(
+                network,
+                genesis,
+                genesis_allocations,
+            ))),
         }
     }
 
@@ -171,6 +179,11 @@ impl OwnerIndex {
 
 #[derive(Clone)]
 struct State {
+    /// The network whose signatures this index accepts. Held rather
+    /// than passed per call: the index replays finalized blocks from
+    /// one chain, so the network is a property of the index, not of an
+    /// individual transaction.
+    network: NetworkId,
     cursor: OwnerCursor,
     genesis_allocations: Vec<(SettlementKey, u64)>,
     coins: BTreeMap<ObjectId, Coin>,
@@ -180,8 +193,13 @@ struct State {
 }
 
 impl State {
-    fn new(genesis: &HellasBlock, genesis_allocations: Vec<(SettlementKey, u64)>) -> Self {
+    fn new(
+        network: NetworkId,
+        genesis: &HellasBlock,
+        genesis_allocations: Vec<(SettlementKey, u64)>,
+    ) -> Self {
         Self {
+            network,
             cursor: OwnerCursor {
                 height: genesis.height().get(),
                 payload: genesis.digest(),
@@ -330,7 +348,7 @@ impl State {
             .cloned()
             .ok_or(OwnerIndexError::ObjectNotFound { id: input })?;
         let owner = Address::try_from(coin.owner).map_err(|_| OwnerIndexError::InvalidSignature)?;
-        if !tx.verify_signature(&owner) {
+        if !tx.verify_signature(self.network, &owner) {
             return Err(OwnerIndexError::InvalidSignature);
         }
         if amount == 0 {
@@ -415,7 +433,7 @@ impl State {
             return Err(OwnerIndexError::MergeOwnerMismatch);
         };
         let address = Address::try_from(owner).map_err(|_| OwnerIndexError::InvalidSignature)?;
-        if !tx.verify_signature(&address) {
+        if !tx.verify_signature(self.network, &address) {
             return Err(OwnerIndexError::InvalidSignature);
         }
 
@@ -552,9 +570,14 @@ mod tests {
     #[test]
     fn indexes_finalized_owner_transitions() {
         let genesis = genesis();
-        let indexer = OwnerIndex::new(&genesis, vec![(settlement(1), 100)]);
+        let indexer = OwnerIndex::new(
+            crate::domain::TEST_NETWORK,
+            &genesis,
+            vec![(settlement(1), 100)],
+        );
         let input = genesis_object_id(0);
-        let tx = Transaction::transfer(&key(1), input, address(2), 40).unwrap();
+        let tx = Transaction::transfer(crate::domain::TEST_NETWORK, &key(1), input, address(2), 40)
+            .unwrap();
         let recipient_id = output_object_id(&Sha256::hash(&tx.encode()), 0);
         let change_id = output_object_id(&Sha256::hash(&tx.encode()), 1);
         let block = block(&genesis, vec![tx]);
@@ -574,8 +597,19 @@ mod tests {
     #[test]
     fn duplicate_finalized_block_is_idempotent() {
         let genesis = genesis();
-        let indexer = OwnerIndex::new(&genesis, vec![(settlement(1), 100)]);
-        let tx = Transaction::transfer(&key(1), genesis_object_id(0), address(2), 40).unwrap();
+        let indexer = OwnerIndex::new(
+            crate::domain::TEST_NETWORK,
+            &genesis,
+            vec![(settlement(1), 100)],
+        );
+        let tx = Transaction::transfer(
+            crate::domain::TEST_NETWORK,
+            &key(1),
+            genesis_object_id(0),
+            address(2),
+            40,
+        )
+        .unwrap();
         let block = block(&genesis, vec![tx]);
 
         assert_eq!(indexer.apply_finalized(&block), Ok(ApplyOutcome::Applied));
@@ -588,8 +622,19 @@ mod tests {
     #[test]
     fn rejected_block_does_not_mutate_index() {
         let genesis = genesis();
-        let indexer = OwnerIndex::new(&genesis, vec![(settlement(1), 100)]);
-        let bad_tx = Transaction::transfer(&key(1), genesis_object_id(0), address(2), 0).unwrap();
+        let indexer = OwnerIndex::new(
+            crate::domain::TEST_NETWORK,
+            &genesis,
+            vec![(settlement(1), 100)],
+        );
+        let bad_tx = Transaction::transfer(
+            crate::domain::TEST_NETWORK,
+            &key(1),
+            genesis_object_id(0),
+            address(2),
+            0,
+        )
+        .unwrap();
         let bad_block = block(&genesis, vec![bad_tx]);
 
         assert_eq!(
@@ -599,7 +644,14 @@ mod tests {
         assert_eq!(indexer.cursor().height, 0);
         assert_eq!(indexer.get_coin(&genesis_object_id(0)), Ok(None));
 
-        let good_tx = Transaction::transfer(&key(1), genesis_object_id(0), address(2), 40).unwrap();
+        let good_tx = Transaction::transfer(
+            crate::domain::TEST_NETWORK,
+            &key(1),
+            genesis_object_id(0),
+            address(2),
+            40,
+        )
+        .unwrap();
         let recipient_id = output_object_id(&Sha256::hash(&good_tx.encode()), 0);
         let good_block = block(&genesis, vec![good_tx]);
 
@@ -617,8 +669,19 @@ mod tests {
     fn legacy_transfer_cannot_spend_non_p256_settlement_key() {
         let genesis = genesis();
         let invalid_owner = SettlementKey::from_bytes([0xa5; SettlementKey::LENGTH]);
-        let indexer = OwnerIndex::new(&genesis, vec![(invalid_owner, 100)]);
-        let tx = Transaction::transfer(&key(1), genesis_object_id(0), address(2), 40).unwrap();
+        let indexer = OwnerIndex::new(
+            crate::domain::TEST_NETWORK,
+            &genesis,
+            vec![(invalid_owner, 100)],
+        );
+        let tx = Transaction::transfer(
+            crate::domain::TEST_NETWORK,
+            &key(1),
+            genesis_object_id(0),
+            address(2),
+            40,
+        )
+        .unwrap();
         let block = block(&genesis, vec![tx]);
 
         assert_eq!(
@@ -633,7 +696,11 @@ mod tests {
     fn indexes_kernel_edge_parties_and_coin_transitions() {
         let genesis = genesis();
         let fixture = kernel_fixture(10).expect("kernel fixture");
-        let indexer = OwnerIndex::new(&genesis, fixture.allocations.clone());
+        let indexer = OwnerIndex::new(
+            crate::domain::TEST_NETWORK,
+            &genesis,
+            fixture.allocations.clone(),
+        );
         let open_block = block(&genesis, vec![Transaction::Kernel(fixture.open.clone())]);
         let edge_id = edge_object_id(fixture.edge);
         let indexed_edge = IndexedEdge::from(fixture.terms.parties());
@@ -706,14 +773,20 @@ mod tests {
         );
         let funding = template.funding;
         let edge = Tx::edge_id_of(&funding, &terms);
-        let open_hash = Tx::open_hash(&funding, &terms);
+        let open_hash = Tx::open_hash(crate::domain::TEST_NETWORK, &funding, &terms);
         let open = Tx::open(
             funding,
             terms.clone(),
             Auth::webauthn(passkey.sign(open_hash).expect("maker assertion")),
             Auth::webauthn(passkey.sign(open_hash).expect("taker assertion")),
         );
-        let close_hash = Tx::payload_hash(edge, CloseKind::Mutual, terms.hash(), &outputs);
+        let close_hash = Tx::payload_hash(
+            crate::domain::TEST_NETWORK,
+            edge,
+            CloseKind::Mutual,
+            terms.hash(),
+            &outputs,
+        );
         let close = Tx::close(
             edge,
             Proof::mutual(
@@ -722,7 +795,11 @@ mod tests {
             ),
             outputs,
         );
-        let indexer = OwnerIndex::new(&genesis, vec![(owner, 40), (owner, 60)]);
+        let indexer = OwnerIndex::new(
+            crate::domain::TEST_NETWORK,
+            &genesis,
+            vec![(owner, 40), (owner, 60)],
+        );
         let open_block = block(&genesis, vec![Transaction::Kernel(open)]);
         let edge_id = edge_object_id(edge);
         let indexed = IndexedEdge::from(terms.parties());
@@ -746,7 +823,11 @@ mod tests {
     fn duplicate_kernel_open_is_atomic_output_collision() {
         let genesis = genesis();
         let fixture = kernel_fixture(10).expect("kernel fixture");
-        let indexer = OwnerIndex::new(&genesis, fixture.allocations.clone());
+        let indexer = OwnerIndex::new(
+            crate::domain::TEST_NETWORK,
+            &genesis,
+            fixture.allocations.clone(),
+        );
         let open_block = block(&genesis, vec![Transaction::Kernel(fixture.open.clone())]);
         assert_eq!(
             indexer.apply_finalized(&open_block),
@@ -771,7 +852,11 @@ mod tests {
     fn close_of_unknown_edge_is_typed_and_does_not_mutate() {
         let genesis = genesis();
         let fixture = kernel_fixture(10).expect("kernel fixture");
-        let indexer = OwnerIndex::new(&genesis, fixture.allocations.clone());
+        let indexer = OwnerIndex::new(
+            crate::domain::TEST_NETWORK,
+            &genesis,
+            fixture.allocations.clone(),
+        );
         let edge_id = edge_object_id(fixture.edge);
         let close_block = block(&genesis, vec![Transaction::Kernel(fixture.mutual_close)]);
 
@@ -787,17 +872,39 @@ mod tests {
     #[test]
     fn replay_matches_incremental_indexing() {
         let genesis = genesis();
-        let tx1 = Transaction::transfer(&key(1), genesis_object_id(0), address(2), 40).unwrap();
+        let tx1 = Transaction::transfer(
+            crate::domain::TEST_NETWORK,
+            &key(1),
+            genesis_object_id(0),
+            address(2),
+            40,
+        )
+        .unwrap();
         let change_id = output_object_id(&Sha256::hash(&tx1.encode()), 1);
         let block1 = block(&genesis, vec![tx1]);
-        let tx2 = Transaction::transfer(&key(1), change_id, address(3), 25).unwrap();
+        let tx2 = Transaction::transfer(
+            crate::domain::TEST_NETWORK,
+            &key(1),
+            change_id,
+            address(3),
+            25,
+        )
+        .unwrap();
         let block2 = block(&block1, vec![tx2]);
 
-        let incremental = OwnerIndex::new(&genesis, vec![(settlement(1), 100)]);
+        let incremental = OwnerIndex::new(
+            crate::domain::TEST_NETWORK,
+            &genesis,
+            vec![(settlement(1), 100)],
+        );
         incremental.apply_finalized(&block1).unwrap();
         incremental.apply_finalized(&block2).unwrap();
 
-        let replayed = OwnerIndex::new(&genesis, vec![(settlement(1), 100)]);
+        let replayed = OwnerIndex::new(
+            crate::domain::TEST_NETWORK,
+            &genesis,
+            vec![(settlement(1), 100)],
+        );
         for block in [&block1, &block2] {
             replayed.apply_finalized(block).unwrap();
         }
@@ -820,7 +927,11 @@ mod tests {
     #[test]
     fn rejects_parent_mismatch() {
         let genesis = genesis();
-        let indexer = OwnerIndex::new(&genesis, vec![(settlement(1), 100)]);
+        let indexer = OwnerIndex::new(
+            crate::domain::TEST_NETWORK,
+            &genesis,
+            vec![(settlement(1), 100)],
+        );
         let bad_parent = Sha256::hash(b"bad-parent");
         let sync_target = crate::execution::store::UtxoSyncTarget::new(
             Sha256::hash(b"root-1"),

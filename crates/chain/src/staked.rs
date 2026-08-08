@@ -22,7 +22,7 @@
 //! epoch counter.
 
 use hellas_kernel::{
-    Auth, BlockHeight, CloseKind, EdgeId, Encode, Key, List, MAX_EDGE_OUTPUTS, Parties,
+    Auth, BlockHeight, CloseKind, EdgeId, Encode, Key, List, MAX_EDGE_OUTPUTS, NetworkId, Parties,
     PayloadHash, Payout, Proof, ProtocolCode, Seal, SealPublicInputs, Secp256k1Signer,
     Secp256k1Verifier, Sig, SigVerifier as _, StakeBondTerms, Terms, TermsHash, Tx as KernelTx,
     Writer as _,
@@ -112,6 +112,7 @@ impl MakerVoucher {
     /// surplus). Returns `None` when `cumulative > total`.
     #[must_use]
     pub fn issue(
+        network: NetworkId,
         client: &Secp256k1Signer,
         provider: Key,
         payment_edge: EdgeId,
@@ -120,7 +121,13 @@ impl MakerVoucher {
         cumulative: u64,
     ) -> Option<Self> {
         let outputs = close_outputs(client.party_key(), provider, total, cumulative)?;
-        let hash = KernelTx::payload_hash(payment_edge, CloseKind::Mutual, terms_hash, &outputs);
+        let hash = KernelTx::payload_hash(
+            network,
+            payment_edge,
+            CloseKind::Mutual,
+            terms_hash,
+            &outputs,
+        );
         Some(Self {
             payment_edge,
             terms_hash,
@@ -143,6 +150,7 @@ impl MakerVoucher {
     pub fn redeem(&self, channel: &Channel, provider: &Secp256k1Signer) -> Option<KernelTx> {
         let outputs = channel.close_outputs(self.cumulative)?;
         let hash = KernelTx::payload_hash(
+            channel.network,
             self.payment_edge,
             CloseKind::Mutual,
             self.terms_hash,
@@ -216,6 +224,7 @@ pub enum SettleError {
 /// commitment).
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Channel {
+    network: NetworkId,
     bond_edge: EdgeId,
     bond: Terms,
     payment_edge: EdgeId,
@@ -239,6 +248,7 @@ impl Channel {
     /// drain the stake with a plain bond timeout.
     #[must_use]
     pub fn new(
+        network: NetworkId,
         bond_edge: EdgeId,
         bond: Terms,
         payment_edge: EdgeId,
@@ -260,6 +270,7 @@ impl Channel {
             return None;
         }
         Some(Self {
+            network,
             bond_edge,
             bond,
             payment_edge,
@@ -290,6 +301,13 @@ impl Channel {
     #[must_use]
     pub fn close_outputs(&self, cumulative: u64) -> Option<List<Payout, MAX_EDGE_OUTPUTS>> {
         close_outputs(self.client(), self.provider(), self.capacity(), cumulative)
+    }
+
+    /// The network this pairing settles on. Both edges live on it, and
+    /// every digest the two parties exchange is bound to it.
+    #[must_use]
+    pub const fn network(&self) -> NetworkId {
+        self.network
     }
 
     #[must_use]
@@ -510,6 +528,7 @@ impl Channel {
         }
         let cumulative = self.cumulative().checked_add(job.price)?;
         let voucher = MakerVoucher::issue(
+            self.network,
             client,
             self.provider(),
             self.payment_edge,
@@ -562,6 +581,7 @@ impl Channel {
             return Err(SettleError::WrongFrontier);
         };
         let hash = KernelTx::payload_hash(
+            self.network,
             self.payment_edge,
             CloseKind::Mutual,
             self.payment.hash(),
@@ -615,6 +635,22 @@ const JOB_RESULT_DOMAIN: &[u8] = b"hellas.staked.job_result.v1";
 const RECEIPT_REQUEST_DOMAIN: &[u8] = b"hellas.staked.receipt_request.v1";
 /// Domain separator for [`FraudArtifact::seal`].
 const PREVERIFIED_SEAL_DOMAIN: &[u8] = b"hellas.staked.preverified_seal.v1";
+
+/// Opens every staked digest: a purpose-specific domain, then the
+/// network that purpose is being served on.
+///
+/// One funnel rather than four call sites, so a fifth staked payload
+/// cannot be born network-blind — which is how the first four were
+/// written. `domain` separates the payloads from each other; the
+/// network separates each of them from its twin on another deployment,
+/// where the same acceptance would otherwise be a valid acceptance and
+/// the same voucher would redeem.
+fn staked_digest(domain: &[u8], network: NetworkId) -> hellas_xet::SingleChunkHasher {
+    let mut hasher = hellas_xet::SingleChunkHasher::new();
+    hasher.write(domain);
+    network.encode_to(&mut hasher);
+    hasher
+}
 
 /// Job admission facts both parties authenticate *at acceptance* —
 /// before any transcript exists. Selects the live bond by exact
@@ -680,9 +716,8 @@ impl JobAcceptanceContext {
 
     /// Canonical digest both parties sign at acceptance.
     #[must_use]
-    pub fn digest(&self) -> PayloadHash {
-        let mut hasher = hellas_xet::SingleChunkHasher::new();
-        hasher.write(JOB_ACCEPTANCE_DOMAIN);
+    pub fn digest(&self, network: NetworkId) -> PayloadHash {
+        let mut hasher = staked_digest(JOB_ACCEPTANCE_DOMAIN, network);
         self.bond_edge.encode_to(&mut hasher);
         self.bond_terms.encode_to(&mut hasher);
         self.payment_edge.encode_to(&mut hasher);
@@ -708,9 +743,8 @@ pub struct JobResultContext {
 impl JobResultContext {
     /// Canonical digest the provider signs at terminal output.
     #[must_use]
-    pub fn digest(&self) -> PayloadHash {
-        let mut hasher = hellas_xet::SingleChunkHasher::new();
-        hasher.write(JOB_RESULT_DOMAIN);
+    pub fn digest(&self, network: NetworkId) -> PayloadHash {
+        let mut hasher = staked_digest(JOB_RESULT_DOMAIN, network);
         self.acceptance.encode_to(&mut hasher);
         self.transcript.encode_to(&mut hasher);
         PayloadHash::from_bytes(hasher.finalize().into_bytes())
@@ -744,11 +778,10 @@ impl FraudArtifact {
     /// The seal bytes this artifact justifies: a commitment to both
     /// context digests under a dedicated domain.
     #[must_use]
-    pub fn seal(&self) -> Seal {
-        let mut hasher = hellas_xet::SingleChunkHasher::new();
-        hasher.write(PREVERIFIED_SEAL_DOMAIN);
-        self.acceptance.digest().encode_to(&mut hasher);
-        self.result.digest().encode_to(&mut hasher);
+    pub fn seal(&self, network: NetworkId) -> Seal {
+        let mut hasher = staked_digest(PREVERIFIED_SEAL_DOMAIN, network);
+        self.acceptance.digest(network).encode_to(&mut hasher);
+        self.result.digest(network).encode_to(&mut hasher);
         Seal::from_bytes(hasher.finalize().into_bytes())
     }
 
@@ -763,7 +796,7 @@ impl FraudArtifact {
         let Some(bond) = public.terms.as_stake_bond() else {
             return false;
         };
-        let acceptance_digest = self.acceptance.digest();
+        let acceptance_digest = self.acceptance.digest(public.network);
         let provider = provider_key(&bond.parties);
         let client = client_key(&bond.parties);
         let sigs = Secp256k1Verifier::new();
@@ -773,7 +806,11 @@ impl FraudArtifact {
             && self.result.acceptance == acceptance_digest
             && sigs.verify_sig(self.client_acceptance_sig, client, acceptance_digest)
             && sigs.verify_sig(self.provider_acceptance_sig, provider, acceptance_digest)
-            && sigs.verify_sig(self.provider_result_sig, provider, self.result.digest())
+            && sigs.verify_sig(
+                self.provider_result_sig,
+                provider,
+                self.result.digest(public.network),
+            )
     }
 }
 
@@ -795,9 +832,8 @@ fn paid_solely_to(outputs: &List<Payout, MAX_EDGE_OUTPUTS>, key: Key) -> bool {
 /// exclude. Domain separation makes the receipt authorization
 /// unforgeable from anything the client has already published.
 #[must_use]
-pub fn receipt_request_digest(acceptance: PayloadHash) -> PayloadHash {
-    let mut hasher = hellas_xet::SingleChunkHasher::new();
-    hasher.write(RECEIPT_REQUEST_DOMAIN);
+pub fn receipt_request_digest(network: NetworkId, acceptance: PayloadHash) -> PayloadHash {
+    let mut hasher = staked_digest(RECEIPT_REQUEST_DOMAIN, network);
     acceptance.encode_to(&mut hasher);
     PayloadHash::from_bytes(hasher.finalize().into_bytes())
 }
@@ -836,8 +872,8 @@ impl PreverifiedSeals {
     }
 
     /// Registers an artifact and returns the seal that redeems it.
-    pub fn insert(&self, artifact: FraudArtifact) -> Seal {
-        let seal = artifact.seal();
+    pub fn insert(&self, network: NetworkId, artifact: FraudArtifact) -> Seal {
+        let seal = artifact.seal(network);
         self.inner
             .lock()
             .expect("preverified seal cache poisoned")
@@ -855,7 +891,8 @@ impl PreverifiedSeals {
             .expect("preverified seal cache poisoned")
             .get(&seal)
             .copied();
-        artifact.is_some_and(|artifact| artifact.seal() == seal && artifact.binds(public))
+        artifact
+            .is_some_and(|artifact| artifact.seal(public.network) == seal && artifact.binds(public))
     }
 }
 
@@ -935,6 +972,7 @@ mod channel_tests {
 
     fn channel() -> Channel {
         let Some(channel) = Channel::new(
+            crate::domain::TEST_NETWORK,
             bond_edge(),
             bond_terms(),
             payment_edge(),
@@ -1084,7 +1122,7 @@ mod channel_tests {
         let mut mine = channel();
         let accepted = job(&mine, 400, 60);
         assert_eq!(mine.admit(now(), accepted), Ok(()));
-        let digest = accepted.digest();
+        let digest = accepted.digest(crate::domain::TEST_NETWORK);
         let result = JobResultContext {
             acceptance: digest,
             transcript: [9; 32],
@@ -1094,9 +1132,9 @@ mod channel_tests {
             client_acceptance_sig: client().sign(digest),
             provider_acceptance_sig: provider().sign(digest),
             result,
-            provider_result_sig: provider().sign(result.digest()),
+            provider_result_sig: provider().sign(result.digest(crate::domain::TEST_NETWORK)),
         };
-        let seal = artifact.seal();
+        let seal = artifact.seal(crate::domain::TEST_NETWORK);
 
         let mut slots = [Payout::default(); MAX_EDGE_OUTPUTS];
         slots[0] = Payout::new(client().party_key(), AWARD);
@@ -1112,10 +1150,72 @@ mod channel_tests {
             ),
         );
         assert!(artifact.binds(&SealPublicInputs {
+            network: crate::domain::TEST_NETWORK,
             edge_id: bond_edge(),
             terms: &bond,
             payouts: &outputs,
         }));
+    }
+
+    /// Every payload the two parties exchange is bound to one network.
+    ///
+    /// Before this, the four staked domains separated the payloads from
+    /// each other but not from their twins on another deployment: a
+    /// devnet acceptance was a valid acceptance anywhere, and a voucher
+    /// redeemed across networks.
+    #[test]
+    fn every_staked_payload_is_bound_to_one_network() {
+        const OTHER: NetworkId = match NetworkId::new("hellas-chain-other") {
+            Some(network) => network,
+            None => panic!("literal is a legal network id"),
+        };
+        let home = crate::domain::TEST_NETWORK;
+
+        let mut mine = channel();
+        let accepted = job(&mine, 400, 60);
+        assert_eq!(mine.admit(now(), accepted), Ok(()));
+
+        let acceptance = accepted.digest(home);
+        assert_ne!(acceptance, accepted.digest(OTHER), "job acceptance");
+
+        let result = JobResultContext {
+            acceptance,
+            transcript: [9; 32],
+        };
+        assert_ne!(result.digest(home), result.digest(OTHER), "job result");
+        assert_ne!(
+            receipt_request_digest(home, acceptance),
+            receipt_request_digest(OTHER, acceptance),
+            "receipt request",
+        );
+
+        let artifact = FraudArtifact {
+            acceptance: accepted,
+            client_acceptance_sig: client().sign(acceptance),
+            provider_acceptance_sig: provider().sign(acceptance),
+            result,
+            provider_result_sig: provider().sign(result.digest(home)),
+        };
+        assert_ne!(artifact.seal(home), artifact.seal(OTHER), "fraud seal");
+
+        // And the end-to-end consequence: an artifact authenticated for
+        // one network does not bind on another.
+        let bond = bond_terms();
+        let mut slots = [Payout::default(); MAX_EDGE_OUTPUTS];
+        slots[0] = Payout::new(client().party_key(), AWARD);
+        slots[1] = Payout::new(signer(3).party_key(), STAKE - AWARD);
+        let outputs = List::take(slots, 2);
+        let public = |network| SealPublicInputs {
+            network,
+            edge_id: bond_edge(),
+            terms: &bond,
+            payouts: &outputs,
+        };
+        assert!(artifact.binds(&public(home)));
+        assert!(
+            !artifact.binds(&public(OTHER)),
+            "a fraud artifact must not slash a bond on another network",
+        );
     }
 
     // Scenario 6: the provider vanishes; the client's refund needs no
@@ -1184,6 +1284,7 @@ mod channel_tests {
 
         let issue_at = |edge, cumulative| {
             MakerVoucher::issue(
+                crate::domain::TEST_NETWORK,
                 &client(),
                 provider().party_key(),
                 edge,
@@ -1209,7 +1310,9 @@ mod channel_tests {
             panic!("genuine voucher issues");
         };
         let forged = MakerVoucher {
-            client_auth: Auth::native(provider().sign(accepted.digest())),
+            client_auth: Auth::native(
+                provider().sign(accepted.digest(crate::domain::TEST_NETWORK)),
+            ),
             ..genuine.clone()
         };
         assert_eq!(
@@ -1230,6 +1333,7 @@ mod channel_tests {
         let accepted = job(&theirs, 400, 60);
         assert_eq!(theirs.admit(now(), accepted), Ok(()));
         let Some(voucher) = MakerVoucher::issue(
+            crate::domain::TEST_NETWORK,
             &client(),
             provider().party_key(),
             payment_edge(),
@@ -1307,7 +1411,16 @@ mod channel_tests {
             (drained_bond, payment()),
         ];
         for (bond, payment) in cases {
-            assert!(Channel::new(bond_edge(), bond, payment_edge(), payment).is_none());
+            assert!(
+                Channel::new(
+                    crate::domain::TEST_NETWORK,
+                    bond_edge(),
+                    bond,
+                    payment_edge(),
+                    payment
+                )
+                .is_none()
+            );
         }
     }
 }
@@ -1334,6 +1447,7 @@ mod tests {
 
     fn context(height: u64) -> KernelContext {
         KernelContext::with_fees(
+            crate::domain::TEST_NETWORK,
             BlockHeight::new(height),
             BlockHash::from_bytes([0; BlockHash::LENGTH]),
             KERNEL_FEES,
@@ -1400,6 +1514,7 @@ mod tests {
             FULL_GAME_CAPACITY,
         );
         let Some(channel) = Channel::new(
+            crate::domain::TEST_NETWORK,
             hellas_kernel::EdgeId::from_bytes([0x44; 32]),
             Terms::stake_bond(full_game_bond_policy()),
             hellas_kernel::EdgeId::from_bytes([0x55; 32]),
@@ -1433,7 +1548,7 @@ mod tests {
             price: 400,
             terminal_deadline: BlockHeight::new(60),
         };
-        let acceptance_digest = acceptance.digest();
+        let acceptance_digest = acceptance.digest(crate::domain::TEST_NETWORK);
         let result = JobResultContext {
             acceptance: acceptance_digest,
             transcript: [9; 32],
@@ -1443,7 +1558,7 @@ mod tests {
             client_acceptance_sig: client.sign(acceptance_digest),
             provider_acceptance_sig: provider.sign(acceptance_digest),
             result,
-            provider_result_sig: provider.sign(result.digest()),
+            provider_result_sig: provider.sign(result.digest(crate::domain::TEST_NETWORK)),
         }
     }
 
@@ -1610,7 +1725,7 @@ mod tests {
                 List::take([client_coin; MAX_PARTY_INPUTS], 1),
                 List::take([client_coin; MAX_PARTY_INPUTS], 0),
             );
-            let open_hash = KernelTx::open_hash(&funding, &terms);
+            let open_hash = KernelTx::open_hash(crate::domain::TEST_NETWORK, &funding, &terms);
             let payment_open = KernelTx::open(
                 funding.clone(),
                 terms.clone(),
@@ -1628,7 +1743,8 @@ mod tests {
                 List::take([provider_coin; MAX_PARTY_INPUTS], 1),
                 List::take([provider_coin; MAX_PARTY_INPUTS], 0),
             );
-            let bond_open_hash = KernelTx::open_hash(&bond_funding, &bond);
+            let bond_open_hash =
+                KernelTx::open_hash(crate::domain::TEST_NETWORK, &bond_funding, &bond);
             let bond_open = KernelTx::open(
                 bond_funding.clone(),
                 bond.clone(),
@@ -1660,12 +1776,22 @@ mod tests {
             let merkleized = batches.merkleize().await.expect("opens merkleize");
             database.finalize(merkleized).await;
 
-            let mut mine = Channel::new(bond_edge, bond.clone(), payment_edge, terms.clone()
-)
-                .expect("mirrored pairing constructs the client channel");
-            let mut theirs = Channel::new(bond_edge, bond, payment_edge, terms.clone()
-)
-                .expect("mirrored pairing constructs the provider channel");
+            let mut mine = Channel::new(
+                crate::domain::TEST_NETWORK,
+                bond_edge,
+                bond.clone(),
+                payment_edge,
+                terms.clone(),
+            )
+            .expect("mirrored pairing constructs the client channel");
+            let mut theirs = Channel::new(
+                crate::domain::TEST_NETWORK,
+                bond_edge,
+                bond,
+                payment_edge,
+                terms.clone(),
+            )
+            .expect("mirrored pairing constructs the provider channel");
 
             // Two honest jobs: E = 800, then E = 1_550. Both sides run
             // the same admission; the client issues, the provider
@@ -1759,7 +1885,7 @@ mod tests {
             theirs
                 .admit(BlockHeight::new(2), fraud)
                 .expect("provider admits the third job");
-            let digest = fraud.digest();
+            let digest = fraud.digest(crate::domain::TEST_NETWORK);
             let result = JobResultContext {
                 acceptance: digest,
                 transcript: [9; 32],
@@ -1769,9 +1895,11 @@ mod tests {
                 client_acceptance_sig: client.sign(digest),
                 provider_acceptance_sig: provider.sign(digest),
                 result,
-                provider_result_sig: provider.sign(result.digest()),
+                provider_result_sig: provider.sign(result.digest(crate::domain::TEST_NETWORK)),
             };
-            let seal = verifier.preverified_seals().insert(artifact);
+            let seal = verifier
+                .preverified_seals()
+                .insert(crate::domain::TEST_NETWORK, artifact);
             let slash = mine.slash_close(seal);
             let batches = execute_all(
                 context(3),
@@ -1835,7 +1963,7 @@ mod tests {
                 List::take([provider_coin; MAX_PARTY_INPUTS], 1),
                 List::take([provider_coin; MAX_PARTY_INPUTS], 0),
             );
-            let open_hash = KernelTx::open_hash(&funding, &terms);
+            let open_hash = KernelTx::open_hash(crate::domain::TEST_NETWORK, &funding, &terms);
             let open = KernelTx::open(
                 funding.clone(),
                 terms.clone(),
@@ -1876,7 +2004,7 @@ mod tests {
                 &provider,
                 &client,
             );
-            let unbound_seal = seals.insert(unbound);
+            let unbound_seal = seals.insert(crate::domain::TEST_NETWORK, unbound);
             let unbound_close = Transaction::Kernel(KernelTx::close(
                 bond_edge,
                 Proof::violation(terms.clone(), unbound_seal),
@@ -1900,7 +2028,7 @@ mod tests {
 
             // The bound artifact slashes into exactly the committed shape.
             let artifact = artifact_for(bond_edge, terms.hash(), &provider, &client);
-            let seal = seals.insert(artifact);
+            let seal = seals.insert(crate::domain::TEST_NETWORK, artifact);
             let close = Transaction::Kernel(KernelTx::close(
                 bond_edge,
                 Proof::violation(terms.clone(), seal),

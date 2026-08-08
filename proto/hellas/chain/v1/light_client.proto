@@ -152,6 +152,11 @@ message GetConsensusInfoRequest {}
 message GetConsensusInfoResponse {
   repeated string validators = 1;
   bytes threshold_identity = 2;
+  // The network every signature on this chain is domain-separated by.
+  // A follower needs it to recompute the authorization hashes it
+  // verifies, and learns it here for the same reason it learns the
+  // validator set here.
+  string network_id = 3;
 }
 
 message GetCoinsByOwnerRequest {

@@ -8,11 +8,7 @@ mod app;
 pub mod client;
 #[cfg(any(feature = "indexer", feature = "validator"))]
 pub mod config;
-#[cfg(any(
-    feature = "client-core",
-    feature = "indexer",
-    feature = "validator"
-))]
+#[cfg(any(feature = "client-core", feature = "indexer", feature = "validator"))]
 mod consensus;
 #[cfg(feature = "domain")]
 pub mod domain;
@@ -41,20 +37,12 @@ pub mod staked;
 #[cfg(feature = "validator")]
 pub mod validator;
 
-#[cfg(any(
-    feature = "client-core",
-    feature = "indexer",
-    feature = "validator"
-))]
+#[cfg(any(feature = "client-core", feature = "indexer", feature = "validator"))]
 pub const CONSENSUS_NAMESPACE: &[u8] = b"hellas";
 
 #[cfg(any(feature = "indexer", feature = "validator"))]
 pub use app::{ActivityReporter, Application, ApplicationConfig, HellasBlock, Mempool};
-#[cfg(any(
-    feature = "client-core",
-    feature = "indexer",
-    feature = "validator"
-))]
+#[cfg(any(feature = "client-core", feature = "indexer", feature = "validator"))]
 pub use consensus::{ConsensusVerificationError, ConsensusVerifier, Finalization};
 #[cfg(any(feature = "indexer", feature = "validator"))]
 pub use execution::store::{UtxoDb, utxo_db_config};

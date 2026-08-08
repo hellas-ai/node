@@ -24,8 +24,17 @@ use hellas_chain::staked::{
     payment_terms,
 };
 use hellas_kernel::{
-    BlockHeight, EdgeId, List, MAX_EDGE_OUTPUTS, Parties, Payout, Secp256k1Signer, StakeBondTerms,
-    Terms,
+    BlockHeight, EdgeId, List, MAX_EDGE_OUTPUTS, NetworkId, Parties, Payout, Secp256k1Signer,
+    StakeBondTerms, Terms,
+};
+
+/// The network this replay runs on. The Quint model is
+/// network-agnostic — it describes the game, not the deployment — so
+/// any single network reproduces it; what matters is that the trace and
+/// the kernel agree on one.
+const NETWORK: NetworkId = match NetworkId::new("hellas-itf-replay") {
+    Some(network) => network,
+    None => panic!("literal is a legal network id"),
 };
 use itf::Runner as ItfRunner;
 use itf::de::{As, Integer};
@@ -84,6 +93,7 @@ fn payment_edge() -> EdgeId {
 
 fn fresh_channel() -> Channel {
     Channel::new(
+        NETWORK,
         EdgeId::from_bytes([1; 32]),
         bond_terms(),
         payment_edge(),
@@ -248,6 +258,7 @@ impl ItfRunner for ChannelRunner {
                 // frontier. Built directly so the model can explore a
                 // frontier that does not advance by the job's price.
                 let voucher = MakerVoucher::issue(
+                    NETWORK,
                     &client(),
                     provider().party_key(),
                     payment_edge(),

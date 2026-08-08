@@ -9,6 +9,7 @@ use commonware_p2p::Address as P2pAddress;
 use commonware_runtime::{BufferPooler, buffer::paged::CacheRef};
 use commonware_utils::ordered::{Map, Set};
 pub use hellas_genesis::{Genesis, GenesisAllocation as GenesisEntry, GenesisValidator};
+use hellas_kernel::NetworkId;
 use serde::{Deserialize, Serialize};
 use std::{
     net::SocketAddr,
@@ -17,6 +18,19 @@ use std::{
     time::Duration,
 };
 use thiserror::Error;
+
+/// The network id a loaded genesis document names.
+///
+/// The single conversion from "the document this node was started with"
+/// to "the network every signature it makes is bound to". Nothing else
+/// in the tree decides what network a node is on — there is deliberately
+/// no compile-time default, because a binary that carries one will
+/// silently re-domain every signature when that constant moves.
+pub fn network_id(genesis: &Genesis) -> Result<NetworkId, ConfigError> {
+    genesis.validate()?;
+    NetworkId::new(&genesis.network_id)
+        .ok_or_else(|| ConfigError::UnrepresentableNetworkId(genesis.network_id.clone()))
+}
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -34,11 +48,8 @@ pub enum ConfigError {
     MissingLocalValidator,
     #[error("configured peer identities do not match the genesis committee")]
     PeerSetMismatch,
-    #[error("network `{configured}` is not supported by this binary; expected `{supported}`")]
-    UnsupportedNetwork {
-        configured: String,
-        supported: &'static str,
-    },
+    #[error("genesis network id `{0}` does not fit a kernel NetworkId")]
+    UnrepresentableNetworkId(String),
     #[error("invalid network address")]
     InvalidAddress(#[from] std::net::AddrParseError),
     #[error("duplicate keys in peer address map")]
@@ -106,7 +117,6 @@ impl Default for Config {
 }
 
 impl Config {
-
     pub fn page_cache(self, pooler: &impl BufferPooler) -> CacheRef {
         let page_cache_count =
             NonZeroUsize::new(self.page_cache_count).unwrap_or(NonZeroUsize::MIN);
@@ -138,13 +148,13 @@ pub struct PeerEntry {
 impl ValidatorConfig {
     pub fn validate_genesis(&self) -> Result<(), ConfigError> {
         self.genesis.validate()?;
-        if self.genesis.network_id != hellas_genesis::DEFAULT_NETWORK_ID {
-            return Err(ConfigError::UnsupportedNetwork {
-                configured: self.genesis.network_id.clone(),
-                supported: hellas_genesis::DEFAULT_NETWORK_ID,
-            });
-        }
+        network_id(&self.genesis)?;
         Ok(())
+    }
+
+    /// The network every signature domain on this node is bound to.
+    pub fn network_id(&self) -> Result<NetworkId, ConfigError> {
+        network_id(&self.genesis)
     }
 
     pub fn decode_private_key(&self) -> Result<ed25519::PrivateKey, ConfigError> {
@@ -378,14 +388,19 @@ mod tests {
     }
 
     #[test]
-    fn rejects_network_id_the_transaction_domain_does_not_support() {
-        let address = addr_from_signing_key(&secp256r1_key_from_seed(7));
-        let mut config = config_with_genesis(SettlementKey::from(address).to_string());
-        config.genesis.network_id = "hellas-testnet-1".to_string();
+    fn any_valid_genesis_network_id_is_accepted_and_carried() {
+        let address =
+            SettlementKey::from(addr_from_signing_key(&secp256r1_key_from_seed(7))).to_string();
+        for id in ["hellas-devnet-1", "hellas-testnet-1", "someone-elses-net"] {
+            let mut config = config_with_genesis(address.clone());
+            config.genesis.network_id = id.to_string();
 
-        assert!(matches!(
-            config.validate_genesis(),
-            Err(ConfigError::UnsupportedNetwork { .. })
-        ));
+            config.validate_genesis().expect("a valid genesis is valid");
+            assert_eq!(
+                config.network_id().expect("id fits").as_str(),
+                id,
+                "the configured network must be the one the node signs under",
+            );
+        }
     }
 }
