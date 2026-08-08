@@ -42,6 +42,7 @@
 
 pub mod fastresume;
 pub mod hf;
+pub mod hf_cache;
 pub mod xorb;
 
 use std::collections::HashMap;
@@ -129,6 +130,9 @@ type Result<T> = std::result::Result<T, StoreError>;
 #[derive(Clone, Default)]
 pub struct ContentStore {
     index: Arc<RwLock<HashMap<XetHash, Entry>>>,
+    /// What this store has already hashed. Owned, so two stores never
+    /// invalidate each other's work.
+    records: Arc<fastresume::Records>,
     substituters: Arc<Vec<Arc<dyn Substituter>>>,
 }
 
@@ -178,7 +182,7 @@ impl ContentStore {
         let mut file = std::fs::File::open(path).map_err(read_err)?;
         let before = file.metadata().map_err(read_err)?;
 
-        if let Some(indexed) = fastresume::get(&before) {
+        if let Some(indexed) = self.records.get(&before) {
             self.record(path, &indexed);
             return Ok(indexed);
         }
@@ -206,7 +210,7 @@ impl ContentStore {
         // of nothing real into the index.
         let after = file.metadata().map_err(read_err)?;
         if fastresume::identical(&before, &after) {
-            fastresume::put(&before, &indexed);
+            self.records.put(&before, &indexed);
         }
         self.record(path, &indexed);
         Ok(indexed)
@@ -321,6 +325,16 @@ impl ContentStore {
             });
         }
         Ok(indexed)
+    }
+
+    /// What this store remembers having hashed.
+    ///
+    /// Exposed so a caller can persist it across restarts — adopting a
+    /// terabyte cache should cost one read per file ever, not one per
+    /// boot.
+    #[must_use]
+    pub fn records(&self) -> &fastresume::Records {
+        &self.records
     }
 
     /// Byte length of indexed content, without reading it.

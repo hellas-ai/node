@@ -33,18 +33,27 @@
 //!
 //! # Scope
 //!
-//! In-process only, so far. A persisted record is a correctness
-//! contract that survives restarts, upgrades and crashes; this removes
-//! every repeat cost within a process and carries no such contract. It
-//! now lives with the store that will own the persisted version.
+//! # Persistence
+//!
+//! Records survive restarts via [`load`] and [`save`], because a store
+//! that re-hashes a 1.5 TB cache every boot is a store nobody will
+//! adopt. The file format carries a magic and a version, and anything
+//! it does not recognise is discarded rather than guessed at — a
+//! misparsed record is a wrong content id, which is the one failure
+//! this module exists to prevent.
+//!
+//! Loading is not trusting: a loaded record is still checked against the
+//! live file's identity before it is used, exactly as an in-process one
+//! is. The file is a cache of work, never a source of truth.
 
 use std::collections::HashMap;
 use std::fs::Metadata;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 use crate::Indexed;
+use hellas_xet::{Chunk, XetHash};
 
 /// What a file must still look like for its recorded hash to be reused.
 ///
@@ -73,35 +82,15 @@ impl FileIdentity {
     }
 }
 
-fn records() -> &'static Mutex<HashMap<FileIdentity, Indexed>> {
-    static RECORDS: OnceLock<Mutex<HashMap<FileIdentity, Indexed>>> = OnceLock::new();
-    RECORDS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Returns the recorded content id for `path`, if the file still looks
-/// exactly as it did when it was hashed.
+/// What one store remembers about files it has hashed.
 ///
-/// Keyed on identity rather than path so the same blob reached through
-/// two revisions' snapshot symlinks is hashed once.
-pub(crate) fn get(metadata: &Metadata) -> Option<Indexed> {
-    let identity = FileIdentity::of(metadata);
-    records()
-        .lock()
-        .ok()
-        .and_then(|records| records.get(&identity).cloned())
-}
-
-/// Records what indexing `metadata`'s file produced.
-///
-/// The chunk list is stored, not just the id: re-deriving the id costs
-/// a full read, and the chunk list is what a later partial fetch needs
-/// to be verifiable. Remembering only the id would make the cheap thing
-/// cheap and leave the valuable thing to be recomputed.
-pub(crate) fn put(metadata: &Metadata, indexed: &Indexed) {
-    let identity = FileIdentity::of(metadata);
-    if let Ok(mut records) = records().lock() {
-        records.insert(identity, indexed.clone());
-    }
+/// Owned rather than global. A process-wide table would mean one
+/// store's `force_recheck` silently emptied another's, and two stores in
+/// one process could never be reasoned about independently — which also
+/// made tests interfere with each other, which is how this was noticed.
+#[derive(Debug, Default)]
+pub struct Records {
+    entries: Mutex<HashMap<FileIdentity, Indexed>>,
 }
 
 /// True when two stats describe the same unchanged file.
@@ -114,21 +103,178 @@ pub(crate) fn identical(before: &Metadata, after: &Metadata) -> bool {
     FileIdentity::of(before) == FileIdentity::of(after)
 }
 
-/// Discards every record, forcing a re-hash of everything.
-///
-/// The "force recheck" every fastresume implementation needs, because
-/// the identity check is a heuristic and heuristics are wrong
-/// eventually.
-pub fn force_recheck() {
-    if let Ok(mut records) = records().lock() {
-        records.clear();
+impl Records {
+    /// An empty table.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// What indexing this file produced last time, if it still looks
+    /// exactly the same.
+    ///
+    /// Keyed on identity rather than path, so one blob reached through
+    /// two revisions' snapshot symlinks is hashed once.
+    #[must_use]
+    pub fn get(&self, metadata: &Metadata) -> Option<Indexed> {
+        let identity = FileIdentity::of(metadata);
+        self.entries
+            .lock()
+            .ok()
+            .and_then(|entries| entries.get(&identity).cloned())
+    }
+
+    /// Records what indexing this file produced.
+    ///
+    /// The chunk list is stored, not just the id: re-deriving the id
+    /// costs a full read, and the chunk list is what a later partial
+    /// fetch needs to be verifiable.
+    pub fn put(&self, metadata: &Metadata, indexed: &Indexed) {
+        let identity = FileIdentity::of(metadata);
+        if let Ok(mut entries) = self.entries.lock() {
+            entries.insert(identity, indexed.clone());
+        }
+    }
+
+    /// Discards every record, forcing a re-hash of everything.
+    ///
+    /// The "force recheck" every fastresume implementation needs,
+    /// because the identity check is a heuristic and heuristics are
+    /// wrong eventually.
+    pub fn force_recheck(&self) {
+        if let Ok(mut entries) = self.entries.lock() {
+            entries.clear();
+        }
+    }
+
+    /// Number of files remembered.
+    #[must_use]
+    pub fn remembered(&self) -> usize {
+        self.entries
+            .lock()
+            .map(|entries| entries.len())
+            .unwrap_or(0)
     }
 }
 
-/// Number of files currently remembered. For tests and diagnostics.
-#[must_use]
-pub fn remembered() -> usize {
-    records().lock().map(|records| records.len()).unwrap_or(0)
+/// Magic at the head of a fastresume file. Present so a truncated or
+/// unrelated file is refused rather than read as records.
+const MAGIC: &[u8; 8] = b"HELLASFR";
+/// Bumped whenever the record layout changes. Old files are discarded,
+/// never reinterpreted.
+const FORMAT_VERSION: u32 = 1;
+
+/// Writes every remembered record to `path`, atomically.
+///
+/// Written to a sibling temporary file and renamed, so a crash midway
+/// leaves the previous file intact rather than a half-written one that
+/// would parse into wrong ids.
+///
+/// # Errors
+///
+/// Returns the underlying I/O error if the file cannot be written or
+/// renamed.
+impl Records {
+    #[allow(clippy::missing_errors_doc, reason = "documented on the item above")]
+    pub fn save(&self, path: &Path) -> std::io::Result<usize> {
+        let records = match self.entries.lock() {
+            Ok(entries) => entries.clone(),
+            Err(_) => return Ok(0),
+        };
+
+        let mut out = Vec::with_capacity(records.len() * 128);
+        out.extend_from_slice(MAGIC);
+        out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+        out.extend_from_slice(&(records.len() as u64).to_le_bytes());
+        for (identity, indexed) in &records {
+            out.extend_from_slice(&identity.dev.to_le_bytes());
+            out.extend_from_slice(&identity.ino.to_le_bytes());
+            out.extend_from_slice(&identity.size.to_le_bytes());
+            out.extend_from_slice(&identity.mtime_ns.to_le_bytes());
+            out.extend_from_slice(&identity.ctime_ns.to_le_bytes());
+            out.extend_from_slice(indexed.id.as_bytes());
+            out.extend_from_slice(&indexed.len.to_le_bytes());
+            out.extend_from_slice(&(indexed.chunks.len() as u64).to_le_bytes());
+            for chunk in &indexed.chunks {
+                out.extend_from_slice(chunk.hash.as_bytes());
+                out.extend_from_slice(&chunk.data_len.to_le_bytes());
+            }
+        }
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let temporary = path.with_extension("fastresume.tmp");
+        std::fs::write(&temporary, &out)?;
+        std::fs::rename(&temporary, path)?;
+        Ok(records.len())
+    }
+}
+
+/// Reads records from `path` into memory, returning how many were
+/// adopted.
+///
+/// A file that is missing, truncated, of another version, or otherwise
+/// unreadable yields zero — never an error and never a partial parse.
+/// The cost of ignoring a cache is a re-hash; the cost of misreading one
+/// is a wrong content id.
+impl Records {
+    /// Reads records from `path`, returning how many were adopted.
+    #[must_use]
+    pub fn load(&self, path: &Path) -> usize {
+        let Ok(bytes) = std::fs::read(path) else {
+            return 0;
+        };
+        let Some(parsed) = parse(&bytes) else {
+            return 0;
+        };
+        let count = parsed.len();
+        if let Ok(mut entries) = self.entries.lock() {
+            entries.extend(parsed);
+        }
+        count
+    }
+}
+
+fn parse(bytes: &[u8]) -> Option<Vec<(FileIdentity, Indexed)>> {
+    let mut at = 0;
+    let mut take = |n: usize| -> Option<&[u8]> {
+        let slice = bytes.get(at..at + n)?;
+        at += n;
+        Some(slice)
+    };
+    if take(8)? != MAGIC {
+        return None;
+    }
+    if u32::from_le_bytes(take(4)?.try_into().ok()?) != FORMAT_VERSION {
+        return None;
+    }
+    let count = usize::try_from(u64::from_le_bytes(take(8)?.try_into().ok()?)).ok()?;
+
+    let mut parsed = Vec::with_capacity(count.min(4096));
+    for _ in 0..count {
+        let identity = FileIdentity {
+            dev: u64::from_le_bytes(take(8)?.try_into().ok()?),
+            ino: u64::from_le_bytes(take(8)?.try_into().ok()?),
+            size: u64::from_le_bytes(take(8)?.try_into().ok()?),
+            mtime_ns: i128::from_le_bytes(take(16)?.try_into().ok()?),
+            ctime_ns: i128::from_le_bytes(take(16)?.try_into().ok()?),
+        };
+        let id = XetHash::from_bytes(take(32)?.try_into().ok()?);
+        let len = u64::from_le_bytes(take(8)?.try_into().ok()?);
+        let chunk_count = usize::try_from(u64::from_le_bytes(take(8)?.try_into().ok()?)).ok()?;
+        let mut chunks = Vec::with_capacity(chunk_count.min(1 << 20));
+        for _ in 0..chunk_count {
+            let hash = XetHash::from_bytes(take(32)?.try_into().ok()?);
+            chunks.push(Chunk::new(
+                hash,
+                u64::from_le_bytes(take(8)?.try_into().ok()?),
+            ));
+        }
+        parsed.push((identity, Indexed { id, chunks, len }));
+    }
+    // Trailing bytes mean this is not the file we think it is.
+    (at == bytes.len()).then_some(parsed)
 }
 
 /// True when `path` cannot be content: HuggingFace caches carry lock
