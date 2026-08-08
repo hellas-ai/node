@@ -41,6 +41,7 @@
 //! defend is a claim we can lose.
 
 pub mod fastresume;
+pub mod xorb;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
