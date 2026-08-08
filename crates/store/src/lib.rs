@@ -41,6 +41,7 @@
 //! defend is a claim we can lose.
 
 pub mod fastresume;
+pub mod hf;
 pub mod xorb;
 
 use std::collections::HashMap;
@@ -63,6 +64,28 @@ pub struct Indexed {
     pub chunks: Vec<Chunk>,
     /// Total length in bytes.
     pub len: u64,
+}
+
+/// Anything that can make content appear that is not here yet.
+///
+/// Separate from [`Substituter`] on purpose. A substituter answers
+/// cheaply and locally; a fetcher spends bandwidth. Only one of those
+/// may be reached from a quote.
+pub trait Fetcher: Send + Sync {
+    /// Name, for diagnostics.
+    fn name(&self) -> &str;
+
+    /// Writes content `id` to `dest`, verifying it.
+    ///
+    /// `expected` is our chunk list for this content when we have one,
+    /// which lets an implementation check a partial response as it
+    /// arrives instead of only once it is whole.
+    fn fetch(
+        &self,
+        id: XetHash,
+        dest: &Path,
+        expected: Option<&[Chunk]>,
+    ) -> core::result::Result<u64, crate::hf::FetchError>;
 }
 
 /// Anything that might already hold content we want.
@@ -90,6 +113,12 @@ pub enum StoreError {
     },
     #[error("{path} is cache debris, not content")]
     Debris { path: PathBuf },
+    #[error("materialising {id}")]
+    Fetch {
+        id: String,
+        #[source]
+        source: crate::hf::FetchError,
+    },
 }
 
 type Result<T> = std::result::Result<T, StoreError>;
@@ -253,6 +282,45 @@ impl ContentStore {
             .read()
             .ok()
             .and_then(|index| index.get(&id).map(|entry| entry.chunks.clone()))
+    }
+
+    /// Makes content `id` available locally, fetching it if it is not
+    /// already here, and indexes the result.
+    ///
+    /// The privileged operation. [`Self::have`] is the question a quote
+    /// may ask; this is the one that costs bandwidth and disk, and so
+    /// belongs behind whatever admission control the caller applies.
+    /// Separating them is the whole reason answering a quote can stop
+    /// being a way to make a stranger's node download an arbitrary
+    /// repository.
+    ///
+    /// `fetch` is handed the chunk list when we already hold one, so a
+    /// partial response can be checked chunk by chunk rather than only
+    /// at the end.
+    pub fn materialize(&self, id: XetHash, dest: &Path, fetch: &dyn Fetcher) -> Result<Indexed> {
+        if let Some(path) = self.locate(id) {
+            return self.index(&path);
+        }
+        fetch
+            .fetch(id, dest, self.chunks(id).as_deref())
+            .map_err(|source| StoreError::Fetch {
+                id: id.to_string(),
+                source,
+            })?;
+        let indexed = self.index(dest)?;
+        // A fetcher that wrote the wrong bytes must not leave them in
+        // the store under a name they do not own.
+        if indexed.id != id {
+            let _ = std::fs::remove_file(dest);
+            return Err(StoreError::Fetch {
+                id: id.to_string(),
+                source: crate::hf::FetchError::WrongContent {
+                    expected: id,
+                    actual: indexed.id,
+                },
+            });
+        }
+        Ok(indexed)
     }
 
     /// Byte length of indexed content, without reading it.
