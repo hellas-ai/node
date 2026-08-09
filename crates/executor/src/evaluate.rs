@@ -470,8 +470,8 @@ impl SchemeEngine for EvaluateEngine {
     async fn materialize_model(&mut self, model: String) -> Result<(), ExecutorError> {
         let spec = ModelSpec::parse(&model).map_err(hellas_models::ModelAssetsError::from)?;
         let locator = ModelLocator {
-            model_id: spec.id,
-            revision: spec.revision,
+            model_id: spec.id().to_string(),
+            revision: spec.revision().to_string(),
             dtype: self.preferred_dtype(),
         };
         let key = locator.clone();
@@ -870,6 +870,66 @@ mod tests {
                 .get_quote(&[0; 32], Instant::now())
                 .is_err_and(|err| matches!(err, crate::StateError::QuoteNotFound(_)))
         );
+    }
+
+    /// The same door, with a name instead of a model.
+    ///
+    /// A revision reaches `hf-hub`'s `refs/` lookup, which reads the file
+    /// it names; an absolute one replaces the cache path outright. So the
+    /// quote request below is not a request for a model at all — it is a
+    /// request that this node read `/etc/passwd` and tell the caller
+    /// something about it.
+    ///
+    /// `InvalidArgument` rather than `FailedPrecondition` is the
+    /// assertion that separates this from the test above: a node that
+    /// merely did not hold the model would say "not here yet", which is
+    /// an invitation to try again with a different path.
+    #[tokio::test]
+    async fn quoting_a_revision_that_is_a_path_is_refused_as_a_bad_name() {
+        for revision in ["/etc/passwd", "../../..", "refs/heads/../../../etc"] {
+            let mut engine = test_engine(Arc::new(key(2)));
+            let mut store = ExecutorState::new();
+            let runner = key(3).public_key();
+
+            let err = engine
+                .quote_prepared_text(
+                    &mut store,
+                    QuotePreparedTextRequest {
+                        huggingface_model_id: "hellas-test/not-on-this-node".to_string(),
+                        huggingface_revision: revision.to_string(),
+                        prompt_token_ids: vec![1, 2, 3],
+                        max_new_tokens: 4,
+                        stop_token_ids: Vec::new(),
+                        start: Some(EvaluateStart {
+                            kind: Some(evaluate_start::Kind::Genesis(EvaluateGenesisStart {})),
+                        }),
+                        accept_dtypes: vec![Dtype::F32.as_wire().to_string()],
+                        runner_public_key: Some(public_key_to_pb(&runner)),
+                        assurance: Assurance::ProducerSigned.to_byte().into(),
+                        retain: Some(false),
+                    },
+                )
+                .await
+                .expect_err("a revision that is a path must not be resolved");
+
+            assert!(
+                matches!(
+                    err,
+                    ExecutorError::ModelAssets(hellas_models::ModelAssetsError::Spec(_)),
+                ),
+                "{revision:?} was refused, but not as a bad name: {err:?}",
+            );
+            assert_eq!(
+                hellas_wire::WireStatus::from(err).code,
+                hellas_wire::WireCode::InvalidArgument,
+            );
+            // A refused quote leaves nothing behind to be run against.
+            assert!(
+                store
+                    .get_quote(&[0; 32], Instant::now())
+                    .is_err_and(|err| matches!(err, crate::StateError::QuoteNotFound(_)))
+            );
+        }
     }
 
     /// The same door, one round trip further away: the evaluate quote

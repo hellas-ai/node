@@ -44,7 +44,7 @@ pub fn program_manifest(
     weight_paths.sort();
     let resolved_revision = resolved_revision_of(&config_path)?;
     let key = ManifestKey::of(
-        &spec.id,
+        spec.id(),
         &resolved_revision,
         dtype,
         backend_profile,
@@ -457,8 +457,8 @@ impl ModelAssets {
     /// shape.
     pub fn prepare_quote(&self, prepared_prompt: &PreparedPrompt) -> PreparedQuote {
         PreparedQuote {
-            huggingface_model_id: self.model.id.clone(),
-            huggingface_revision: self.model.revision.clone(),
+            huggingface_model_id: self.model.id().to_string(),
+            huggingface_revision: self.model.revision().to_string(),
             prompt_token_ids: prepared_prompt.input_ids.clone(),
             stop_token_ids: prepared_prompt.stop_token_ids.clone(),
             accept_dtype: self.dtype.as_wire().to_string(),
