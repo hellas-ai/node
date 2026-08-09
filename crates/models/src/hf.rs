@@ -73,15 +73,15 @@ impl RepoFiles {
         }
         let Some(api) = self.api.as_ref() else {
             return Err(ModelAssetsError::NotMaterialized {
-                model_id: self.model.id.clone(),
-                revision: self.model.revision.clone(),
+                model_id: self.model.id().to_string(),
+                revision: self.model.revision().to_string(),
                 file: file.to_string(),
             });
         };
         api.get(file)
             .map_err(|source| ModelAssetsError::FetchModelAsset {
-                model_id: self.model.id.clone(),
-                revision: self.model.revision.clone(),
+                model_id: self.model.id().to_string(),
+                revision: self.model.revision().to_string(),
                 file: file.to_string(),
                 source,
             })
@@ -153,7 +153,11 @@ fn local_file(cache: &Cache, model: &ModelSpec, file: &str) -> Option<PathBuf> {
 }
 
 fn repo_of(model: &ModelSpec) -> Repo {
-    Repo::with_revision(model.id.clone(), RepoType::Model, model.revision.clone())
+    Repo::with_revision(
+        model.id().to_string(),
+        RepoType::Model,
+        model.revision().to_string(),
+    )
 }
 
 fn model_repo(model: &ModelSpec) -> Result<ApiRepo> {
@@ -174,16 +178,21 @@ fn model_repo(model: &ModelSpec) -> Result<ApiRepo> {
 }
 
 fn immutable_snapshot_root(cache: &Path, model: &ModelSpec) -> Option<PathBuf> {
-    if model.revision.len() != 40 || !model.revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if model.revision().len() != 40
+        || !model
+            .revision()
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
         return None;
     }
 
-    let repo = Repo::with_revision(model.id.clone(), RepoType::Model, model.revision.clone());
+    let repo = repo_of(model);
     Some(
         cache
             .join(repo.folder_name())
             .join("snapshots")
-            .join(&model.revision),
+            .join(model.revision()),
     )
 }
 
@@ -299,8 +308,8 @@ mod tests {
         for (file, bytes) in files {
             put(&repo.join("snapshots").join(commit).join(file), bytes);
         }
-        if model.revision != commit {
-            put(&repo.join("refs").join(&model.revision), commit.as_bytes());
+        if model.revision() != commit {
+            put(&repo.join("refs").join(model.revision()), commit.as_bytes());
         }
     }
 
@@ -564,9 +573,13 @@ mod tests {
         );
     }
 
+    /// Anything that is not a commit sha goes through `refs/`. The
+    /// revisions that used to be interesting here — `../snapshots/escape`
+    /// and friends — no longer reach this function at all: `ModelSpec`
+    /// refuses them, which is where a name that becomes a path belongs.
     #[test]
     fn mutable_or_malformed_revision_uses_hub_refs() {
-        for revision in ["main", "../snapshots/escape", "abc123"] {
+        for revision in ["main", "refs/pr/7", "abc123"] {
             let model =
                 ModelSpec::parse(&format!("Qwen/Qwen3-0.6B@{revision}")).expect("valid model spec");
             assert_eq!(
