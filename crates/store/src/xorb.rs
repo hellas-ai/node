@@ -79,6 +79,8 @@ pub enum XorbError {
     LengthMismatch { declared: usize, actual: usize },
     #[error("chunk hashed to {actual}, expected {expected}")]
     HashMismatch { expected: XetHash, actual: XetHash },
+    #[error("{trailing} bytes follow the {count} chunks that were asked for")]
+    Trailing { count: usize, trailing: usize },
 }
 
 /// One decoded chunk and how many bytes of the xorb it occupied.
@@ -105,10 +107,15 @@ pub fn decode_chunk(bytes: &[u8]) -> Result<Decoded, XorbError> {
         .get(HEADER..HEADER + compressed_size)
         .ok_or(XorbError::Truncated)?;
 
+    // The header says how big this chunk decompresses to, and that is
+    // the bound the decompressor is given. Without it a few kilobytes of
+    // payload expand to whatever the sender chose before anything checks
+    // the length — and the check that follows is only reached if the
+    // allocation succeeded.
     let data = match scheme {
         Scheme::None => payload.to_vec(),
-        Scheme::Lz4 => lz4_frame(payload)?,
-        Scheme::ByteGrouping4Lz4 => ungroup(&lz4_frame(payload)?),
+        Scheme::Lz4 => lz4_frame(payload, uncompressed_size)?,
+        Scheme::ByteGrouping4Lz4 => ungroup(&lz4_frame(payload, uncompressed_size)?),
     };
     if data.len() != uncompressed_size {
         return Err(XorbError::LengthMismatch {
@@ -159,6 +166,15 @@ pub fn decode_chunks(
         offset += next.consumed;
         decoded.push(next.data);
     }
+    // The range was requested by byte offsets covering exactly these
+    // chunks, so anything after them is something we did not ask for and
+    // cannot account for.
+    if offset != bytes.len() {
+        return Err(XorbError::Trailing {
+            count,
+            trailing: bytes.len() - offset,
+        });
+    }
     Ok(decoded)
 }
 
@@ -166,10 +182,17 @@ fn u24(bytes: &[u8]) -> usize {
     usize::from(bytes[0]) | usize::from(bytes[1]) << 8 | usize::from(bytes[2]) << 16
 }
 
-fn lz4_frame(payload: &[u8]) -> Result<Vec<u8>, XorbError> {
+/// Decompresses at most `declared + 1` bytes.
+///
+/// One byte more than the header declared, deliberately: stopping at
+/// exactly `declared` would truncate an over-long expansion into
+/// agreement with the header, and the caller's length check — the thing
+/// that catches a lying header — would pass.
+fn lz4_frame(payload: &[u8], declared: usize) -> Result<Vec<u8>, XorbError> {
     use std::io::Read as _;
     let mut out = Vec::new();
     lz4_flex::frame::FrameDecoder::new(payload)
+        .take(declared.saturating_add(1) as u64)
         .read_to_end(&mut out)
         .map_err(|_| XorbError::Decompress)?;
     Ok(out)
@@ -317,6 +340,65 @@ mod tests {
             decode_range(&framed(&lie, Scheme::Lz4), &expected),
             Err(XorbError::HashMismatch { .. }),
         ));
+    }
+
+    /// A header is a claim, and the payload is the sender's. Decoding
+    /// must be bounded by what the header declared, not by what the
+    /// payload turns out to expand to — otherwise the length check that
+    /// catches the lie is reached only if the allocation succeeded.
+    #[test]
+    fn a_chunk_that_expands_past_its_declared_length_is_refused_not_allocated() {
+        // 16 MiB of zeros compresses to a few kilobytes, and the header
+        // declares one byte. A decoder that expands first and checks
+        // afterwards allocates all of it.
+        let bomb = vec![0_u8; 16 * 1024 * 1024];
+        let mut framed = framed(&bomb, Scheme::Lz4);
+        assert!(framed.len() < 100_000, "the fixture must be a bomb");
+        framed[5..8].copy_from_slice(&1_usize.to_le_bytes()[..3]);
+
+        assert_eq!(
+            decode_chunk(&framed),
+            Err(XorbError::LengthMismatch {
+                declared: 1,
+                // One more than declared: enough to know the header lied,
+                // and nothing like the 16 MiB it asked for.
+                actual: 2,
+            }),
+        );
+    }
+
+    /// The same, for byte grouping — the ungrouping happens after
+    /// decompression, so the bound has to be on the decompression.
+    #[test]
+    fn a_byte_grouped_chunk_is_bounded_by_its_declared_length_too() {
+        let bomb = vec![0_u8; 16 * 1024 * 1024];
+        let mut framed = framed(&bomb, Scheme::ByteGrouping4Lz4);
+        framed[5..8].copy_from_slice(&8_usize.to_le_bytes()[..3]);
+        assert!(matches!(
+            decode_chunk(&framed),
+            Err(XorbError::LengthMismatch { declared: 8, .. }),
+        ));
+    }
+
+    /// Bytes after the chunks that were asked for are bytes nobody
+    /// accounted for. The range was requested by byte offsets covering
+    /// exactly those chunks.
+    #[test]
+    fn bytes_after_the_requested_chunks_are_refused() {
+        let data = sample(1_000);
+        let expected = [Chunk::new(chunk_hash(&data), data.len() as u64)];
+        let mut xorb = framed(&data, Scheme::Lz4);
+        let honest = xorb.len();
+        xorb.extend_from_slice(&framed(&sample(50), Scheme::None));
+
+        assert_eq!(
+            decode_range(&xorb, &expected),
+            Err(XorbError::Trailing {
+                count: 1,
+                trailing: xorb.len() - honest,
+            }),
+        );
+        assert!(decode_range(&xorb[..honest], &expected).is_ok());
     }
 
     #[test]

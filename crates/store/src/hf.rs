@@ -74,6 +74,21 @@ pub struct Repo {
     pub revision: String,
 }
 
+/// The most a token response may be.
+///
+/// It is a small JSON object with a token and a URL in it. Everything
+/// here is read into memory before anything about it is checked, so
+/// every body needs a number — a response is a stranger's choice of
+/// length until it has been read.
+const TOKEN_BODY_LIMIT: u64 = 64 * 1024;
+
+/// The most a reconstruction response may be.
+///
+/// It lists every term and signed URL for one file: a 14 GB model runs
+/// to a few hundred terms of a few hundred bytes each. Two orders of
+/// magnitude of headroom, and still a bound.
+const RECONSTRUCTION_BODY_LIMIT: u64 = 8 * 1024 * 1024;
+
 /// Why a fetch failed.
 #[derive(Debug, thiserror::Error)]
 pub enum FetchError {
@@ -95,6 +110,15 @@ pub enum FetchError {
     Xorb(#[from] crate::xorb::XorbError),
     #[error("reconstructed content hashed to {actual}, asked for {expected}")]
     WrongContent { expected: XetHash, actual: XetHash },
+    #[error("{context}: response is longer than the {limit} bytes allowed")]
+    TooLarge { context: String, limit: u64 },
+    #[error("{context}: asked for {expected} bytes, got {actual} with status {status}")]
+    BadRange {
+        context: String,
+        status: u16,
+        expected: u64,
+        actual: u64,
+    },
 }
 
 type Result<T> = std::result::Result<T, FetchError>;
@@ -152,7 +176,7 @@ impl Reconstruction {
                 let range = term.get("range").ok_or_else(|| bad("term range missing"))?;
                 Ok(Term {
                     xorb: hash_field(term, "hash")?,
-                    chunks: u64_field(range, "start")?..u64_field(range, "end")?,
+                    chunks: half_open(range)?,
                     unpacked_length: u64_field(term, "unpacked_length")?,
                 })
             })
@@ -190,9 +214,9 @@ impl Reconstruction {
                                 Ok(FetchRange {
                                     url: url.clone(),
                                     // Half-open.
-                                    chunks: u64_field(chunks, "start")?..u64_field(chunks, "end")?,
+                                    chunks: half_open(chunks)?,
                                     // Inclusive. Deliberately not the same shape.
-                                    bytes: u64_field(bytes, "start")?..=u64_field(bytes, "end")?,
+                                    bytes: inclusive(bytes)?,
                                 })
                             })
                             .collect::<Result<Vec<_>>>()
@@ -230,6 +254,36 @@ impl Reconstruction {
     }
 }
 
+/// A `{start, end}` object read as a half-open chunk range.
+///
+/// A range that ends before it starts is refused here rather than
+/// underflowing at `end - start` several layers down, where the number
+/// it produces is enormous and the failure is a panic or an absurd
+/// allocation instead of a parse error.
+fn half_open(value: &serde_json::Value) -> Result<core::ops::Range<u64>> {
+    let start = u64_field(value, "start")?;
+    let end = u64_field(value, "end")?;
+    if end < start {
+        return Err(FetchError::Malformed(format!(
+            "range {start}..{end} ends before it starts"
+        )));
+    }
+    Ok(start..end)
+}
+
+/// The same, for the byte ranges — which are inclusive, so `start == end`
+/// is one byte and not zero.
+fn inclusive(value: &serde_json::Value) -> Result<core::ops::RangeInclusive<u64>> {
+    let start = u64_field(value, "start")?;
+    let end = u64_field(value, "end")?;
+    if end < start {
+        return Err(FetchError::Malformed(format!(
+            "byte range {start}..={end} ends before it starts"
+        )));
+    }
+    Ok(start..=end)
+}
+
 fn u64_field(value: &serde_json::Value, field: &str) -> Result<u64> {
     value
         .get(field)
@@ -263,6 +317,19 @@ impl HfCas {
         }
     }
 
+    /// Points this source at another hub.
+    ///
+    /// The field was always here and its comment always said "overridable
+    /// for testing"; without a way to set it, that was an aspiration.
+    /// Every bound in this module is about what a *response* may do, and
+    /// a response is the one thing production cannot be asked for on
+    /// demand.
+    #[must_use]
+    pub fn with_hub(mut self, hub: impl Into<String>) -> Self {
+        self.hub = hub.into();
+        self
+    }
+
     /// Obtains a CAS read token.
     ///
     /// Deliberately sends no `Authorization` header: public repositories
@@ -277,7 +344,7 @@ impl HfCas {
             self.repo.id,
             self.repo.revision,
         );
-        let body = get(&url, None)?;
+        let body = get(&url, None, TOKEN_BODY_LIMIT)?;
         let value: serde_json::Value = serde_json::from_slice(&body)
             .map_err(|err| FetchError::Malformed(format!("token response: {err}")))?;
         let field = |name: &str| {
@@ -296,7 +363,7 @@ impl HfCas {
     /// Reads the file's layout across xorbs.
     pub fn reconstruction(&self, token: &XetToken, id: XetHash) -> Result<Reconstruction> {
         let url = format!("{}/v2/reconstructions/{id}", token.cas_url);
-        let body = get(&url, Some(&token.access_token))?;
+        let body = get(&url, Some(&token.access_token), RECONSTRUCTION_BODY_LIMIT)?;
         let json = String::from_utf8(body)
             .map_err(|_| FetchError::Malformed("reconstruction is not UTF-8".to_string()))?;
         Reconstruction::parse(&json)
@@ -318,8 +385,12 @@ impl HfCas {
         for term in &plan.terms {
             for range in plan.ranges_for(term) {
                 let bytes = get_range(&range.url, *range.bytes.start(), *range.bytes.end())?;
-                let count = usize::try_from(range.chunks.end - range.chunks.start)
-                    .map_err(|_| FetchError::Malformed("absurd chunk count".to_string()))?;
+                let count = range
+                    .chunks
+                    .end
+                    .checked_sub(range.chunks.start)
+                    .and_then(|count| usize::try_from(count).ok())
+                    .ok_or_else(|| FetchError::Malformed("absurd chunk count".to_string()))?;
                 // Verify per-chunk when we already know what to expect.
                 // Without a chunk list this is impossible: the response
                 // carries no chunk hashes.
@@ -439,40 +510,74 @@ pub fn verified(id: XetHash, assembled: &[u8], offset: u64) -> Result<&[u8]> {
     Ok(content)
 }
 
-fn get(url: &str, bearer: Option<&str>) -> Result<Vec<u8>> {
+fn get(url: &str, bearer: Option<&str>, limit: u64) -> Result<Vec<u8>> {
     let mut request = ureq::get(url);
     if let Some(token) = bearer {
         request = request.header("Authorization", &format!("Bearer {token}"));
     }
-    read_body(request, url)
+    let (_, body) = read_body(request, url, limit)?;
+    Ok(body)
 }
 
+/// Exactly the bytes that were asked for, or an error.
+///
+/// A range request is the one case where the length is known in advance,
+/// so it is the one case where "however much you send" is inexcusable.
+/// A 200 here would be the whole xorb — potentially gigabytes — in
+/// answer to a request for a few hundred kilobytes.
 fn get_range(url: &str, start: u64, end: u64) -> Result<Vec<u8>> {
     // Inclusive, matching the reconstruction response's own convention
     // and the signed range on the URL.
+    let expected = end
+        .checked_sub(start)
+        .and_then(|span| span.checked_add(1))
+        .ok_or_else(|| FetchError::Malformed(format!("byte range {start}..={end}")))?;
     let request = ureq::get(url).header("Range", &format!("bytes={start}-{end}"));
-    read_body(request, url)
+    let (status, body) = read_body(request, url, expected)?;
+    if status != 206 || body.len() as u64 != expected {
+        return Err(FetchError::BadRange {
+            context: format!("GET {url}"),
+            status,
+            expected,
+            actual: body.len() as u64,
+        });
+    }
+    Ok(body)
 }
 
+/// Reads at most `limit` bytes of a response, and refuses one more.
+///
+/// `read_to_end` on a response body is an allocation whose size the
+/// other end chooses. Reading `limit + 1` and refusing the overflow is
+/// the difference between a bounded read and a promise.
 fn read_body(
     request: ureq::RequestBuilder<ureq::typestate::WithoutBody>,
     url: &str,
-) -> Result<Vec<u8>> {
+    limit: u64,
+) -> Result<(u16, Vec<u8>)> {
     let context = || format!("GET {url}");
     let mut response = request.call().map_err(|source| FetchError::Http {
         context: context(),
         source: Box::new(source),
     })?;
+    let status = response.status().as_u16();
     let mut body = Vec::new();
     response
         .body_mut()
         .as_reader()
+        .take(limit.saturating_add(1))
         .read_to_end(&mut body)
         .map_err(|source| FetchError::Io {
             context: context(),
             source,
         })?;
-    Ok(body)
+    if body.len() as u64 > limit {
+        return Err(FetchError::TooLarge {
+            context: context(),
+            limit,
+        });
+    }
+    Ok((status, body))
 }
 
 impl crate::Fetcher for HfCas {

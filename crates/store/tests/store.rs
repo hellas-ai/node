@@ -110,6 +110,62 @@ fn adopting_a_directory_answers_have_for_everything_in_it() {
     assert!(!store.have(XetHash::hash(&bytes(1000, 999))));
 }
 
+/// Only regular files are content.
+///
+/// A cache is a directory we do not own. A fifo under `blobs/` blocks
+/// adoption of everything after it, on `open`, forever; a symlink to
+/// `/dev/zero` reads until the disk fills; a symlink to an unrelated
+/// readable file indexes bytes from outside the cache under an id this
+/// node then claims to hold.
+#[test]
+fn adoption_indexes_regular_files_and_nothing_else() {
+    let fixture = Fixture::new("file-types");
+    let real = bytes(50_000, 60);
+    fixture.write("blobs/abcdef", &real);
+
+    // Something outside the cache that a symlink could reach.
+    let outside = fixture.write("outside/secrets.bin", b"not this cache's content");
+    std::os::unix::fs::symlink(&outside, fixture.0.join("blobs/linked")).expect("symlink");
+    // And a snapshot symlink, which points at a blob that is indexed
+    // under its own name anyway.
+    std::os::unix::fs::symlink(
+        fixture.0.join("blobs/abcdef"),
+        fixture.0.join("blobs/snapshot-style"),
+    )
+    .expect("symlink");
+
+    // A fifo: `open` on it blocks until somebody writes, which for an
+    // adoption walk is forever.
+    let fifo = fixture.0.join("blobs/pipe");
+    let status = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("mkfifo");
+    assert!(status.success(), "the fixture needs a fifo");
+
+    // Adoption runs on another thread and the timeout is an assertion:
+    // without the file-type check, `open` on the fifo never returns and
+    // this test hangs rather than failing.
+    let store = ContentStore::new();
+    let walker = store.clone();
+    let blobs = fixture.0.join("blobs");
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(walker.adopt(&blobs).map(|found| found.len()));
+    });
+    let adopted = receiver
+        .recv_timeout(std::time::Duration::from_secs(20))
+        .expect("adoption blocked on something that is not a regular file")
+        .expect("adopt");
+
+    assert_eq!(adopted, 1, "one regular file under blobs/");
+    assert!(store.have(XetHash::hash(&real)));
+    assert!(
+        !store.have(XetHash::hash(b"not this cache's content")),
+        "a symlink out of the cache must not put its target in the store",
+    );
+}
+
 /// A HuggingFace cache is littered with things that are not content.
 /// Indexing them would put ids of lock files and half-downloads into a
 /// store whose whole value is that an id means the bytes.
