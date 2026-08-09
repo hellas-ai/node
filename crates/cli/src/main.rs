@@ -129,14 +129,22 @@ impl From<GatewayResponsesBackend> for hellas_gateway::ResponsesBackend {
 
 /// Default `--dtype` preference list for `llm`, resolved at dispatch.
 ///
+/// This is what the client *asks a provider for*. It is not a
+/// capability this node advertises: a serving node's dtypes come from
+/// `serve --dtype`, and the executor narrows those to what the backend
+/// it selected can actually run.
+///
 /// - **Network mode** (no `--local` / `--verify-local`): `[bf16, f32, f16]`
-///   regardless of build. The remote executor decides what it can run; the
-///   CLI's local hardware capability is irrelevant to the wire request.
+///   regardless of build, **including a CPU build** — the weights are
+///   loaded on the provider, so this machine's hardware says nothing
+///   about what to ask for. Asking for f32 first here would make a CPU
+///   laptop unable to use a bf16-only GPU provider at all, since the
+///   refusal is per-dtype and the provider's list is what it is.
 /// - **Local-ish mode on a cuda/metal build**: same `[bf16, f32, f16]`.
 ///   The operator opted into a GPU-backend feature, so the build assumes
-///   Ampere+/M2+ where bf16 is natively supported. If the GPU lacks bf16
-///   the weight load will fail loudly at first attempt — that's a build /
-///   hardware mismatch the operator should fix, not something we paper over.
+///   Ampere+/M2+ where bf16 is natively supported. If the machine turns
+///   out to have no such device the embedded executor drops bf16 from
+///   what it will accept, and the client's second preference is taken.
 /// - **Local-ish mode on a cpu / unspecified build**: `[f32, f16]`. Skips
 ///   bf16 because CPU bf16 throughput is rarely a win and we want a default
 ///   that loads on every backend, including GPUs without native bf16
@@ -327,8 +335,17 @@ enum Commands {
     },
     #[cfg(feature = "gateway")]
     /// Run HTTP gateway exposing OpenAI/Anthropic/plain APIs over Hellas network
+    ///
+    /// The gateway is a client-side process with no inbound
+    /// authentication, and it downloads any model a request names so it
+    /// can tokenize for it. Loopback is the whole of its access control.
+    /// Binding it anywhere else, or putting a proxy in front of it, lets
+    /// every caller that can reach the port choose what this machine
+    /// downloads; `--force-model` is what takes that choice away.
     Gateway {
-        /// Host interface to bind
+        /// Host interface to bind. Anything but loopback exposes an
+        /// unauthenticated port whose callers choose which models this
+        /// machine downloads — pair it with `--force-model`.
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
         /// Port to listen on. Omit to try 8080 with fallback to an OS-assigned port.

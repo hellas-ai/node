@@ -67,6 +67,10 @@ pub enum ModelAssetsError {
     },
     #[error("model.safetensors.index.json has no valid weight_map")]
     InvalidModelIndex,
+    #[error(
+        "model.safetensors.index.json names a weight file outside the model's own snapshot: {file}"
+    )]
+    WeightFileOutsideSnapshot { file: String },
     #[error("failed to load tokenizer {path:?}")]
     LoadTokenizer {
         path: PathBuf,
