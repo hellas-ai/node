@@ -133,6 +133,78 @@ fn a_changed_file_is_hashed_again_despite_its_record() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// The claim `adopt` is worth anything for: a record is keyed on the
+/// file's identity, not on its name.
+///
+/// `hellas store adopt` walks `blobs/`. The quote gate resolves
+/// `snapshots/<commit>/model.safetensors`, which is a symlink to one of
+/// those blobs. Two names, one inode — and if the record were keyed on
+/// the path, the node would re-hash every shard it had just adopted and
+/// nobody would notice, because the answer would still be right.
+///
+/// The tests above write the record for the very path they then index,
+/// so they cannot see this: they prove a record is believed, not that it
+/// is *found*. Here the record is written for the blob and consumed
+/// through the symlink.
+///
+/// The control is a second copy of the same bytes at a different inode.
+/// Same size, same content, same directory — and it must be hashed,
+/// because it is a different file. Without it "keyed on identity" would
+/// be indistinguishable from "keyed on nothing".
+#[test]
+fn a_record_written_for_a_blob_is_found_through_the_snapshot_symlink() {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let root = scratch("blob-and-symlink");
+    let blobs = root.join("blobs");
+    let snapshot = root.join("snapshots").join("c1899de2");
+    std::fs::create_dir_all(&blobs).expect("blobs");
+    std::fs::create_dir_all(&snapshot).expect("snapshot");
+
+    let content = bytes(250_000, 11);
+    let blob = blobs.join("model-etag");
+    std::fs::write(&blob, &content).expect("write the blob");
+    let through_the_snapshot = snapshot.join("model.safetensors");
+    std::os::unix::fs::symlink(
+        std::path::Path::new("../../blobs").join("model-etag"),
+        &through_the_snapshot,
+    )
+    .expect("snapshot symlink");
+
+    // Two names for one file, which is the whole premise.
+    let stat = |path: &std::path::Path| std::fs::metadata(path).expect("stat");
+    assert_eq!(
+        (stat(&blob).dev(), stat(&blob).ino()),
+        (
+            stat(&through_the_snapshot).dev(),
+            stat(&through_the_snapshot).ino(),
+        ),
+    );
+
+    // What `adopt` leaves behind, written for the blob.
+    let records = root.join("fastresume.bin");
+    record_claiming(&blob, impossible_id(), &records);
+    assert_eq!(hellas_models::load_store_records(&records), 1);
+
+    assert_eq!(
+        hellas_models::content_id_of(&through_the_snapshot).expect("id"),
+        ContentId::from_bytes(impossible_id().into_bytes()),
+        "the node re-hashed a shard `adopt` had already hashed under its blob name",
+    );
+
+    // The control: same bytes, different inode, so no record applies.
+    let twin = blobs.join("twin-etag");
+    std::fs::write(&twin, &content).expect("write the twin");
+    assert_ne!(stat(&twin).ino(), stat(&blob).ino());
+    assert_eq!(
+        hellas_models::content_id_of(&twin).expect("id"),
+        ContentId::hash(&content),
+        "a different file must be hashed, whatever its contents look like",
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// The other direction: what this process hashed must be there for the
 /// next one, at the path the node was told to use.
 #[test]
