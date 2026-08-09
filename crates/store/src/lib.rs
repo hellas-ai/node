@@ -255,14 +255,19 @@ impl ContentStore {
             };
             for entry in entries.flatten() {
                 let path = entry.path();
-                // `symlink_metadata` so a snapshot symlink is followed
-                // once, via the file it points at, not indexed twice.
+                // `file_type` is `lstat`, and only a regular file is
+                // content. A symlink here would be followed to bytes
+                // that are already indexed under their own name — or,
+                // pointed at `/dev/zero`, read forever. A fifo under
+                // `blobs/` would block adoption of the whole cache on
+                // `open`. Neither is exotic in a directory we do not own.
                 let Ok(kind) = entry.file_type() else {
                     continue;
                 };
                 if kind.is_dir() {
                     pending.push(path);
-                } else if !fastresume::is_cache_debris(&path)
+                } else if kind.is_file()
+                    && !fastresume::is_cache_debris(&path)
                     && let Ok(indexed) = self.index(&path)
                 {
                     adopted.push(indexed);
