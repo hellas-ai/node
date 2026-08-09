@@ -1,54 +1,72 @@
-# 06 — Three small defects, found and reported, not yet fixed
+# 06 — Three small defects, found and reported
 
-Unrelated to each other. Grouped because each is small.
+**Landed.** Unrelated to each other; grouped because each is small. One
+of the three turned out to be misdiagnosed, and the answer taken is not
+the one this file first proposed.
 
-## 6a. CPU providers advertise BF16, which always fails
+## 6a. A BF16 capability that always fails
 
-`crates/cli/src/main.rs:147`:
+**The diagnosis was wrong, and the bug was real.**
 
-```rust
-if is_local_mode && !cuda_or_metal { vec![F32, F16] } else { vec![BF16, F32, F16] }
-```
+This file blamed `crates/cli/src/main.rs`'s
+`if is_local_mode && !cuda_or_metal` for a provider advertising BF16.
+`default_llm_dtypes` is not an advertisement: it is the preference list
+`hellas llm` *asks a provider for*, used at `main.rs:837` and nowhere
+else. A serving node's dtypes come from `serve --dtype`, which already
+defaults per build via `DEFAULT_DTYPE_STR`.
 
-A provider **serving the network** on a CPU build takes the `else`
-branch and advertises BF16. Candle then **panics** —
-`panic!("BF16 is only supported by Candle on CUDA/Metal devices")`,
-`catgrad/src/interpreter/backend/candle.rs:389` — not an error.
+Worse, the proposed fix — `!cuda_or_metal` alone — would have broken the
+ordinary case. A GPU provider defaults to `--dtype bf16`, a single
+entry; `resolve_accept_dtypes` refuses anything not in that list. A CPU
+laptop asking f32 first would be refused, retry f16, be refused again,
+and never run.
 
-It is contained: `worker.rs:144` catches it and fails the job. So not a
-crash, but a capability advertised that can never succeed, after
-reading gigabytes. Under the staked flow that is an accepted job the
-provider committed to and will always fail.
+The real hole is one storey down: **capability is derived from build
+features, and the device is a runtime fact**.
+`CandleBackend::new_accel(true)` falls back to `Device::Cpu` when no
+CUDA or Metal device is present (catgrad `candle.rs`), so a
+`candle-cuda` build on a host with no GPU serves BF16 from a CPU device
+— where candle *panics* rather than erring. `worker.rs` catches the
+panic and fails the job, so every accepted job fails after reading
+gigabytes. Under the staked flow that is work the provider committed to
+and can never deliver.
 
-The doc comment above the function enumerates network mode, local+GPU
-and local+CPU — network+CPU is not mentioned, which reads like the case
-fell through the condition rather than being chosen.
-
-**Fix:** either the condition (`!cuda_or_metal` alone) or make catgrad
-return an error instead of panicking. Both, ideally. **Needs a product
-decision**: should a CPU provider serve the network at all?
+**Landed:** `backend::runnable_dtypes` filters the advertised list by
+what the selected device can run, once, at executor spawn. A node left
+with nothing it can serve refuses to start and names the mismatch. The
+CLI's list is unchanged, and its doc comment now says why network mode
+asks for BF16 from a CPU build on purpose.
 
 ## 6b. Unvalidated path join from attacker-supplied filenames
 
-`crates/models/src/hf.rs:121` joins a filename onto the snapshot root.
-Those filenames come from the model's own `model.safetensors.index.json`
-`weight_map` — i.e. from the repository the caller named. A `../..`
-component escapes the snapshot directory; the resulting file is read and
-hashed.
+`crates/models/src/hf.rs` joined weight-map filenames onto the snapshot
+root. Those names come from the model's own
+`model.safetensors.index.json` — i.e. from the repository the caller
+named — and a `..` component walked out of the snapshot to any file this
+process can read, which was then opened and hashed.
 
-**Unproven.** The hash is not returned to the caller — only the
-manifest's aggregate `ContentId` goes on the wire — so no oracle was
-constructed. `hf-hub`'s own write path was not audited.
+Still unproven as an oracle: the per-file id is not returned to the
+caller, only the manifest's aggregate `ContentId`.
 
-**Fix:** reject any component that is not a plain filename. Cheap,
-and removes the need to reason about whether an oracle exists.
+**Landed:** every component of a weight-map name must be a plain name,
+checked before anything is opened, refused as
+`WeightFileOutsideSnapshot`. Shards in a subdirectory still resolve;
+`..`, absolute paths and `.` do not.
 
 ## 6c. The gateway still fetches on demand
 
-`crates/gateway/src/state.rs` uses `Reach::Download`. Deliberate — it is
-client-side — but a gateway exposed to untrusted HTTP callers is the
-same door as the quote path was, one storey down.
+`crates/gateway/src/state.rs` uses `Reach::Download`, deliberately: the
+gateway is the operator's own client-side process and tokenizes for
+requests it is itself submitting.
 
-**Decide:** is the gateway ever exposed to untrusted callers? If yes it
-needs the same treatment. If no, write that down where someone
-deploying it will read it.
+**Unchanged, with the reasoning written where a deployer meets it** —
+the doc on `GatewayState::model_assets` and `hellas gateway --help`.
+What it says: loopback is the entire access control, there is no inbound
+authentication in the crate, and `--host 0.0.0.0` or a reverse proxy
+hands every caller a remote fetch primitive, because the model id comes
+from the request body. `--force-model` is the only thing today that
+takes that choice away.
+
+**Left for George:** whether the gateway is ever exposed to untrusted
+callers. If it is, it wants the executor's treatment — a local-reach
+mode or a model allowlist — and that is a decision, not a cleanup.

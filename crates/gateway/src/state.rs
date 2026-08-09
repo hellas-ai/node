@@ -212,6 +212,39 @@ impl GatewayState {
         ExecutionStrategy::Run(primary)
     }
 
+    /// This model's tokenizer and template, downloading them if this
+    /// machine does not have them.
+    ///
+    /// # Why this may download, and what a deployer takes on by exposing
+    /// it
+    ///
+    /// [`Reach::Download`] is deliberate here and is *not* the mistake
+    /// the quote path had. The gateway is the operator's own client-side
+    /// process: it tokenizes for requests it is itself submitting, so
+    /// fetching a model it does not hold is work done on its owner's
+    /// behalf. Nothing inside the executor may do this, which is why the
+    /// reach is named at every call site rather than defaulted.
+    ///
+    /// The property that makes it safe is *who can reach it*, and that
+    /// is a deployment decision, not a code one:
+    ///
+    /// - `hellas gateway` binds `127.0.0.1` by default, and there is no
+    ///   inbound authentication anywhere in this crate. Loopback is the
+    ///   entire access control.
+    /// - `--host 0.0.0.0`, a container port publish, or a reverse proxy
+    ///   in front of it hands every caller that can reach the port a
+    ///   remote fetch primitive: the model id comes from the request
+    ///   body, so a caller names a 700 GB repository and this process
+    ///   downloads it. That is the same door the quote path closed, one
+    ///   storey down.
+    /// - `--force-model` is the only thing in the tree that shuts it:
+    ///   it replaces the request's model before it reaches here, so
+    ///   callers can no longer choose what gets fetched.
+    ///
+    /// Unchanged deliberately, because no evidence says the gateway is
+    /// exposed today. If it is ever deployed to untrusted callers it
+    /// wants the executor's treatment — a local-reach mode, or a model
+    /// allowlist — and that is a decision, not a cleanup.
     async fn model_assets(&self, model: &str) -> anyhow::Result<Arc<ModelAssets>> {
         {
             let cache = self.model_cache.read().await;
@@ -238,11 +271,6 @@ impl GatewayState {
 
         let model_name = model.to_string();
         let dtype = self.dtype;
-        // The gateway is the operator's own client-side process: it
-        // tokenizes for requests it is itself submitting, so a download
-        // here is deliberate work on its owner's behalf. That is not
-        // true of anything inside the executor, which is why the reach
-        // is named at every call site rather than defaulted.
         let assets = tokio::task::spawn_blocking(move || {
             ModelAssets::load(&model_name, dtype, Reach::Download)
         })

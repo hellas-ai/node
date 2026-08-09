@@ -25,7 +25,7 @@ where looking stops producing new items, and we are not there.
 | ~~[04](04-fastresume-in-the-node.md)~~ | ~~A node uses what `adopt` learned~~ | **Landed** with 01 — same subsystem, same tests |
 | ~~[05](05-manifest-memo.md)~~ | ~~Stop rebuilding the manifest per quote~~ | **Landed.** Keyed on the files, not their names |
 | [02](02-catgrad-cutover.md) | catgrad stops fetching | Small now 01 has landed; closes the last uncontrolled fetch |
-| [06](06-security-cleanup.md) | Three unrelated small defects | One is a capability that always fails |
+| ~~[06](06-security-cleanup.md)~~ | ~~Three unrelated small defects~~ | **Landed.** One of the three was misdiagnosed; see the file |
 | [03](03-peer-fetch.md) | Peer-to-peer fetch | Needs a wire protocol; genuinely its own thing |
 | [07](07-conformance-gaps.md) | Untested protocol corners | Fold into whatever touches them |
 | [08](08-documentation-debt.md) | Docs and history | Fold in, or do when tired |

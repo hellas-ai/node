@@ -200,11 +200,42 @@ pub(super) fn get_model_metadata_files(
     Ok((config, tokenizer, tokenizer_config, chat_template))
 }
 
+/// `file` as a name that can only ever land inside the snapshot.
+///
+/// The names in a weight map come from the repository the *caller*
+/// chose, and every one of them is joined onto a snapshot root and then
+/// read and hashed. `..` in that string walks out of the snapshot, out
+/// of the cache, and up to anything this process can read.
+///
+/// No oracle was demonstrated — the per-file id is not returned to the
+/// caller, only the manifest's aggregate `ContentId` — and rejecting the
+/// name is cheaper than establishing that no oracle exists. Ordinary
+/// names are untouched: every component must simply be a plain name, so
+/// a repository that keeps its shards in a subdirectory still resolves,
+/// and one that names `../..` is refused before anything is opened.
+fn inside_the_snapshot(file: &str) -> Result<&str> {
+    let path = Path::new(file);
+    let plain = path.components().count() > 0
+        && path
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)));
+    if plain {
+        Ok(file)
+    } else {
+        Err(ModelAssetsError::WeightFileOutsideSnapshot {
+            file: file.to_string(),
+        })
+    }
+}
+
 pub(super) fn get_program_files(
     model: &ModelSpec,
     reach: Reach,
 ) -> Result<(Vec<PathBuf>, PathBuf, PathBuf, PathBuf)> {
-    let repo = RepoFiles::open(model, reach)?;
+    program_files_of(&RepoFiles::open(model, reach)?)
+}
+
+fn program_files_of(repo: &RepoFiles) -> Result<(Vec<PathBuf>, PathBuf, PathBuf, PathBuf)> {
     let weights = if let Some(index_path) = repo.optional("model.safetensors.index.json") {
         let bytes = std::fs::read(&index_path).map_err(|source| ModelAssetsError::ReadAsset {
             path: index_path,
@@ -219,7 +250,7 @@ pub(super) fn get_program_files(
         let mut files = HashSet::new();
         for file in weight_map.values() {
             let file = file.as_str().ok_or(ModelAssetsError::InvalidModelIndex)?;
-            files.insert(repo.require(file)?);
+            files.insert(repo.require(inside_the_snapshot(file)?)?);
         }
         files.into_iter().collect()
     } else {
@@ -451,6 +482,70 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&first);
         let _ = std::fs::remove_dir_all(&second);
+    }
+
+    /// A weight map is repository content, and the repository is the
+    /// caller's choice. A name that walks out of the snapshot is refused
+    /// before the file is opened — and the file it would have reached is
+    /// real here, so this fails rather than passing for want of a target.
+    #[test]
+    fn a_weight_map_cannot_name_a_file_outside_the_snapshot() {
+        let root = scratch("escape");
+        let model =
+            ModelSpec::parse(&format!("Qwen/Qwen3-0.6B@{REVISION}")).expect("valid model spec");
+        // `snapshots/<commit>/../../../` is the cache root.
+        let escape = "../../../outside.safetensors";
+        put(&root.join("outside.safetensors"), b"not this model's");
+        let index = format!(r#"{{"weight_map":{{"a":"{escape}"}}}}"#);
+        materialize(
+            &root,
+            &model,
+            REVISION,
+            &[
+                ("config.json", b"{}"),
+                ("tokenizer.json", b"{}"),
+                ("tokenizer_config.json", b"{}"),
+                ("model.safetensors.index.json", index.as_bytes()),
+            ],
+        );
+        assert!(
+            root.join("models--Qwen--Qwen3-0.6B")
+                .join("snapshots")
+                .join(REVISION)
+                .join(escape)
+                .is_file(),
+            "the escaping name must resolve to a real file, or this test proves nothing",
+        );
+
+        match program_files_of(&local_only(&model, &root)) {
+            Err(ModelAssetsError::WeightFileOutsideSnapshot { file }) => {
+                assert_eq!(file, escape);
+            }
+            other => panic!("expected the escaping name to be refused, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The other half: ordinary names, including a repository that keeps
+    /// its shards in a subdirectory, still resolve.
+    #[test]
+    fn ordinary_weight_names_are_untouched() {
+        for name in [
+            "model-00001-of-00002.safetensors",
+            "shards/model.safetensors",
+        ] {
+            assert_eq!(inside_the_snapshot(name).expect("an ordinary name"), name);
+        }
+        for name in ["", ".", "..", "../escape", "/etc/passwd", "a/../../b"] {
+            assert!(
+                matches!(
+                    inside_the_snapshot(name),
+                    Err(ModelAssetsError::WeightFileOutsideSnapshot { .. }),
+                ),
+                "{name:?} must be refused",
+            );
+        }
     }
 
     #[test]

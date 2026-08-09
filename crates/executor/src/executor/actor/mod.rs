@@ -182,11 +182,45 @@ impl Executor {
         })
     }
 
-    fn spawn_runtime(config: ExecutorRuntimeConfig) -> Result<ExecutorHandle, ExecutorError> {
+    fn spawn_runtime(
+        #[allow(unused_mut, reason = "only the evaluate build narrows the dtypes")]
+        mut config: ExecutorRuntimeConfig,
+    ) -> Result<ExecutorHandle, ExecutorError> {
         assert!(
             config.fetch_max_in_flight > 0,
             "fetch_max_in_flight must be greater than zero"
         );
+        // Advertise only what the device that was actually selected can
+        // run. The build features chose which backend was compiled in;
+        // they do not know whether a GPU is present, and BF16 on a CPU
+        // device is a panic inside candle rather than an error. Filtering
+        // here means an operator learns at startup, instead of every
+        // accepted job failing after reading gigabytes.
+        #[cfg(feature = "evaluate")]
+        {
+            assert!(
+                !config.supported_dtypes.is_empty(),
+                "executor with evaluate enabled must support at least one dtype"
+            );
+            let backend = backend::create_backend()?;
+            let runnable = backend::runnable_dtypes(&backend, &config.supported_dtypes);
+            if runnable.is_empty() {
+                return Err(crate::BackendInitError::new(format!(
+                    "this node was asked to serve {:?}, and the backend it selected ({backend:?}) \
+                     can run none of them; pass --dtype f32",
+                    config.supported_dtypes,
+                ))
+                .into());
+            }
+            if runnable.len() != config.supported_dtypes.len() {
+                tracing::warn!(
+                    asked = ?config.supported_dtypes,
+                    serving = ?runnable,
+                    "the selected backend cannot run every dtype this node was asked to serve",
+                );
+            }
+            config.supported_dtypes = runnable;
+        }
         #[cfg(feature = "evaluate")]
         let preferred_dtype = config
             .supported_dtypes
@@ -202,11 +236,6 @@ impl Executor {
         let fetch_caller_policy = FetchCallerPolicy::new(config.fetch_access_policy.caller_keys());
         #[cfg(feature = "evaluate")]
         let evaluate: Option<Box<dyn SchemeEngine>> = {
-            assert!(
-                !config.supported_dtypes.is_empty(),
-                "executor with evaluate enabled must support at least one dtype"
-            );
-            backend::create_backend()?;
             Some(Box::new(EvaluateEngine::new(
                 config.artifacts,
                 config.supported_dtypes,
@@ -381,4 +410,51 @@ impl Executor {
 
 fn evaluate_disabled() -> ExecutorError {
     ExecutorError::PolicyDenied("evaluate scheme is not enabled on this node".to_string())
+}
+
+#[cfg(all(
+    test,
+    feature = "evaluate",
+    not(any(feature = "candle-cuda", feature = "candle-metal"))
+))]
+mod tests {
+    use super::*;
+
+    fn key() -> ProducerSigningKey {
+        ProducerSigningKey::from_secret_bytes([7; 32]).expect("valid test key")
+    }
+
+    fn spawn(dtypes: Vec<Dtype>) -> Result<ExecutorHandle, ExecutorError> {
+        Executor::spawn_with_producer_key(
+            ExecutePolicy::Eager,
+            1,
+            dtypes,
+            key(),
+            b"genesis".to_vec(),
+            Assurance::ProducerSigned,
+        )
+    }
+
+    /// On this build the backend is the CPU device, where BF16 is a
+    /// panic inside candle rather than an error. A node that can serve
+    /// nothing it was asked to serve must say so at startup instead of
+    /// accepting jobs it will fail after reading the weights.
+    ///
+    /// The second half is the control: the same call with a dtype the
+    /// device can run must start, so this is a fact about BF16 and not
+    /// about spawning.
+    #[tokio::test]
+    async fn a_cpu_node_refuses_to_advertise_bf16() {
+        let message = match spawn(vec![Dtype::BF16]) {
+            Err(refused) => refused.to_string(),
+            Ok(_) => panic!("bf16 on a cpu device must not be advertised"),
+        };
+        assert!(message.contains("BF16"), "{message}");
+        assert!(message.contains("--dtype f32"), "{message}");
+
+        assert!(
+            spawn(vec![Dtype::F32]).is_ok(),
+            "f32 is servable on any device",
+        );
+    }
 }
