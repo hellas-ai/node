@@ -142,6 +142,66 @@ fn content_that_does_not_hash_to_its_id_is_not_kept() {
     let _ = Arc::new(0_u8);
 }
 
+/// Publishing verified bytes must not follow, truncate, or half-write a
+/// destination.
+///
+/// `std::fs::write` did all three. The bytes are verified before this
+/// point and cannot change; the *destination* can, and a symlink at
+/// `dest` sent the whole download somewhere else entirely.
+#[test]
+fn verified_bytes_are_published_atomically_and_follow_nothing() {
+    use hellas_store::hf::publish;
+
+    let dir = std::env::temp_dir().join(format!("hellas-publish-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("dir");
+
+    // Ordinary case: the bytes land, and nothing is left beside them.
+    let dest = dir.join("weights").join("model.safetensors");
+    publish(&dest, b"the verified bytes").expect("publish");
+    assert_eq!(
+        std::fs::read(&dest).expect("read back"),
+        b"the verified bytes",
+    );
+    assert_eq!(
+        std::fs::read_dir(dest.parent().expect("parent"))
+            .expect("list")
+            .count(),
+        1,
+        "a temporary file was left behind",
+    );
+
+    // Replacing: the old content is gone, in one step.
+    publish(&dest, b"newer verified bytes").expect("publish again");
+    assert_eq!(
+        std::fs::read(&dest).expect("read back"),
+        b"newer verified bytes",
+    );
+
+    // A symlink at the destination is replaced, not followed. Without
+    // this the download lands wherever the link points — which, in a
+    // HuggingFace cache, is a blob some other model is using.
+    let elsewhere = dir.join("someone-elses-file");
+    std::fs::write(&elsewhere, b"not to be touched").expect("write");
+    let link = dir.join("linked-dest");
+    std::os::unix::fs::symlink(&elsewhere, &link).expect("symlink");
+    publish(&link, b"the verified bytes").expect("publish through a symlink");
+    assert_eq!(
+        std::fs::read(&elsewhere).expect("read back"),
+        b"not to be touched",
+        "publishing followed the symlink and overwrote another file",
+    );
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .expect("stat")
+            .file_type()
+            .is_file(),
+        "the destination must be the file itself, not a link to one",
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The check inside `HfCas::fetch` that a happy-path test can never
 /// exercise: assembled bytes that are not the content we asked for.
 #[test]

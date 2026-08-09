@@ -202,6 +202,114 @@ fn have_is_false_once_the_file_is_gone() {
     assert_eq!(store.locate(indexed.id), None);
 }
 
+/// `have` must not claim content that was overwritten either. The file
+/// is still there, the name is still there, and the bytes the id is
+/// about are gone — which is the ordinary case, not the exotic one.
+#[test]
+fn have_is_false_once_the_file_is_rewritten() {
+    let fixture = Fixture::new("rewrite");
+    let content = bytes(20_000, 51);
+    let path = fixture.write("shard.bin", &content);
+
+    let store = ContentStore::new();
+    let indexed = store.index(&path).expect("index");
+    assert!(store.have(indexed.id));
+
+    // Same name, same length, different bytes: nothing a check for
+    // existence could ever notice.
+    let replacement = bytes(20_000, 52);
+    fixture.write("shard.bin", &replacement);
+    assert!(path.exists());
+    assert!(
+        !store.have(indexed.id),
+        "an index entry is a claim about bytes, not about a path",
+    );
+
+    // And the new bytes are findable under their own id.
+    let reindexed = store.index(&path).expect("index again");
+    assert_eq!(reindexed.id, XetHash::hash(&replacement));
+    assert!(store.have(reindexed.id));
+}
+
+/// A substituter is another source's answer, and a source can be wrong.
+/// `materialize(a)` must never return content `b`.
+#[test]
+fn materializing_refuses_a_source_that_answers_with_other_content() {
+    struct Lying(XetHash, PathBuf);
+    impl Substituter for Lying {
+        fn name(&self) -> &str {
+            "lying"
+        }
+        fn locate(&self, id: XetHash) -> Option<PathBuf> {
+            (id == self.0).then(|| self.1.clone())
+        }
+    }
+
+    struct Unreachable;
+    impl hellas_store::Fetcher for Unreachable {
+        fn name(&self) -> &str {
+            "unreachable"
+        }
+        fn fetch(
+            &self,
+            _id: XetHash,
+            _dest: &Path,
+            _expected: Option<&[hellas_xet::Chunk]>,
+        ) -> Result<u64, hellas_store::hf::FetchError> {
+            panic!("a local answer must not be followed by a fetch");
+        }
+    }
+
+    let fixture = Fixture::new("lying-substituter");
+    let wanted = XetHash::hash(b"the content that was asked for");
+    let elsewhere = fixture.write("elsewhere.bin", b"something else entirely");
+
+    let store = ContentStore::new().with_substituter(Arc::new(Lying(wanted, elsewhere)));
+    assert!(store.have(wanted), "the source claims to hold it");
+    assert!(
+        store
+            .materialize(wanted, &fixture.0.join("dest.bin"), &Unreachable)
+            .is_err(),
+        "content that is not what was asked for must not be returned as if it were",
+    );
+}
+
+/// Cleaning up after a failed fetch means cleaning up what we made
+/// appear. A destination that was already there belongs to whoever put
+/// it there.
+#[test]
+fn a_destination_that_was_already_there_is_not_deleted() {
+    struct Liar;
+    impl hellas_store::Fetcher for Liar {
+        fn name(&self) -> &str {
+            "liar"
+        }
+        fn fetch(
+            &self,
+            _id: XetHash,
+            dest: &Path,
+            _expected: Option<&[hellas_xet::Chunk]>,
+        ) -> Result<u64, hellas_store::hf::FetchError> {
+            std::fs::write(dest, b"not the content you asked for").expect("write");
+            Ok(29)
+        }
+    }
+
+    let fixture = Fixture::new("existing-dest");
+    let dest = fixture.write("dest.bin", b"someone else's file");
+    let store = ContentStore::new();
+
+    assert!(
+        store
+            .materialize(XetHash::hash(b"the real content"), &dest, &Liar)
+            .is_err(),
+    );
+    assert!(
+        dest.exists(),
+        "a file we did not create is not ours to delete"
+    );
+}
+
 /// Empty content has a defined id and is not special-cased into
 /// existence.
 #[test]

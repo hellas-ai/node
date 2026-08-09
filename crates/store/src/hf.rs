@@ -339,19 +339,77 @@ impl HfCas {
         }
 
         let content = verified(id, &assembled, plan.offset_into_first_range)?;
-
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent).map_err(|source| FetchError::Io {
-                context: format!("creating {}", parent.display()),
-                source,
-            })?;
-        }
-        std::fs::write(dest, content).map_err(|source| FetchError::Io {
-            context: format!("writing {}", dest.display()),
-            source,
-        })?;
+        publish(dest, content)?;
         Ok(content.len() as u64)
     }
+}
+
+/// Puts verified bytes at `dest`, atomically, without following anything.
+///
+/// Public for the same reason [`verified`] is: it is only ever called
+/// after a network fetch, and a step that can only run against
+/// production is a step nobody can regression-test.
+///
+/// The bytes cannot change once verified, but the destination can.
+/// `std::fs::write` opens `dest` by name, which follows a symlink to
+/// wherever it points, truncates whatever it finds, and — if the write
+/// fails halfway — leaves a short file under a name that now claims to be
+/// a whole one. Two materializations of different content to the same
+/// path could interleave into a mixture of both.
+///
+/// So: a uniquely named sibling opened with `create_new`, which cannot
+/// follow anything because it refuses to open something that exists;
+/// `sync_all`, so a crash cannot leave the rename pointing at a file the
+/// page cache never wrote; then `rename`, which is atomic. A reader at
+/// `dest` sees the old file or the whole new one, never a prefix.
+pub fn publish(dest: &Path, content: &[u8]) -> Result<()> {
+    use std::io::Write as _;
+
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).map_err(|source| FetchError::Io {
+            context: format!("creating {}", parent.display()),
+            source,
+        })?;
+    }
+
+    let name = dest
+        .file_name()
+        .ok_or_else(|| FetchError::Malformed(format!("{} is not a file name", dest.display())))?;
+    let mut incoming = name.to_os_string();
+    incoming.push(format!(
+        ".{}.{}.incoming",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos(),
+    ));
+    let incoming = dest.with_file_name(incoming);
+
+    let io = |context: String| move |source| FetchError::Io { context, source };
+    let write = || -> Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&incoming)
+            .map_err(io(format!("creating {}", incoming.display())))?;
+        file.write_all(content)
+            .map_err(io(format!("writing {}", incoming.display())))?;
+        file.sync_all()
+            .map_err(io(format!("syncing {}", incoming.display())))?;
+        std::fs::rename(&incoming, dest).map_err(io(format!(
+            "renaming {} to {}",
+            incoming.display(),
+            dest.display(),
+        )))
+    };
+    let outcome = write();
+    if outcome.is_err() {
+        // Ours, and only ours: a file we created under a name nobody
+        // else knows.
+        let _ = std::fs::remove_file(&incoming);
+    }
+    outcome
 }
 
 /// Trims the leading offset and checks the result is the content that
