@@ -44,6 +44,131 @@ pub(super) struct RepoFiles {
     api: Option<ApiRepo>,
 }
 
+/// One snapshot of one repository in one cache.
+///
+/// The unit of resolution, and the reason this type exists at all: a
+/// snapshot directory is a set of files that were written for the *same
+/// commit*, so taking every file from one of these is what makes a
+/// manifest's `resolved_revision` true about its bytes.
+#[derive(Clone, Debug)]
+struct Snapshot {
+    /// `<cache>/models--org--name/snapshots/<commit>`.
+    dir: PathBuf,
+    commit: String,
+}
+
+impl Snapshot {
+    /// Where `file` is in this snapshot, if this snapshot has it.
+    fn file(&self, file: &str) -> Option<PathBuf> {
+        let path = self.dir.join(file);
+        path.is_file().then_some(path)
+    }
+}
+
+/// Where one resolution's files come from — all of them.
+///
+/// Not a per-file choice. Cache selection used to happen once per file,
+/// which meant `main` could resolve `config.json` out of one cache at
+/// commit X and the weights out of another at commit Y, and the signed
+/// manifest then said X while committing to Y's bytes. A model is a
+/// snapshot, so a source is a snapshot.
+enum Source<'a> {
+    /// One snapshot already on this disk.
+    Local(Snapshot),
+    /// The hub, which writes into the environment's cache. Reachable
+    /// only under [`Reach::Download`], because resolving a path here is
+    /// downloading it.
+    Hub(&'a ApiRepo),
+}
+
+impl Source<'_> {
+    /// The path to `file`, which this model cannot do without.
+    ///
+    /// A missing file in a local snapshot is
+    /// [`ModelAssetsError::NotMaterialized`] — a refusal naming what the
+    /// operator would have to make available, not an attempt to make it
+    /// available, and not a licence to look in the next cache.
+    fn require(&self, model: &ModelSpec, file: &str) -> Result<PathBuf> {
+        match self {
+            Self::Local(snapshot) => {
+                snapshot
+                    .file(file)
+                    .ok_or_else(|| ModelAssetsError::NotMaterialized {
+                        model_id: model.id().to_string(),
+                        revision: model.revision().to_string(),
+                        file: file.to_string(),
+                    })
+            }
+            Self::Hub(api) => api
+                .get(file)
+                .map_err(|source| ModelAssetsError::FetchModelAsset {
+                    model_id: model.id().to_string(),
+                    revision: model.revision().to_string(),
+                    file: file.to_string(),
+                    source,
+                }),
+        }
+    }
+
+    /// The path to `file` when this model has one, `None` when it does
+    /// not — for files whose absence is a fact about the repo rather
+    /// than a failure.
+    fn optional(&self, file: &str) -> Option<PathBuf> {
+        match self {
+            Self::Local(snapshot) => snapshot.file(file),
+            Self::Hub(api) => api.get(file).ok(),
+        }
+    }
+
+    /// The commit these files came from.
+    ///
+    /// For a local snapshot it is structural: every path was joined onto
+    /// one snapshot directory, so there is nothing to derive and nothing
+    /// to check. For the hub it has to be read back off the paths the
+    /// download landed at, and checked, because a branch can move
+    /// between two `get` calls.
+    ///
+    /// `paths` must be files at the root of the snapshot — a repository
+    /// that keeps its shards in a subdirectory has weight paths one level
+    /// further down, and they are covered by the fact that one `ApiRepo`
+    /// writes into one repository directory.
+    fn commit(&self, paths: &[&Path]) -> Result<String> {
+        match self {
+            Self::Local(snapshot) => Ok(snapshot.commit.clone()),
+            Self::Hub(_) => one_commit(paths),
+        }
+    }
+}
+
+/// The single snapshot directory every one of `paths` lies in.
+///
+/// Taken from the directory the file actually resolved through, never
+/// from the requested revision: `main` moves, and the manifest must name
+/// the commit whose bytes were read.
+fn one_commit(paths: &[&Path]) -> Result<String> {
+    let mut commit: Option<&str> = None;
+    for path in paths {
+        let name = path
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            .ok_or(ModelAssetsError::UnresolvedRevision)?;
+        match commit {
+            None => commit = Some(name),
+            Some(first) if first != name => {
+                return Err(ModelAssetsError::MixedSnapshots {
+                    first: first.to_string(),
+                    second: name.to_string(),
+                });
+            }
+            Some(_) => {}
+        }
+    }
+    commit
+        .map(str::to_string)
+        .ok_or(ModelAssetsError::UnresolvedRevision)
+}
+
 impl RepoFiles {
     pub(super) fn open(model: &ModelSpec, reach: Reach) -> Result<Self> {
         let api = match reach {
@@ -61,47 +186,51 @@ impl RepoFiles {
         }
     }
 
-    /// The path to `file`, which this model cannot do without.
-    ///
-    /// Under [`Reach::Local`] a missing file is
-    /// [`ModelAssetsError::NotMaterialized`] — a refusal naming what the
-    /// operator would have to make available, not an attempt to make it
-    /// available.
-    fn require(&self, file: &str) -> Result<PathBuf> {
-        if let Some(path) = self.local(file) {
-            return Ok(path);
-        }
-        let Some(api) = self.api.as_ref() else {
-            return Err(ModelAssetsError::NotMaterialized {
-                model_id: self.model.id().to_string(),
-                revision: self.model.revision().to_string(),
-                file: file.to_string(),
-            });
-        };
-        api.get(file)
-            .map_err(|source| ModelAssetsError::FetchModelAsset {
-                model_id: self.model.id().to_string(),
-                revision: self.model.revision().to_string(),
-                file: file.to_string(),
-                source,
-            })
-    }
-
-    /// The path to `file` when this model has one, `None` when it does
-    /// not — for files whose absence is a fact about the repo rather
-    /// than a failure.
-    fn optional(&self, file: &str) -> Option<PathBuf> {
-        if let Some(path) = self.local(file) {
-            return Some(path);
-        }
-        self.api.as_ref()?.get(file).ok()
-    }
-
-    /// Where `file` already is on this disk, if it is here at all.
-    fn local(&self, file: &str) -> Option<PathBuf> {
+    /// Every snapshot of this model's revision on this disk, in cache
+    /// order.
+    fn snapshots(&self) -> Vec<Snapshot> {
         self.caches
             .iter()
-            .find_map(|cache| local_file(cache, &self.model, file))
+            .filter_map(|cache| snapshot_in(cache, &self.model))
+            .collect()
+    }
+
+    /// Resolves a whole file set out of a *single* snapshot.
+    ///
+    /// Each cache is asked for the complete model and taken or left as a
+    /// whole. A cache holding half of one is not half an answer; it is a
+    /// cache that does not have this model, and the next one is asked
+    /// from scratch.
+    ///
+    /// Only a missing file moves on. A snapshot whose index will not
+    /// parse, or whose weight map names a file outside itself, is an
+    /// error about this node's disk — reporting it beats quietly serving
+    /// whatever the next cache happens to hold.
+    ///
+    /// The refusal reported is the first cache's, since that is the one
+    /// a download would have written to and the one an operator is most
+    /// likely to be looking at.
+    fn resolve<T>(&self, files_of: impl Fn(&Source<'_>) -> Result<T>) -> Result<T> {
+        let mut refusal = None;
+        for snapshot in self.snapshots() {
+            match files_of(&Source::Local(snapshot)) {
+                Ok(files) => return Ok(files),
+                Err(err @ ModelAssetsError::NotMaterialized { .. }) => {
+                    refusal.get_or_insert(err);
+                }
+                Err(other) => return Err(other),
+            }
+        }
+        if let Some(api) = self.api.as_ref() {
+            return files_of(&Source::Hub(api));
+        }
+        Err(
+            refusal.unwrap_or_else(|| ModelAssetsError::NotMaterialized {
+                model_id: self.model.id().to_string(),
+                revision: self.model.revision().to_string(),
+                file: "config.json".to_string(),
+            }),
+        )
     }
 }
 
@@ -114,7 +243,7 @@ impl RepoFiles {
 /// This is the whole of the store/gate convergence: `adopt` records a
 /// root, and the gate resolves against it. Note what it is *not*. It
 /// carries no content ids and makes no claim that any file is present or
-/// unmodified; it only widens where "is this file on this disk?" is
+/// unmodified; it only widens where "does this disk hold this model?" is
 /// asked. The answer is still a `stat`, and the bytes are still hashed
 /// later when the manifest is built.
 ///
@@ -130,7 +259,8 @@ fn local_caches() -> Vec<Cache> {
     caches
 }
 
-/// Resolves `file` against a HuggingFace cache, and nothing else.
+/// The snapshot this cache holds for this model's revision, if it holds
+/// one.
 ///
 /// Two layouts, because a revision is either pinned or a branch:
 ///
@@ -142,14 +272,35 @@ fn local_caches() -> Vec<Cache> {
 ///   snapshot it currently points at — exactly the lookup `ApiRepo::get`
 ///   makes before it decides to download.
 ///
-/// So what this finds is what a download would have skipped, and what it
-/// does not find is what a download would have paid for.
-fn local_file(cache: &Cache, model: &ModelSpec, file: &str) -> Option<PathBuf> {
-    if let Some(root) = immutable_snapshot_root(cache.path(), model) {
-        let path = root.join(file);
-        return path.is_file().then_some(path);
-    }
-    cache.repo(repo_of(model)).get(file)
+/// The contents of a `refs/` file become a path segment, so they are
+/// required to be a plain name. A cache is not a trusted input just
+/// because it is local.
+fn snapshot_in(cache: &Cache, model: &ModelSpec) -> Option<Snapshot> {
+    let repo = cache.path().join(repo_of(model).folder_name());
+    let commit = if is_commit(model.revision()) {
+        model.revision().to_string()
+    } else {
+        let named = std::fs::read_to_string(repo.join("refs").join(model.revision())).ok()?;
+        let named = named.trim().to_string();
+        if !is_plain_name(&named) {
+            return None;
+        }
+        named
+    };
+    let dir = repo.join("snapshots").join(&commit);
+    dir.is_dir().then_some(Snapshot { dir, commit })
+}
+
+/// True for a revision that names a commit rather than a branch or tag.
+fn is_commit(revision: &str) -> bool {
+    revision.len() == 40 && revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// True for a string that is one ordinary path component.
+fn is_plain_name(name: &str) -> bool {
+    let mut components = Path::new(name).components();
+    matches!(components.next(), Some(std::path::Component::Normal(_)))
+        && components.next().is_none()
 }
 
 fn repo_of(model: &ModelSpec) -> Repo {
@@ -177,36 +328,35 @@ fn model_repo(model: &ModelSpec) -> Result<ApiRepo> {
     Ok(api.repo(repo_of(model)))
 }
 
-fn immutable_snapshot_root(cache: &Path, model: &ModelSpec) -> Option<PathBuf> {
-    if model.revision().len() != 40
-        || !model
-            .revision()
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit())
-    {
-        return None;
-    }
-
-    let repo = repo_of(model);
-    Some(
-        cache
-            .join(repo.folder_name())
-            .join("snapshots")
-            .join(model.revision()),
-    )
+/// The metadata files a tokenizer and a chat template are built from.
+pub(super) struct MetadataFiles {
+    pub config: PathBuf,
+    pub tokenizer: PathBuf,
+    pub tokenizer_config: PathBuf,
+    pub chat_template: Option<PathBuf>,
 }
 
-pub(super) fn get_model_metadata_files(
-    model: &ModelSpec,
-    reach: Reach,
-) -> Result<(PathBuf, PathBuf, PathBuf, Option<PathBuf>)> {
-    let repo = RepoFiles::open(model, reach)?;
-    let config = repo.require("config.json")?;
-    let tokenizer = repo.require("tokenizer.json")?;
-    let tokenizer_config = repo.require("tokenizer_config.json")?;
-    let chat_template = repo.optional("chat_template.jinja");
+/// Everything a program manifest is built from, and the commit they all
+/// came from.
+pub(super) struct ProgramFiles {
+    pub commit: String,
+    pub weights: Vec<PathBuf>,
+    pub config: PathBuf,
+    pub tokenizer: PathBuf,
+    pub tokenizer_config: PathBuf,
+}
 
-    Ok((config, tokenizer, tokenizer_config, chat_template))
+pub(super) fn get_model_metadata_files(model: &ModelSpec, reach: Reach) -> Result<MetadataFiles> {
+    RepoFiles::open(model, reach)?.resolve(|source| metadata_files_of(model, source))
+}
+
+fn metadata_files_of(model: &ModelSpec, source: &Source<'_>) -> Result<MetadataFiles> {
+    Ok(MetadataFiles {
+        config: source.require(model, "config.json")?,
+        tokenizer: source.require(model, "tokenizer.json")?,
+        tokenizer_config: source.require(model, "tokenizer_config.json")?,
+        chat_template: source.optional("chat_template.jinja"),
+    })
 }
 
 /// `file` as a name that can only ever land inside the snapshot.
@@ -237,15 +387,12 @@ fn inside_the_snapshot(file: &str) -> Result<&str> {
     }
 }
 
-pub(super) fn get_program_files(
-    model: &ModelSpec,
-    reach: Reach,
-) -> Result<(Vec<PathBuf>, PathBuf, PathBuf, PathBuf)> {
-    program_files_of(&RepoFiles::open(model, reach)?)
+pub(super) fn get_program_files(model: &ModelSpec, reach: Reach) -> Result<ProgramFiles> {
+    RepoFiles::open(model, reach)?.resolve(|source| program_files_of(model, source))
 }
 
-fn program_files_of(repo: &RepoFiles) -> Result<(Vec<PathBuf>, PathBuf, PathBuf, PathBuf)> {
-    let weights = if let Some(index_path) = repo.optional("model.safetensors.index.json") {
+fn program_files_of(model: &ModelSpec, source: &Source<'_>) -> Result<ProgramFiles> {
+    let weights = if let Some(index_path) = source.optional("model.safetensors.index.json") {
         let bytes = std::fs::read(&index_path).map_err(|source| ModelAssetsError::ReadAsset {
             path: index_path,
             source,
@@ -259,18 +406,23 @@ fn program_files_of(repo: &RepoFiles) -> Result<(Vec<PathBuf>, PathBuf, PathBuf,
         let mut files = HashSet::new();
         for file in weight_map.values() {
             let file = file.as_str().ok_or(ModelAssetsError::InvalidModelIndex)?;
-            files.insert(repo.require(inside_the_snapshot(file)?)?);
+            files.insert(source.require(model, inside_the_snapshot(file)?)?);
         }
         files.into_iter().collect()
     } else {
-        vec![repo.require("model.safetensors")?]
+        vec![source.require(model, "model.safetensors")?]
     };
-    Ok((
+    let config = source.require(model, "config.json")?;
+    let tokenizer = source.require(model, "tokenizer.json")?;
+    let tokenizer_config = source.require(model, "tokenizer_config.json")?;
+    let commit = source.commit(&[&config, &tokenizer, &tokenizer_config])?;
+    Ok(ProgramFiles {
+        commit,
         weights,
-        repo.require("config.json")?,
-        repo.require("tokenizer.json")?,
-        repo.require("tokenizer_config.json")?,
-    ))
+        config,
+        tokenizer,
+        tokenizer_config,
+    })
 }
 
 #[cfg(test)]
@@ -278,6 +430,7 @@ mod tests {
     use super::*;
 
     const REVISION: &str = "c1899de289a04d12100db370d81485cdf75e47ca";
+    const OTHER_REVISION: &str = "0e4b1f6a9c2d8b7e5a3f1c0d9b8a7e6f5d4c3b2a";
 
     /// A scratch cache root, unique per test so these run in parallel and
     /// never read the developer's real HuggingFace cache.
@@ -313,8 +466,32 @@ mod tests {
         }
     }
 
+    fn snapshot_of(root: &Path, commit: &str) -> PathBuf {
+        root.join("models--Qwen--Qwen3-0.6B")
+            .join("snapshots")
+            .join(commit)
+    }
+
+    /// The three files every resolution needs, so a cache written with
+    /// them is a cache that holds a whole model.
+    fn metadata(config: &[u8]) -> Vec<(&str, &[u8])> {
+        vec![
+            ("config.json", config),
+            ("tokenizer.json", b"{}"),
+            ("tokenizer_config.json", b"{}"),
+        ]
+    }
+
     fn local_only(model: &ModelSpec, root: &Path) -> RepoFiles {
         RepoFiles::with_caches(model, vec![Cache::new(root.to_path_buf())], None)
+    }
+
+    fn metadata_files(repo: &RepoFiles, model: &ModelSpec) -> Result<MetadataFiles> {
+        repo.resolve(|source| metadata_files_of(model, source))
+    }
+
+    fn program_files(repo: &RepoFiles, model: &ModelSpec) -> Result<ProgramFiles> {
+        repo.resolve(|source| program_files_of(model, source))
     }
 
     #[test]
@@ -340,21 +517,22 @@ mod tests {
         let root = scratch("pinned");
         let model =
             ModelSpec::parse(&format!("Qwen/Qwen3-0.6B@{REVISION}")).expect("valid model spec");
-        materialize(&root, &model, REVISION, &[("config.json", b"{}")]);
+        materialize(&root, &model, REVISION, &metadata(b"{}"));
 
         let repo = local_only(&model, &root);
+        let files = metadata_files(&repo, &model).expect("a materialized model");
         assert_eq!(
-            repo.require("config.json").expect("materialized file"),
-            root.join("models--Qwen--Qwen3-0.6B")
-                .join("snapshots")
-                .join(REVISION)
-                .join("config.json"),
+            files.config,
+            snapshot_of(&root, REVISION).join("config.json"),
         );
+        assert_eq!(files.chat_template, None);
+
+        // A snapshot missing a file this model cannot do without is a
+        // refusal naming that file.
         assert!(matches!(
-            repo.require("tokenizer.json"),
-            Err(ModelAssetsError::NotMaterialized { ref file, .. }) if file == "tokenizer.json",
+            program_files(&repo, &model),
+            Err(ModelAssetsError::NotMaterialized { ref file, .. }) if file == "model.safetensors",
         ));
-        assert_eq!(repo.optional("chat_template.jinja"), None);
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -363,20 +541,14 @@ mod tests {
     fn branch_revision_resolves_through_its_ref() {
         let root = scratch("branch");
         let model = ModelSpec::parse("Qwen/Qwen3-0.6B").expect("valid model spec");
-        materialize(&root, &model, REVISION, &[("config.json", b"{}")]);
+        materialize(&root, &model, REVISION, &metadata(b"{}"));
 
         let repo = local_only(&model, &root);
+        let files = metadata_files(&repo, &model).expect("a materialized model");
         assert_eq!(
-            repo.require("config.json").expect("materialized file"),
-            root.join("models--Qwen--Qwen3-0.6B")
-                .join("snapshots")
-                .join(REVISION)
-                .join("config.json"),
+            files.config,
+            snapshot_of(&root, REVISION).join("config.json"),
         );
-        assert!(matches!(
-            repo.require("model.safetensors"),
-            Err(ModelAssetsError::NotMaterialized { ref file, .. }) if file == "model.safetensors",
-        ));
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -388,7 +560,7 @@ mod tests {
         let root = scratch("empty");
         let model = ModelSpec::parse("evil/enormous-repo").expect("valid model spec");
 
-        match local_only(&model, &root).require("config.json") {
+        match metadata_files(&local_only(&model, &root), &model) {
             Err(ModelAssetsError::NotMaterialized {
                 model_id,
                 revision,
@@ -398,7 +570,7 @@ mod tests {
                 assert_eq!(revision, "main");
                 assert_eq!(file, "config.json");
             }
-            other => panic!("expected a refusal, got {other:?}"),
+            other => panic!("expected a refusal, got {}", described(other)),
         }
 
         let _ = std::fs::remove_dir_all(&root);
@@ -412,82 +584,124 @@ mod tests {
         let root = scratch("materialized");
         let model = ModelSpec::parse("Qwen/Qwen3-0.6B").expect("valid model spec");
         let index = br#"{"weight_map":{"a":"model-00001-of-00002.safetensors","b":"model-00002-of-00002.safetensors"}}"#;
-        materialize(
-            &root,
-            &model,
-            REVISION,
-            &[
-                ("config.json", b"{}"),
-                ("tokenizer.json", b"{}"),
-                ("tokenizer_config.json", b"{}"),
-                ("model.safetensors.index.json", index),
-                ("model-00001-of-00002.safetensors", b"shard one"),
-                ("model-00002-of-00002.safetensors", b"shard two"),
+        let mut files = metadata(b"{}");
+        files.extend_from_slice(&[
+            ("model.safetensors.index.json", index.as_slice()),
+            ("model-00001-of-00002.safetensors", b"shard one"),
+            ("model-00002-of-00002.safetensors", b"shard two"),
+        ]);
+        materialize(&root, &model, REVISION, &files);
+
+        let snapshot = snapshot_of(&root, REVISION);
+        let resolved = program_files(&local_only(&model, &root), &model).expect("a whole model");
+        assert_eq!(resolved.commit, REVISION);
+        assert_eq!(resolved.config, snapshot.join("config.json"));
+        assert_eq!(resolved.tokenizer, snapshot.join("tokenizer.json"));
+        assert_eq!(
+            resolved.tokenizer_config,
+            snapshot.join("tokenizer_config.json"),
+        );
+        let mut weights = resolved.weights;
+        weights.sort();
+        assert_eq!(
+            weights,
+            vec![
+                snapshot.join("model-00001-of-00002.safetensors"),
+                snapshot.join("model-00002-of-00002.safetensors"),
             ],
         );
-
-        let repo = local_only(&model, &root);
-        let snapshot = root
-            .join("models--Qwen--Qwen3-0.6B")
-            .join("snapshots")
-            .join(REVISION);
-        assert_eq!(
-            repo.optional("model.safetensors.index.json"),
-            Some(snapshot.join("model.safetensors.index.json")),
-        );
-        for file in [
-            "config.json",
-            "tokenizer.json",
-            "tokenizer_config.json",
-            "model-00001-of-00002.safetensors",
-            "model-00002-of-00002.safetensors",
-        ] {
-            assert_eq!(repo.require(file).expect(file), snapshot.join(file));
-        }
 
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A file in an adopted cache resolves even when the environment's
-    /// cache is empty — and the environment's copy wins when both hold
-    /// it, because that is the one a download would have refreshed.
+    /// A model is never assembled out of two caches.
+    ///
+    /// This is the case that used to produce a manifest that lied.
+    /// Selection happened per file, so `main` took `config.json` from the
+    /// first cache — at commit A — and everything else from the second,
+    /// at commit B; the commit was then read off the config path, so the
+    /// signed manifest said A while committing to B's bytes.
+    ///
+    /// The first cache here is deliberately the incomplete one, so
+    /// "answers from the first cache that has anything" fails and only
+    /// "answers from the first cache that has *everything*" passes.
     #[test]
-    fn a_second_cache_is_resolved_against_after_the_first() {
-        let first = scratch("two-caches-first");
-        let second = scratch("two-caches-second");
+    fn a_model_is_never_assembled_out_of_two_caches() {
+        let first = scratch("split-first");
+        let second = scratch("split-second");
         let model = ModelSpec::parse("Qwen/Qwen3-0.6B").expect("valid model spec");
+
+        // A branch, because that is what can point at two commits.
         materialize(&first, &model, REVISION, &[("config.json", b"{}")]);
-        materialize(
-            &second,
-            &model,
-            REVISION,
-            &[("config.json", b"{}"), ("tokenizer.json", b"{}")],
-        );
+        let mut whole = metadata(b"{}");
+        whole.push(("model.safetensors", b"the weights"));
+        materialize(&second, &model, OTHER_REVISION, &whole);
 
         let repo = RepoFiles::with_caches(
             &model,
             vec![Cache::new(first.clone()), Cache::new(second.clone())],
             None,
         );
-        let snapshot = |root: &Path| {
-            root.join("models--Qwen--Qwen3-0.6B")
-                .join("snapshots")
-                .join(REVISION)
+        let resolved = program_files(&repo, &model).expect("the second cache holds a whole model");
+
+        assert_eq!(
+            resolved.commit, OTHER_REVISION,
+            "the manifest must name the commit every file came from",
+        );
+        let snapshot = snapshot_of(&second, OTHER_REVISION);
+        for path in [
+            &resolved.config,
+            &resolved.tokenizer,
+            &resolved.tokenizer_config,
+            &resolved.weights[0],
+        ] {
+            assert_eq!(
+                path.parent(),
+                Some(snapshot.as_path()),
+                "{} came from outside the snapshot the manifest names",
+                path.display(),
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&first);
+        let _ = std::fs::remove_dir_all(&second);
+    }
+
+    /// The other half: an adopted cache is still consulted, and the
+    /// first cache that holds the whole model wins.
+    #[test]
+    fn the_first_cache_holding_a_whole_model_answers() {
+        let first = scratch("two-caches-first");
+        let second = scratch("two-caches-second");
+        let model = ModelSpec::parse("Qwen/Qwen3-0.6B").expect("valid model spec");
+        materialize(&second, &model, REVISION, &metadata(b"{}"));
+
+        let both = |model: &ModelSpec| {
+            RepoFiles::with_caches(
+                model,
+                vec![Cache::new(first.clone()), Cache::new(second.clone())],
+                None,
+            )
         };
+
+        // Only the second cache holds it: an adopted cache must still be
+        // an answer.
         assert_eq!(
-            repo.require("config.json").expect("in both caches"),
-            snapshot(&first).join("config.json"),
-            "the first cache listed answers when it can",
+            metadata_files(&both(&model), &model)
+                .expect("a model only the adopted cache holds")
+                .config,
+            snapshot_of(&second, REVISION).join("config.json"),
         );
+
+        // Both hold it: the environment's cache is the one a download
+        // would have refreshed, so it answers.
+        materialize(&first, &model, REVISION, &metadata(b"{}"));
         assert_eq!(
-            repo.require("tokenizer.json").expect("only in the second"),
-            snapshot(&second).join("tokenizer.json"),
-            "a file only the adopted cache holds must still resolve",
+            metadata_files(&both(&model), &model)
+                .expect("a model both caches hold")
+                .config,
+            snapshot_of(&first, REVISION).join("config.json"),
         );
-        assert!(matches!(
-            repo.require("model.safetensors"),
-            Err(ModelAssetsError::NotMaterialized { .. }),
-        ));
 
         let _ = std::fs::remove_dir_all(&first);
         let _ = std::fs::remove_dir_all(&second);
@@ -506,31 +720,22 @@ mod tests {
         let escape = "../../../outside.safetensors";
         put(&root.join("outside.safetensors"), b"not this model's");
         let index = format!(r#"{{"weight_map":{{"a":"{escape}"}}}}"#);
-        materialize(
-            &root,
-            &model,
-            REVISION,
-            &[
-                ("config.json", b"{}"),
-                ("tokenizer.json", b"{}"),
-                ("tokenizer_config.json", b"{}"),
-                ("model.safetensors.index.json", index.as_bytes()),
-            ],
-        );
+        let mut files = metadata(b"{}");
+        files.push(("model.safetensors.index.json", index.as_bytes()));
+        materialize(&root, &model, REVISION, &files);
         assert!(
-            root.join("models--Qwen--Qwen3-0.6B")
-                .join("snapshots")
-                .join(REVISION)
-                .join(escape)
-                .is_file(),
+            snapshot_of(&root, REVISION).join(escape).is_file(),
             "the escaping name must resolve to a real file, or this test proves nothing",
         );
 
-        match program_files_of(&local_only(&model, &root)) {
+        match program_files(&local_only(&model, &root), &model) {
             Err(ModelAssetsError::WeightFileOutsideSnapshot { file }) => {
                 assert_eq!(file, escape);
             }
-            other => panic!("expected the escaping name to be refused, got {other:?}"),
+            other => panic!(
+                "expected the escaping name to be refused, got {}",
+                described(other)
+            ),
         }
 
         let _ = std::fs::remove_dir_all(&root);
@@ -558,34 +763,72 @@ mod tests {
     }
 
     #[test]
-    fn immutable_revision_maps_directly_to_snapshot() {
+    fn a_pinned_revision_is_its_own_snapshot() {
+        let root = scratch("pin-maps");
         let model =
             ModelSpec::parse(&format!("Qwen/Qwen3-0.6B@{REVISION}")).expect("valid model spec");
+        materialize(&root, &model, REVISION, &[("config.json", b"{}")]);
 
-        assert_eq!(
-            immutable_snapshot_root(Path::new("/cache/hub"), &model),
-            Some(
-                Path::new("/cache/hub")
-                    .join("models--Qwen--Qwen3-0.6B")
-                    .join("snapshots")
-                    .join(REVISION)
-            )
-        );
+        let found = snapshot_in(&Cache::new(root.clone()), &model).expect("the snapshot");
+        assert_eq!(found.commit, REVISION);
+        assert_eq!(found.dir, snapshot_of(&root, REVISION));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Anything that is not a commit sha goes through `refs/`. The
-    /// revisions that used to be interesting here — `../snapshots/escape`
-    /// and friends — no longer reach this function at all: `ModelSpec`
-    /// refuses them, which is where a name that becomes a path belongs.
+    /// Anything that is not a commit sha goes through `refs/`, and what
+    /// that file says becomes a path segment — so a cache is not a
+    /// trusted input just because it is local.
     #[test]
-    fn mutable_or_malformed_revision_uses_hub_refs() {
-        for revision in ["main", "refs/pr/7", "abc123"] {
-            let model =
-                ModelSpec::parse(&format!("Qwen/Qwen3-0.6B@{revision}")).expect("valid model spec");
-            assert_eq!(
-                immutable_snapshot_root(Path::new("/cache/hub"), &model),
-                None
+    fn a_ref_that_names_something_other_than_a_snapshot_resolves_to_nothing() {
+        let root = scratch("bad-ref");
+        let model = ModelSpec::parse("Qwen/Qwen3-0.6B").expect("valid model spec");
+        materialize(&root, &model, REVISION, &[("config.json", b"{}")]);
+        let refs = root
+            .join("models--Qwen--Qwen3-0.6B")
+            .join("refs")
+            .join("main");
+
+        // The control: an honest ref resolves.
+        assert!(snapshot_in(&Cache::new(root.clone()), &model).is_some());
+
+        for named in ["../snapshots", "..", ".", "a/b", "", "no-such-commit"] {
+            put(&refs, named.as_bytes());
+            assert!(
+                snapshot_in(&Cache::new(root.clone()), &model).is_none(),
+                "a ref naming {named:?} must resolve to nothing",
             );
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The hub cannot be asked in a test, so the check that its files all
+    /// landed in one snapshot is asserted where it lives.
+    #[test]
+    fn files_from_two_snapshots_are_not_one_model() {
+        let a = Path::new("/cache/models--org--m/snapshots/aaa");
+        let b = Path::new("/cache/models--org--m/snapshots/bbb");
+        assert_eq!(
+            one_commit(&[&a.join("config.json"), &a.join("tokenizer.json")]).expect("one snapshot"),
+            "aaa",
+        );
+        assert!(matches!(
+            one_commit(&[&a.join("config.json"), &b.join("tokenizer.json")]),
+            Err(ModelAssetsError::MixedSnapshots { .. }),
+        ));
+        assert!(matches!(
+            one_commit(&[]),
+            Err(ModelAssetsError::UnresolvedRevision),
+        ));
+    }
+
+    /// `ModelAssetsError` is not `Debug`-comparable in a `match` arm's
+    /// fallthrough without moving it, so failures describe themselves.
+    fn described<T>(result: Result<T>) -> String {
+        match result {
+            Ok(_) => "a successful resolution".to_string(),
+            Err(err) => format!("{err:?}"),
         }
     }
 }

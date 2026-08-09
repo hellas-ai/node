@@ -39,10 +39,14 @@ pub fn program_manifest(
     reach: Reach,
 ) -> Result<EvaluateProgramManifest> {
     let spec = ModelSpec::parse(model)?;
-    let (mut weight_paths, config_path, tokenizer_path, tokenizer_config_path) =
-        get_program_files(&spec, reach)?;
+    let super::hf::ProgramFiles {
+        commit: resolved_revision,
+        weights: mut weight_paths,
+        config: config_path,
+        tokenizer: tokenizer_path,
+        tokenizer_config: tokenizer_config_path,
+    } = get_program_files(&spec, reach)?;
     weight_paths.sort();
-    let resolved_revision = resolved_revision_of(&config_path)?;
     let key = ManifestKey::of(
         spec.id(),
         &resolved_revision,
@@ -114,20 +118,6 @@ fn build_program_manifest(
         backend_profile: backend_profile.to_string(),
         build: build_id(),
     })
-}
-
-/// The commit a resolved path landed in.
-///
-/// Taken from the snapshot directory the file actually resolved
-/// through, never from the requested revision: `main` moves, and the
-/// manifest must name the commit whose bytes were read.
-fn resolved_revision_of(config_path: &Path) -> Result<String> {
-    Ok(config_path
-        .parent()
-        .and_then(|path| path.file_name())
-        .and_then(|name| name.to_str())
-        .ok_or(ModelAssetsError::UnresolvedRevision)?
-        .to_string())
 }
 
 /// Everything a [`program_manifest`] answer is a function of.
@@ -400,8 +390,12 @@ impl ModelAssets {
     /// model id comes from the caller.
     pub fn load(model_name: &str, dtype: Dtype, reach: Reach) -> Result<Self> {
         let model = ModelSpec::parse(model_name)?;
-        let (config_path, tokenizer_path, tokenizer_config_path, chat_template_path) =
-            get_model_metadata_files(&model, reach)?;
+        let super::hf::MetadataFiles {
+            config: config_path,
+            tokenizer: tokenizer_path,
+            tokenizer_config: tokenizer_config_path,
+            chat_template: chat_template_path,
+        } = get_model_metadata_files(&model, reach)?;
         let config_bytes = read_asset(&config_path)?;
         let config: Value = serde_json::from_slice(&config_bytes)
             .map_err(|source| ModelAssetsError::ParseModelMetadata { source })?;
