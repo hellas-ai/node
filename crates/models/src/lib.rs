@@ -20,8 +20,8 @@ use hellas_rpc::{TokenBytesError, spec::ModelSpecError};
 
 pub use assets::{
     ChatMessage, ModelAssets, PreparedPrompt, PreparedQuote, Reach, TextOutputDecoder,
-    content_id_of, materialize_program_files, program_manifest, require_program_files, store,
-    to_catgrad_dtype,
+    content_id_of, load_store_records, materialize_program_files, program_manifest,
+    require_program_files, save_store_records, store, to_catgrad_dtype,
 };
 
 type Result<T> = std::result::Result<T, ModelAssetsError>;
@@ -38,7 +38,7 @@ pub enum ModelAssetsError {
         source: ApiError,
     },
     #[error(
-        "{model_id}@{revision} is not available on this node: {file} is not in its HuggingFace cache. Only models a node already holds can be quoted; ask the operator to add it (`hellas serve --preload {model_id}@{revision}`, or point the node at a cache that has it)"
+        "{model_id}@{revision} is not available on this node: {file} is not in any HuggingFace cache this node resolves against. Only models a node already holds can be quoted; ask the operator to add it (`hellas serve --preload {model_id}@{revision}`, or `hellas store adopt --cache PATH` for a cache that already has it)"
     )]
     NotMaterialized {
         model_id: String,

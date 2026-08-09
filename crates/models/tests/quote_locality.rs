@@ -61,6 +61,11 @@ fn a_quote_for_an_unmaterialized_model_is_refused_without_reaching_the_network()
     unsafe {
         std::env::set_var("HF_ENDPOINT", &endpoint);
         std::env::set_var("HF_HOME", &cache);
+        // The gate also resolves against caches `hellas store adopt`
+        // recorded. Point that registry at an empty directory: this test
+        // is about a model nobody holds, and it must not depend on what
+        // the developer running it happens to have adopted.
+        std::env::set_var("HELLAS_STORE_DIR", cache.join("hellas"));
         std::env::remove_var("HF_TOKEN");
         std::env::remove_var("HUGGING_FACE_HUB_TOKEN");
     }

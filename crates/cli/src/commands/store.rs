@@ -16,16 +16,6 @@ use hellas_xet::XetHash;
 
 use crate::commands::CliResult;
 
-/// Where the fastresume record lives by default.
-///
-/// Beside the other Hellas state rather than inside the HuggingFace
-/// cache: the cache is not ours, and writing our bookkeeping into
-/// someone else's directory is how tools get blamed for each other's
-/// bugs.
-fn default_records() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".hellas/store/fastresume.bin"))
-}
-
 #[derive(Subcommand)]
 pub enum StoreCommand {
     /// Index a HuggingFace cache so its contents can be served without
@@ -86,7 +76,7 @@ pub async fn run(command: StoreCommand) -> CliResult {
 
 fn records_path(explicit: Option<PathBuf>) -> CliResult<PathBuf> {
     explicit
-        .or_else(default_records)
+        .or_else(hellas_store::state::records_path)
         .ok_or_else(|| anyhow::anyhow!("no home directory; pass --records"))
 }
 
@@ -110,6 +100,14 @@ fn adopt(cache: Option<PathBuf>, records: Option<PathBuf>, recheck: bool) -> Cli
     let elapsed = started.elapsed();
     let saved = store.records().save(&records_path)?;
 
+    // Adopting a cache the quote path has never heard of would leave the
+    // operator watching quotes refuse for models this command just said
+    // it holds. Recording the root is what makes those one question.
+    let registry = hellas_store::state::adopted_caches_path();
+    if let Some(registry) = registry.as_deref() {
+        hellas_store::hf_cache::remember_adopted(registry, cache.root())?;
+    }
+
     println!("cache      {}", cache.root().display());
     println!(
         "known      {loaded} remembered from {}",
@@ -118,6 +116,10 @@ fn adopt(cache: Option<PathBuf>, records: Option<PathBuf>, recheck: bool) -> Cli
     println!("adopted    {adopted} blobs in {elapsed:.2?}");
     println!("contents   {} distinct", store.len());
     println!("records    {saved} saved");
+    match registry.as_deref() {
+        Some(registry) => println!("quotable   from {}", registry.display()),
+        None => println!("quotable   no; set HELLAS_STORE_DIR or HOME so the root can be recorded"),
+    }
     Ok(())
 }
 
@@ -127,6 +129,15 @@ fn status(records: Option<PathBuf>) -> CliResult {
     let loaded = store.records().load(&path);
     println!("records    {}", path.display());
     println!("remembered {loaded} files");
+    // The caches a node resolves models against. Kept beside the record
+    // rather than derived from `--records`, because it is state about
+    // this node and not about one invocation of this command.
+    if let Some(registry) = hellas_store::state::adopted_caches_path() {
+        println!("caches     {}", registry.display());
+        for root in hellas_store::hf_cache::adopted_caches_in(&registry) {
+            println!("adopted    {}", root.display());
+        }
+    }
     if loaded == 0 && !path.exists() {
         println!("\nNothing adopted yet. Try: hellas store adopt");
     }

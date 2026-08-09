@@ -36,10 +36,11 @@ pub enum Reach {
 /// someone can forget to consult.
 pub(super) struct RepoFiles {
     model: ModelSpec,
-    /// Where this machine's HuggingFace client keeps its files. Read
-    /// once, so a resolver answers about one cache rather than about
-    /// whatever the environment happens to say per call.
-    cache: Cache,
+    /// Every HuggingFace cache this node answers about, in the order
+    /// they are consulted. Read once, so a resolver answers about one
+    /// set of caches rather than about whatever the environment and the
+    /// registry happen to say per call.
+    caches: Vec<Cache>,
     api: Option<ApiRepo>,
 }
 
@@ -49,13 +50,13 @@ impl RepoFiles {
             Reach::Local => None,
             Reach::Download => Some(model_repo(model)?),
         };
-        Ok(Self::with_cache(model, Cache::from_env(), api))
+        Ok(Self::with_caches(model, local_caches(), api))
     }
 
-    fn with_cache(model: &ModelSpec, cache: Cache, api: Option<ApiRepo>) -> Self {
+    fn with_caches(model: &ModelSpec, caches: Vec<Cache>, api: Option<ApiRepo>) -> Self {
         Self {
             model: model.clone(),
-            cache,
+            caches,
             api,
         }
     }
@@ -98,8 +99,35 @@ impl RepoFiles {
 
     /// Where `file` already is on this disk, if it is here at all.
     fn local(&self, file: &str) -> Option<PathBuf> {
-        local_file(&self.cache, &self.model, file)
+        self.caches
+            .iter()
+            .find_map(|cache| local_file(cache, &self.model, file))
     }
+}
+
+/// Every cache a local resolution may look in.
+///
+/// The environment's cache first — that is the one a download would
+/// write to, so it is where the freshest copy of anything is — and then
+/// every cache `hellas store adopt` was pointed at.
+///
+/// This is the whole of the store/gate convergence: `adopt` records a
+/// root, and the gate resolves against it. Note what it is *not*. It
+/// carries no content ids and makes no claim that any file is present or
+/// unmodified; it only widens where "is this file on this disk?" is
+/// asked. The answer is still a `stat`, and the bytes are still hashed
+/// later when the manifest is built.
+///
+/// Reading the registry spends no network, which is the property
+/// [`Reach::Local`] exists to guarantee.
+fn local_caches() -> Vec<Cache> {
+    let mut caches = vec![Cache::from_env()];
+    for root in hellas_store::hf_cache::adopted_caches() {
+        if !caches.iter().any(|cache| cache.path() == &root) {
+            caches.push(Cache::new(root));
+        }
+    }
+    caches
 }
 
 /// Resolves `file` against a HuggingFace cache, and nothing else.
@@ -246,7 +274,7 @@ mod tests {
     }
 
     fn local_only(model: &ModelSpec, root: &Path) -> RepoFiles {
-        RepoFiles::with_cache(model, Cache::new(root.to_path_buf()), None)
+        RepoFiles::with_caches(model, vec![Cache::new(root.to_path_buf())], None)
     }
 
     #[test]
@@ -378,6 +406,51 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A file in an adopted cache resolves even when the environment's
+    /// cache is empty — and the environment's copy wins when both hold
+    /// it, because that is the one a download would have refreshed.
+    #[test]
+    fn a_second_cache_is_resolved_against_after_the_first() {
+        let first = scratch("two-caches-first");
+        let second = scratch("two-caches-second");
+        let model = ModelSpec::parse("Qwen/Qwen3-0.6B").expect("valid model spec");
+        materialize(&first, &model, REVISION, &[("config.json", b"{}")]);
+        materialize(
+            &second,
+            &model,
+            REVISION,
+            &[("config.json", b"{}"), ("tokenizer.json", b"{}")],
+        );
+
+        let repo = RepoFiles::with_caches(
+            &model,
+            vec![Cache::new(first.clone()), Cache::new(second.clone())],
+            None,
+        );
+        let snapshot = |root: &Path| {
+            root.join("models--Qwen--Qwen3-0.6B")
+                .join("snapshots")
+                .join(REVISION)
+        };
+        assert_eq!(
+            repo.require("config.json").expect("in both caches"),
+            snapshot(&first).join("config.json"),
+            "the first cache listed answers when it can",
+        );
+        assert_eq!(
+            repo.require("tokenizer.json").expect("only in the second"),
+            snapshot(&second).join("tokenizer.json"),
+            "a file only the adopted cache holds must still resolve",
+        );
+        assert!(matches!(
+            repo.require("model.safetensors"),
+            Err(ModelAssetsError::NotMaterialized { .. }),
+        ));
+
+        let _ = std::fs::remove_dir_all(&first);
+        let _ = std::fs::remove_dir_all(&second);
     }
 
     #[test]
