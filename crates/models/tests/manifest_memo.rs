@@ -178,8 +178,14 @@ fn a_manifest_is_built_once_and_rebuilt_whenever_its_answer_could_differ() {
 
     // -- The files. A shard rewritten in place is a different model,
     //    however unchanged its name and revision are.
-    let rewritten = vec![9_u8; 8192];
-    std::fs::write(blob(&hub, "model.safetensors"), &rewritten).expect("rewrite the shard");
+    //
+    //    Every rewrite below keeps the shard's length, and that is the
+    //    point: this test used to grow the shard from 4 KiB to 8 KiB, so
+    //    it passed against a `FileIdentity` of `size` alone and proved
+    //    nothing about the four other fields it claims to check.
+    let shard = blob(&hub, "model.safetensors");
+    let rewritten = vec![9_u8; weights.len()];
+    std::fs::write(&shard, &rewritten).expect("rewrite the shard");
     let after_rewrite = manifest(&at(COMMIT_A), Dtype::F32, "cpu");
     assert_eq!(
         after_rewrite.weights,
@@ -194,7 +200,71 @@ fn a_manifest_is_built_once_and_rebuilt_whenever_its_answer_could_differ() {
     assert_eq!(
         (stats.hits, stats.misses, stats.entries),
         (1, 5, 5),
-        "a file that changed is a miss",
+        "a file the same size as before, with different bytes, is a miss",
+    );
+
+    // -- The same rewrite with the modification time put back.
+    //
+    //    `utimensat` can move mtime backwards; nothing in userspace can
+    //    move ctime backwards. So after this the file agrees with its
+    //    record on dev, ino, size *and* mtime, and disagrees only on
+    //    ctime — which is the only field that can still tell the truth,
+    //    and the only reason the record is safe to keep at all.
+    let was = std::fs::metadata(&shard)
+        .expect("stat the shard")
+        .modified()
+        .expect("a modification time");
+    let backdated = vec![3_u8; weights.len()];
+    std::fs::write(&shard, &backdated).expect("rewrite the shard again");
+    std::fs::File::options()
+        .write(true)
+        .open(&shard)
+        .expect("open the shard")
+        .set_times(
+            std::fs::FileTimes::new()
+                .set_modified(was)
+                .set_accessed(was),
+        )
+        .expect("put the modification time back");
+    assert_eq!(
+        std::fs::metadata(&shard)
+            .expect("stat the shard")
+            .modified()
+            .expect("a modification time"),
+        was,
+        "the backdating must have taken, or this case proves nothing",
+    );
+    let after_backdating = manifest(&at(COMMIT_A), Dtype::F32, "cpu");
+    assert_eq!(
+        after_backdating.weights,
+        vec![ContentId::hash(&backdated)],
+        "a shard whose mtime was put back is still a different shard",
+    );
+    let stats = hellas_models::program_manifest_memo_stats();
+    assert_eq!(
+        (stats.hits, stats.misses, stats.entries),
+        (1, 6, 6),
+        "only ctime moved, and that has to be enough",
+    );
+
+    // -- The shape the HuggingFace client actually writes: a new blob,
+    //    renamed over the old one. Same length again, so what changed is
+    //    the inode.
+    let replaced = vec![5_u8; weights.len()];
+    let incoming = shard.with_extension("incoming");
+    std::fs::write(&incoming, &replaced).expect("write the replacement");
+    std::fs::rename(&incoming, &shard).expect("replace the shard atomically");
+    let after_replacement = manifest(&at(COMMIT_A), Dtype::F32, "cpu");
+    assert_eq!(
+        after_replacement.weights,
+        vec![ContentId::hash(&replaced)],
+        "a shard replaced by rename is a different shard",
+    );
+    let stats = hellas_models::program_manifest_memo_stats();
+    assert_eq!(
+        (stats.hits, stats.misses, stats.entries),
+        (1, 7, 7),
+        "an atomic replacement is a miss",
     );
 
     // -- Purgeable, and purging costs only the rebuild.
@@ -203,13 +273,13 @@ fn a_manifest_is_built_once_and_rebuilt_whenever_its_answer_could_differ() {
     assert_eq!(stats.entries, 0, "purging must forget everything");
     let after_purge = manifest(&at(COMMIT_A), Dtype::F32, "cpu");
     assert_eq!(
-        after_purge, after_rewrite,
+        after_purge, after_replacement,
         "a rebuilt manifest must be the manifest it replaced",
     );
     let stats = hellas_models::program_manifest_memo_stats();
     assert_eq!(
         (stats.hits, stats.misses, stats.entries),
-        (1, 6, 1),
+        (1, 8, 1),
         "after a purge the next manifest is built again",
     );
 
