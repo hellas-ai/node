@@ -19,8 +19,9 @@ use tokenizers::Error as TokenizerError;
 use hellas_rpc::{TokenBytesError, spec::ModelSpecError};
 
 pub use assets::{
-    ChatMessage, ModelAssets, PreparedPrompt, PreparedQuote, Reach, TextOutputDecoder,
-    content_id_of, load_store_records, materialize_program_files, program_manifest,
+    ChatMessage, ManifestMemoStats, ModelAssets, PreparedPrompt, PreparedQuote, Reach,
+    TextOutputDecoder, content_id_of, forget_program_manifests, load_store_records,
+    materialize_program_files, program_manifest, program_manifest_memo_stats,
     require_program_files, save_store_records, store, to_catgrad_dtype,
 };
 
