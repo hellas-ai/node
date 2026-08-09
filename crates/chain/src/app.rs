@@ -5,32 +5,50 @@ pub use block::HellasBlock;
 use crate::domain::{Activity, PublicKey, Scheme, SettlementKey, Transaction};
 #[cfg(feature = "validator")]
 use crate::domain::{KERNEL_FEES, MAX_BLOCK_TX_BYTES, MAX_TXS_PER_BLOCK};
-use crate::execution::store::{UtxoDatabase, UtxoSyncTarget, empty_state};
+use crate::execution::store::empty_state;
+#[cfg(feature = "validator")]
+use crate::execution::store::{UtxoDatabase, UtxoSyncTarget};
 #[cfg(feature = "validator")]
 use crate::execution::{ChainVerifier, execute_all, execute_proposal};
 use crate::light_client::{ConsensusActivity, ProposalInfo};
 use crate::owner_index::OwnerIndex;
 use commonware_actor::Feedback;
 use commonware_codec::Encode;
+#[cfg(feature = "validator")]
+use commonware_consensus::simplex::types::Context;
+#[cfg(feature = "validator")]
+use commonware_consensus::{Block as _, CertifiableBlock, Heightable, types::Height};
 use commonware_consensus::{
-    Block as _, CertifiableBlock, Heightable, Reporter,
-    simplex::types::{Activity as SimplexActivity, Context, Proposal},
-    types::Height,
+    Reporter,
+    simplex::types::{Activity as SimplexActivity, Proposal},
 };
-use commonware_cryptography::{Digestible, sha256::Digest};
+#[cfg(feature = "validator")]
+use commonware_cryptography::Digestible;
+use commonware_cryptography::sha256::Digest;
+#[cfg(feature = "validator")]
 use commonware_glue::stateful::{
     Application as StatefulApplication, Proposed,
     db::{DatabaseSet, Merkleized as _, Unmerkleized as _},
 };
-use commonware_runtime::{Spawner, telemetry::metrics::Registered};
-use commonware_storage::{Context as StorageContext, mmr::Location, qmdb::sync::Target};
+use commonware_runtime::Spawner;
+#[cfg(feature = "validator")]
+use commonware_runtime::telemetry::metrics::Registered;
+use commonware_storage::Context as StorageContext;
+#[cfg(feature = "validator")]
+use commonware_storage::{mmr::Location, qmdb::sync::Target};
+#[cfg(feature = "validator")]
 use commonware_utils::{SystemTimeExt, non_empty_range};
+#[cfg(feature = "validator")]
 use futures::{Stream, StreamExt};
 use hellas_kernel::NetworkId;
+#[cfg(feature = "validator")]
 use prometheus_client::metrics::gauge::Gauge;
+#[cfg(feature = "validator")]
 use rand::Rng;
 use std::{collections::VecDeque, sync::Arc};
 use tokio::sync::{Mutex, broadcast};
+#[cfg(feature = "validator")]
+use tracing::{error, info, warn};
 
 type MarshalVariant = commonware_consensus::marshal::standard::Standard<HellasBlock>;
 pub type MarshalMailbox = commonware_consensus::marshal::core::Mailbox<Scheme, MarshalVariant>;
@@ -60,10 +78,16 @@ impl Mempool {
         self.inner.lock().await.push_back(tx);
     }
 
+    /// Proposal-time only. A follower accepts submissions (`submit`) so it
+    /// can forward them upstream, but it never drains its own mempool into
+    /// a block: that is `StatefulApplication::propose`, which is
+    /// `validator`-gated.
+    #[cfg(feature = "validator")]
     pub(crate) async fn snapshot(&self) -> Vec<Transaction> {
         self.inner.lock().await.iter().cloned().collect()
     }
 
+    #[cfg(feature = "validator")]
     async fn commit_snapshot(&self, snapshot_len: usize, retained: Vec<Transaction>) {
         let mut mempool = self.inner.lock().await;
         let split_at = snapshot_len.min(mempool.len());
@@ -78,9 +102,20 @@ impl Mempool {
 pub struct Application {
     /// The network this node validates. Every kernel context it builds
     /// names it, so every authorization it accepts was made for it.
+    ///
+    /// Only a validator builds kernel contexts. An `indexer` build keeps
+    /// no copy: it passes `network` straight to `OwnerIndex::new` and
+    /// never executes a transaction itself.
+    #[cfg(feature = "validator")]
     network: NetworkId,
     genesis: HellasBlock,
+    /// Read by `execute_proposal`/`execute_all`, which are `validator`-only.
+    #[cfg(feature = "validator")]
     genesis_allocations: Arc<Vec<(SettlementKey, u64)>>,
+    /// Set by `StatefulApplication::finalized`. Only a validator runs
+    /// consensus, so on an `indexer` build the gauge would sit at zero
+    /// forever and misreport the follower's height; better absent.
+    #[cfg(feature = "validator")]
     finalized_height: Registered<Gauge>,
     owner_index: OwnerIndex,
     #[cfg(feature = "validator")]
@@ -107,6 +142,7 @@ impl Application {
     where
         E: StorageContext + Spawner,
     {
+        #[cfg(feature = "validator")]
         let finalized_height = context.register(
             "finalized_height",
             "Highest finalized block height",
@@ -122,9 +158,12 @@ impl Application {
         let genesis = HellasBlock::genesis(genesis_leader, state_root, sync_target);
         let owner_index = OwnerIndex::new(network, &genesis, genesis_allocations.clone());
         Self {
+            #[cfg(feature = "validator")]
             network,
             genesis,
+            #[cfg(feature = "validator")]
             genesis_allocations: Arc::new(genesis_allocations),
+            #[cfg(feature = "validator")]
             finalized_height,
             owner_index,
             #[cfg(feature = "validator")]
@@ -133,6 +172,7 @@ impl Application {
     }
 }
 
+#[cfg(feature = "validator")]
 fn sync_target_from_merkleized<E>(
     merkleized: &<UtxoDatabase<E> as DatabaseSet<E>>::Merkleized,
 ) -> UtxoSyncTarget

@@ -14,6 +14,7 @@ use hellas_kernel::{
     InvalidProofReason, State, Tx as KernelTx,
 };
 use thiserror::Error;
+use tracing::warn;
 
 type Batch<E> = <UtxoDatabase<E> as DatabaseSet<E>>::Unmerkleized;
 

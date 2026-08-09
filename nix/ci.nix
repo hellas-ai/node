@@ -31,6 +31,24 @@ let
     clippy = mk "check-clippy" "cargo clippy --workspace --all-targets -- -D warnings" (
       cargoEnv rustToolchain
     );
+    # Default features alone leave most of the CLI unlinted: `evaluate`,
+    # `node` and `gateway` are all off by default, which is most of what
+    # the binary actually does. Not `--all-features` — that pulls
+    # candle-cuda and objc2, which cannot build here. So: the buildable
+    # feature sets, named.
+    clippy-features = mk "check-clippy-features" (builtins.concatStringsSep " && " (
+      map
+        (f: "cargo clippy -p hellas-cli --no-default-features --features ${f} --all-targets -- -D warnings")
+        [
+          "chain"
+          "indexer"
+          "validator"
+          "evaluate"
+          "node"
+          "gateway"
+          "otel"
+        ]
+    )) (cargoEnv rustToolchain);
     # The kernel's whole suite, including `tests/itf.rs` — the Quint↔Rust
     # replay that the entire abstract-correspondence story rests on — and
     # the exact-error pins in `tests/channel/`. `--all-features` is load

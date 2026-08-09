@@ -28,6 +28,7 @@ use hellas_rpc::spec::DEFAULT_MODEL_REVISION;
 #[cfg(feature = "evaluate")]
 use hellas_rpc::stream::output_event_to_pb;
 use hellas_rpc::{Assurance, ContentId, Digest, JobTerms, PublicKey, RequestCommitment};
+#[cfg(feature = "evaluate")]
 use hellas_rpc::{EvaluateRequest, OutputEventEnvelope, Retention};
 use uuid::Uuid;
 
