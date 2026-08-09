@@ -278,6 +278,10 @@ enum Commands {
         /// Persistent canonical artifact blob store path (default: $HOME/.hellas/artifacts)
         #[arg(long = "artifact-store-path")]
         artifact_store_path: Option<PathBuf>,
+        /// What `hellas store adopt` already hashed, so this node does not hash it again
+        /// (default: $HELLAS_STORE_DIR/fastresume.bin, else $HOME/.hellas/store/fastresume.bin)
+        #[arg(long = "store-records")]
+        store_records: Option<PathBuf>,
         /// Prometheus metrics port (e.g. 9090)
         #[arg(long = "metrics-port")]
         metrics_port: Option<u16>,
@@ -694,6 +698,7 @@ async fn main() {
             queue_size,
             preload_models,
             artifact_store_path,
+            store_records,
             metrics_port,
             graffiti,
             dtype,
@@ -707,6 +712,7 @@ async fn main() {
                 queue_size,
                 preload_models,
                 artifact_store_path,
+                store_records,
                 metrics_port,
                 graffiti,
                 dtype,

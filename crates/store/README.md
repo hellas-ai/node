@@ -39,6 +39,28 @@ unchanged blob, because the result is persisted.
 
 Measured on a real 29-blob cache: **647 ms cold, 549 µs warm.**
 
+## Adopting is what makes a model quotable
+
+`adopt` writes two things under `$HOME/.hellas/store` — or
+`$HELLAS_STORE_DIR`, and never inside the HuggingFace cache, which is
+not ours:
+
+| file | what it is |
+| --- | --- |
+| `fastresume.bin` | what has already been hashed |
+| `adopted-caches` | which cache roots were adopted |
+
+A node reads both. It loads the record at startup (`hellas serve
+--store-records`) so it does not re-hash a cache the CLI already read,
+and it resolves `Reach::Local` model files against every adopted root —
+which is what makes `hellas store adopt --cache /data/hf` followed by a
+quote for a model in `/data/hf` succeed.
+
+Neither file is trusted. A record is re-checked against the live file's
+identity before it is used, and the cache list is a list of places to
+look that carries no ids and asserts nothing about what is there.
+Presence is still a `stat`, and integrity is still a hash.
+
 ## Indexing produces two things, and the second is the valuable one
 
 `index` returns the content id **and the chunk list**. Keeping only the

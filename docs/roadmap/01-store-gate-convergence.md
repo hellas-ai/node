@@ -1,48 +1,60 @@
 # 01 — The store and the quote gate must answer one question
 
-## What is wrong
+**Landed.** What follows is the problem as found, the answer taken, and
+the part that is still two things.
 
-There are two unrelated notions of "does this node have that model".
+## What was wrong
+
+There were two unrelated notions of "does this node have that model".
 
 - **The store** (`crates/store`) indexes by **content id**. This is what
   `hellas store adopt` populates.
 - **The quote gate** (`crates/models/src/hf.rs`, `Reach::Local`)
   resolves by **HuggingFace cache path**.
 
-Verified: the quote gate references `hellas_store` nowhere.
+Verified at the time: the quote gate referenced `hellas_store` nowhere.
 
-## Why it matters
+So `hellas store adopt --cache /data/hf` did not make a model quotable.
+An operator who adopted a cache and then watched quotes refuse had been
+told two different things by one program, silently, because both
+subsystems were individually correct — about different disks.
 
-`hellas store adopt` does not make a model quotable. An operator who
-adopts a cache and then watches quotes refuse has been told two
-different things by one program. Worse, it is silent — both subsystems
-are individually correct.
+## What landed
 
-It also means the store's chunk lists — the thing that makes a peer's
-partial response verifiable — are not consulted on the path that decides
-whether we can serve a model at all.
+Approach 2 of the two below, at the granularity of a **cache root**.
 
-## Done looks like
+`adopt` records the root it indexed in `adopted-caches`, beside the
+fastresume record. `Reach::Local` resolution consults the environment's
+cache first and then every recorded root. `hellas store adopt` followed
+by a quote for a model in that cache now succeeds, and
+`crates/models/tests/adopted_cache_is_quotable.rs` says so end to end,
+with the same call before adopting as its control.
 
-One presence question with one answer. Options, in rough preference
-order:
+Why not approach 1 — the gate asking the store by content id. It needs
+the store to hold a `(model, revision)` → ids map, which only the
+manifest builder can compute, and which would then be a *content* claim
+consulted by a *presence* check. That is precisely the conflation the
+warning below exists to prevent: the gate would start answering "we hold
+these bytes" from a remembered id rather than from a `stat`. A cache
+root is the unit both halves already speak, so making one populate the
+other needed no new claim at all.
 
-1. The gate asks the store. Requires the store to know the mapping from
-   `(model, revision, dtype)` to the content ids of that model's files —
-   i.e. the manifest becomes a store-resident object, not something
-   recomputed. This is the principled answer and the most work.
-2. The store adopts *paths* as well as ids, so `adopt` registers the
-   snapshot layout the gate resolves against. Cheaper, keeps two
-   indexes but makes one populate the other.
+## What is still separate
 
-Whichever: `hellas store adopt` followed by a quote for an adopted model
-must succeed, and there must be a test that says so.
+- The store's index is still by content id; the gate still resolves by
+  path. They now share one input — which caches this node adopted — but
+  they are not one lookup.
+- The chunk lists are still not consulted on the path that decides
+  whether we can serve a model. Nothing about presence is verifiable
+  from a peer's partial response yet; that is [03](03-peer-fetch.md).
+- Nothing maps a model to its content ids without building a manifest,
+  so [05](05-manifest-memo.md) is unchanged by this.
 
-## Watch out for
+## Watch out for — both preserved
 
-- Presence is not integrity. The gate stats paths; hashing happens later
-  when the manifest is built. Do not let convergence quietly turn a
-  path check into an implied content guarantee.
-- The gate's locality is currently **structural** — under `Reach::Local`
-  the resolver holds no hub client (`api: None`). Do not regress that
-  into a boolean during the refactor.
+- Presence is not integrity. The registry is a list of places to look.
+  It carries no ids and asserts nothing about any file. The gate still
+  stats; the bytes are still hashed when the manifest is built.
+- The gate's locality is still **structural** — under `Reach::Local` the
+  resolver holds no hub client (`api: None`), only a longer list of
+  directories. Reading the registry spends no network.

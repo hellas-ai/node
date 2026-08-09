@@ -43,6 +43,7 @@
 pub mod fastresume;
 pub mod hf;
 pub mod hf_cache;
+pub mod state;
 pub mod xorb;
 
 use std::collections::HashMap;

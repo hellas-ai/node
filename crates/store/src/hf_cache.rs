@@ -39,6 +39,14 @@
 //! saves nothing, and code that reads an id we have decided not to
 //! trust invites someone to trust it later. Ids in the store are ones
 //! we computed.
+//!
+//! # Which caches this node adopted
+//!
+//! [`remember_adopted`] and [`adopted_caches`] persist the *roots* that
+//! `adopt` was pointed at. This is the seam the quote path resolves
+//! against, so that adopting a cache and quoting a model in it are one
+//! question with one answer rather than two subsystems each right about
+//! a different disk.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -142,6 +150,91 @@ impl HfCache {
             .filter(|blobs| blobs.is_dir())
             .collect()
     }
+}
+
+/// The HuggingFace caches this node has adopted.
+///
+/// A cache root is the unit both halves of the system already speak: the
+/// store walks one to hash its blobs, and the model layer resolves a
+/// model's files inside one. Recording which roots were adopted is what
+/// lets `hellas store adopt --cache /data/hf` make a model quotable —
+/// otherwise the store learns about a cache the quote path has never
+/// heard of, and the operator is told two different things by one
+/// program.
+///
+/// It is a list of places to look, not a list of what is there. Nothing
+/// here asserts a file exists or has any particular content; resolving
+/// still stats, and hashing still happens when the manifest is built.
+///
+/// Returns an empty list when the registry is missing or unreadable: the
+/// cost of forgetting a cache is a refusal an operator can fix, and the
+/// registry is a hint about where to look rather than a source of truth.
+#[must_use]
+pub fn adopted_caches() -> Vec<PathBuf> {
+    crate::state::adopted_caches_path()
+        .map(|path| adopted_caches_in(&path))
+        .unwrap_or_default()
+}
+
+/// [`adopted_caches`], from a named registry file.
+#[must_use]
+pub fn adopted_caches_in(registry: &Path) -> Vec<PathBuf> {
+    let Ok(text) = std::fs::read_to_string(registry) else {
+        return Vec::new();
+    };
+    parse_registry(&text)
+}
+
+/// Records `root` as a cache this node has adopted, so later processes
+/// resolve models against it too.
+///
+/// Idempotent, and order-preserving so the file stays readable by the
+/// person who has to debug it. Written atomically, like the fastresume
+/// record: two `adopt` runs racing lose one entry rather than corrupting
+/// the list.
+///
+/// # Errors
+///
+/// Returns the underlying I/O error if the registry cannot be written.
+pub fn remember_adopted(registry: &Path, root: &Path) -> std::io::Result<()> {
+    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let mut roots = adopted_caches_in(registry);
+    if roots.contains(&root) {
+        return Ok(());
+    }
+    roots.push(root);
+
+    let mut text = String::new();
+    for root in &roots {
+        // A path that is not UTF-8 cannot be written as a line and would
+        // come back as a different path. Skipping it keeps the file
+        // honest; the operator can still pass --cache.
+        if let Some(root) = root.to_str() {
+            text.push_str(root);
+            text.push('\n');
+        }
+    }
+    if let Some(parent) = registry.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let temporary = registry.with_extension("tmp");
+    std::fs::write(&temporary, text.as_bytes())?;
+    std::fs::rename(&temporary, registry)
+}
+
+fn parse_registry(text: &str) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let root = PathBuf::from(line);
+        if !roots.contains(&root) {
+            roots.push(root);
+        }
+    }
+    roots
 }
 
 impl Substituter for HfCache {

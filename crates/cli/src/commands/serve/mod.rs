@@ -40,6 +40,7 @@ pub struct ServeOptions {
     pub queue_size: usize,
     pub preload_models: Vec<String>,
     pub artifact_store_path: Option<PathBuf>,
+    pub store_records: Option<PathBuf>,
     pub metrics_port: Option<u16>,
     pub graffiti: String,
     pub dtype: Vec<Dtype>,
@@ -86,6 +87,32 @@ async fn run_with_store(
     artifact_store_path: PathBuf,
     #[cfg(feature = "evaluate")] artifact_store: ArtifactStoreConfig,
 ) -> CliResult<()> {
+    // What an earlier `hellas store adopt` already hashed.
+    //
+    // Without this a node re-hashes every weight shard the first time it
+    // is asked to quote — 647 ms against 549 µs on a 29-blob cache — so
+    // the whole benefit of `adopt` would accrue to a CLI process that
+    // exited immediately afterwards.
+    //
+    // Two nodes sharing one record file is decided rather than avoided:
+    // `save` is a write-and-rename, so the later writer wins whole and
+    // the earlier one's work is lost. Losing it costs a re-hash, which
+    // is the cost of not having adopted at all.
+    #[cfg(feature = "evaluate")]
+    let store_records = options
+        .store_records
+        .clone()
+        .or_else(hellas_store::state::records_path);
+    #[cfg(feature = "evaluate")]
+    if let Some(path) = store_records.as_deref() {
+        let loaded = hellas_models::load_store_records(path);
+        info!(
+            records = loaded,
+            path = %path.display(),
+            "loaded what an earlier run already hashed",
+        );
+    }
+
     let preload_models = dedupe_preload_models(options.preload_models);
     let build = option_env!("GIT_REV").unwrap_or("unknown").to_string();
     let graffiti = {
@@ -171,6 +198,22 @@ async fn run_with_store(
         .context("failed to listen for shutdown signal")?;
 
     println!("Shutting down...");
+    // Before the shutdown timeout, which can end in `process::exit`.
+    #[cfg(feature = "evaluate")]
+    if let Some(path) = store_records.as_deref() {
+        match hellas_models::save_store_records(path) {
+            Ok(saved) => info!(
+                records = saved,
+                path = %path.display(),
+                "saved what this run hashed",
+            ),
+            Err(error) => warn!(
+                %error,
+                path = %path.display(),
+                "could not save what this run hashed; the next start will re-hash it",
+            ),
+        }
+    }
     match timeout(Duration::from_secs(5), node.shutdown()).await {
         Ok(result) => result.context("failed to shut down RPC server")?,
         Err(_) => {
