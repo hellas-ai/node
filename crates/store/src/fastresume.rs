@@ -59,8 +59,14 @@ use hellas_xet::{Chunk, XetHash};
 ///
 /// Every field is a way the file could have changed underneath us. They
 /// are checked together; there is no most-significant one.
+///
+/// Public because it is the one definition of "the same file" this
+/// workspace has. Anything else that remembers work done on a file —
+/// the model layer's manifest memo, for one — must ask the same
+/// question this asks, and a second implementation of it would be a
+/// second answer.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-struct FileIdentity {
+pub struct FileIdentity {
     dev: u64,
     ino: u64,
     size: u64,
@@ -69,7 +75,9 @@ struct FileIdentity {
 }
 
 impl FileIdentity {
-    fn of(metadata: &Metadata) -> Self {
+    /// This file's identity, as `stat` describes it.
+    #[must_use]
+    pub fn of(metadata: &Metadata) -> Self {
         Self {
             dev: metadata.dev(),
             ino: metadata.ino(),

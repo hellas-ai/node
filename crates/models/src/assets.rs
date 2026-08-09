@@ -1,7 +1,11 @@
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use catgrad_llm_models::utils::{get_model, get_model_architecture};
 use hellas_rpc::{ContentId, DagCborEncoder, Dtype, EvaluateProgramManifest};
+use hellas_store::fastresume::FileIdentity;
 use serde_json::Value;
 use tokenizers::Tokenizer;
 
@@ -22,6 +26,12 @@ pub use super::prompt::{ChatMessage, PreparedPrompt};
 /// resolving those shards *is* fetching them, so a quote answered with
 /// download reach turns "ask a stranger's node for a price" into "make a
 /// stranger's node download a repository of my choosing".
+///
+/// Answered from [`MANIFESTS`] when this process has already built this
+/// exact manifest. What is never skipped is *resolving and stat-ing* the
+/// files: the memo is keyed on what they are, not on what they were
+/// called, so a model that stopped being here, or a shard that was
+/// rewritten, is a miss rather than a stale signature.
 pub fn program_manifest(
     model: &str,
     dtype: Dtype,
@@ -32,11 +42,52 @@ pub fn program_manifest(
     let (mut weight_paths, config_path, tokenizer_path, tokenizer_config_path) =
         get_program_files(&spec, reach)?;
     weight_paths.sort();
+    let resolved_revision = resolved_revision_of(&config_path)?;
+    let key = ManifestKey::of(
+        &spec.id,
+        &resolved_revision,
+        dtype,
+        backend_profile,
+        weight_paths
+            .iter()
+            .chain([&config_path, &tokenizer_path, &tokenizer_config_path]),
+    )?;
+    if let Some(manifest) = MANIFESTS.get(&key) {
+        return Ok(manifest);
+    }
+
+    let manifest = build_program_manifest(
+        &weight_paths,
+        &config_path,
+        &tokenizer_path,
+        &tokenizer_config_path,
+        resolved_revision,
+        dtype,
+        backend_profile,
+    )?;
+    MANIFESTS.insert(key, &manifest);
+    Ok(manifest)
+}
+
+/// Builds the manifest, reading and hashing everything it names.
+///
+/// Split out from [`program_manifest`] so that what the memo skips is
+/// exactly one function call: the hashing, the config parse, the catgrad
+/// graph build, and the tokenizer manifest encode.
+fn build_program_manifest(
+    weight_paths: &[PathBuf],
+    config_path: &Path,
+    tokenizer_path: &Path,
+    tokenizer_config_path: &Path,
+    resolved_revision: String,
+    dtype: Dtype,
+    backend_profile: &str,
+) -> Result<EvaluateProgramManifest> {
     let weights = weight_paths
         .iter()
         .map(|path| content_id_of(path))
         .collect::<Result<Vec<_>>>()?;
-    let config_bytes = read_asset(&config_path)?;
+    let config_bytes = read_asset(config_path)?;
     let config: Value = serde_json::from_slice(&config_bytes)
         .map_err(|source| ModelAssetsError::ParseModelMetadata { source })?;
     let graph = get_model(&config, 1, None, to_catgrad_dtype(dtype))?
@@ -46,22 +97,13 @@ pub fn program_manifest(
         &serde_json::to_vec(&graph)
             .map_err(|source| ModelAssetsError::SerializeProgram { source })?,
     );
-    let tokenizer = content_id_of(&tokenizer_path)?;
-    let tokenizer_config = content_id_of(&tokenizer_config_path)?;
+    let tokenizer = content_id_of(tokenizer_path)?;
+    let tokenizer_config = content_id_of(tokenizer_config_path)?;
     let mut tokenizer_manifest = DagCborEncoder::new();
     tokenizer_manifest.array(3);
     tokenizer_manifest.str("hellas.program.tokenizer.v2");
     tokenizer_manifest.bytes(tokenizer.as_bytes());
     tokenizer_manifest.bytes(tokenizer_config.as_bytes());
-    let resolved_revision = config_path
-        .parent()
-        .and_then(|path| path.file_name())
-        .and_then(|name| name.to_str())
-        .ok_or(ModelAssetsError::UnresolvedRevision)?
-        .to_string();
-    let build = ContentId::hash(
-        format!("hellas:{}:{}", hellas_rpc::VERSION, hellas_rpc::GIT_REV).as_bytes(),
-    );
     Ok(EvaluateProgramManifest {
         weights,
         graph,
@@ -70,8 +112,180 @@ pub fn program_manifest(
         resolved_revision,
         numeric_profile: dtype.as_wire().to_string(),
         backend_profile: backend_profile.to_string(),
-        build,
+        build: build_id(),
     })
+}
+
+/// The commit a resolved path landed in.
+///
+/// Taken from the snapshot directory the file actually resolved
+/// through, never from the requested revision: `main` moves, and the
+/// manifest must name the commit whose bytes were read.
+fn resolved_revision_of(config_path: &Path) -> Result<String> {
+    Ok(config_path
+        .parent()
+        .and_then(|path| path.file_name())
+        .and_then(|name| name.to_str())
+        .ok_or(ModelAssetsError::UnresolvedRevision)?
+        .to_string())
+}
+
+/// Everything a [`program_manifest`] answer is a function of.
+///
+/// Two halves, and both are load-bearing.
+///
+/// What was *asked*: the model id, the commit its revision resolved to,
+/// the dtype, the backend profile, and this build. The commit comes from
+/// the snapshot the files resolved through rather than from the request,
+/// because `main` moves — and it is in the key on its own account, since
+/// two revisions of a repo can share every blob and differ only in which
+/// commit the manifest names.
+///
+/// What was *read*: the identity of every file the manifest hashes or
+/// parses, in [`FileIdentity`]'s sense — the same question fastresume
+/// asks before reusing a hash, asked here for the same reason. This half
+/// is why reuse is safe at all. The id this returns is signed into an
+/// `execution_environment`; a stale entry is a provider committing to
+/// weights it does not have, which is a claim it loses under the fraud
+/// game. A key of names alone would do exactly that the first time a
+/// shard was rewritten in place.
+///
+/// Identities carry no path, so one blob reached through two snapshots'
+/// symlinks is one identity — which is correct, and is what leaves the
+/// resolved commit doing real work in the key.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ManifestKey {
+    model_id: String,
+    resolved_revision: String,
+    dtype: Dtype,
+    backend_profile: String,
+    build: ContentId,
+    files: Vec<FileIdentity>,
+}
+
+impl ManifestKey {
+    fn of<'a>(
+        model_id: &str,
+        resolved_revision: &str,
+        dtype: Dtype,
+        backend_profile: &str,
+        files: impl Iterator<Item = &'a PathBuf>,
+    ) -> Result<Self> {
+        let files = files
+            .map(|path| {
+                std::fs::metadata(path)
+                    .map(|metadata| FileIdentity::of(&metadata))
+                    .map_err(|source| ModelAssetsError::ReadAsset {
+                        path: path.clone(),
+                        source,
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            model_id: model_id.to_string(),
+            resolved_revision: resolved_revision.to_string(),
+            dtype,
+            backend_profile: backend_profile.to_string(),
+            build: build_id(),
+            files,
+        })
+    }
+}
+
+/// This build, as the manifest reports it.
+///
+/// Constant while the process runs, so in the key it only ever costs a
+/// comparison. It is there because a key that described less than the
+/// answer would be a key that lies.
+fn build_id() -> ContentId {
+    ContentId::hash(format!("hellas:{}:{}", hellas_rpc::VERSION, hellas_rpc::GIT_REV).as_bytes())
+}
+
+/// Program manifests this process has already built.
+///
+/// Not merely a speed-up. `program_manifest` runs once per quote, and a
+/// quote is something any peer that can dial this node may ask for; the
+/// work it repeats — the config parse, the catgrad graph build, the
+/// tokenizer manifest encode — is per-request work an unpaid caller
+/// chooses the size of.
+static MANIFESTS: LazyLock<ManifestMemo> = LazyLock::new(ManifestMemo::default);
+
+/// Entries kept before the memo is emptied.
+///
+/// A key names a model this node holds, at one commit, dtype and backend
+/// profile, so the live set is small and bounded by the disk. The cap is
+/// against slow accumulation — every rewrite of a shard retires a key
+/// without removing it — and emptying is the whole eviction policy on
+/// purpose: this is a cache of work, so losing it costs a rebuild and
+/// can never change an answer.
+const MANIFEST_MEMO_CAPACITY: usize = 256;
+
+#[derive(Default)]
+struct ManifestMemo {
+    entries: Mutex<HashMap<ManifestKey, EvaluateProgramManifest>>,
+    hits: AtomicU64,
+    misses: AtomicU64,
+}
+
+impl ManifestMemo {
+    fn get(&self, key: &ManifestKey) -> Option<EvaluateProgramManifest> {
+        let found = self
+            .entries
+            .lock()
+            .ok()
+            .and_then(|entries| entries.get(key).cloned());
+        if found.is_some() {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.misses.fetch_add(1, Ordering::Relaxed);
+        }
+        found
+    }
+
+    fn insert(&self, key: ManifestKey, manifest: &EvaluateProgramManifest) {
+        if let Ok(mut entries) = self.entries.lock() {
+            if entries.len() >= MANIFEST_MEMO_CAPACITY {
+                entries.clear();
+            }
+            entries.insert(key, manifest.clone());
+        }
+    }
+}
+
+/// What the program manifest memo has done since this process started.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ManifestMemoStats {
+    /// Manifests answered from the memo.
+    pub hits: u64,
+    /// Manifests that had to be built.
+    pub misses: u64,
+    /// Manifests currently remembered.
+    pub entries: usize,
+}
+
+#[must_use]
+pub fn program_manifest_memo_stats() -> ManifestMemoStats {
+    ManifestMemoStats {
+        hits: MANIFESTS.hits.load(Ordering::Relaxed),
+        misses: MANIFESTS.misses.load(Ordering::Relaxed),
+        entries: MANIFESTS
+            .entries
+            .lock()
+            .map(|entries| entries.len())
+            .unwrap_or(0),
+    }
+}
+
+/// Forgets every remembered manifest, forcing the next quote for each to
+/// build it again.
+///
+/// The "force recheck" the fastresume records have, for the same reason:
+/// the identity check a memo turns on is a heuristic, and heuristics are
+/// wrong eventually. Costs a rebuild and nothing else.
+pub fn forget_program_manifests() {
+    if let Ok(mut entries) = MANIFESTS.entries.lock() {
+        entries.clear();
+    }
 }
 
 /// Refuses unless every file a [`program_manifest`] for this model
