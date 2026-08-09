@@ -280,6 +280,12 @@ enum Commands {
         artifact_store_path: Option<PathBuf>,
         /// What `hellas store adopt` already hashed, so this node does not hash it again
         /// (default: $HELLAS_STORE_DIR/fastresume.bin, else $HOME/.hellas/store/fastresume.bin)
+        ///
+        /// The records are a hash cache for model weights, loaded and saved
+        /// through `hellas-models`, which only exists on an `evaluate` build.
+        /// A node that cannot evaluate has nothing to fastresume, so the flag
+        /// is not offered rather than accepted and ignored.
+        #[cfg(feature = "evaluate")]
         #[arg(long = "store-records")]
         store_records: Option<PathBuf>,
         /// Prometheus metrics port (e.g. 9090)
@@ -698,6 +704,7 @@ async fn main() {
             queue_size,
             preload_models,
             artifact_store_path,
+            #[cfg(feature = "evaluate")]
             store_records,
             metrics_port,
             graffiti,
@@ -712,6 +719,7 @@ async fn main() {
                 queue_size,
                 preload_models,
                 artifact_store_path,
+                #[cfg(feature = "evaluate")]
                 store_records,
                 metrics_port,
                 graffiti,

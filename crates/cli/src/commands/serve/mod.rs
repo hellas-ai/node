@@ -40,6 +40,9 @@ pub struct ServeOptions {
     pub queue_size: usize,
     pub preload_models: Vec<String>,
     pub artifact_store_path: Option<PathBuf>,
+    /// Read only by the fastresume load/save below, which go through
+    /// `hellas-models` and so exist only on an `evaluate` build.
+    #[cfg(feature = "evaluate")]
     pub store_records: Option<PathBuf>,
     pub metrics_port: Option<u16>,
     pub graffiti: String,
@@ -63,6 +66,14 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
     #[cfg(feature = "evaluate")]
     {
         let storage_path = artifact_store_path.join("evaluate");
+        // Not needless, whatever clippy sees: the `#[cfg(not(evaluate))]`
+        // call below is the other arm, and without this `return` the
+        // block's value becomes the function's under one cfg and not the
+        // other. Clippy cannot see across the cfg split.
+        #[expect(
+            clippy::needless_return,
+            reason = "the cfg-gated arm below is the alternative"
+        )]
         return tokio::task::spawn_blocking(move || {
             commonware_runtime::tokio::Runner::new(
                 commonware_runtime::tokio::Config::new().with_storage_directory(storage_path),

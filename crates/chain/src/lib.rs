@@ -1,8 +1,4 @@
 #[cfg(any(feature = "indexer", feature = "validator"))]
-#[macro_use]
-extern crate tracing;
-
-#[cfg(any(feature = "indexer", feature = "validator"))]
 mod app;
 #[cfg(feature = "client-core")]
 pub mod client;

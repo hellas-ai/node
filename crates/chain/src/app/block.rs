@@ -11,8 +11,10 @@ use commonware_consensus::{
 };
 use commonware_cryptography::{Digest as _, Digestible, Hasher, Sha256, sha256::Digest};
 
+#[cfg(feature = "validator")]
 pub(crate) const SYNCHRONY_BOUND: u64 = 5_000;
 
+#[cfg(feature = "validator")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum ValidationError {
     #[error("context mismatch")]
@@ -94,6 +96,12 @@ impl HellasBlock {
         &self.txs
     }
 
+    /// The proposer-side check inside `StatefulApplication::verify`. A
+    /// follower never runs it: it ingests blocks that already carry a
+    /// finalization certificate, checked by `ConsensusVerifier`, so the
+    /// context/height/timestamp agreement is already settled by the
+    /// quorum that signed them.
+    #[cfg(feature = "validator")]
     pub(crate) fn validate(
         &self,
         expected_context: &Context<Digest, PublicKey>,
@@ -208,7 +216,8 @@ impl Read for HellasBlock {
     }
 }
 
-#[cfg(test)]
+// Exercises `validate`, which only exists on a `validator` build.
+#[cfg(all(test, feature = "validator"))]
 mod tests {
     use super::*;
     use commonware_cryptography::{Signer as _, ed25519};
