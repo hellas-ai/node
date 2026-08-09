@@ -115,6 +115,16 @@ pub enum StoreError {
     },
     #[error("{path} is cache debris, not content")]
     Debris { path: PathBuf },
+    #[error("{path} changed while it was being read")]
+    Raced { path: PathBuf },
+    #[error("{path} now names a different file than the one that was read")]
+    Replaced { path: PathBuf },
+    #[error("{path} holds {actual}, which is not the {expected} that was asked for")]
+    WrongContent {
+        expected: String,
+        actual: String,
+        path: PathBuf,
+    },
     #[error("materialising {id}")]
     Fetch {
         id: String,
@@ -140,6 +150,13 @@ pub struct ContentStore {
 #[derive(Clone, Debug)]
 struct Entry {
     path: PathBuf,
+    /// The file this id was computed from, as `stat` described it.
+    ///
+    /// An entry says "these bytes are at this path", and a path is not a
+    /// promise. Keeping the identity is what lets [`ContentStore::locate`]
+    /// notice that the name now refers to something else, instead of
+    /// answering `have` for content that was overwritten an hour ago.
+    identity: fastresume::FileIdentity,
     chunks: Vec<Chunk>,
 }
 
@@ -181,38 +198,42 @@ impl ContentStore {
         };
         let mut file = std::fs::File::open(path).map_err(read_err)?;
         let before = file.metadata().map_err(read_err)?;
+        let identity = fastresume::FileIdentity::of(&before);
 
-        if let Some(indexed) = self.records.get(&before) {
-            self.record(path, &indexed);
-            return Ok(indexed);
-        }
-
-        let mut hasher = XetFileHasher::new();
-        let mut buffer = vec![0_u8; STREAM_BUFFER];
-        let mut len = 0_u64;
-        loop {
-            let read = file.read(&mut buffer).map_err(read_err)?;
-            if read == 0 {
-                break;
+        let remembered = self.records.get(&before);
+        let indexed = match remembered.clone() {
+            Some(indexed) => indexed,
+            None => {
+                let mut hasher = XetFileHasher::new();
+                let mut buffer = vec![0_u8; STREAM_BUFFER];
+                let mut len = 0_u64;
+                loop {
+                    let read = file.read(&mut buffer).map_err(read_err)?;
+                    if read == 0 {
+                        break;
+                    }
+                    len += read as u64;
+                    hasher.update(&buffer[..read]);
+                }
+                let chunks = hasher.finalize_chunks();
+                Indexed {
+                    id: hellas_xet::file_hash(&chunks),
+                    chunks,
+                    len,
+                }
             }
-            len += read as u64;
-            hasher.update(&buffer[..read]);
-        }
-        let chunks = hasher.finalize_chunks();
-        let indexed = Indexed {
-            id: hellas_xet::file_hash(&chunks),
-            chunks,
-            len,
         };
 
-        // A file rewritten while we read it yields an id for bytes that
-        // were never on disk together. Recording that would put a hash
-        // of nothing real into the index.
-        let after = file.metadata().map_err(read_err)?;
-        if fastresume::identical(&before, &after) {
+        // Nothing is remembered, recorded or returned until this holds.
+        // Whether the id was computed just now or looked up, it is an id
+        // for the descriptor; recording it against a *name* needs that
+        // name to still refer to the same file, and an id that cannot be
+        // bound to what was read is an error rather than an answer.
+        still_the_file_that_was_read(path, identity, &file)?;
+        if remembered.is_none() {
             self.records.put(&before, &indexed);
         }
-        self.record(path, &indexed);
+        self.record(path, identity, &indexed);
         Ok(indexed)
     }
 
@@ -269,9 +290,21 @@ impl ContentStore {
             .index
             .read()
             .ok()
-            .and_then(|index| index.get(&id).filter(|entry| entry.path.exists()).cloned())
+            .and_then(|index| index.get(&id).cloned())
         {
-            return Some(entry.path);
+            // Existence is not the question. The question is whether the
+            // name still refers to the file whose bytes produced this id:
+            // an ordinary rewrite leaves the path there and the entry
+            // false, and a quote answered on it commits to weights this
+            // node no longer holds.
+            if std::fs::metadata(&entry.path)
+                .is_ok_and(|metadata| fastresume::FileIdentity::of(&metadata) == entry.identity)
+            {
+                return Some(entry.path);
+            }
+            if let Ok(mut index) = self.index.write() {
+                index.remove(&id);
+            }
         }
         self.substituters
             .iter()
@@ -303,8 +336,22 @@ impl ContentStore {
     /// at the end.
     pub fn materialize(&self, id: XetHash, dest: &Path, fetch: &dyn Fetcher) -> Result<Indexed> {
         if let Some(path) = self.locate(id) {
-            return self.index(&path);
+            let indexed = self.index(&path)?;
+            // A source said it held this id. Believing that without
+            // looking is how `materialize(a)` comes to return content
+            // `b` — a substituter is another node's answer, not ours.
+            if indexed.id != id {
+                return Err(StoreError::WrongContent {
+                    expected: id.to_string(),
+                    actual: indexed.id.to_string(),
+                    path,
+                });
+            }
+            return Ok(indexed);
         }
+        // Only what we made appear is ours to clean up. A `dest` that was
+        // already there belongs to whoever put it there.
+        let ours = dest.symlink_metadata().is_err();
         fetch
             .fetch(id, dest, self.chunks(id).as_deref())
             .map_err(|source| StoreError::Fetch {
@@ -315,7 +362,9 @@ impl ContentStore {
         // A fetcher that wrote the wrong bytes must not leave them in
         // the store under a name they do not own.
         if indexed.id != id {
-            let _ = std::fs::remove_file(dest);
+            if ours {
+                let _ = std::fs::remove_file(dest);
+            }
             return Err(StoreError::Fetch {
                 id: id.to_string(),
                 source: crate::hf::FetchError::WrongContent {
@@ -349,17 +398,59 @@ impl ContentStore {
         self.len() == 0
     }
 
-    fn record(&self, path: &Path, indexed: &Indexed) {
+    fn record(&self, path: &Path, identity: fastresume::FileIdentity, indexed: &Indexed) {
         if let Ok(mut index) = self.index.write() {
             index.insert(
                 indexed.id,
                 Entry {
                     path: path.to_path_buf(),
+                    identity,
                     chunks: indexed.chunks.clone(),
                 },
             );
         }
     }
+}
+
+/// The file that was read is still the file this name refers to.
+///
+/// Two questions, and they are not the same one.
+///
+/// `file` is the descriptor the bytes came from. If its identity moved
+/// while it was being read, the id is a Merkle root over bytes that were
+/// never on disk together — a hash of nothing real. The old code noticed
+/// this and declined to *remember* it, but still put it in the live index
+/// and returned it, which is the half that mattered.
+///
+/// `path` is the name the id is about to be recorded against. A rename
+/// over an open file leaves the descriptor untouched, so no amount of
+/// re-`fstat`ing sees it; only stat-ing the name does. Without this the
+/// index would map A's id to a path that now holds B, and `locate` would
+/// hand that path to a caller who asked for A.
+///
+/// Either way this is an error rather than a silent skip. The caller
+/// asked what the bytes at this name are, and the honest answer is that
+/// nobody knows.
+fn still_the_file_that_was_read(
+    path: &Path,
+    read: fastresume::FileIdentity,
+    file: &std::fs::File,
+) -> Result<()> {
+    let read_err = |source| StoreError::Read {
+        path: path.to_path_buf(),
+        source,
+    };
+    if fastresume::FileIdentity::of(&file.metadata().map_err(read_err)?) != read {
+        return Err(StoreError::Raced {
+            path: path.to_path_buf(),
+        });
+    }
+    if fastresume::FileIdentity::of(&std::fs::metadata(path).map_err(read_err)?) != read {
+        return Err(StoreError::Replaced {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(())
 }
 
 impl core::fmt::Debug for ContentStore {
@@ -375,5 +466,98 @@ impl core::fmt::Debug for ContentStore {
                     .collect::<Vec<_>>(),
             )
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "hellas-store-binding-{}-{name}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    fn opened(path: &Path) -> (std::fs::File, fastresume::FileIdentity) {
+        let file = std::fs::File::open(path).expect("open");
+        let identity = fastresume::FileIdentity::of(&file.metadata().expect("fstat"));
+        (file, identity)
+    }
+
+    /// The binding, asserted where it can be made to happen rather than
+    /// raced for: an id is about a descriptor, and recording it against a
+    /// name requires the name to still mean that descriptor.
+    #[test]
+    fn what_was_read_is_bound_to_the_name_it_is_recorded_against() {
+        use std::io::Write as _;
+
+        let dir = scratch("binding");
+        let path = dir.join("shard.bin");
+        std::fs::write(&path, b"the bytes that were read").expect("write");
+
+        // Nothing moved.
+        let (file, identity) = opened(&path);
+        still_the_file_that_was_read(&path, identity, &file).expect("an untouched file");
+
+        // Rewritten under the descriptor: the id would cover bytes that
+        // were never on disk together.
+        let (file, identity) = opened(&path);
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("reopen")
+            .write_all(b" and some more")
+            .expect("append");
+        assert!(matches!(
+            still_the_file_that_was_read(&path, identity, &file),
+            Err(StoreError::Raced { .. }),
+        ));
+
+        // Renamed over. On Linux the descriptor does see this — the
+        // rename unlinks the old name, the link count changes, and that
+        // moves the replaced inode's ctime — so it is refused by the
+        // first check rather than the second. Either refusal will do;
+        // resolving as content is what must not happen.
+        let (file, identity) = opened(&path);
+        let other = dir.join("other.bin");
+        std::fs::write(&other, b"different bytes entirely").expect("write");
+        std::fs::rename(&other, &path).expect("rename over");
+        assert!(matches!(
+            still_the_file_that_was_read(&path, identity, &file),
+            Err(StoreError::Raced { .. } | StoreError::Replaced { .. }),
+        ));
+
+        // The case the descriptor genuinely cannot see, and the one a
+        // HuggingFace cache is made of: the name is a symlink into
+        // `blobs/`, and it is repointed at another blob. Nothing happens
+        // to the file that was read — no write, no link count change —
+        // so only stat-ing the *name* can tell.
+        let blobs = dir.join("blobs");
+        std::fs::create_dir_all(&blobs).expect("blobs");
+        std::fs::write(blobs.join("a"), b"blob a").expect("blob a");
+        std::fs::write(blobs.join("b"), b"blob b").expect("blob b");
+        let link = dir.join("snapshot-shard.bin");
+        std::os::unix::fs::symlink(blobs.join("a"), &link).expect("symlink");
+
+        let (file, identity) = opened(&link);
+        let swap = dir.join("swap");
+        std::os::unix::fs::symlink(blobs.join("b"), &swap).expect("symlink");
+        std::fs::rename(&swap, &link).expect("repoint the symlink");
+        assert_eq!(
+            fastresume::FileIdentity::of(&file.metadata().expect("fstat")),
+            identity,
+            "the descriptor must be untouched, or this case tests the wrong thing",
+        );
+        assert!(matches!(
+            still_the_file_that_was_read(&link, identity, &file),
+            Err(StoreError::Replaced { .. }),
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

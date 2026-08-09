@@ -101,16 +101,6 @@ pub struct Records {
     entries: Mutex<HashMap<FileIdentity, Indexed>>,
 }
 
-/// True when two stats describe the same unchanged file.
-///
-/// Used to check that a file did not change *while it was being
-/// hashed*: a read that races a rewrite produces an id for bytes that
-/// were never on disk together, and recording it would poison the
-/// record with a hash of nothing real.
-pub(crate) fn identical(before: &Metadata, after: &Metadata) -> bool {
-    FileIdentity::of(before) == FileIdentity::of(after)
-}
-
 impl Records {
     /// What indexing this file produced last time, if it still looks
     /// exactly the same.
