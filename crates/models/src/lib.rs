@@ -105,6 +105,10 @@ pub enum ModelAssetsError {
     InvalidProgramGraph,
     #[error("model cache path has no immutable revision")]
     UnresolvedRevision,
+    #[error(
+        "this model's files came from two different snapshots, {first} and {second}; a manifest names one commit and must contain that commit's bytes"
+    )]
+    MixedSnapshots { first: String, second: String },
     #[error("failed to decode tokens")]
     DecodeTokens {
         #[source]
