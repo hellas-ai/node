@@ -16,8 +16,8 @@ pub(crate) mod map_store;
 use hellas_kernel::{
     Auth, Batch, BlockHeight, CloseKind, Coin, CoinId, Edge, EdgeId, Funding, Genesis, InsertError,
     KernelResult, Key, List, MAX_EDGE_OUTPUTS, NetworkId, Parties, PayloadHash, Payout, Proof,
-    Seal, SealPublicInputs, SealVerifier, Sig, SigVerifier, Snapshot, State, Store, Terms,
-    TermsHash, Tx, View,
+    RegistryChunk, RegistryChunkId, RegistryNamespace, Seal, SealPublicInputs, SealVerifier, Sig,
+    SigVerifier, Snapshot, State, Store, Terms, TermsHash, Tx, View,
 };
 
 /// The network every fixture in this crate's tests is bound to.
@@ -91,16 +91,34 @@ struct EdgeSlot {
     edge: Option<Edge>,
 }
 
+/// A registry slot the store will accept writes to.
+///
+/// `FixedStore` pre-declares every slot, so a registry-aware test names
+/// the chunk ids it intends to touch the same way it names coin and edge
+/// ids. `R` defaults to zero so the many tests that touch no registry
+/// state keep their two-parameter `FixedStore<C, E>` spelling.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
-pub(crate) struct FixedStore<const C: usize, const E: usize> {
-    coins: [CoinSlot; C],
-    edges: [EdgeSlot; E],
+struct RegistrySlot {
+    id: RegistryChunkId,
+    chunk: Option<RegistryChunk>,
 }
 
-impl<const C: usize, const E: usize> FixedStore<C, E> {
-    pub(crate) const fn empty(coins: [CoinId; C], edges: [EdgeId; E]) -> Self {
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+pub(crate) struct FixedStore<const C: usize, const E: usize, const R: usize = 0> {
+    coins: [CoinSlot; C],
+    edges: [EdgeSlot; E],
+    registry: [RegistrySlot; R],
+}
+
+impl<const C: usize, const E: usize, const R: usize> FixedStore<C, E, R> {
+    pub(crate) const fn empty_with_registry(
+        coins: [CoinId; C],
+        edges: [EdgeId; E],
+        registry: [RegistryChunkId; R],
+    ) -> Self {
         let mut coin_slots = [CoinSlot::EMPTY; C];
         let mut edge_slots = [EdgeSlot::EMPTY; E];
+        let mut registry_slots = [RegistrySlot::EMPTY; R];
         let mut index = 0;
 
         while index < C {
@@ -114,9 +132,16 @@ impl<const C: usize, const E: usize> FixedStore<C, E> {
             index += 1;
         }
 
+        index = 0;
+        while index < R {
+            registry_slots[index] = RegistrySlot::empty(registry[index]);
+            index += 1;
+        }
+
         Self {
             coins: coin_slots,
             edges: edge_slots,
+            registry: registry_slots,
         }
     }
 
@@ -128,6 +153,11 @@ impl<const C: usize, const E: usize> FixedStore<C, E> {
         self.find_edge(id).and_then(|index| self.edges[index].edge)
     }
 
+    pub(crate) fn registry_chunk(&self, id: RegistryChunkId) -> Option<RegistryChunk> {
+        self.find_registry(id)
+            .and_then(|index| self.registry[index].chunk)
+    }
+
     fn find_coin(&self, id: CoinId) -> Option<usize> {
         self.coins.iter().position(|slot| slot.id == id)
     }
@@ -135,11 +165,21 @@ impl<const C: usize, const E: usize> FixedStore<C, E> {
     fn find_edge(&self, id: EdgeId) -> Option<usize> {
         self.edges.iter().position(|slot| slot.id == id)
     }
+
+    fn find_registry(&self, id: RegistryChunkId) -> Option<usize> {
+        self.registry.iter().position(|slot| slot.id == id)
+    }
 }
 
-impl<const C: usize, const E: usize> Store for FixedStore<C, E> {
+impl<const C: usize, const E: usize> FixedStore<C, E> {
+    pub(crate) const fn empty(coins: [CoinId; C], edges: [EdgeId; E]) -> Self {
+        Self::empty_with_registry(coins, edges, [])
+    }
+}
+
+impl<const C: usize, const E: usize, const R: usize> Store for FixedStore<C, E, R> {
     type Batch<'a>
-        = FixedTx<'a, C, E>
+        = FixedTx<'a, C, E, R>
     where
         Self: 'a;
 
@@ -151,12 +191,12 @@ impl<const C: usize, const E: usize> Store for FixedStore<C, E> {
     }
 }
 
-pub(crate) struct FixedTx<'a, const C: usize, const E: usize> {
-    working: FixedStore<C, E>,
-    parent: &'a mut FixedStore<C, E>,
+pub(crate) struct FixedTx<'a, const C: usize, const E: usize, const R: usize = 0> {
+    working: FixedStore<C, E, R>,
+    parent: &'a mut FixedStore<C, E, R>,
 }
 
-impl<const C: usize, const E: usize> Batch for FixedTx<'_, C, E> {
+impl<const C: usize, const E: usize, const R: usize> Batch for FixedTx<'_, C, E, R> {
     fn coin(&self, id: CoinId) -> Option<Coin> {
         self.working.coin(id)
     }
@@ -197,20 +237,65 @@ impl<const C: usize, const E: usize> Batch for FixedTx<'_, C, E> {
         self.working.edges[index].edge.take()
     }
 
+    fn registry_chunk(&self, id: RegistryChunkId) -> Option<RegistryChunk> {
+        self.working.registry_chunk(id)
+    }
+
+    fn insert_registry_chunk(
+        &mut self,
+        id: RegistryChunkId,
+        chunk: RegistryChunk,
+    ) -> KernelResult<(), InsertError> {
+        let Some(index) = self.working.find_registry(id) else {
+            return Err(InsertError::Unavailable);
+        };
+        if self.working.registry[index].chunk.is_some() {
+            return Err(InsertError::Exists);
+        }
+        self.working.registry[index].chunk = Some(chunk);
+        Ok(())
+    }
+
+    fn remove_registry_chunk(&mut self, id: RegistryChunkId) -> Option<RegistryChunk> {
+        let index = self.working.find_registry(id)?;
+        self.working.registry[index].chunk.take()
+    }
+
     fn commit(self) {
         *self.parent = self.working;
     }
 }
 
-impl<const C: usize, const E: usize> Snapshot for FixedStore<C, E> {
-    type View = View<C, E>;
+impl<const C: usize, const E: usize, const R: usize> Snapshot for FixedStore<C, E, R> {
+    type View = View<C, E, R>;
 
     fn view(&self) -> Self::View {
-        View::new(
+        View::with_registry(
             self.coins.map(|slot| slot.coin.map(|coin| (slot.id, coin))),
             self.edges.map(|slot| slot.edge.map(|edge| (slot.id, edge))),
+            self.registry
+                .map(|slot| slot.chunk.map(|chunk| (slot.id, chunk))),
         )
     }
+}
+
+/// Registry slots every trace, property, and model-checking harness
+/// declares, and that no currently-landed transition may write.
+///
+/// Declared rather than omitted on purpose. With no slot at all a stray
+/// registry write fails as [`InsertError::Unavailable`] and surfaces as
+/// "the kernel rejected a valid operation", which names the wrong bug.
+/// With these declared, the write succeeds against the store and is
+/// caught by the invariant that says the transition should not have
+/// made it — which names the right one. A write to a slot outside this
+/// pair still fails, just less legibly.
+pub(crate) const CANARY_REGISTRY_SLOTS: usize = 2;
+
+pub(crate) fn canary_registry_slots() -> [RegistryChunkId; CANARY_REGISTRY_SLOTS] {
+    [
+        RegistryChunkId::derive(NETWORK, RegistryNamespace::PaymentClose, [0xc0; 32], 0),
+        RegistryChunkId::derive(NETWORK, RegistryNamespace::BondLease, [0xc1; 32], 0),
+    ]
 }
 
 impl CoinSlot {
@@ -235,10 +320,21 @@ impl EdgeSlot {
     }
 }
 
-pub(crate) fn state<const C: usize, const E: usize, const G: usize>(
-    store: FixedStore<C, E>,
+impl RegistrySlot {
+    const EMPTY: Self = Self {
+        id: RegistryChunkId::from_bytes([0; RegistryChunkId::LENGTH]),
+        chunk: None,
+    };
+
+    const fn empty(id: RegistryChunkId) -> Self {
+        Self { id, chunk: None }
+    }
+}
+
+pub(crate) fn state<const C: usize, const E: usize, const R: usize, const G: usize>(
+    store: FixedStore<C, E, R>,
     seeds: [Genesis; G],
-) -> State<FixedStore<C, E>> {
+) -> State<FixedStore<C, E, R>> {
     let Ok(state) = State::genesis(store, &seeds) else {
         panic!("genesis rejected test seed");
     };

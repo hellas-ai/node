@@ -176,8 +176,11 @@ fn open_pays_fee_from_funding() {
     let output = Tx::edge_id_of(&funding_value, &terms_value);
     let open = open_tx(funding_value, terms_value);
     let mut state = state(store_for(&open), [MAKER_SEED, TAKER_SEED]);
-    let Ok(event) = state.apply(FEE_CONTEXT, &FAKE_VERIFIER, &open) else {
+    let Ok(outcome) = state.apply(FEE_CONTEXT, &FAKE_VERIFIER, &open) else {
         panic!("operation rejected");
+    };
+    let Some(event) = outcome.public_event() else {
+        panic!("an open applied without announcing itself");
     };
 
     assert_eq!(
@@ -210,8 +213,11 @@ fn open_fee_uses_resource_cost() {
     let cost = open.cost();
     let reserve_cost = reserve_cost_for(output);
     let lifetime_fee = lifetime_fee_for(RESOURCE_CONTEXT, TIMEOUT);
-    let Ok(event) = state.apply(RESOURCE_CONTEXT, &FAKE_VERIFIER, &open) else {
+    let Ok(outcome) = state.apply(RESOURCE_CONTEXT, &FAKE_VERIFIER, &open) else {
         panic!("operation rejected");
+    };
+    let Some(event) = outcome.public_event() else {
+        panic!("an open applied without announcing itself");
     };
 
     assert_eq!(

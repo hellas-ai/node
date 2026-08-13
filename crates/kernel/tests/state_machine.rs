@@ -327,6 +327,16 @@ impl StateMachineTest for L1Test {
             }
             None => assert_eq!(store.edge_count(), 0, "live edge set"),
         }
+
+        // The map-backed store accepts any chunk id, so this catches a
+        // registry write to *any* slot, derived or not — the reference
+        // machine models coins and edges and has no registry state for
+        // a chunk to correspond to.
+        assert_eq!(
+            store.registry_chunk_count(),
+            0,
+            "reference machine has no registry state, kernel wrote some",
+        );
     }
 }
 

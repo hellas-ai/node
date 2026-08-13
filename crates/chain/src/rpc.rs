@@ -102,10 +102,10 @@ async fn get_edge_at(
         .map_err(|error| QueryError::StateUnavailable(format!("edge read failed: {error:?}")))?
     {
         Some(Object::Edge(edge)) => Some(EdgeState::from(edge)),
-        Some(Object::Coin(_)) => {
+        Some(object) => {
             return Err(QueryError::WrongObjectKind {
                 expected: ObjectKind::Edge,
-                actual: ObjectKind::Coin,
+                actual: object.kind(),
             });
         }
         None => None,

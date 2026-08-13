@@ -109,8 +109,12 @@ fn apply_iter_emits_events_per_op() {
     ];
 
     let mut observed: Vec<(usize, EventKind)> = Vec::new();
-    let Ok(()) = state.apply_iter(CONTEXT, &FAKE_VERIFIER, ops, |i, ev| {
-        observed.push((i, ev.kind().clone()));
+    let Ok(()) = state.apply_iter(CONTEXT, &FAKE_VERIFIER, ops, |i, outcome| {
+        assert!(outcome.registry().is_empty(), "op {i} wrote registry state");
+        let Some(event) = outcome.public_event() else {
+            panic!("op {i} applied without announcing itself");
+        };
+        observed.push((i, event.kind().clone()));
     }) else {
         panic!("valid batch rejected");
     };
@@ -162,8 +166,8 @@ fn apply_iter_rolls_back_on_mid_batch_failure() {
     ];
 
     let mut observed = Vec::new();
-    let Err(error) = state.apply_iter(CONTEXT, &FAKE_VERIFIER, ops, |i, ev| {
-        observed.push((i, ev.kind().clone()));
+    let Err(error) = state.apply_iter(CONTEXT, &FAKE_VERIFIER, ops, |i, outcome| {
+        observed.push((i, outcome.public_event().map(|event| event.kind().clone())));
     }) else {
         panic!("invalid batch accepted");
     };

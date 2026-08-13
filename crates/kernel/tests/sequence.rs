@@ -84,7 +84,16 @@ proptest! {
             if result.is_err() {
                 prop_assert_eq!(state, before);
             }
-            if let Ok(event) = result {
+            if let Ok(outcome) = result {
+                prop_assert!(
+                    outcome.registry().is_empty(),
+                    "{:?} wrote registry state",
+                    step,
+                );
+                let Some(event) = outcome.public_event() else {
+                    prop_assert!(false, "{:?} applied without announcing itself", step);
+                    unreachable!()
+                };
                 assert_event_matches(step, event.kind())?;
             }
             assert_invariants(&state)?;

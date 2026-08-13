@@ -1,6 +1,7 @@
 //! Kernel error vocabulary.
 
 use crate::primitive::{CoinId, EdgeId};
+use crate::registry::{RegistryChunkId, RegistryDiffError};
 
 /// Public kernel result type.
 pub type KernelResult<T, E = ApplyError> = core::result::Result<T, E>;
@@ -86,6 +87,22 @@ pub enum ApplyError {
         id: EdgeId,
     },
 
+    /// A required registry chunk does not exist. Same dual
+    /// interpretation as [`Self::MissingCoin`]: validation = the named
+    /// registry value is not live, fold = store bug.
+    MissingRegistryChunk {
+        /// Missing chunk id.
+        id: RegistryChunkId,
+    },
+
+    /// A registry chunk changed between validation and fold. Same
+    /// interpretation as [`Self::CoinChanged`]: a [`crate::Batch`]
+    /// contract violation.
+    RegistryChunkChanged {
+        /// Changed chunk id.
+        id: RegistryChunkId,
+    },
+
     /// An output id is already occupied.
     OutputExists {
         /// Occupied output coin id.
@@ -128,6 +145,24 @@ pub enum ApplyError {
         reason: InvalidProofReason,
     },
 
+    /// A move does not advance the edge it names.
+    InvalidMove {
+        /// Edge the move addresses.
+        input: EdgeId,
+        /// Specific reason the move was rejected.
+        reason: InvalidMoveReason,
+    },
+
+    /// A transition produced a registry diff its own bound refuses.
+    ///
+    /// A transition bug, not user input: an operation decides which slots
+    /// it writes before it writes any of them, so neither a duplicate nor
+    /// an overflow is reachable from a payload.
+    RegistryDiffRejected {
+        /// Reason the mutation could not join the diff.
+        reason: RegistryDiffError,
+    },
+
     /// The backing store rejected a coin insertion.
     CoinInsertRejected {
         /// Coin id that could not be inserted.
@@ -140,6 +175,14 @@ pub enum ApplyError {
     EdgeInsertRejected {
         /// Edge id that could not be inserted.
         id: EdgeId,
+        /// Reason the store rejected the insertion.
+        reason: InsertError,
+    },
+
+    /// The backing store rejected a registry chunk insertion.
+    RegistryChunkInsertRejected {
+        /// Chunk id that could not be inserted.
+        id: RegistryChunkId,
         /// Reason the store rejected the insertion.
         reason: InsertError,
     },
@@ -197,6 +240,161 @@ pub enum InvalidOpenReason {
     /// left between a job's terminal deadline and the bond timeout for a
     /// challenge to land, so the bond could never cover a job.
     ChallengeMarginZero,
+    /// Work terms name a protocol other than the kernel-owned
+    /// correctness game, whose rules are the only ones the kernel
+    /// enforces for these shapes.
+    WorkProtocolMismatch,
+    /// Work-stake-bond terms commit a zero `max_challenge_bond` or
+    /// `move_timeout`: no game could be funded, or none could advance.
+    WorkGamePolicyZero,
+    /// Work-stake-bond timeout payouts are empty or pay a key other
+    /// than the provider. An unleased bond times out permissionlessly,
+    /// so any other routing would let the stake return to the wrong
+    /// party.
+    WorkStakeReturnRouting,
+    /// A work-profile open carries a `WebAuthn` authorization. These
+    /// profiles' later moves need the parties' own secp256k1
+    /// signatures, so an open they could not follow up on is refused.
+    WorkAuthNotNative,
+    /// A work-stake-bond open carries taker funding. The bond is the
+    /// provider's stake alone; a client contribution would be
+    /// transferred to the provider by a permissionless unleased
+    /// timeout.
+    WorkStakeTakerFunded,
+    /// Work-payment terms and the bond they embed do not name the same
+    /// two parties in mirrored roles.
+    WorkBondPartiesMismatch,
+    /// Work-payment terms commit an admission horizon other than the
+    /// embedded bond's own horizon, so admitted jobs could outlive the
+    /// bond that insures them.
+    WorkAdmissionHorizonMismatch,
+    /// Work-payment terms commit a zero or over-long response window.
+    WorkResponseWindowOutOfRange,
+    /// Work-payment terms commit a zero or over-long start validity
+    /// window.
+    WorkStartValidityOutOfRange,
+    /// A work-payment open locks a reserve that does not cover both of
+    /// its close routes, so one of its two exits could never be taken.
+    WorkPaymentReserveTooSmall,
+    /// A work-payment open leaves no capacity: the omission bond meets
+    /// or exceeds the value the cheaper close route distributes, so no
+    /// certificate could ever be admitted against it.
+    WorkPaymentCapacityUnfunded,
+    /// The live edge named as the bond does not commit the terms the
+    /// payment embeds. The embedded witness is the bond's own canonical
+    /// bytes, so a mismatch means the payment named some other edge —
+    /// a legacy bond, a different bond, or an unrelated channel.
+    WorkBondTermsMismatch,
+    /// The named bond is already leased. A bond insures one payment
+    /// channel at a time: a second channel would be priced against
+    /// stake the first can still consume.
+    WorkBondAlreadyLeased,
+    /// The named bond's lease slots hold something that is not a lease.
+    WorkBondLeaseFault {
+        /// How the stored value failed to be a lease.
+        fault: BondLeaseFault,
+    },
+}
+
+/// Why a present bond-lease registry slot pair is not a readable lease.
+///
+/// Every variant is an invalid transaction, never absence. Absence is a
+/// permission — it lets a payment open take the lease and lets a bond
+/// take its immediate timeout — so anything that could be mistaken for
+/// it has to be refused.
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+pub enum BondLeaseFault {
+    /// Exactly one of the two derived slots is occupied. A lease is
+    /// written whole, so this is state no kernel transition produced.
+    Partial,
+    /// A stored chunk is not its half of a whole lease: wrong
+    /// namespace, wrong record kind, wrong chunk count or index, or a
+    /// value length that is not this record's width.
+    Shape,
+    /// The reassembled bytes are not a canonical lease record.
+    Body,
+    /// The lease names a different bond than the slots it was read
+    /// from.
+    Edge,
+}
+
+/// Why a present pending-close registry slot is not a readable record.
+///
+/// Every variant is an invalid transaction, never absence. A close that
+/// read a corrupted record as "no contest is live" would hand a fresh
+/// start to whoever corrupted it.
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+pub enum PendingCloseFault {
+    /// The stored chunk is not a whole single-chunk pending record: wrong
+    /// namespace, wrong record kind, wrong chunk count or index, or a
+    /// value length that is not this record's width.
+    Shape,
+    /// The chunk's bytes are not a canonical pending record.
+    Body,
+    /// The record names a different payment edge than the slot it was
+    /// read from.
+    Edge,
+}
+
+/// Specific reason an [`ApplyError::InvalidMove`] was raised.
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+pub enum InvalidMoveReason {
+    /// The revealed terms do not commit the edge the move names.
+    TermsMismatch,
+    /// The edge is not a work-payment channel, so it has no close
+    /// contest to open or answer.
+    NotAPaymentChannel,
+    /// The move's inclusion height is outside the signed validity
+    /// window.
+    OutsideValidityWindow,
+    /// The signed validity window is wider than the terms allow, so the
+    /// authorization would stay includable longer than the channel
+    /// agreed to.
+    ValiditySpanTooWide,
+    /// A contest is already live on this edge. A second start by either
+    /// role is refused without mutation: the first start's deadline is
+    /// the one the response is bound to, and extending it is exactly the
+    /// attack the window exists to stop.
+    ClosePending,
+    /// No contest is live on this edge, so there is nothing to answer.
+    ClosePendingMissing,
+    /// The pending slot holds something that is not this edge's record.
+    ClosePendingFault {
+        /// How the stored value failed to be a record.
+        fault: PendingCloseFault,
+    },
+    /// The response names a contest other than the live one. A racing
+    /// party must answer the start that won, not the one it submitted.
+    StartIdMismatch,
+    /// The response was signed by a role other than the certificate's
+    /// beneficiary.
+    ResponderNotBeneficiary,
+    /// The one legal response has already landed.
+    AlreadyResponded,
+    /// The response window has shut.
+    ResponseWindowClosed,
+    /// A certificate names a different payment edge or terms than the
+    /// move that carries it.
+    CertificateNotBound,
+    /// A start encodes a present certificate for zero. Zero has only the
+    /// implicit absent encoding.
+    CertificateNotPositive,
+    /// A response certificate does not strictly exceed the amount the
+    /// contest already settles at.
+    CertificateNotIncreasing,
+    /// A certificate names more than the channel's payment capacity.
+    CertificateOverCapacity,
+    /// The edge's reserve does not price its close routes, so no
+    /// capacity can be derived.
+    ReserveTooSmall,
+    /// Adding the committed response window to the current height
+    /// overflowed. The work profile is disabled this close to the height
+    /// ceiling rather than wrapping a deadline into the past.
+    DeadlineOverflow,
+    /// A signature on the move payload was rejected.
+    BadSignature,
+    /// A client certificate signature was rejected.
+    BadCertificateSignature,
 }
 
 /// Specific reason an [`ApplyError::InvalidClose`] was raised.
@@ -240,4 +438,41 @@ pub enum InvalidProofReason {
     /// A `Proof::Timeout` carries payouts that do not equal
     /// `Terms::timeout_outputs`.
     PayoutMismatch,
+    /// An adjudicated close names an edge with no live contest. The
+    /// contest *is* the proof, so its absence leaves nothing adjudicated.
+    ClosePendingMissing,
+    /// The pending slot holds something that is not this edge's record.
+    ClosePendingFault {
+        /// How the stored value failed to be a record.
+        fault: PendingCloseFault,
+    },
+    /// An adjudicated close was submitted while the response window is
+    /// still open and no response has landed.
+    ResponseWindowOpen,
+    /// An adjudicated close carries a seal that is not the one this
+    /// contest's record derives.
+    SealMismatch,
+    /// A freeze's inclusion height is outside its signed validity
+    /// window, or that window is wider than consensus allows.
+    FreezeOutsideValidityWindow,
+    /// A freeze settles below the amount its edge's live contest has
+    /// already reached.
+    FreezeBelowSettled,
+    /// A tag-4 bond close read lease slots holding something that is
+    /// not a lease. Never read as "unleased": that answer is what
+    /// decides whether the immediate timeout exit is open.
+    BondLeaseFault {
+        /// How the stored value failed to be a lease.
+        fault: BondLeaseFault,
+    },
+    /// A tag-4 bond's timeout was submitted while its lease points at a
+    /// live correctness game. The game plays for this stake and settles
+    /// itself; returning the stake underneath it would decide the game
+    /// by consuming the prize.
+    BondLeaseGameLive,
+    /// The provider's total exceeds the value the close distributes.
+    /// Unreachable for amounts admitted under the open-time capacity
+    /// rule, and a rejection rather than a wrapping subtraction because
+    /// the alternative is paying the client from nothing.
+    PayoutOverCapacity,
 }

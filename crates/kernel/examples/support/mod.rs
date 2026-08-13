@@ -6,7 +6,8 @@ use std::collections::BTreeMap;
 use hellas_kernel::{
     Batch, Block, BlockHash, BlockHeight, Coin, CoinId, Context, Cost, Edge, EdgeId, EventKind,
     Fees, Genesis, InsertError, KernelResult, Key, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS,
-    NetworkId, PayloadHash, Payout, SealVerifier, Sig, SigVerifier, State, Store, Tx,
+    NetworkId, PayloadHash, Payout, RegistryChunk, RegistryChunkId, SealVerifier, Sig, SigVerifier,
+    State, Store, Tx,
 };
 
 /// The network these examples settle on. Every authorization they build
@@ -21,6 +22,7 @@ use secp256k1::{Message, Secp256k1, SecretKey};
 pub(crate) struct MemStore {
     coins: BTreeMap<CoinId, Coin>,
     edges: BTreeMap<EdgeId, Edge>,
+    registry: BTreeMap<RegistryChunkId, RegistryChunk>,
 }
 
 impl MemStore {
@@ -52,6 +54,7 @@ impl Store for MemStore {
             working: Working {
                 coins: self.coins.clone(),
                 edges: self.edges.clone(),
+                registry: self.registry.clone(),
             },
             parent: self,
         }
@@ -62,6 +65,7 @@ impl Store for MemStore {
 struct Working {
     coins: BTreeMap<CoinId, Coin>,
     edges: BTreeMap<EdgeId, Edge>,
+    registry: BTreeMap<RegistryChunkId, RegistryChunk>,
 }
 
 pub(crate) struct MemTx<'a> {
@@ -102,9 +106,30 @@ impl Batch for MemTx<'_> {
         self.working.edges.remove(&id)
     }
 
+    fn registry_chunk(&self, id: RegistryChunkId) -> Option<RegistryChunk> {
+        self.working.registry.get(&id).copied()
+    }
+
+    fn insert_registry_chunk(
+        &mut self,
+        id: RegistryChunkId,
+        chunk: RegistryChunk,
+    ) -> KernelResult<(), InsertError> {
+        if self.working.registry.contains_key(&id) {
+            return Err(InsertError::Exists);
+        }
+        self.working.registry.insert(id, chunk);
+        Ok(())
+    }
+
+    fn remove_registry_chunk(&mut self, id: RegistryChunkId) -> Option<RegistryChunk> {
+        self.working.registry.remove(&id)
+    }
+
     fn commit(self) {
         self.parent.coins = self.working.coins;
         self.parent.edges = self.working.edges;
+        self.parent.registry = self.working.registry;
     }
 }
 

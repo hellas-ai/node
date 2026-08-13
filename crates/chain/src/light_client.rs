@@ -7,10 +7,18 @@ fn wrong_object_kind_message(expected: ObjectKind, actual: ObjectKind) -> String
     format!("{WRONG_OBJECT_KIND_V1_PREFIX}{expected};actual={actual}")
 }
 
+/// Parses one kind token out of a wrong-object-kind status message.
+///
+/// The tokens are exactly what [`ObjectKind`]'s `Display` writes, and the
+/// pairing is checked by `wrong_kind_survives_wire_status_mapping` below.
+/// An unrecognized token is not guessed at: the status falls back to
+/// [`QueryError::Remote`], carrying the message a newer peer sent rather
+/// than a kind this build invented.
 fn parse_object_kind(value: &str) -> Option<ObjectKind> {
     match value {
         "coin" => Some(ObjectKind::Coin),
         "edge" => Some(ObjectKind::Edge),
+        "registry-chunk" => Some(ObjectKind::RegistryChunk),
         _ => None,
     }
 }
@@ -260,6 +268,8 @@ mod tests {
         for (expected, actual) in [
             (ObjectKind::Coin, ObjectKind::Edge),
             (ObjectKind::Edge, ObjectKind::Coin),
+            (ObjectKind::Edge, ObjectKind::RegistryChunk),
+            (ObjectKind::RegistryChunk, ObjectKind::Coin),
         ] {
             let status = WireStatus::from(QueryError::WrongObjectKind { expected, actual });
             assert_eq!(status.code(), WireCode::Aborted);

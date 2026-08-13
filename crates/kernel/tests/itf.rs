@@ -46,7 +46,38 @@ use support::{
     l1_fees as fee_model, l1_stake as stake_model,
 };
 
-use hellas_kernel::{EventKind, Fees};
+use hellas_kernel::{ApplyOutcome, EventKind, Fees, View};
+
+/// The abstract `lastEvent` an outcome corresponds to.
+///
+/// `None` covers both "this input produced no operation" and "this
+/// operation emitted no public event"; the models spell both `NoEvent`.
+/// An operation the model says announces something and the kernel
+/// applies silently therefore fails `result_invariant` rather than
+/// passing unnoticed.
+fn event_kind(outcome: &ApplyOutcome) -> Option<EventKind> {
+    outcome.public_event().map(|event| event.kind().clone())
+}
+
+/// The registry half of the state comparison.
+///
+/// No Quint module holds a registry var and no trace carries a chunk,
+/// so the strongest correspondence available is that replaying a trace
+/// writes no registry state at all — if it did, the kernel would be
+/// committing consensus state the abstract state never claimed and the
+/// model would be silently incomplete rather than loudly wrong.
+/// `models/registry.md` records what that leaves unproven.
+fn check_no_registry_state<const C: usize, const E: usize, const R: usize>(
+    view: &View<C, E, R>,
+) -> Result<(), String> {
+    if view.registry_len() == 0 {
+        return Ok(());
+    }
+    Err(format!(
+        "kernel holds {} registry chunk(s) after replaying a trace whose model has none",
+        view.registry_len(),
+    ))
+}
 
 // -- Runner -----------------------------------------------------------------
 
@@ -75,10 +106,10 @@ impl ItfRunner for L1Runner {
                 let op = op_for(&expected.last_input)
                     .expect("op_for returned None for input that should have produced one");
                 let context = context_for_height(expected.height)?;
-                let event = actual.apply(context, &FAKE_VERIFIER, &op).map_err(|err| {
+                let outcome = actual.apply(context, &FAKE_VERIFIER, &op).map_err(|err| {
                     format!("kernel rejected input {:?}: {err:?}", expected.last_input)
                 })?;
-                Ok(Some(event.kind().clone()))
+                Ok(event_kind(&outcome))
             }
             // The model refused this attempt; the kernel must too. Any
             // `ApplyError` is accepted here: the model records no
@@ -92,11 +123,11 @@ impl ItfRunner for L1Runner {
                 let context = context_for_height(expected.height)?;
                 actual
                     .apply(context, &FAKE_VERIFIER, &op)
-                    .map_or(Ok(None), |event| {
+                    .map_or(Ok(None), |outcome| {
                         Err(format!(
                             "kernel accepted rejected input {:?}: {:?}",
                             expected.last_input,
-                            event.kind(),
+                            event_kind(&outcome),
                         ))
                     })
             }
@@ -189,6 +220,7 @@ impl ItfRunner for L1Runner {
         }
 
         check_open_auth(&view, expected)?;
+        check_no_registry_state(&view)?;
 
         Ok(true)
     }
@@ -238,10 +270,10 @@ impl ItfRunner for L1FeesRunner {
                 let shape = shape_tag.to_model();
                 let op = fee_model::open(shape);
                 let context = fee_model::context(expected.height, fee_model::fees_for_open(shape));
-                let event = actual
+                let outcome = actual
                     .apply(context, &FAKE_VERIFIER, &op)
                     .map_err(|err| format!("kernel rejected l1_fees open {shape:?}: {err:?}"))?;
-                Ok(Some(event.kind().clone()))
+                Ok(event_kind(&outcome))
             }
             fee_itf::Input::CloseInput(proof_tag) => {
                 let proof = proof_tag.to_model();
@@ -251,11 +283,11 @@ impl ItfRunner for L1FeesRunner {
                     expected.height,
                     fees_for_close(expected.current_close_fee)?,
                 );
-                let event = actual.apply(context, &FAKE_VERIFIER, &op).map_err(|err| {
+                let outcome = actual.apply(context, &FAKE_VERIFIER, &op).map_err(|err| {
                     format!("kernel rejected l1_fees close {proof:?} for {shape:?}: {err:?}")
                 })?;
                 self.applied_close = Some(proof);
-                Ok(Some(event.kind().clone()))
+                Ok(event_kind(&outcome))
             }
             // The model refused this open (e.g. underfunded); the kernel
             // must too, and `state_invariant` verifies nothing moved.
@@ -265,10 +297,10 @@ impl ItfRunner for L1FeesRunner {
                 let context = fee_model::context(expected.height, fee_model::fees_for_open(shape));
                 actual
                     .apply(context, &FAKE_VERIFIER, &op)
-                    .map_or(Ok(None), |event| {
+                    .map_or(Ok(None), |outcome| {
                         Err(format!(
                             "kernel accepted rejected l1_fees open {shape:?}: {:?}",
-                            event.kind(),
+                            event_kind(&outcome),
                         ))
                     })
             }
@@ -285,10 +317,10 @@ impl ItfRunner for L1FeesRunner {
                 );
                 actual
                     .apply(context, &FAKE_VERIFIER, &op)
-                    .map_or(Ok(None), |event| {
+                    .map_or(Ok(None), |outcome| {
                         Err(format!(
                             "kernel accepted rejected l1_fees close {proof:?} for {shape:?}: {:?}",
-                            event.kind(),
+                            event_kind(&outcome),
                         ))
                     })
             }
@@ -370,6 +402,7 @@ impl ItfRunner for L1FeesRunner {
         check_fee_open_parties(expected, shape)?;
         check_fee_paid(expected, &view, shape, self.genesis_total)?;
         check_fee_close_outcome(expected, self.applied_close)?;
+        check_no_registry_state(&view)?;
 
         Ok(true)
     }
@@ -763,17 +796,17 @@ impl ItfRunner for L1StakeRunner {
             stake_itf::Input::NoInput | stake_itf::Input::TickInput => Ok(None),
             stake_itf::Input::OpenInput(variant) => {
                 let op = stake_model::open(variant.to_model());
-                let event = actual
+                let outcome = actual
                     .apply(context, &FAKE_VERIFIER, &op)
                     .map_err(|err| format!("kernel rejected l1_stake open {variant:?}: {err:?}"))?;
-                Ok(Some(event.kind().clone()))
+                Ok(event_kind(&outcome))
             }
             stake_itf::Input::CloseInput(payouts) => {
                 let op = stake_close_tx(payouts);
-                let event = actual.apply(context, &FAKE_VERIFIER, &op).map_err(|err| {
+                let outcome = actual.apply(context, &FAKE_VERIFIER, &op).map_err(|err| {
                     format!("kernel rejected l1_stake close {payouts:?}: {err:?}")
                 })?;
-                Ok(Some(event.kind().clone()))
+                Ok(event_kind(&outcome))
             }
             // The model refused these; the kernel must too, leaving the
             // store untouched.
@@ -935,6 +968,7 @@ impl ItfRunner for L1StakeRunner {
                 ));
             }
         }
+        check_no_registry_state(&view)?;
 
         Ok(true)
     }

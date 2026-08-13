@@ -45,7 +45,7 @@ fn terms_hash_commits_to_basic_fields() {
     assert_eq!(terms.protocol(), ProtocolCode::new(7));
     assert_eq!(terms.parties(), parties);
     assert_eq!(terms.timeout(), timeout);
-    assert_eq!(terms.timeout_outputs(), &outputs);
+    assert_eq!(terms.timeout_outputs(), Some(&outputs));
     assert_eq!(terms.hash(), terms.hash());
     assert_ne!(
         terms.hash(),

@@ -24,8 +24,8 @@
 use hellas_kernel::{
     Auth, BlockHeight, CloseKind, EdgeId, Encode, Key, List, MAX_EDGE_OUTPUTS, NetworkId, Parties,
     PayloadHash, Payout, Proof, ProtocolCode, Seal, SealPublicInputs, Secp256k1Signer,
-    Secp256k1Verifier, Sig, SigVerifier as _, StakeBondTerms, Terms, TermsHash, Tx as KernelTx,
-    Writer as _,
+    Secp256k1Verifier, Sig, SigVerifier as _, StakeBondBaseRef, StakeBondTerms, Terms, TermsHash,
+    TermsProfile, Tx as KernelTx, Writer as _,
 };
 #[cfg(feature = "preverified-seals")]
 use std::collections::HashMap;
@@ -254,8 +254,15 @@ impl Channel {
         payment_edge: EdgeId,
         payment: Terms,
     ) -> Option<Self> {
-        let policy = bond.as_stake_bond()?;
-        if payment.as_stake_bond().is_some() {
+        // The legacy pairing is a tag-1 bond against a basic payment
+        // edge. Naming both shapes exactly keeps a work-channel bond,
+        // whose lease and dispute rules this marketplace does not
+        // implement, from being paired by a shape test that only asked
+        // "is it some kind of bond".
+        let Some(StakeBondBaseRef::Legacy(policy)) = bond.stake_bond_base() else {
+            return None;
+        };
+        if !matches!(payment.profile(), TermsProfile::Basic) {
             return None;
         }
         let provider = provider_key(&policy.parties);
@@ -264,8 +271,8 @@ impl Channel {
         if !mirrored {
             return None;
         }
-        let refunds_client = paid_solely_to(payment.timeout_outputs(), client);
-        let returns_stake = paid_solely_to(bond.timeout_outputs(), provider);
+        let refunds_client = paid_solely_to(payment.timeout_outputs()?, client);
+        let returns_stake = paid_solely_to(bond.timeout_outputs()?, provider);
         if !refunds_client || !returns_stake {
             return None;
         }
@@ -318,8 +325,17 @@ impl Channel {
     #[must_use]
     pub fn bond_policy(&self) -> &StakeBondTerms {
         self.bond
-            .as_stake_bond()
+            .stake_bond_base()
+            .map(StakeBondBaseRef::base)
             .expect("Channel bond terms are stake-bond shaped by construction")
+    }
+
+    /// The payment edge's committed timeout payouts. Basic terms by
+    /// construction, so they always commit one.
+    fn payment_timeout_outputs(&self) -> &List<Payout, MAX_EDGE_OUTPUTS> {
+        self.payment
+            .timeout_outputs()
+            .expect("Channel payment terms are basic shaped by construction")
     }
 
     /// The client key (payment maker, bond taker, slash beneficiary).
@@ -337,8 +353,7 @@ impl Channel {
     /// The payment edge's exact close value, committed by its terms.
     #[must_use]
     pub fn capacity(&self) -> u64 {
-        self.payment
-            .timeout_outputs()
+        self.payment_timeout_outputs()
             .as_slice()
             .iter()
             .fold(0_u64, |sum, payout| sum.saturating_add(payout.value()))
@@ -600,6 +615,7 @@ impl Channel {
     #[must_use]
     pub fn payment_timeout_close(&self) -> KernelTx {
         KernelTx::timeout_close(self.payment_edge, &self.payment)
+            .expect("Channel payment terms are basic shaped by construction")
     }
 
     /// The provider's clean epoch end: a `Timeout` close of the bond
@@ -607,6 +623,7 @@ impl Channel {
     #[must_use]
     pub fn bond_timeout_close(&self) -> KernelTx {
         KernelTx::timeout_close(self.bond_edge, &self.bond)
+            .expect("Channel bond terms are stake-bond shaped by construction")
     }
 
     /// The client's fraud exit: a `Violation` close of the bond under
@@ -793,7 +810,10 @@ impl FraudArtifact {
     /// fraud evidence names this bond, this job, and these parties.
     #[must_use]
     pub fn binds(&self, public: &SealPublicInputs<'_>) -> bool {
-        let Some(bond) = public.terms.as_stake_bond() else {
+        // The legacy artifact settles the legacy bond only. A tag-4
+        // work bond's violation is decided by the game the kernel runs,
+        // not by this process-local verifier.
+        let Some(StakeBondBaseRef::Legacy(bond)) = public.terms.stake_bond_base() else {
             return false;
         };
         let acceptance_digest = self.acceptance.digest(public.network);
@@ -1155,6 +1175,77 @@ mod channel_tests {
             terms: &bond,
             payouts: &outputs,
         }));
+    }
+
+    /// The preverified route settles the legacy bond and nothing else.
+    ///
+    /// This is load bearing now that consensus admits a tag-4 bond
+    /// without the seal capability (`execution/kernel.rs`): the reason
+    /// that is safe is that no preverified artifact can ever slash one.
+    /// A tag-4 bond's violation is decided by the kernel's own game,
+    /// under rules — the lease, the winner record, the native seal —
+    /// this process-local artifact knows nothing about, so an artifact
+    /// that bound to it would be slashing a bond by the wrong rules.
+    ///
+    /// The two inputs below differ in exactly one thing: the profile the
+    /// same stake policy is spelled in.
+    #[test]
+    fn a_preverified_artifact_binds_a_legacy_bond_and_never_a_native_one() {
+        use hellas_kernel::WorkStakeBondTerms;
+
+        let legacy = bond_terms();
+        let native = Terms::work_stake_bond(WorkStakeBondTerms {
+            base: sample_stake_bond(),
+            max_challenge_bond: 1,
+            move_timeout: 1,
+            game_protocol: hellas_kernel::ProtocolCode::CATENA_FRAUD_V2.get(),
+        });
+
+        // One artifact per profile, each authenticated *for its own*
+        // bond. Reusing the legacy artifact against tag-4 inputs would
+        // prove nothing: it would be refused for naming another terms
+        // hash, and the profile check could be deleted with no test
+        // noticing.
+        let artifact_for = |terms: &Terms| {
+            let mut mine = channel();
+            let mut accepted = job(&mine, 400, 60);
+            assert_eq!(mine.admit(now(), accepted), Ok(()));
+            accepted.bond_terms = terms.hash();
+            let digest = accepted.digest(crate::domain::TEST_NETWORK);
+            let result = JobResultContext {
+                acceptance: digest,
+                transcript: [9; 32],
+            };
+            FraudArtifact {
+                acceptance: accepted,
+                client_acceptance_sig: client().sign(digest),
+                provider_acceptance_sig: provider().sign(digest),
+                result,
+                provider_result_sig: provider().sign(result.digest(crate::domain::TEST_NETWORK)),
+            }
+        };
+
+        let mut slots = [Payout::default(); MAX_EDGE_OUTPUTS];
+        slots[0] = Payout::new(client().party_key(), AWARD);
+        slots[1] = Payout::new(signer(3).party_key(), STAKE - AWARD);
+        let outputs = List::take(slots, 2);
+        fn public<'a>(
+            terms: &'a Terms,
+            payouts: &'a List<Payout, MAX_EDGE_OUTPUTS>,
+        ) -> SealPublicInputs<'a> {
+            SealPublicInputs {
+                network: crate::domain::TEST_NETWORK,
+                edge_id: bond_edge(),
+                terms,
+                payouts,
+            }
+        }
+
+        assert!(artifact_for(&legacy).binds(&public(&legacy, &outputs)));
+        assert!(
+            !artifact_for(&native).binds(&public(&native, &outputs)),
+            "a preverified artifact must never settle a natively verified bond",
+        );
     }
 
     /// Every payload the two parties exchange is bound to one network.

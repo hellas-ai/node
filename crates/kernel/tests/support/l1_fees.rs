@@ -1,4 +1,4 @@
-use super::{FixedStore, coin_id, state};
+use super::{CANARY_REGISTRY_SLOTS, FixedStore, canary_registry_slots, coin_id, state};
 
 use hellas_kernel::{
     BlockHash, BlockHeight, CloseKind, CoinId, Context, EdgeId, Fees, Funding, Genesis, Key, List,
@@ -20,8 +20,8 @@ pub(crate) const RAISED_CLOSE_FEE: i64 = 18;
 pub(crate) const BASE_FEES: Fees = Fees::new(1, 3, 0, 3);
 pub(crate) const RAISED_FEES: Fees = Fees::new(18, 0, 0, 0);
 
-pub(crate) type TraceState = State<FixedStore<12, 5>>;
-pub(crate) type TraceView = View<12, 5>;
+pub(crate) type TraceState = State<FixedStore<12, 5, CANARY_REGISTRY_SLOTS>>;
+pub(crate) type TraceView = View<12, 5, CANARY_REGISTRY_SLOTS>;
 
 #[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) enum FundingShape {
@@ -49,7 +49,7 @@ pub(crate) fn initial_state_underfunded() -> TraceState {
 
 fn initial_state_with(maker_value: u64, taker_value: u64) -> TraceState {
     state(
-        FixedStore::empty(
+        FixedStore::empty_with_registry(
             [
                 MAKER_ID,
                 TAKER_ID,
@@ -71,6 +71,7 @@ fn initial_state_with(maker_value: u64, taker_value: u64) -> TraceState {
                 edge_id(FundingShape::Empty),
                 edge_id(FundingShape::SelfEdge),
             ],
+            canary_registry_slots(),
         ),
         [
             Genesis::coin(MAKER_ID, MAKER, maker_value),

@@ -17,7 +17,7 @@ mod support;
 use hellas_kernel::{
     ApplyError, Batch, BlockHash, BlockHeight, Coin, CoinId, Context, Edge, EdgeId, Funding,
     Genesis, InsertError, KernelResult, Key, List, MAX_EDGE_OUTPUTS, Parties, Payout, Proof,
-    ProtocolCode, State, Store, Terms, Tx,
+    ProtocolCode, RegistryChunk, RegistryChunkId, State, Store, Terms, Tx,
 };
 use support::{
     FAKE_VERIFIER, coin_id, key, list,
@@ -228,6 +228,25 @@ impl Batch for SabotageTx<'_> {
         }
     }
 
+    // No registry sabotage mode: the sabotage tests drive the coin/edge
+    // effects `State::apply` folds today. A mode here would name a fold
+    // that does not exist yet.
+    fn registry_chunk(&self, id: RegistryChunkId) -> Option<RegistryChunk> {
+        self.inner.registry_chunk(id)
+    }
+
+    fn insert_registry_chunk(
+        &mut self,
+        id: RegistryChunkId,
+        chunk: RegistryChunk,
+    ) -> KernelResult<(), InsertError> {
+        self.inner.insert_registry_chunk(id, chunk)
+    }
+
+    fn remove_registry_chunk(&mut self, id: RegistryChunkId) -> Option<RegistryChunk> {
+        self.inner.remove_registry_chunk(id)
+    }
+
     fn commit(self) {
         self.inner.commit();
     }
@@ -259,10 +278,21 @@ fn scenario() -> (State<MapStore>, Tx, Tx, EdgeId) {
     (state, open, close, edge)
 }
 
-type Snapshot = (Vec<(CoinId, Coin)>, Vec<(EdgeId, Edge)>);
+type Snapshot = (
+    Vec<(CoinId, Coin)>,
+    Vec<(EdgeId, Edge)>,
+    Vec<(RegistryChunkId, RegistryChunk)>,
+);
 
+/// Every object kind the store holds. Registry chunks are included for
+/// the same reason coins and edges are: a rolled-back apply that left a
+/// chunk behind would otherwise compare equal to one that did not.
 fn snapshot(store: &MapStore) -> Snapshot {
-    (store.coins().collect(), store.edges().collect())
+    (
+        store.coins().collect(),
+        store.edges().collect(),
+        store.registry_chunks().collect(),
+    )
 }
 
 /// Applies `op` over a sabotaged wrap of `inner`, asserting the expected

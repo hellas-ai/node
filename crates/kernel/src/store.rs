@@ -1,8 +1,14 @@
 //! Object-store boundary.
 //!
-//! The store presents a typed transactional view over coin and edge slots.
-//! Storage representation is left to the implementation; the kernel only ever
-//! addresses slots through their typed identifier.
+//! The store presents a typed transactional view over coin, edge, and
+//! registry-chunk slots. Storage representation is left to the
+//! implementation; the kernel only ever addresses slots through their
+//! typed identifier.
+//!
+//! Registry chunks share this one store rather than getting their own.
+//! They are consensus state, so they have to live under the same
+//! authenticated root as coins and edges; a second store beside this one
+//! would be state consensus agrees on but does not commit to.
 //!
 //! Abstract counterpart: the store atomicity / read-isolation assumptions
 //! in `models/deps/assumptions.qnt`. The Quint model captures atomicity by
@@ -13,6 +19,7 @@ use crate::{
     error::{InsertError, KernelResult},
     object::{Coin, Edge},
     primitive::{CoinId, EdgeId},
+    registry::{RegistryChunk, RegistryChunkId},
 };
 
 /// Storage boundary for on-chain objects.
@@ -60,6 +67,28 @@ pub trait Batch {
 
     /// Removes and returns the edge stored under `id`, if any.
     fn remove_edge(&mut self, id: EdgeId) -> Option<Edge>;
+
+    /// Returns the registry chunk stored under `id`, if any.
+    fn registry_chunk(&self, id: RegistryChunkId) -> Option<RegistryChunk>;
+
+    /// Inserts `chunk` under `id`.
+    ///
+    /// Replacing a chunk is a remove followed by an insert, not an
+    /// overwrite: the same two steps a coin or edge slot takes, so one
+    /// slot rule covers all three object kinds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InsertError::Exists`] if `id` is already occupied, or
+    /// [`InsertError::Unavailable`] if the store cannot accept `id`.
+    fn insert_registry_chunk(
+        &mut self,
+        id: RegistryChunkId,
+        chunk: RegistryChunk,
+    ) -> KernelResult<(), InsertError>;
+
+    /// Removes and returns the registry chunk stored under `id`, if any.
+    fn remove_registry_chunk(&mut self, id: RegistryChunkId) -> Option<RegistryChunk>;
 
     /// Commits staged mutations to the backing store.
     fn commit(self);

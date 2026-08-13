@@ -18,7 +18,10 @@
 
 use std::collections::BTreeMap;
 
-use hellas_kernel::{Batch, Coin, CoinId, Edge, EdgeId, Genesis, InsertError, KernelResult, Store};
+use hellas_kernel::{
+    Batch, Coin, CoinId, Edge, EdgeId, Genesis, InsertError, KernelResult, RegistryChunk,
+    RegistryChunkId, Store,
+};
 
 /// Two-phase staged transaction: writes go to a side `working` map; on
 /// `commit`, the working map is swapped into the parent. A dropped
@@ -27,6 +30,7 @@ use hellas_kernel::{Batch, Coin, CoinId, Edge, EdgeId, Genesis, InsertError, Ker
 pub(crate) struct MapStore {
     coins: BTreeMap<CoinId, Coin>,
     edges: BTreeMap<EdgeId, Edge>,
+    registry: BTreeMap<RegistryChunkId, RegistryChunk>,
 }
 
 impl MapStore {
@@ -48,6 +52,13 @@ impl MapStore {
     pub(crate) fn edge(&self, id: EdgeId) -> Option<Edge> {
         self.edges.get(&id).copied()
     }
+
+    /// Direct read of a registry chunk by id (bypasses the transaction
+    /// layer).
+    #[must_use]
+    pub(crate) fn registry_chunk(&self, id: RegistryChunkId) -> Option<RegistryChunk> {
+        self.registry.get(&id).copied()
+    }
 }
 
 impl Store for MapStore {
@@ -60,6 +71,7 @@ impl Store for MapStore {
         let working = Working {
             coins: self.coins.clone(),
             edges: self.edges.clone(),
+            registry: self.registry.clone(),
         };
         MapTx {
             working,
@@ -74,6 +86,7 @@ impl Store for MapStore {
 struct Working {
     coins: BTreeMap<CoinId, Coin>,
     edges: BTreeMap<EdgeId, Edge>,
+    registry: BTreeMap<RegistryChunkId, RegistryChunk>,
 }
 
 pub(crate) struct MapTx<'a> {
@@ -114,9 +127,30 @@ impl Batch for MapTx<'_> {
         self.working.edges.remove(&id)
     }
 
+    fn registry_chunk(&self, id: RegistryChunkId) -> Option<RegistryChunk> {
+        self.working.registry.get(&id).copied()
+    }
+
+    fn insert_registry_chunk(
+        &mut self,
+        id: RegistryChunkId,
+        chunk: RegistryChunk,
+    ) -> KernelResult<(), InsertError> {
+        if self.working.registry.contains_key(&id) {
+            return Err(InsertError::Exists);
+        }
+        self.working.registry.insert(id, chunk);
+        Ok(())
+    }
+
+    fn remove_registry_chunk(&mut self, id: RegistryChunkId) -> Option<RegistryChunk> {
+        self.working.registry.remove(&id)
+    }
+
     fn commit(self) {
         self.parent.coins = self.working.coins;
         self.parent.edges = self.working.edges;
+        self.parent.registry = self.working.registry;
     }
 }
 
@@ -139,6 +173,14 @@ impl MapStore {
 
     pub(crate) fn edge_count(&self) -> usize {
         self.edges.len()
+    }
+
+    pub(crate) fn registry_chunks(&self) -> impl Iterator<Item = (RegistryChunkId, RegistryChunk)> {
+        self.registry.iter().map(|(id, chunk)| (*id, *chunk))
+    }
+
+    pub(crate) fn registry_chunk_count(&self) -> usize {
+        self.registry.len()
     }
 }
 

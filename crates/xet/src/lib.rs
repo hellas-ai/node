@@ -1,7 +1,23 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
+// The kernel is `#![no_std]` and depends on this crate with default
+// features off, so this crate's default-off surface must be allocation-free
+// — not merely allocation-light. Everything that needs a growable buffer
+// (the chunkers, and the Merkle tree, whose node count is unbounded) sits
+// behind `std`, which `chunking` already implies. What the kernel calls —
+// `XetHash`, `chunk_hash`, `SingleChunkHasher` — never allocates.
+#[cfg(feature = "std")]
 extern crate alloc;
 
+// Proof of the paragraph above, checked by the compiler rather than by
+// reading. With `std` off, `alloc` names this empty module: a re-added
+// `extern crate alloc` collides with it ("defined multiple times") and any
+// stray `alloc::…` path resolves in here and finds nothing. CI runs the
+// proof as `check-xet-no-alloc`.
+#[cfg(not(feature = "std"))]
+mod alloc {}
+
+#[cfg(feature = "std")]
 use alloc::vec::Vec;
 use core::{fmt, str::FromStr};
 #[cfg(feature = "serde")]
@@ -39,9 +55,13 @@ const HASH_WINDOW_SIZE: usize = 64;
 #[cfg(feature = "chunking")]
 const INITIAL_SKIP: usize = MIN_CHUNK_SIZE - HASH_WINDOW_SIZE - 1;
 
+#[cfg(feature = "std")]
 const TREE_BRANCHING_FACTOR: u64 = 4;
+#[cfg(feature = "std")]
 const MAX_GROUP_SIZE: usize = 2 * TREE_BRANCHING_FACTOR as usize + 1;
+#[cfg(feature = "std")]
 const MAX_ENTRY_SIZE: usize = 64 + 3 + 20 + 1;
+#[cfg(feature = "std")]
 const MAX_MERGE_BUFFER_SIZE: usize = MAX_GROUP_SIZE * MAX_ENTRY_SIZE;
 const ZERO_KEY: [u8; 32] = [0; 32];
 
@@ -94,6 +114,7 @@ impl XetHash {
         self.0
     }
 
+    #[cfg(feature = "std")]
     fn natural_cut_value(self) -> u64 {
         let mut limb = [0; 8];
         limb.copy_from_slice(&self.0[24..]);
@@ -210,18 +231,15 @@ impl<'de> Deserialize<'de> for XetHash {
                 formatter.write_str("a 32-byte Xet hash")
             }
 
+            // Only the borrowed form. serde's default `visit_byte_buf`
+            // already forwards an owned buffer here, so restating it
+            // would buy nothing but a `Vec` — and with it an allocator
+            // this crate refuses to require.
             fn visit_bytes<E>(self, bytes: &[u8]) -> Result<Self::Value, E>
             where
                 E: serde::de::Error,
             {
                 XetHash::from_slice(bytes).map_err(E::custom)
-            }
-
-            fn visit_byte_buf<E>(self, bytes: Vec<u8>) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                self.visit_bytes(&bytes)
             }
         }
 
@@ -484,6 +502,10 @@ impl XetFileHasher {
 /// At every level, Xet takes a natural cut after the third or later child whose
 /// last hash limb is divisible by four. A group is capped at nine children, and
 /// a final remainder of one or two children is merged as-is.
+///
+/// A level holds one node per group, so the working set is bounded only by
+/// the input: this needs an allocator, and lives behind `std`.
+#[cfg(feature = "std")]
 #[must_use]
 pub fn merkle_root(chunks: &[Chunk]) -> XetHash {
     if chunks.is_empty() {
@@ -509,6 +531,7 @@ pub fn merkle_root(chunks: &[Chunk]) -> XetHash {
 }
 
 /// Computes the Xet xorb hash: the unfinalized Merkle root of its chunks.
+#[cfg(feature = "std")]
 #[must_use]
 pub fn xorb_hash(chunks: &[Chunk]) -> XetHash {
     merkle_root(chunks)
@@ -518,6 +541,7 @@ pub fn xorb_hash(chunks: &[Chunk]) -> XetHash {
 ///
 /// The Merkle root is finalized with BLAKE3 keyed by 32 zero bytes. As in the
 /// reference implementation, an empty chunk sequence maps directly to zero.
+#[cfg(feature = "std")]
 #[must_use]
 pub fn file_hash(chunks: &[Chunk]) -> XetHash {
     if chunks.is_empty() {
@@ -527,6 +551,7 @@ pub fn file_hash(chunks: &[Chunk]) -> XetHash {
     XetHash::from(*blake3::keyed_hash(&ZERO_KEY, merkle_root(chunks).as_bytes()).as_bytes())
 }
 
+#[cfg(feature = "std")]
 fn next_merge_cut(nodes: &[Chunk]) -> usize {
     if nodes.len() <= 2 {
         return nodes.len();
@@ -541,6 +566,7 @@ fn next_merge_cut(nodes: &[Chunk]) -> usize {
     end
 }
 
+#[cfg(feature = "std")]
 fn merge(nodes: &[Chunk]) -> Chunk {
     let mut buffer = [0; MAX_MERGE_BUFFER_SIZE];
     let mut position = 0;
@@ -560,6 +586,7 @@ fn merge(nodes: &[Chunk]) -> Chunk {
     Chunk::new(XetHash::from(*hash.as_bytes()), total_len)
 }
 
+#[cfg(feature = "std")]
 fn write_hash(buffer: &mut [u8], position: &mut usize, hash: XetHash) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
 
@@ -572,6 +599,7 @@ fn write_hash(buffer: &mut [u8], position: &mut usize, hash: XetHash) {
     }
 }
 
+#[cfg(feature = "std")]
 fn write_decimal(buffer: &mut [u8], position: &mut usize, value: u64) {
     if value == 0 {
         buffer[*position] = b'0';

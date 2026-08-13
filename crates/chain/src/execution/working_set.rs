@@ -2,11 +2,15 @@
 
 use std::collections::HashMap;
 
-use hellas_kernel::{Batch, Coin, CoinId, Edge, EdgeId, InsertError, KernelResult, Store};
+use hellas_kernel::{
+    Batch, Coin, CoinId, Edge, EdgeId, InsertError, KernelResult, RegistryChunk, RegistryChunkId,
+    Store,
+};
 
 /// Synchronous staging area for one block's apply pass.
 ///
-/// Holds one entry per `(CoinId | EdgeId)` the block references, with
+/// Holds one entry per `(CoinId | EdgeId | RegistryChunkId)` the block
+/// references, with
 /// `None` representing "slot is currently empty" (e.g. an output coin id
 /// the block will create) and `Some(_)` representing "slot is currently
 /// occupied". The kernel reads through [`Batch::coin`] / [`Batch::edge`]
@@ -15,13 +19,15 @@ use hellas_kernel::{Batch, Coin, CoinId, Edge, EdgeId, InsertError, KernelResult
 ///
 /// **Pre-load required.** Inserts and removes only operate on slots
 /// declared in advance via [`Self::insert_coin_slot`] /
-/// [`Self::insert_edge_slot`]. A kernel write to an unknown slot returns
-/// [`InsertError::Unavailable`] — the parallel-execution safety
-/// property: the host has to surface every id it intends to mutate.
+/// [`Self::insert_edge_slot`] / [`Self::insert_registry_chunk_slot`]. A
+/// kernel write to an unknown slot returns [`InsertError::Unavailable`] —
+/// the parallel-execution safety property: the host has to surface every
+/// id it intends to mutate.
 #[derive(Debug, Clone, Default)]
 pub struct BlockWorkingSet {
     coins: HashMap<CoinId, Option<Coin>>,
     edges: HashMap<EdgeId, Option<Edge>>,
+    registry: HashMap<RegistryChunkId, Option<RegistryChunk>>,
 }
 
 impl BlockWorkingSet {
@@ -43,6 +49,16 @@ impl BlockWorkingSet {
         self.edges.insert(id, edge);
     }
 
+    /// Declares a registry chunk slot. Same semantics as
+    /// [`Self::insert_coin_slot`].
+    pub fn insert_registry_chunk_slot(
+        &mut self,
+        id: RegistryChunkId,
+        chunk: Option<RegistryChunk>,
+    ) {
+        self.registry.insert(id, chunk);
+    }
+
     /// Reads the current coin at `id`, ignoring pre-load tracking.
     #[must_use]
     pub fn coin(&self, id: CoinId) -> Option<Coin> {
@@ -53,6 +69,12 @@ impl BlockWorkingSet {
     #[must_use]
     pub fn edge(&self, id: EdgeId) -> Option<Edge> {
         self.edges.get(&id).copied().flatten()
+    }
+
+    /// Reads the current registry chunk at `id`.
+    #[must_use]
+    pub fn registry_chunk(&self, id: RegistryChunkId) -> Option<RegistryChunk> {
+        self.registry.get(&id).copied().flatten()
     }
 }
 
@@ -66,6 +88,7 @@ impl Store for BlockWorkingSet {
         WorkingBatch {
             coins: self.coins.clone(),
             edges: self.edges.clone(),
+            registry: self.registry.clone(),
             parent: self,
         }
     }
@@ -79,6 +102,7 @@ impl Store for BlockWorkingSet {
 pub struct WorkingBatch<'a> {
     coins: HashMap<CoinId, Option<Coin>>,
     edges: HashMap<EdgeId, Option<Edge>>,
+    registry: HashMap<RegistryChunkId, Option<RegistryChunk>>,
     parent: &'a mut BlockWorkingSet,
 }
 
@@ -123,9 +147,34 @@ impl Batch for WorkingBatch<'_> {
         slot.take()
     }
 
+    fn registry_chunk(&self, id: RegistryChunkId) -> Option<RegistryChunk> {
+        self.registry.get(&id).copied().flatten()
+    }
+
+    fn insert_registry_chunk(
+        &mut self,
+        id: RegistryChunkId,
+        chunk: RegistryChunk,
+    ) -> KernelResult<(), InsertError> {
+        match self.registry.get(&id) {
+            None => Err(InsertError::Unavailable),
+            Some(Some(_)) => Err(InsertError::Exists),
+            Some(None) => {
+                self.registry.insert(id, Some(chunk));
+                Ok(())
+            }
+        }
+    }
+
+    fn remove_registry_chunk(&mut self, id: RegistryChunkId) -> Option<RegistryChunk> {
+        let slot = self.registry.get_mut(&id)?;
+        slot.take()
+    }
+
     fn commit(self) {
         self.parent.coins = self.coins;
         self.parent.edges = self.edges;
+        self.parent.registry = self.registry;
     }
 }
 

@@ -521,7 +521,7 @@ async fn run_close(args: CloseArgs) -> CliResult {
             if terms.hash() != edge.terms_hash {
                 anyhow::bail!("terms file does not match the live edge commitment");
             }
-            if terms.timeout_outputs() != &outputs {
+            if terms.timeout_outputs() != Some(&outputs) {
                 anyhow::bail!("timeout payouts do not match the committed Terms file");
             }
             Proof::timeout(terms)

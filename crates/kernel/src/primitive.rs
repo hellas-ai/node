@@ -392,6 +392,14 @@ impl Decode for Sig {
 pub struct ProtocolCode(u8);
 
 impl ProtocolCode {
+    /// The kernel-owned correctness game.
+    ///
+    /// Unlike the chain-local codes a marketplace assigns, this one
+    /// selects transition rules the kernel implements itself, so it is
+    /// reserved here rather than by a deployment. Renumbering it is a
+    /// hard fork.
+    pub const CATENA_FRAUD_V2: Self = Self(crate::consts::CATENA_FRAUD_PROTOCOL_CODE);
+
     /// Creates a protocol code.
     #[must_use]
     pub const fn new(value: u8) -> Self {
@@ -449,6 +457,20 @@ impl Party {
             0 => Some(Self::Maker),
             1 => Some(Self::Taker),
             _ => None,
+        }
+    }
+
+    /// Returns the settlement key `parties` assigns to this position.
+    ///
+    /// The work-channel roles *are* these positions — on a payment edge
+    /// the client is the maker and the provider is the taker — so one
+    /// closed enum names the signer of every payment-close action, and a
+    /// role that could not answer this question could not be checked.
+    #[must_use]
+    pub const fn key_of(self, parties: crate::object::Parties) -> Key {
+        match self {
+            Self::Maker => parties.maker(),
+            Self::Taker => parties.taker(),
         }
     }
 }

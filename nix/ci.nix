@@ -107,6 +107,15 @@ let
     wasm-xet = mk "check-wasm-xet" "cargo check -p hellas-xet --target wasm32-unknown-unknown" (
       cargoEnv (rustToolchain.override { targets = [ "wasm32-unknown-unknown" ]; })
     );
+    # `hellas-xet` sits inside the `#![no_std]` kernel's dependency
+    # closure, which must be allocation-free. With default features off
+    # the crate takes the `alloc` name for an empty module of its own, so
+    # this build is what fails — loudly, at compile time — the moment
+    # someone reaches for a `Vec` there again. It cannot ride along with
+    # `check-clippy`: a workspace build unifies `chunking` back on.
+    xet-no-alloc = mk "check-xet-no-alloc" "cargo build -p hellas-xet --no-default-features" (
+      cargoEnv rustToolchain
+    );
   };
 
   checks = baseChecks // extraChecks;

@@ -22,6 +22,8 @@ mod close;
 mod op;
 #[path = "channel/open.rs"]
 mod open;
+#[path = "channel/work.rs"]
+mod work;
 
 use support::l1::{
     self, CONTEXT, EdgeKey, MAKER, MAKER_ID as MAKER_COIN, OpenKey, PARTIES, PROTOCOL, TAKER,
@@ -167,7 +169,7 @@ fn open_op() -> Tx {
 fn open_edge_id(open: &Tx) -> EdgeId {
     match open {
         Tx::Open { funding, terms, .. } => Tx::edge_id_of(funding, terms),
-        Tx::Close { .. } => panic!("expected Tx::Open"),
+        Tx::Close { .. } | Tx::Move { .. } => panic!("expected Tx::Open"),
     }
 }
 
@@ -247,22 +249,37 @@ fn output_ids3(first: CoinId, second: CoinId, third: CoinId) -> List<CoinId, MAX
     list(&[first, second, third])
 }
 
-fn apply<const C: usize, const E: usize>(
-    state: &mut State<FixedStore<C, E>>,
+fn apply<const C: usize, const E: usize, const R: usize>(
+    state: &mut State<FixedStore<C, E, R>>,
     op: &Tx,
 ) -> hellas_kernel::Event {
     apply_with(state, CONTEXT, op)
 }
 
-fn apply_with<const C: usize, const E: usize>(
-    state: &mut State<FixedStore<C, E>>,
+/// Applies `op` and returns the public event it announces.
+///
+/// Both halves of the outcome are checked here rather than at the forty
+/// call sites below. An ordinary open or close is a public edge
+/// mutation, so it always announces itself, and it moves no registry
+/// state — a transition that quietly started writing chunks would fail
+/// every channel test that routes through this helper.
+fn apply_with<const C: usize, const E: usize, const R: usize>(
+    state: &mut State<FixedStore<C, E, R>>,
     context: Context,
     op: &Tx,
 ) -> hellas_kernel::Event {
-    let Ok(event) = state.apply(context, &FAKE_VERIFIER, op) else {
+    let Ok(outcome) = state.apply(context, &FAKE_VERIFIER, op) else {
         panic!("operation rejected");
     };
-    event
+    assert!(
+        outcome.registry().is_empty(),
+        "an ordinary edge operation wrote registry state: {:?}",
+        outcome.registry(),
+    );
+    let Some(event) = outcome.public_event() else {
+        panic!("an edge operation applied without announcing itself");
+    };
+    event.clone()
 }
 
 fn lifetime_fee_for(context: Context, timeout: BlockHeight) -> Option<u64> {

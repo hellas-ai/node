@@ -2,7 +2,7 @@ use super::{store::UtxoDatabase, verifier::ChainVerifier, working_set::BlockWork
 use crate::domain::{
     Address, Coin, MAX_EDGE_LIFETIME_BLOCKS, MergeInputFault, Object, ObjectId, ObjectKind,
     SettlementKey, Transaction, coin_object_id, edge_object_id, genesis_object_id,
-    merge_input_fault, output_object_id,
+    merge_input_fault, output_object_id, registry_chunk_object_id,
 };
 use commonware_codec::{Encode, EncodeSize};
 use commonware_cryptography::{Hasher, Sha256};
@@ -10,8 +10,10 @@ use commonware_glue::stateful::db::DatabaseSet;
 use commonware_runtime::Spawner;
 use commonware_storage::Context as StorageContext;
 use hellas_kernel::{
-    ApplyError, Coin as KernelCoin, CoinId, Context as KernelContext, EdgeId, Event, EventKind,
-    InvalidProofReason, State, Tx as KernelTx,
+    ApplyError, CloseKind, Coin as KernelCoin, CoinId, Context as KernelContext, EdgeId, Event,
+    EventKind, InvalidProofReason, Move as KernelMove, Proof as KernelProof, RegistryChunkId,
+    RegistryDiff, StakeBondBaseRef, State, TermsProfile, Tx as KernelTx, bond_lease_slots,
+    pending_payment_close_slot,
 };
 use thiserror::Error;
 use tracing::warn;
@@ -423,8 +425,38 @@ where
     Ok(())
 }
 
+/// Preloads the registry chunk slot `id` into `working`.
+///
+/// Kept beside the coin and edge loaders because the three obey one rule:
+/// a slot the kernel may write has to be declared before apply, whether
+/// it is currently occupied or not.
+async fn load_registry_chunk_slot<E>(
+    batches: &Batch<E>,
+    working: &mut BlockWorkingSet,
+    id: RegistryChunkId,
+) -> Result<(), ExecutionError>
+where
+    E: StorageContext + Spawner + Send + Sync + 'static,
+{
+    let object_id = registry_chunk_object_id(id);
+    let chunk = match batches.get(&object_id).await.map_err(storage_err)? {
+        Some(Object::RegistryChunk(chunk)) => Some(chunk),
+        Some(object) => {
+            return Err(ExecutionError::WrongObjectKind {
+                id: object_id,
+                expected: ObjectKind::RegistryChunk,
+                actual: object.kind(),
+            });
+        }
+        None => None,
+    };
+    working.insert_registry_chunk_slot(id, chunk);
+    Ok(())
+}
+
 async fn load_kernel_slots<E>(
     batches: &Batch<E>,
+    context: KernelContext,
     tx: &KernelTx,
 ) -> Result<BlockWorkingSet, ExecutionError>
 where
@@ -437,12 +469,70 @@ where
                 load_coin_slot(batches, &mut working, *id).await?;
             }
             load_edge_slot(batches, &mut working, KernelTx::edge_id_of(funding, terms)).await?;
+            // A work-payment open leases the bond it names, which means
+            // it reads that edge and writes both chunks of the lease.
+            // All three have to be declared: an undeclared read is
+            // reported as absence, which would let a live bond look
+            // missing, and an undeclared write cannot be replayed at
+            // all.
+            if let TermsProfile::WorkPayment(payment) = terms.profile() {
+                load_edge_slot(batches, &mut working, payment.bond_edge).await?;
+                for slot in bond_lease_slots(context.network(), payment.bond_edge) {
+                    load_registry_chunk_slot(batches, &mut working, slot).await?;
+                }
+            }
         }
-        KernelTx::Close { input, outputs, .. } => {
+        KernelTx::Close {
+            input,
+            proof,
+            outputs,
+        } => {
             load_edge_slot(batches, &mut working, *input).await?;
             for id in KernelTx::close_output_ids(*input, outputs).iter() {
                 load_coin_slot(batches, &mut working, *id).await?;
             }
+            // The two work-payment exits read, and retire, the contest
+            // record. Declaring it only when a record is expected would
+            // be the wrong plan for the freeze route, whose *absence*
+            // check is a read of the same slot.
+            if matches!(proof.kind(), CloseKind::Freeze | CloseKind::Adjudicated) {
+                load_registry_chunk_slot(
+                    batches,
+                    &mut working,
+                    pending_payment_close_slot(context.network(), *input),
+                )
+                .await?;
+            }
+            // A tag-4 bond's timeout is decided by its lease: unleased
+            // it may be taken at once, leased it waits for the horizon
+            // and deletes the record. Both slots are declared whichever
+            // way that goes, for the same reason the freeze route
+            // declares a slot it may find empty — the absence is the
+            // answer, so it has to be read rather than assumed.
+            if let KernelProof::Timeout { terms } = proof
+                && matches!(terms.stake_bond_base(), Some(StakeBondBaseRef::Work(_)))
+            {
+                for slot in bond_lease_slots(context.network(), *input) {
+                    load_registry_chunk_slot(batches, &mut working, slot).await?;
+                }
+            }
+        }
+        // A move consumes nothing. It reads the edge it addresses and
+        // writes the one derived contest slot, and the host has to
+        // declare both: `BlockWorkingSet` reports an undeclared read as
+        // absence, which would let a live edge masquerade as missing.
+        KernelTx::Move { action } => {
+            let payment_edge = match action {
+                KernelMove::StartPaymentClose(start) => start.payment_edge(),
+                KernelMove::RespondPaymentClose(response) => response.payment_edge(),
+            };
+            load_edge_slot(batches, &mut working, payment_edge).await?;
+            load_registry_chunk_slot(
+                batches,
+                &mut working,
+                pending_payment_close_slot(context.network(), payment_edge),
+            )
+            .await?;
         }
     }
     Ok(working)
@@ -465,12 +555,25 @@ fn classify_kernel_error(working: &BlockWorkingSet, source: ApplyError) -> Execu
                 id: edge_object_id(id),
             }
         }
+        ApplyError::MissingRegistryChunk { id } if working.registry_chunk(id).is_none() => {
+            ExecutionError::ObjectNotFound {
+                id: registry_chunk_object_id(id),
+            }
+        }
         ApplyError::MissingCoin { .. }
         | ApplyError::CoinChanged { .. }
         | ApplyError::MissingEdge { .. }
         | ApplyError::EdgeChanged { .. }
+        | ApplyError::MissingRegistryChunk { .. }
+        | ApplyError::RegistryChunkChanged { .. }
         | ApplyError::CoinInsertRejected { .. }
-        | ApplyError::EdgeInsertRejected { .. } => {
+        | ApplyError::EdgeInsertRejected { .. }
+        | ApplyError::RegistryChunkInsertRejected { .. }
+        // A transition that overran or duplicated its own registry diff
+        // decided which slots it writes before writing any of them, so
+        // this is the kernel disagreeing with itself rather than a
+        // payload the host can blame.
+        | ApplyError::RegistryDiffRejected { .. } => {
             ExecutionError::KernelHostContract { error: source }
         }
         ApplyError::OutputExists { .. }
@@ -478,7 +581,8 @@ fn classify_kernel_error(working: &BlockWorkingSet, source: ApplyError) -> Execu
         | ApplyError::DuplicateInput { .. }
         | ApplyError::InvalidOpen { .. }
         | ApplyError::InvalidClose { .. }
-        | ApplyError::InvalidProof { .. } => ExecutionError::KernelApply { error: source },
+        | ApplyError::InvalidProof { .. }
+        | ApplyError::InvalidMove { .. } => ExecutionError::KernelApply { error: source },
     }
 }
 
@@ -541,6 +645,45 @@ where
     (batches, None)
 }
 
+/// Persists an operation's registry writes into the batch that already
+/// carries its coin and edge effect.
+///
+/// The kernel's [`RegistryDiff`] is the authoritative slot list, in
+/// replay order. Every mutation is first checked against the post-apply
+/// working set: the kernel wrote these slots itself, so a working set
+/// that reports anything else means the host's `Batch` is not the store
+/// the kernel actually applied to — the same contract failure the event
+/// replay below checks for coins and edges.
+///
+/// Nothing here is conditional on the operation having a public event.
+/// A registry-only operation announces nothing, and replaying only
+/// events would drop its state entirely.
+fn replay_kernel_registry<E>(
+    mut batches: Batch<E>,
+    working: &BlockWorkingSet,
+    registry: &RegistryDiff,
+) -> (Batch<E>, Option<ExecutionError>)
+where
+    E: StorageContext + Spawner + Send + Sync + 'static,
+{
+    for mutation in registry {
+        let id = mutation.id();
+        if working.registry_chunk(id) != mutation.chunk() {
+            return (
+                batches,
+                Some(ExecutionError::KernelHostContract {
+                    error: ApplyError::RegistryChunkChanged { id },
+                }),
+            );
+        }
+        batches = batches.write(
+            registry_chunk_object_id(id),
+            mutation.chunk().map(Object::RegistryChunk),
+        );
+    }
+    (batches, None)
+}
+
 /// Consensus admission for staked (fraud-game) opens, checked before the
 /// kernel ever sees the transaction. A bond whose `Violation` path can
 /// never verify is just locked funds with a dead dispute game, so staked
@@ -570,16 +713,42 @@ fn check_open(context: KernelContext, tx: &KernelTx) -> Result<(), ExecutionErro
             max: MAX_EDGE_LIFETIME_BLOCKS,
         });
     }
-    if terms.as_stake_bond().is_none() {
-        return Ok(());
+    // The gate is a statement about *how a bond is verified*, not about
+    // the fact that it holds stake, so it is decided per profile.
+    match terms.stake_bond_base() {
+        // A legacy bond's `Violation` is decided by an external
+        // `SealVerifier`. Without that capability it is not a bond,
+        // just locked funds with a dead dispute game, so the gate lifts
+        // exactly with the cfg that supplies the verifier
+        // (`ChainVerifier::verify_seal`).
+        Some(StakeBondBaseRef::Legacy(_)) if !cfg!(feature = "preverified-seals") => {
+            return Err(ExecutionError::StakedOpenUnsupported);
+        }
+        Some(StakeBondBaseRef::Legacy(_)) => {}
+        // A tag-4 bond is natively verified end to end and never
+        // consults that verifier: `FraudArtifact::binds` refuses tag-4
+        // public inputs outright (`staked.rs`), so the preverified
+        // route could not settle one even where it is compiled in. Its
+        // dispute is the kernel's own correctness game, and until that
+        // game lands no `Violation` of either kind can fire for it —
+        // which is why gating the open on a capability it does not use
+        // bought nothing and cost everything: it left the payment
+        // channel that depends on a live bond unopenable in production
+        // while an *unbonded* payment open sailed through.
+        //
+        // What makes admitting it safe is that the stake is never
+        // trapped. Unleased, the bond times out immediately and
+        // permissionlessly to the provider; leased, it times out at the
+        // admission horizon the lifetime cap above already bounds, and
+        // takes the lease with it.
+        Some(StakeBondBaseRef::Work(_)) | None => {}
     }
-    // A bond whose `Violation` path can never verify is not a bond,
-    // just locked funds with a dead dispute game. The gate lifts
-    // exactly with the seal-verification capability, because it reads
-    // the same cfg that supplies it (`ChainVerifier::verify_seal`).
-    if !cfg!(feature = "preverified-seals") {
-        return Err(ExecutionError::StakedOpenUnsupported);
-    }
+    // There is deliberately no work-payment gate beside these. A work
+    // payment is settleable by the kernel itself — `Freeze` and
+    // `Adjudicated` are checked inline, against staged registry state,
+    // with no external seal verifier involved — and since it now
+    // requires a live tag-4 bond to lease, it can no longer be opened
+    // against stake that does not exist.
     Ok(())
 }
 
@@ -595,20 +764,30 @@ where
     if let Err(err) = check_open(context, tx) {
         return Err((batches, err));
     }
-    let working = match load_kernel_slots(&batches, tx).await {
+    let working = match load_kernel_slots(&batches, context, tx).await {
         Ok(working) => working,
         Err(err) => return Err((batches, err)),
     };
     let mut state = State::new(working);
-    let event = match state.apply(context, verifier, tx) {
-        Ok(event) => event,
+    let outcome = match state.apply(context, verifier, tx) {
+        Ok(outcome) => outcome,
         Err(source) => {
             let err = classify_kernel_error(state.store(), source);
             return Err((batches, err));
         }
     };
     let working = state.into_store();
-    let (batches, replay_error) = replay_kernel_event(batches, &working, &event);
+    // Both halves land in one batch, which the block commits or drops
+    // as a unit: an event persisted without its registry writes would
+    // be a partially applied operation.
+    let (batches, replay_error) = match outcome.public_event() {
+        Some(event) => replay_kernel_event(batches, &working, event),
+        None => (batches, None),
+    };
+    if let Some(error) = replay_error {
+        return Err((batches, error));
+    }
+    let (batches, replay_error) = replay_kernel_registry(batches, &working, outcome.registry());
     match replay_error {
         Some(error) => Err((batches, error)),
         None => Ok(batches),
@@ -686,6 +865,9 @@ mod tests {
                 }
                 Some(Object::Edge(edge)) => {
                     edges.insert(*id, edge);
+                }
+                Some(Object::RegistryChunk(chunk)) => {
+                    panic!("kernel open/close scenarios store no registry chunk, found {chunk:?}");
                 }
                 None => {}
             }
@@ -1028,7 +1210,7 @@ mod tests {
             )
             .await
             .expect("genesis seed");
-            let working = load_kernel_slots(&contract_batches, &fixture.open)
+            let working = load_kernel_slots(&contract_batches, context(1), &fixture.open)
                 .await
                 .expect("preload funded slots");
             let input = fixture
@@ -1060,7 +1242,7 @@ mod tests {
 
     /// The lifetime cap covers every open, not just stake bonds.
     ///
-    /// It once sat behind the `as_stake_bond()` early return, so a
+    /// It once sat behind the stake-bond early return, so a
     /// basic edge could commit a `u64::MAX` timeout — permanent under
     /// exactly the justification the cap exists for, since zero
     /// lifetime fees price the span at nothing either way.
@@ -1222,6 +1404,785 @@ mod tests {
                         .expect("kernel still validates admitted staked opens");
                 assert!(matches!(error, ExecutionError::KernelApply { .. }));
             }
+        });
+    }
+
+    /// The seal gate follows how a bond is *verified*, not the fact that
+    /// it holds stake. A legacy bond's violation is decided by an
+    /// external verifier this deployment may not have, and it stays
+    /// gated on exactly that capability. A tag-4 work bond never
+    /// consults that verifier — its dispute is the kernel's own game,
+    /// and the legacy artifact refuses tag-4 inputs outright — so
+    /// gating it bought nothing and left a payment channel that
+    /// *requires* a live bond unopenable in production.
+    ///
+    /// A work payment is likewise ungated: the kernel settles it inline
+    /// and now refuses one whose bond is not live. Both halves are
+    /// asserted here as kernel rejections, so a gate that came back
+    /// would fail as an admission error where a kernel error is
+    /// expected.
+    #[test]
+    fn a_legacy_bond_is_stake_gated_and_the_native_work_profiles_are_not() {
+        use hellas_kernel::{
+            Auth, BlockHeight as KernelHeight, Funding, Key as KernelKey, List,
+            MAX_EDGE_OUTPUTS as OUTPUTS, MAX_PARTY_INPUTS as INPUTS, Parties,
+            Payout as KernelPayout, ProtocolCode, Sig, StakeBondTerms, Terms as KernelTerms,
+            WorkPaymentTerms, WorkStakeBondTerms,
+        };
+
+        let provider = KernelKey::from_bytes([2; KernelKey::LENGTH]);
+        let client = KernelKey::from_bytes([3; KernelKey::LENGTH]);
+        let mut stake_outputs = [KernelPayout::default(); OUTPUTS];
+        stake_outputs[0] = KernelPayout::new(provider, 1);
+        let bond = WorkStakeBondTerms {
+            base: StakeBondTerms {
+                protocol: ProtocolCode::CATENA_FRAUD_V2,
+                parties: Parties::new(provider, client),
+                timeout: KernelHeight::new(50),
+                timeout_outputs: List::take(stake_outputs, 1),
+                treasury: KernelKey::from_bytes([4; KernelKey::LENGTH]),
+                award: 1,
+                stake: 1,
+                max_job_price: 1,
+                max_dispute_cost: 0,
+                challenge_margin: 1,
+            },
+            max_challenge_bond: 1,
+            move_timeout: 1,
+            game_protocol: ProtocolCode::CATENA_FRAUD_V2.get(),
+        };
+        let payment = KernelTerms::work_payment(WorkPaymentTerms {
+            protocol: ProtocolCode::CATENA_FRAUD_V2,
+            parties: Parties::new(client, provider),
+            admission_horizon: bond.base.timeout,
+            bond_edge: EdgeId::from_bytes([6; EdgeId::LENGTH]),
+            bond_terms: bond.clone(),
+            private_policy_commitment: [7; 32],
+            omit_response_blocks: hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
+            start_validity_blocks: 8,
+            omission_bond: 1,
+        });
+        let work_open = |terms: KernelTerms| {
+            let zero = CoinId::from_bytes([0; CoinId::LENGTH]);
+            let empty = List::take([zero; INPUTS], 0);
+            let garbage = Auth::native(Sig::from_bytes([0; 64]));
+            Transaction::Kernel(KernelTx::open(
+                Funding::new(empty.clone(), empty),
+                terms,
+                garbage.clone(),
+                garbage,
+            ))
+        };
+        // The same stake policy, spelled as a legacy tag-1 bond: the
+        // one difference between the two legs below is the profile.
+        let legacy_bond = work_open(KernelTerms::stake_bond(bond.base.clone()));
+        let work_bond = work_open(KernelTerms::work_stake_bond(bond));
+        let payment_terms = payment.clone();
+        let work_payment = work_open(payment);
+
+        run_qmdb(|runtime| async move {
+            let database = database(runtime, "work_profile_gate").await;
+            let batches = database.new_batches().await;
+
+            // A legacy bond's dispute needs the external verifier, so
+            // admission refuses it wherever that verifier is not wired.
+            let (batches, error) =
+                apply_transaction(batches, context(1), &ChainVerifier::new(), &legacy_bond)
+                    .await
+                    .err()
+                    .expect("legacy bond open refused");
+            #[cfg(not(feature = "preverified-seals"))]
+            assert_eq!(error, ExecutionError::StakedOpenUnsupported);
+            #[cfg(feature = "preverified-seals")]
+            assert!(matches!(error, ExecutionError::KernelApply { .. }));
+            assert!(!error.is_transient_for_mempool());
+
+            // A tag-4 bond reaches the kernel in both builds. Here the
+            // kernel refuses it because a zero-funded open cannot lock
+            // the stake it commits — which is proof the gate is no
+            // longer what stops it.
+            let (batches, error) =
+                apply_transaction(batches, context(1), &ChainVerifier::new(), &work_bond)
+                    .await
+                    .err()
+                    .expect("work bond open refused");
+            assert!(
+                matches!(error, ExecutionError::KernelApply { .. }),
+                "a native work bond is admitted to the kernel: {error:?}",
+            );
+            assert!(!error.is_transient_for_mempool());
+
+            // The payment edge locks no stake and consensus settles it
+            // inline, so admission has nothing left to say about it. It
+            // is refused here by the kernel, for an unfunded channel:
+            // this open locks no value at all, so its omission bond is
+            // larger than everything a close could distribute. That
+            // check runs before the bond is loaded, which is why this
+            // names a capacity failure and not a missing bond.
+            let (_batches, error) =
+                apply_transaction(batches, context(1), &ChainVerifier::new(), &work_payment)
+                    .await
+                    .err()
+                    .expect("unfunded work payment open refused");
+            assert_eq!(
+                error,
+                ExecutionError::KernelApply {
+                    error: ApplyError::InvalidOpen {
+                        output: hellas_kernel::Tx::edge_id_of(
+                            &Funding::new(
+                                List::take([CoinId::from_bytes([0; CoinId::LENGTH]); INPUTS], 0),
+                                List::take([CoinId::from_bytes([0; CoinId::LENGTH]); INPUTS], 0),
+                            ),
+                            &payment_terms,
+                        ),
+                        reason: hellas_kernel::InvalidOpenReason::WorkPaymentCapacityUnfunded,
+                    },
+                },
+            );
+            assert!(!error.is_transient_for_mempool());
+        });
+    }
+
+    /// A funded payment open naming a bond that is not there is refused,
+    /// and refused as a *missing object* rather than as bad terms: the
+    /// bond may simply not have landed yet, and the mempool's job is to
+    /// hold that transaction rather than drop it.
+    ///
+    /// This is the reviewer's attack at the chain boundary. `C` signs a
+    /// bond open and a payment open for the same block; `P` withholds
+    /// the bond and submits the payment alone. Before the lease existed,
+    /// consensus consumed the client's funding and created a payment
+    /// edge whose named bond did not exist.
+    #[test]
+    fn a_payment_open_naming_an_absent_bond_is_retained_not_settled() {
+        use hellas_kernel::{
+            Auth, BlockHeight as KernelHeight, Funding, Key as KernelKey, List, MAX_EDGE_OUTPUTS,
+            MAX_PARTY_INPUTS as INPUTS, Parties, Payout as KernelPayout, ProtocolCode,
+            Secp256k1Signer, StakeBondTerms, Terms as KernelTerms, WorkPaymentTerms,
+            WorkStakeBondTerms,
+        };
+
+        const FUNDING: u64 = 100;
+
+        let Ok(client) = Secp256k1Signer::from_secret_scalar([0x41; 32]) else {
+            panic!("client key");
+        };
+        let Ok(provider) = Secp256k1Signer::from_secret_scalar([0x42; 32]) else {
+            panic!("provider key");
+        };
+        let client_key = client.party_key();
+        let provider_key = provider.party_key();
+        let network = crate::domain::TEST_NETWORK;
+
+        let bond = WorkStakeBondTerms {
+            base: StakeBondTerms {
+                protocol: ProtocolCode::CATENA_FRAUD_V2,
+                parties: Parties::new(provider_key, client_key),
+                timeout: KernelHeight::new(500),
+                timeout_outputs: List::take(
+                    [KernelPayout::new(provider_key, 12); MAX_EDGE_OUTPUTS],
+                    1,
+                ),
+                treasury: KernelKey::from_bytes([0x43; KernelKey::LENGTH]),
+                award: 12,
+                stake: 12,
+                max_job_price: 4,
+                max_dispute_cost: 3,
+                challenge_margin: 5,
+            },
+            max_challenge_bond: 3,
+            move_timeout: 20,
+            game_protocol: ProtocolCode::CATENA_FRAUD_V2.get(),
+        };
+        // The bond edge id of a bond nobody posted.
+        let bond_funding = Funding::new(
+            List::take([CoinId::from_bytes(genesis_object_id(1).into()); INPUTS], 1),
+            List::take([CoinId::from_bytes([0; CoinId::LENGTH]); INPUTS], 0),
+        );
+        let bond_edge =
+            KernelTx::edge_id_of(&bond_funding, &KernelTerms::work_stake_bond(bond.clone()));
+
+        let terms = KernelTerms::work_payment(WorkPaymentTerms {
+            protocol: ProtocolCode::CATENA_FRAUD_V2,
+            parties: Parties::new(client_key, provider_key),
+            admission_horizon: bond.base.timeout,
+            bond_edge,
+            bond_terms: bond,
+            private_policy_commitment: [0x45; 32],
+            omit_response_blocks: hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
+            start_validity_blocks: 8,
+            omission_bond: 2,
+        });
+        let funding = Funding::new(
+            List::take([CoinId::from_bytes(genesis_object_id(0).into()); INPUTS], 1),
+            List::take([CoinId::from_bytes([0; CoinId::LENGTH]); INPUTS], 0),
+        );
+        let edge = KernelTx::edge_id_of(&funding, &terms);
+        let open_hash = KernelTx::open_hash(network, &funding, &terms);
+        let open = Transaction::Kernel(KernelTx::open(
+            funding,
+            terms,
+            Auth::native(client.sign(open_hash)),
+            Auth::native(provider.sign(open_hash)),
+        ));
+
+        run_qmdb(|runtime| async move {
+            let database = database(runtime, "payment_without_bond").await;
+            let batches = database.new_batches().await;
+            let allocations = vec![(SettlementKey::from(client_key), FUNDING)];
+
+            // Applied alone, it is refused as the missing bond edge —
+            // and that error is transient, so the mempool holds the
+            // transaction until the bond lands rather than dropping a
+            // signature the client can never reissue.
+            let batches = execute_all(
+                context(1),
+                &ChainVerifier::new(),
+                &[],
+                &allocations,
+                batches,
+            )
+            .await
+            .expect("genesis seed");
+            let (batches, error) =
+                apply_transaction(batches, context(1), &ChainVerifier::new(), &open)
+                    .await
+                    .err()
+                    .expect("a payment open without its bond is refused");
+            assert_eq!(
+                error,
+                ExecutionError::ObjectNotFound {
+                    id: edge_object_id(bond_edge),
+                },
+            );
+            assert!(error.is_transient_for_mempool());
+            assert!(!error.is_fatal_storage());
+
+            // In a proposal it is retained, not included: no unbonded
+            // channel is settled and no client funding is consumed.
+            let (batches, included, retained) = execute_proposal(
+                context(1),
+                &ChainVerifier::new(),
+                vec![open],
+                &allocations,
+                MAX_TXS_PER_BLOCK,
+                usize::MAX,
+                batches,
+            )
+            .await
+            .expect("a payment open without its bond is not fatal");
+            assert!(included.is_empty());
+            assert_eq!(retained.len(), 1);
+
+            // And the block that block would commit holds no such edge.
+            let merkleized = batches.merkleize().await.expect("block merkleizes");
+            database.finalize(merkleized).await;
+            let read = database.read().await;
+            assert_eq!(
+                read.get(&edge_object_id(edge)).await.expect("edge read"),
+                None,
+            );
+            assert!(
+                matches!(
+                    read.get(&genesis_object_id(0)).await,
+                    Ok(Some(Object::Coin(_))),
+                ),
+                "the client's funding is untouched",
+            );
+        });
+    }
+
+    /// A complete work-payment channel, end to end through consensus
+    /// execution: open, a client start that understates, the provider's
+    /// one response, and the adjudicated close that pays the contested
+    /// amount plus the forfeited omission bond.
+    ///
+    /// This is the whole slice at the chain boundary — the lifted
+    /// admission gate, the declared registry slot, the atomic registry
+    /// replay, and the payout — rather than a kernel unit test with a
+    /// database attached. The start and its response share a block, so
+    /// the same-block visibility §4.6 requires is exercised here at the
+    /// storage layer and not only in the kernel.
+    ///
+    /// Four transitions that must *not* be admitted ride alongside it,
+    /// on staged batches that are never finalized: a close inside the
+    /// response window, a close under the superseded seal, a client
+    /// answering its own start, and an answer at its deadline. A happy
+    /// path drives only legal transitions, so without these a kernel
+    /// rule that had stopped firing would leave this test green.
+    #[test]
+    fn a_work_payment_channel_settles_end_to_end_through_consensus() {
+        use hellas_kernel::{
+            Auth, BlockHeight as KernelHeight, Decode as _, EarnedCertificate, Funding,
+            InvalidMoveReason, Key as KernelKey, List, MAX_EDGE_OUTPUTS,
+            MAX_PARTY_INPUTS as INPUTS, Move, Parties, Party, PaymentCloseResponse,
+            PaymentCloseStart, Payout as KernelPayout, PendingPaymentClose, Proof, ProtocolCode,
+            Secp256k1Signer, StakeBondTerms, Terms as KernelTerms, WorkPaymentTerms,
+            WorkStakeBondTerms, bond_lease_slots, pending_payment_close_slot,
+        };
+
+        const FUNDING: u64 = 100;
+        /// The provider's whole allocation, and so the bond's stake:
+        /// the open checks the two are equal.
+        const STAKE: u64 = 12;
+        const OMISSION_BOND: u64 = 2;
+        const WINDOW: u64 = hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS;
+        /// The bond's timeout, and so the channel's admission horizon.
+        const HORIZON: u64 = 500;
+        // The client opens at 30; the provider answers with the client's
+        // own signature for 60.
+        const UNDERSTATED: u64 = 30;
+        const EARNED: u64 = 60;
+
+        let Ok(client) = Secp256k1Signer::from_secret_scalar([0x21; 32]) else {
+            panic!("client key");
+        };
+        let Ok(provider) = Secp256k1Signer::from_secret_scalar([0x22; 32]) else {
+            panic!("provider key");
+        };
+        let client_key = client.party_key();
+        let provider_key = provider.party_key();
+        let network = crate::domain::TEST_NETWORK;
+
+        let bond = WorkStakeBondTerms {
+            base: StakeBondTerms {
+                protocol: ProtocolCode::CATENA_FRAUD_V2,
+                parties: Parties::new(provider_key, client_key),
+                timeout: KernelHeight::new(HORIZON),
+                timeout_outputs: List::take(
+                    [KernelPayout::new(provider_key, STAKE); MAX_EDGE_OUTPUTS],
+                    1,
+                ),
+                treasury: KernelKey::from_bytes([0x23; KernelKey::LENGTH]),
+                award: STAKE,
+                stake: STAKE,
+                max_job_price: 4,
+                max_dispute_cost: 3,
+                challenge_margin: 5,
+            },
+            max_challenge_bond: 3,
+            move_timeout: 20,
+            game_protocol: ProtocolCode::CATENA_FRAUD_V2.get(),
+        };
+        // The bond the channel leases: the provider's whole allocation,
+        // staked under mirrored roles.
+        let bond_for_timeout = bond.clone();
+        let bond_terms = KernelTerms::work_stake_bond(bond.clone());
+        let bond_funding = Funding::new(
+            List::take([CoinId::from_bytes(genesis_object_id(1).into()); INPUTS], 1),
+            List::take([CoinId::from_bytes([0; CoinId::LENGTH]); INPUTS], 0),
+        );
+        let bond_edge = KernelTx::edge_id_of(&bond_funding, &bond_terms);
+        let bond_open_hash = KernelTx::open_hash(network, &bond_funding, &bond_terms);
+        let bond_open = KernelTx::open(
+            bond_funding,
+            bond_terms,
+            Auth::native(provider.sign(bond_open_hash)),
+            Auth::native(client.sign(bond_open_hash)),
+        );
+
+        let terms = KernelTerms::work_payment(WorkPaymentTerms {
+            protocol: ProtocolCode::CATENA_FRAUD_V2,
+            parties: Parties::new(client_key, provider_key),
+            admission_horizon: bond.base.timeout,
+            bond_edge,
+            bond_terms: bond,
+            private_policy_commitment: [0x25; 32],
+            omit_response_blocks: WINDOW,
+            start_validity_blocks: 8,
+            omission_bond: OMISSION_BOND,
+        });
+
+        let funding = Funding::new(
+            List::take([CoinId::from_bytes(genesis_object_id(0).into()); INPUTS], 1),
+            List::take([CoinId::from_bytes([0; CoinId::LENGTH]); INPUTS], 0),
+        );
+        let edge = KernelTx::edge_id_of(&funding, &terms);
+        let open_hash = KernelTx::open_hash(network, &funding, &terms);
+        let open = KernelTx::open(
+            funding,
+            terms.clone(),
+            Auth::native(client.sign(open_hash)),
+            Auth::native(provider.sign(open_hash)),
+        );
+
+        // The client understates, having closed its own issuance gate
+        // first: this signature is the write-ahead commitment.
+        let understated = EarnedCertificate::new(edge, terms.hash(), UNDERSTATED);
+        let start_earned = understated.digest(network);
+        let start_body_digest = hellas_kernel::start_digest(
+            network,
+            edge,
+            terms.hash(),
+            Party::Maker,
+            (2, 2),
+            start_earned,
+        );
+        let start = KernelTx::move_action(Move::StartPaymentClose(PaymentCloseStart::new(
+            edge,
+            terms.clone(),
+            Party::Maker,
+            (2, 2),
+            Some((understated, client.sign(start_earned))),
+            client.sign(start_body_digest),
+        )));
+        let start_id = hellas_kernel::start_id(start_body_digest, 2);
+
+        // The provider answers with the greater certificate it holds —
+        // the client's own signature, contradicting the client's start.
+        let earned = EarnedCertificate::new(edge, terms.hash(), EARNED);
+        let earned_digest = earned.digest(network);
+        let response_body_digest = hellas_kernel::response_digest(
+            network,
+            edge,
+            terms.hash(),
+            start_id,
+            Party::Taker,
+            earned_digest,
+        );
+        let response = KernelTx::move_action(Move::RespondPaymentClose(PaymentCloseResponse::new(
+            edge,
+            start_id,
+            Party::Taker,
+            (earned, client.sign(earned_digest)),
+            provider.sign(response_body_digest),
+        )));
+        // The same answer, kept to resubmit once its window has shut.
+        let late_response = response.clone();
+        // And the answer the client is not allowed to give: the same
+        // certificate and the same contest, signed by the maker in the
+        // maker's role. Every signature on it verifies.
+        let client_response_digest = hellas_kernel::response_digest(
+            network,
+            edge,
+            terms.hash(),
+            start_id,
+            Party::Maker,
+            earned_digest,
+        );
+        let client_response =
+            KernelTx::move_action(Move::RespondPaymentClose(PaymentCloseResponse::new(
+                edge,
+                start_id,
+                Party::Maker,
+                (earned, client.sign(earned_digest)),
+                client.sign(client_response_digest),
+            )));
+
+        // The bond's own exit, at the horizon it committed to. It is
+        // leased for the whole of this test, so this is the close that
+        // has to read the lease and delete it.
+        let stake_return = List::take(
+            [KernelPayout::new(provider_key, STAKE); MAX_EDGE_OUTPUTS],
+            1,
+        );
+        let stake_out = KernelTx::close_output_ids(bond_edge, &stake_return)
+            .iter()
+            .next()
+            .copied()
+            .expect("one stake payout");
+        let bond_timeout = KernelTx::close(
+            bond_edge,
+            Proof::timeout(KernelTerms::work_stake_bond(bond_for_timeout)),
+            stake_return,
+        );
+
+        let provider_total = EARNED + OMISSION_BOND;
+        let mut split = [KernelPayout::default(); MAX_EDGE_OUTPUTS];
+        split[0] = KernelPayout::new(provider_key, provider_total);
+        split[1] = KernelPayout::new(client_key, FUNDING - provider_total);
+        let split = List::take(split, 2);
+        let payout_ids = KernelTx::close_output_ids(edge, &split);
+
+        run_qmdb(|runtime| async move {
+            let database = database(runtime, "work_payment_end_to_end").await;
+            let allocations = vec![
+                (SettlementKey::from(client_key), FUNDING),
+                (SettlementKey::from(provider_key), STAKE),
+            ];
+            let slot = registry_chunk_object_id(pending_payment_close_slot(network, edge));
+            let lease = bond_lease_slots(network, bond_edge).map(registry_chunk_object_id);
+
+            // Both in one block, in the order the design describes: `P`
+            // posts the bond it holds a client-signed payment open
+            // against, then submits that open. The payment reads an edge
+            // created a transaction earlier in the same block, so this
+            // passes only if the execution layer's staged batch reads
+            // its own writes.
+            apply_and_finalize(
+                &database,
+                context(1),
+                &[Transaction::Kernel(bond_open), Transaction::Kernel(open)],
+                &allocations,
+            )
+            .await;
+            assert!(
+                matches!(
+                    database.read().await.get(&edge_object_id(edge)).await,
+                    Ok(Some(Object::Edge(_))),
+                ),
+                "the lifted gate admits a work-payment open",
+            );
+            // The channel is bonded, durably: the open's edge and the
+            // two lease chunks are one committed block.
+            assert!(
+                matches!(
+                    database.read().await.get(&edge_object_id(bond_edge)).await,
+                    Ok(Some(Object::Edge(_))),
+                ),
+                "the native work bond is admitted without the seal gate",
+            );
+            for (index, slot) in lease.into_iter().enumerate() {
+                let Ok(Some(Object::RegistryChunk(chunk))) = database.read().await.get(&slot).await
+                else {
+                    panic!("lease chunk {index} persisted");
+                };
+                assert_eq!(chunk.value_len(), 203, "the lease is its fixed width");
+            }
+
+            // Before the block that settles anything: the same start on
+            // a staged batch that is never finalized, which is the only
+            // state in which the contest's two window rules are
+            // separable. The kernel owns these rules and unit-tests
+            // them; what is asserted here is that they still bite a
+            // transaction arriving through consensus execution. The
+            // happy path below would not notice their loss — it drives
+            // only legal transitions.
+            let verifier = ChainVerifier::new();
+            let Ok(probe) = apply_transaction(
+                database.new_batches().await,
+                context(2),
+                &verifier,
+                &Transaction::Kernel(start.clone()),
+            )
+            .await
+            else {
+                panic!("the start applies to a staged batch");
+            };
+            let Ok(Some(Object::RegistryChunk(chunk))) = probe.get(&slot).await else {
+                panic!("the staged start wrote its contest record");
+            };
+            let Ok(opened) = PendingPaymentClose::decode_exact(chunk.data()) else {
+                panic!("the staged record decodes");
+            };
+            assert!(!opened.responded(), "no answer has landed yet");
+            // The contest as it stands before any answer, and the seal
+            // that names exactly that state.
+            let stale_seal = opened.seal(network, edge, terms.hash());
+            let mut understated_split = [KernelPayout::default(); MAX_EDGE_OUTPUTS];
+            understated_split[0] = KernelPayout::new(provider_key, UNDERSTATED);
+            understated_split[1] = KernelPayout::new(client_key, FUNDING - UNDERSTATED);
+            let early_close = Transaction::Kernel(KernelTx::close(
+                edge,
+                Proof::adjudicated(stale_seal),
+                List::take(understated_split, 2),
+            ));
+            // The close a submitter racing the response would carry: the
+            // settled split, under the seal of the contest it was built
+            // against.
+            let stale_close = Transaction::Kernel(KernelTx::close(
+                edge,
+                Proof::adjudicated(stale_seal),
+                split.clone(),
+            ));
+
+            // Everything about the early close is right for the state it
+            // names — seal, split, both owners — and it is still refused,
+            // because the provider's window has not run out. That guard
+            // is the exact complement of the response's, so admitting
+            // this would admit a close and an answer at one height.
+            let (probe, error) = apply_transaction(probe, context(2), &verifier, &early_close)
+                .await
+                .err()
+                .expect("an adjudicated close inside the response window is refused");
+            assert_eq!(
+                error,
+                ExecutionError::KernelApply {
+                    error: ApplyError::InvalidProof {
+                        input: edge,
+                        reason: InvalidProofReason::ResponseWindowOpen,
+                    },
+                },
+            );
+
+            // Only the certificate's beneficiary may answer. A client
+            // "response" is the client raising its own claim, which its
+            // start already let it do.
+            let (probe, error) = apply_transaction(
+                probe,
+                context(2),
+                &verifier,
+                &Transaction::Kernel(client_response),
+            )
+            .await
+            .err()
+            .expect("a client response is refused");
+            assert_eq!(
+                error,
+                ExecutionError::KernelApply {
+                    error: ApplyError::InvalidMove {
+                        input: edge,
+                        reason: InvalidMoveReason::ResponderNotBeneficiary,
+                    },
+                },
+            );
+
+            // And the genuine answer, at the deadline its start opened.
+            // The deadline is exclusive, so this is the first height at
+            // which the answer is late — and, by the complement above,
+            // the first height at which the close is not early.
+            let (probe, error) = apply_transaction(
+                probe,
+                context(2 + WINDOW),
+                &verifier,
+                &Transaction::Kernel(late_response),
+            )
+            .await
+            .err()
+            .expect("a response at its deadline is refused");
+            assert_eq!(
+                error,
+                ExecutionError::KernelApply {
+                    error: ApplyError::InvalidMove {
+                        input: edge,
+                        reason: InvalidMoveReason::ResponseWindowClosed,
+                    },
+                },
+            );
+            // Nothing above is committed: the block below is what makes
+            // the start real.
+            drop(probe);
+
+            // The start and the answer that depends on it ride in one
+            // block, which is the case §4.6 fixes: "the charged lookup
+            // observes earlier same-block mutations". The response reads
+            // the contest slot the start wrote a transaction earlier, so
+            // this passes only if the execution layer's staged batch
+            // reads its own writes — separate blocks would prove only
+            // that committed state is visible, which is a weaker claim
+            // and the one every other test here makes.
+            apply_and_finalize(
+                &database,
+                context(2),
+                &[Transaction::Kernel(start), Transaction::Kernel(response)],
+                &allocations,
+            )
+            .await;
+            let Ok(Some(Object::RegistryChunk(chunk))) = database.read().await.get(&slot).await
+            else {
+                panic!("the block persisted its contest record");
+            };
+            let Ok(record) = PendingPaymentClose::decode_exact(chunk.data()) else {
+                panic!("the stored record decodes");
+            };
+            assert_eq!(record.start_id(), start_id);
+            assert_eq!(record.start_cumulative(), UNDERSTATED);
+            assert_eq!(record.final_cumulative(), EARNED);
+            assert!(
+                record.responded(),
+                "the response found the start from the same block",
+            );
+            assert!(
+                record.penalty_due(),
+                "the client contradicted its own start"
+            );
+
+            // The seal is what binds a close to one contest state. This
+            // one pays the settled split — every payout below is
+            // identical — but names the contest as it stood before the
+            // answer landed, and the close it would have settled is
+            // gone. Refusing it is the whole reason an adjudicated close
+            // carries a seal the chain could have recomputed itself.
+            let (probe, error) = apply_transaction(
+                database.new_batches().await,
+                context(3),
+                &verifier,
+                &stale_close,
+            )
+            .await
+            .err()
+            .expect("a close naming the pre-response contest is refused");
+            assert_eq!(
+                error,
+                ExecutionError::KernelApply {
+                    error: ApplyError::InvalidProof {
+                        input: edge,
+                        reason: InvalidProofReason::SealMismatch,
+                    },
+                },
+            );
+            drop(probe);
+
+            let close = KernelTx::close(
+                edge,
+                Proof::adjudicated(record.seal(network, edge, terms.hash())),
+                split,
+            );
+            apply_and_finalize(
+                &database,
+                context(3),
+                &[Transaction::Kernel(close)],
+                &allocations,
+            )
+            .await;
+
+            let read = database.read().await;
+            assert_eq!(
+                read.get(&edge_object_id(edge)).await.expect("edge read"),
+                None,
+            );
+            assert_eq!(
+                read.get(&slot).await.expect("contest slot read"),
+                None,
+                "the close retired the contest in the same batch as the payout",
+            );
+            for (id, expected) in payout_ids.iter().zip([
+                (SettlementKey::from(provider_key), provider_total),
+                (SettlementKey::from(client_key), FUNDING - provider_total),
+            ]) {
+                let Ok(Some(Object::Coin(coin))) = read.get(&coin_object_id(*id)).await else {
+                    panic!("payout coin exists");
+                };
+                assert_eq!((coin.owner, coin.value), expected);
+            }
+            drop(read);
+
+            // Closing the payment does not release the bond: the client
+            // keeps its unexpired challenge rights, so the lease outlives
+            // the channel's edge and the stake waits for the horizon both
+            // parties committed to.
+            let Ok(Some(Object::RegistryChunk(_))) = database.read().await.get(&lease[0]).await
+            else {
+                panic!("the lease survives the payment close");
+            };
+            apply_and_finalize(
+                &database,
+                context(HORIZON),
+                &[Transaction::Kernel(bond_timeout)],
+                &allocations,
+            )
+            .await;
+            let read = database.read().await;
+            assert_eq!(
+                read.get(&edge_object_id(bond_edge))
+                    .await
+                    .expect("bond read"),
+                None,
+            );
+            for (index, slot) in lease.into_iter().enumerate() {
+                assert_eq!(
+                    read.get(&slot).await.expect("lease read"),
+                    None,
+                    "the horizon close retired lease chunk {index}",
+                );
+            }
+            let Ok(Some(Object::Coin(coin))) = read.get(&coin_object_id(stake_out)).await else {
+                panic!("the stake returns to the provider");
+            };
+            assert_eq!(
+                (coin.owner, coin.value),
+                (SettlementKey::from(provider_key), STAKE)
+            );
         });
     }
 
@@ -1407,6 +2368,245 @@ mod tests {
                 );
             }
         });
+    }
+
+    #[test]
+    fn registry_chunk_slots_load_from_the_authenticated_database() {
+        run_qmdb(|runtime| async move {
+            let database = database(runtime, "registry_slots").await;
+            let chunk = crate::domain::test_registry_chunk();
+            let stored = hellas_kernel::RegistryChunkId::derive(
+                crate::domain::TEST_NETWORK,
+                hellas_kernel::RegistryNamespace::GameOrWinner,
+                [0x33; 32],
+                0,
+            );
+            let absent = hellas_kernel::RegistryChunkId::derive(
+                crate::domain::TEST_NETWORK,
+                hellas_kernel::RegistryNamespace::GameOrWinner,
+                [0x33; 32],
+                1,
+            );
+            // A chunk id whose slot is occupied by another object kind.
+            let occupied = hellas_kernel::RegistryChunkId::derive(
+                crate::domain::TEST_NETWORK,
+                hellas_kernel::RegistryNamespace::BondLease,
+                [0x44; 32],
+                0,
+            );
+
+            let batches = database.new_batches().await;
+            let batches = batches.write(
+                registry_chunk_object_id(stored),
+                Some(Object::RegistryChunk(chunk)),
+            );
+            let batches = batches.write(
+                registry_chunk_object_id(occupied),
+                Some(Object::Coin(Coin {
+                    owner: SettlementKey::from_bytes([0x42; SettlementKey::LENGTH]),
+                    value: 5,
+                })),
+            );
+
+            // The chunk survives the object codec's fixed-size padding
+            // and comes back byte-identical.
+            let mut working = BlockWorkingSet::new();
+            load_registry_chunk_slot(&batches, &mut working, stored)
+                .await
+                .expect("stored chunk loads");
+            assert_eq!(working.registry_chunk(stored), Some(chunk));
+
+            // An empty slot is declared, not skipped: the kernel may
+            // still write it, and a write to an undeclared slot fails.
+            load_registry_chunk_slot(&batches, &mut working, absent)
+                .await
+                .expect("absent chunk loads as an empty slot");
+            assert_eq!(working.registry_chunk(absent), None);
+
+            assert_eq!(
+                load_registry_chunk_slot(&batches, &mut working, occupied).await,
+                Err(ExecutionError::WrongObjectKind {
+                    id: registry_chunk_object_id(occupied),
+                    expected: ObjectKind::RegistryChunk,
+                    actual: ObjectKind::Coin,
+                }),
+            );
+
+            let undeclared = hellas_kernel::RegistryChunkId::derive(
+                crate::domain::TEST_NETWORK,
+                hellas_kernel::RegistryNamespace::PaymentClose,
+                [0x55; 32],
+                0,
+            );
+            let mut batch = hellas_kernel::Store::begin(&mut working);
+            assert_eq!(
+                hellas_kernel::Batch::insert_registry_chunk(&mut batch, undeclared, chunk),
+                Err(InsertError::Unavailable),
+            );
+            assert_eq!(
+                hellas_kernel::Batch::insert_registry_chunk(&mut batch, absent, chunk),
+                Ok(())
+            );
+            hellas_kernel::Batch::commit(batch);
+            assert_eq!(working.registry_chunk(absent), Some(chunk));
+        });
+    }
+
+    /// The registry half of an outcome has to reach durable storage in
+    /// the same batch as its edge half. No landed transition writes a
+    /// chunk yet, so the replay is driven with a diff built by hand —
+    /// the exact shape `State::apply` hands back once a v2 transition
+    /// produces one.
+    #[test]
+    fn registry_writes_and_deletes_replay_into_the_block_batch() {
+        run_qmdb(|runtime| async move {
+            let database = database(runtime, "registry_replay").await;
+            let chunk = crate::domain::test_registry_chunk();
+            let created = hellas_kernel::RegistryChunkId::derive(
+                crate::domain::TEST_NETWORK,
+                hellas_kernel::RegistryNamespace::GameOrWinner,
+                [0x61; 32],
+                0,
+            );
+            let removed = hellas_kernel::RegistryChunkId::derive(
+                crate::domain::TEST_NETWORK,
+                hellas_kernel::RegistryNamespace::GameOrWinner,
+                [0x61; 32],
+                1,
+            );
+
+            // `removed` is durable before the block; `created` is not.
+            let batches = database.new_batches().await;
+            let batches = batches.write(
+                registry_chunk_object_id(removed),
+                Some(Object::RegistryChunk(chunk)),
+            );
+
+            // The post-apply working set: the kernel filled one slot
+            // and emptied the other.
+            let mut working = BlockWorkingSet::new();
+            working.insert_registry_chunk_slot(created, Some(chunk));
+            working.insert_registry_chunk_slot(removed, None);
+
+            let mut diff = hellas_kernel::RegistryDiff::empty();
+            diff.push(hellas_kernel::RegistryMutation::write(created, chunk))
+                .expect("first slot");
+            diff.push(hellas_kernel::RegistryMutation::delete(removed))
+                .expect("second slot");
+
+            let (batches, error) = replay_kernel_registry(batches, &working, &diff);
+            assert_eq!(error, None);
+            let merkleized = batches.merkleize().await.expect("block merkleizes");
+            database.finalize(merkleized).await;
+
+            let reader = database.read().await;
+            assert_eq!(
+                reader
+                    .get(&registry_chunk_object_id(created))
+                    .await
+                    .expect("QMDB read"),
+                Some(Object::RegistryChunk(chunk)),
+                "a written slot is durable",
+            );
+            assert_eq!(
+                reader
+                    .get(&registry_chunk_object_id(removed))
+                    .await
+                    .expect("QMDB read"),
+                None,
+                "a deleted slot is gone",
+            );
+        });
+    }
+
+    /// The working set is the store the kernel just wrote through, so a
+    /// slot that does not hold what the diff says it holds means the
+    /// host's `Batch` is not that store. Replaying it anyway would
+    /// commit a state no kernel produced.
+    #[test]
+    fn registry_replay_refuses_a_working_set_that_disagrees_with_the_diff() {
+        run_qmdb(|runtime| async move {
+            let database = database(runtime, "registry_replay_disagrees").await;
+            let chunk = crate::domain::test_registry_chunk();
+            let id = hellas_kernel::RegistryChunkId::derive(
+                crate::domain::TEST_NETWORK,
+                hellas_kernel::RegistryNamespace::BondLease,
+                [0x62; 32],
+                0,
+            );
+            let expected = Some(ExecutionError::KernelHostContract {
+                error: ApplyError::RegistryChunkChanged { id },
+            });
+
+            // A write the working set does not reflect.
+            let mut absent = BlockWorkingSet::new();
+            absent.insert_registry_chunk_slot(id, None);
+            let mut write = hellas_kernel::RegistryDiff::empty();
+            write
+                .push(hellas_kernel::RegistryMutation::write(id, chunk))
+                .expect("one slot");
+            let (batches, error) =
+                replay_kernel_registry(database.new_batches().await, &absent, &write);
+            assert_eq!(error, expected);
+
+            // A delete the working set did not perform.
+            let mut present = BlockWorkingSet::new();
+            present.insert_registry_chunk_slot(id, Some(chunk));
+            let mut delete = hellas_kernel::RegistryDiff::empty();
+            delete
+                .push(hellas_kernel::RegistryMutation::delete(id))
+                .expect("one slot");
+            let (batches, error) = replay_kernel_registry(batches, &present, &delete);
+            assert_eq!(error, expected);
+
+            // Neither refusal wrote the slot.
+            let merkleized = batches.merkleize().await.expect("block merkleizes");
+            database.finalize(merkleized).await;
+            let reader = database.read().await;
+            assert_eq!(
+                reader
+                    .get(&registry_chunk_object_id(id))
+                    .await
+                    .expect("QMDB read"),
+                None,
+            );
+        });
+    }
+
+    #[test]
+    fn registry_host_contract_failures_classify_like_coin_and_edge_ones() {
+        let working = BlockWorkingSet::new();
+        let id = hellas_kernel::RegistryChunkId::derive(
+            crate::domain::TEST_NETWORK,
+            hellas_kernel::RegistryNamespace::BondLease,
+            [0x11; 32],
+            0,
+        );
+
+        // Undeclared slot: the value the transaction named is not live,
+        // which is user error and transient for the mempool.
+        let missing = classify_kernel_error(&working, ApplyError::MissingRegistryChunk { id });
+        assert_eq!(
+            missing,
+            ExecutionError::ObjectNotFound {
+                id: registry_chunk_object_id(id),
+            }
+        );
+        assert!(missing.is_transient_for_mempool());
+
+        // A chunk that moved under the kernel, or an insert the store
+        // refused, is the host breaking the Batch contract.
+        for error in [
+            ApplyError::RegistryChunkChanged { id },
+            ApplyError::RegistryChunkInsertRejected {
+                id,
+                reason: InsertError::Exists,
+            },
+        ] {
+            let classified = classify_kernel_error(&working, error);
+            assert_eq!(classified, ExecutionError::KernelHostContract { error });
+            assert!(classified.is_fatal_storage());
+        }
     }
 
     #[test]

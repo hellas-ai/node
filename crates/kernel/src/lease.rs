@@ -1,0 +1,404 @@
+#![allow(clippy::redundant_pub_crate)]
+
+//! The exclusive bond lease: the record a payment channel takes out
+//! against the stake that insures it.
+//!
+//! # Why a bond needs a lease at all
+//!
+//! A work-stake bond is one provider's stake and one client's recourse.
+//! Nothing in the bond edge itself says which channel it is currently
+//! insuring, and without that the same stake could back several payment
+//! channels at once — every one of them priced as if it had the whole
+//! stake to slash. The lease is the record that makes the bond
+//! exclusive: a payment open creates it, and a second payment open
+//! naming the same bond finds the slots occupied and is refused.
+//!
+//! It is also what tells a bond close whether anyone still has recourse
+//! against it. An unleased bond has no challenge exposure, so its
+//! `Timeout` is immediate; a leased one must wait for the admission
+//! horizon it committed to.
+//!
+//! # Two chunks, and why absence is decided by both
+//!
+//! The record is 203 canonical bytes, so it spans two
+//! [`RegistryChunk`]s. "No lease" therefore means *both* derived slots
+//! are empty, and every other shape — one present chunk, a wrong chunk
+//! count, a value that does not decode, a record naming another bond —
+//! is a fault rather than absence. A close that read a half-written or
+//! corrupted lease as "unleased" would take the immediate exit out from
+//! under a live channel's recourse.
+//!
+//! # What the lease does not decide
+//!
+//! Nothing about the money. The scalar a channel settles at, the contest
+//! that establishes it, and the payouts it produces are all
+//! [`crate::work`]'s and [`crate::tx::work`]'s, and none of them reads
+//! this record: the lease is checked once, at payment open, because the
+//! payment edge's own id already commits to the bond it names (see the
+//! `bond_edge` field of [`crate::WorkPaymentTerms`]). Two of the fields
+//! here — the live-game pointer and the challenged bitmap — belong to the
+//! correctness game, which is not implemented in this slice. They are
+//! created empty and stay empty.
+//!
+//! Abstract counterpart: none. Like the rest of the registry, the lease
+//! has no Quint var and no ITF trace; `models/registry.md` records which
+//! properties that leaves to Rust tests alone — including bond
+//! exclusivity itself.
+
+use crate::{
+    canonical::{
+        Decode, DecodeError, ENVELOPE_SIZE, Encode, Writer, decode_envelope, decode_field,
+        encode_envelope, tag,
+    },
+    consts::HASH_LENGTH,
+    error::BondLeaseFault,
+    network::NetworkId,
+    primitive::{EdgeId, TermsHash},
+    registry::{
+        RegistryChunk, RegistryChunkId, RegistryMutation, RegistryNamespace, RegistryRecordTag,
+    },
+    store::Batch,
+};
+
+/// Body version every bond-lease record carries. Decode rejects any
+/// other value, so one body shape has exactly one meaning.
+const BOND_LEASE_VERSION: u8 = 2;
+
+/// Chunks one lease value occupies.
+///
+/// Derived from the record's fixed width by the same rule
+/// [`RegistryChunk::split`] applies, and asserted below rather than
+/// trusted: the count decides how many slots a reader consults, and a
+/// count that disagreed with the encoding would make a complete lease
+/// look partial.
+pub const BOND_LEASE_CHUNKS: u8 = 2;
+
+/// The bitmap is 256 challenge slots, one bit each.
+const CHALLENGED_BITMAP_LENGTH: usize = 32;
+
+/// The exclusive lease one payment channel holds over one work-stake
+/// bond.
+///
+/// Created whole by the payment open and never partially written: the
+/// two chunks are one atomic registry diff, so no block can commit a
+/// lease that only half exists.
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+pub struct BondLease {
+    bond_edge: EdgeId,
+    payment_edge: EdgeId,
+    payment_terms_hash: TermsHash,
+    private_policy_commitment: [u8; HASH_LENGTH],
+    admission_horizon: u64,
+    live_game_id: [u8; HASH_LENGTH],
+    challenged_bitmap: [u8; CHALLENGED_BITMAP_LENGTH],
+}
+
+impl BondLease {
+    /// Canonical encoded length, envelope included.
+    pub const ENCODED_SIZE: usize = ENVELOPE_SIZE
+        + u8::MAX_ENCODED_SIZE
+        + 2 * EdgeId::MAX_ENCODED_SIZE
+        + TermsHash::MAX_ENCODED_SIZE
+        + HASH_LENGTH
+        + u64::MAX_ENCODED_SIZE
+        + HASH_LENGTH
+        + CHALLENGED_BITMAP_LENGTH;
+
+    /// Creates the lease a payment open takes out over `bond_edge`.
+    ///
+    /// Both mutable fields start empty, which is the whole of their
+    /// meaning here: no game is live, and no challenge slot has been
+    /// consumed. The zero `live_game_id` is the canonical "none" — a
+    /// game id is a hash, and this record is the only place that reads
+    /// zero as absence.
+    #[must_use]
+    pub(crate) const fn opened(
+        bond_edge: EdgeId,
+        payment_edge: EdgeId,
+        payment_terms_hash: TermsHash,
+        private_policy_commitment: [u8; HASH_LENGTH],
+        admission_horizon: u64,
+    ) -> Self {
+        Self {
+            bond_edge,
+            payment_edge,
+            payment_terms_hash,
+            private_policy_commitment,
+            admission_horizon,
+            live_game_id: [0; HASH_LENGTH],
+            challenged_bitmap: [0; CHALLENGED_BITMAP_LENGTH],
+        }
+    }
+
+    /// Returns the bond this lease is held over.
+    #[must_use]
+    pub const fn bond_edge(&self) -> EdgeId {
+        self.bond_edge
+    }
+
+    /// Returns the payment channel holding the lease.
+    #[must_use]
+    pub const fn payment_edge(&self) -> EdgeId {
+        self.payment_edge
+    }
+
+    /// Returns the payment terms the lease is bound to.
+    ///
+    /// Retained here so a later game or settlement can identify the
+    /// channel even after its edge has been spent.
+    #[must_use]
+    pub const fn payment_terms_hash(&self) -> TermsHash {
+        self.payment_terms_hash
+    }
+
+    /// Returns the channel's salted private-policy commitment.
+    #[must_use]
+    pub const fn private_policy_commitment(&self) -> [u8; HASH_LENGTH] {
+        self.private_policy_commitment
+    }
+
+    /// Returns the height at and after which no further job is admitted.
+    #[must_use]
+    pub const fn admission_horizon(&self) -> u64 {
+        self.admission_horizon
+    }
+
+    /// Returns the live game id, or `None` when no game is live.
+    ///
+    /// All-zero is the canonical "none". A game id is a hash, so the
+    /// record needs no separate presence flag that could disagree with
+    /// it.
+    #[must_use]
+    pub fn live_game_id(&self) -> Option<[u8; HASH_LENGTH]> {
+        if self.live_game_id.iter().all(|byte| *byte == 0) {
+            None
+        } else {
+            Some(self.live_game_id)
+        }
+    }
+
+    /// Returns the 256-bit monotone challenged-slot bitmap.
+    #[must_use]
+    pub const fn challenged_bitmap(&self) -> [u8; CHALLENGED_BITMAP_LENGTH] {
+        self.challenged_bitmap
+    }
+
+    /// Returns this record packed into its chunks, in slot order.
+    ///
+    /// `None` is unreachable for a record of this fixed width — the
+    /// encoding is 203 bytes and two chunks carry 240 — and is kept a
+    /// rejection rather than a panic because this runs on the apply
+    /// path.
+    #[must_use]
+    pub(crate) fn to_chunks(self) -> Option<[RegistryChunk; BOND_LEASE_CHUNKS as usize]> {
+        let mut buf = [0_u8; Self::ENCODED_SIZE];
+        let written = self.write_to(&mut buf);
+        let value = buf.get(..written)?;
+        Some([
+            RegistryChunk::split(
+                RegistryNamespace::BondLease,
+                RegistryRecordTag::BondLease,
+                value,
+                0,
+            )?,
+            RegistryChunk::split(
+                RegistryNamespace::BondLease,
+                RegistryRecordTag::BondLease,
+                value,
+                1,
+            )?,
+        ])
+    }
+
+    /// Reads the record the two stored chunks hold.
+    ///
+    /// Every way a present pair can fail to be this bond's lease is a
+    /// fault, never absence: reassembly is refused unless both chunks
+    /// agree on the record they belong to, occupy their own index, and
+    /// carry exactly this record's width.
+    fn from_chunks(
+        chunks: [RegistryChunk; BOND_LEASE_CHUNKS as usize],
+        bond_edge: EdgeId,
+    ) -> Result<Self, BondLeaseFault> {
+        let mut buf = [0_u8; Self::ENCODED_SIZE];
+        let mut written = 0_usize;
+        for (index, chunk) in chunks.iter().enumerate() {
+            let expected_index = u8::try_from(index).map_err(|_| BondLeaseFault::Shape)?;
+            if chunk.namespace() != RegistryNamespace::BondLease
+                || chunk.record_tag() != RegistryRecordTag::BondLease
+                || chunk.chunk_count() != BOND_LEASE_CHUNKS
+                || chunk.chunk_index() != expected_index
+                || usize::from(chunk.value_len()) != Self::ENCODED_SIZE
+            {
+                return Err(BondLeaseFault::Shape);
+            }
+            let data = chunk.data();
+            let end = written
+                .checked_add(data.len())
+                .ok_or(BondLeaseFault::Shape)?;
+            buf.get_mut(written..end)
+                .ok_or(BondLeaseFault::Shape)?
+                .copy_from_slice(data);
+            written = end;
+        }
+        // Reassembly consumes exactly `value_len` bytes: the per-chunk
+        // `data_len` rule already fixes each chunk's live width for its
+        // index, so a pair that passed the checks above spans the
+        // record exactly. The equality is spelled out because the
+        // decoder below is handed this slice and would otherwise
+        // silently accept a shorter one as "insufficient bytes".
+        if written != Self::ENCODED_SIZE {
+            return Err(BondLeaseFault::Shape);
+        }
+        let lease = buf
+            .get(..written)
+            .ok_or(BondLeaseFault::Shape)
+            .and_then(|value| Self::decode_exact(value).map_err(|_| BondLeaseFault::Body))?;
+        if lease.bond_edge != bond_edge {
+            return Err(BondLeaseFault::Edge);
+        }
+        Ok(lease)
+    }
+}
+
+/// Returns the registry slot holding chunk `chunk_index` of the lease on
+/// `bond_edge`.
+///
+/// One derivation, used by the kernel transitions and by the host that
+/// preloads the slots for them. A host that derived its own would
+/// preload a slot the kernel never reads.
+#[must_use]
+pub fn bond_lease_slot(network: NetworkId, bond_edge: EdgeId, chunk_index: u8) -> RegistryChunkId {
+    RegistryChunkId::derive(
+        network,
+        RegistryNamespace::BondLease,
+        bond_edge.to_bytes(),
+        chunk_index,
+    )
+}
+
+/// Returns both registry slots the lease on `bond_edge` occupies, in
+/// order.
+#[must_use]
+pub fn bond_lease_slots(
+    network: NetworkId,
+    bond_edge: EdgeId,
+) -> [RegistryChunkId; BOND_LEASE_CHUNKS as usize] {
+    [
+        bond_lease_slot(network, bond_edge, 0),
+        bond_lease_slot(network, bond_edge, 1),
+    ]
+}
+
+/// Reads the lease on `bond_edge` from the staged batch.
+///
+/// Both slots are consulted on every call, and both are charged: the
+/// answer "unleased" is only sound when nothing is in either of them,
+/// so a reader that stopped at the first empty slot would be answering
+/// a different question than the one the caller asked.
+pub(crate) fn read_bond_lease<B: Batch>(
+    batch: &B,
+    network: NetworkId,
+    bond_edge: EdgeId,
+) -> Result<Option<BondLease>, BondLeaseFault> {
+    let stored = bond_lease_slots(network, bond_edge).map(|slot| batch.registry_chunk(slot));
+    match stored {
+        [None, None] => Ok(None),
+        [Some(first), Some(second)] => BondLease::from_chunks([first, second], bond_edge).map(Some),
+        // A lease is written whole or not at all, so one occupied slot
+        // is not a lease being built: it is state no transition of this
+        // kernel could have produced.
+        [Some(_), None] | [None, Some(_)] => Err(BondLeaseFault::Partial),
+    }
+}
+
+/// Returns the mutations that create the lease `lease` occupies.
+pub(crate) fn create_mutations(
+    network: NetworkId,
+    lease: BondLease,
+) -> Option<[RegistryMutation; BOND_LEASE_CHUNKS as usize]> {
+    let slots = bond_lease_slots(network, lease.bond_edge());
+    let chunks = lease.to_chunks()?;
+    Some([
+        RegistryMutation::write(slots[0], chunks[0]),
+        RegistryMutation::write(slots[1], chunks[1]),
+    ])
+}
+
+/// Returns the mutations that delete the lease on `bond_edge`.
+pub(crate) fn delete_mutations(
+    network: NetworkId,
+    bond_edge: EdgeId,
+) -> [RegistryMutation; BOND_LEASE_CHUNKS as usize] {
+    bond_lease_slots(network, bond_edge).map(RegistryMutation::delete)
+}
+
+impl Encode for BondLease {
+    const MAX_ENCODED_SIZE: usize = Self::ENCODED_SIZE;
+
+    fn encoded_size(&self) -> usize {
+        Self::ENCODED_SIZE
+    }
+
+    fn encode_to<W: Writer + ?Sized>(&self, writer: &mut W) {
+        encode_envelope(writer, tag::BOND_LEASE);
+        BOND_LEASE_VERSION.encode_to(writer);
+        self.bond_edge.encode_to(writer);
+        self.payment_edge.encode_to(writer);
+        self.payment_terms_hash.encode_to(writer);
+        self.private_policy_commitment.encode_to(writer);
+        // Raw eight bytes, not the `BlockHeight` composite: §0.1 fixes
+        // every height inside a registry record as a bare `u64`.
+        self.admission_horizon.encode_to(writer);
+        self.live_game_id.encode_to(writer);
+        self.challenged_bitmap.encode_to(writer);
+    }
+}
+
+impl Decode for BondLease {
+    fn decode(buf: &[u8]) -> Result<(Self, usize), DecodeError> {
+        let mut consumed = decode_envelope(buf, tag::BOND_LEASE)?;
+        let version = decode_field::<u8>(buf, &mut consumed)?;
+        if version != BOND_LEASE_VERSION {
+            return Err(DecodeError::InvalidTag { tag: version });
+        }
+        let bond_edge = decode_field(buf, &mut consumed)?;
+        let payment_edge = decode_field(buf, &mut consumed)?;
+        let payment_terms_hash = decode_field(buf, &mut consumed)?;
+        let private_policy_commitment = decode_field(buf, &mut consumed)?;
+        let admission_horizon = decode_field(buf, &mut consumed)?;
+        let live_game_id = decode_field(buf, &mut consumed)?;
+        let challenged_bitmap = decode_field(buf, &mut consumed)?;
+        Ok((
+            Self {
+                bond_edge,
+                payment_edge,
+                payment_terms_hash,
+                private_policy_commitment,
+                admission_horizon,
+                live_game_id,
+                challenged_bitmap,
+            },
+            consumed,
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::consts::REGISTRY_CHUNK_DATA_CAPACITY;
+
+    /// The record's width decides how many slots every reader consults,
+    /// so the two have to be derived from one another rather than
+    /// declared side by side.
+    #[test]
+    fn the_lease_is_exactly_two_registry_chunks() {
+        assert_eq!(BondLease::ENCODED_SIZE, 203);
+        assert_eq!(
+            RegistryChunk::chunk_count_for(BondLease::ENCODED_SIZE),
+            Some(BOND_LEASE_CHUNKS),
+        );
+        const { assert!(BondLease::ENCODED_SIZE > REGISTRY_CHUNK_DATA_CAPACITY) };
+    }
+}

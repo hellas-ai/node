@@ -255,7 +255,8 @@ pub(crate) fn kernel_fixture_at(
         ),
         outputs.clone(),
     );
-    let timeout_close = Tx::timeout_close(edge, &terms);
+    let timeout_close =
+        Tx::timeout_close(edge, &terms).expect("basic terms commit a timeout payout");
 
     Ok(KernelFixture {
         allocations: vec![(maker, 40), (taker, 60)],

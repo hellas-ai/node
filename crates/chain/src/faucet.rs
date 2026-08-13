@@ -169,7 +169,8 @@ mod tests {
             let merkleized = batches.merkleize().await.expect("open merkleizes");
             database.finalize(merkleized).await;
 
-            let close = KernelTx::timeout_close(edge, &terms);
+            let close = KernelTx::timeout_close(edge, &terms)
+                .expect("faucet terms are basic and commit a timeout payout");
             let batches = execute_all(
                 context(TIMEOUT),
                 &verifier,
@@ -184,7 +185,12 @@ mod tests {
                 batches.get(&edge_object_id(edge)).await.expect("edge read"),
                 None,
             );
-            let ids = KernelTx::close_output_ids(edge, terms.timeout_outputs());
+            let ids = KernelTx::close_output_ids(
+                edge,
+                terms
+                    .timeout_outputs()
+                    .expect("faucet terms commit a timeout payout"),
+            );
             assert_eq!(
                 batches
                     .get(&coin_object_id(ids.as_slice()[0]))

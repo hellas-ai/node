@@ -181,24 +181,30 @@ impl Edge {
         ))
     }
 
-    /// Validates a close against the edge's locked principal and reserve.
+    /// Validates a close against the edge's locked principal and reserve,
+    /// returning the value it distributes.
     ///
     /// Payouts must sum to the principal locked at open plus the part of the
     /// open-time close reserve not consumed by this close kind. The committed
     /// close fee is priced by the fee schedule stored on the edge at open time,
     /// so current block fees cannot make an already-open edge unclosable.
+    ///
+    /// The distributed total is returned rather than discarded because
+    /// the work-payment proofs derive their payout split from it, and a
+    /// second [`Self::close_value`] call there would be a second place
+    /// for the two to disagree.
     pub(super) fn closes<const N: usize>(
         self,
         coins: &List<(CoinId, Coin), N>,
         close_cost: Cost,
-    ) -> Result<(), InvalidCloseReason> {
+    ) -> Result<u64, InvalidCloseReason> {
         let expected = self
             .close_value(close_cost)
             .ok_or(InvalidCloseReason::ReserveTooSmall)?;
         match Self::total(coins) {
             None => Err(InvalidCloseReason::PayoutOverflow),
             Some(total) if total != expected => Err(InvalidCloseReason::ValueMismatch),
-            Some(_) => Ok(()),
+            Some(_) => Ok(expected),
         }
     }
 
@@ -380,7 +386,7 @@ mod tests {
                 Key::from_bytes([3; Key::LENGTH]),
             ),
             TermsHash::from_bytes([4; TermsHash::LENGTH]),
-            CloseKindSet::all(),
+            CloseKindSet::BASIC,
         );
         let mut edge_buf = [0; Edge::MAX_ENCODED_SIZE + 1];
         assert_canonical_round_trip(edge, &mut edge_buf);

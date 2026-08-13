@@ -43,6 +43,14 @@ pub(crate) mod tag {
     pub(crate) const TERMS: u8 = 11;
     pub(crate) const PROOF: u8 = 12;
     pub(crate) const TX: u8 = 13;
+    // Tag numbers are fixed consensus assignments, not the next free
+    // slot: the gaps below are reserved and must not be filled in.
+    pub(crate) const EARNED_CERTIFICATE: u8 = 20;
+    pub(crate) const PAYMENT_CLOSE_START: u8 = 21;
+    pub(crate) const PAYMENT_CLOSE_RESPONSE: u8 = 22;
+    pub(crate) const PAYMENT_CLOSE_PENDING: u8 = 23;
+    pub(crate) const REGISTRY_CHUNK: u8 = 24;
+    pub(crate) const BOND_LEASE: u8 = 31;
 }
 
 /// Streaming destination for [`Encode`] output.
@@ -211,6 +219,14 @@ pub enum DecodeError {
         /// Number of unconsumed bytes.
         remaining: usize,
     },
+    /// Every byte parsed, but the parsed fields are not the one canonical
+    /// encoding of any value: a derived field disagrees with the field it
+    /// is derived from, or declared-dead bytes are not zero. Accepting
+    /// such an input would give one state two byte representations.
+    NonCanonical {
+        /// Name of the field whose canonical rule the input broke.
+        field: &'static str,
+    },
 }
 
 pub(crate) fn encode_envelope<W: Writer + ?Sized>(writer: &mut W, type_tag: u8) {
@@ -240,6 +256,26 @@ pub(crate) fn decode_envelope(buf: &[u8], expected_tag: u8) -> Result<usize, Dec
         return Err(DecodeError::InvalidTag { tag: type_tag });
     }
     Ok(consumed)
+}
+
+/// Reads the type tag of the envelope at the head of `buf` without
+/// consuming it.
+///
+/// For the one decoder that dispatches on the *nested* envelope rather
+/// than on a variant byte: a `Tx::Move` body is a complete tagged
+/// composite, so its tag is where the action kind lives and a second
+/// action byte beside it would be a redundant encoding. The tag is only
+/// peeked — the selected body still runs [`decode_envelope`], which is
+/// what checks the format version and rejects a mismatch.
+pub(crate) fn peek_envelope_tag(buf: &[u8]) -> Result<u8, DecodeError> {
+    let (header, _) = decode_fixed::<{ ENVELOPE_SIZE }>(buf)?;
+    header
+        .get(1)
+        .copied()
+        .ok_or(DecodeError::InsufficientBytes {
+            needed: ENVELOPE_SIZE,
+            got: 1,
+        })
 }
 
 pub(crate) fn decode_field<T: Decode>(buf: &[u8], consumed: &mut usize) -> Result<T, DecodeError> {
@@ -324,6 +360,30 @@ impl<const N: usize> Encode for [u8; N] {
 impl<const N: usize> Decode for [u8; N] {
     fn decode(buf: &[u8]) -> Result<(Self, usize), DecodeError> {
         decode_fixed(buf)
+    }
+}
+
+impl Encode for u16 {
+    const MAX_ENCODED_SIZE: usize = 2;
+    fn encoded_size(&self) -> usize {
+        2
+    }
+    fn encode_to<W: Writer + ?Sized>(&self, writer: &mut W) {
+        writer.write(&self.to_be_bytes());
+    }
+}
+
+impl Decode for u16 {
+    fn decode(buf: &[u8]) -> Result<(Self, usize), DecodeError> {
+        let Some(head) = buf.get(..2) else {
+            return Err(DecodeError::InsufficientBytes {
+                needed: 2,
+                got: buf.len(),
+            });
+        };
+        let mut bytes = [0_u8; 2];
+        bytes.copy_from_slice(head);
+        Ok((Self::from_be_bytes(bytes), 2))
     }
 }
 
@@ -466,10 +526,13 @@ impl<T: Decode + Copy + Default, const N: usize> Decode for crate::List<T, N> {
 mod tests {
     use super::Encode;
     use crate::consts::{
-        CLOSE, COIN_GENESIS, COIN_PAYOUT, EDGE_OPEN, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, OPEN,
-        SEAL_PLACEHOLDER, SIG_PLACEHOLDER, TERMS_BASIC,
+        CLOSE, COIN_GENESIS, COIN_PAYOUT, EDGE_OPEN, ID_LENGTH, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS,
+        OPEN, REGISTRY_CHUNK_ID, SEAL_PLACEHOLDER, SIG_PLACEHOLDER, TERMS_BASIC, TERMS_STAKE_BOND,
+        TERMS_WORK_PAYMENT, TERMS_WORK_STAKE_BOND,
     };
-    use crate::{CoinId, EdgeId, Key, List, PayloadHash, Payout, ProtocolCode, Terms, TermsHash};
+    use crate::{
+        CoinId, EdgeId, Key, List, NetworkId, PayloadHash, Payout, ProtocolCode, Terms, TermsHash,
+    };
 
     #[test]
     fn every_commitment_preimage_fits_one_xet_chunk() {
@@ -482,7 +545,14 @@ mod tests {
             EDGE_OPEN.len()
                 + TermsHash::MAX_ENCODED_SIZE
                 + 2 * <List<CoinId, MAX_PARTY_INPUTS>>::MAX_ENCODED_SIZE,
+            // Terms decode recomputes this hash, so a body wide enough
+            // to reach the chunk bound would be a remotely triggered
+            // halt in a kernel that cannot unwind. Every domain is
+            // measured against the *widest* body, not its own.
             TERMS_BASIC.len() + Terms::MAX_ENCODED_SIZE,
+            TERMS_STAKE_BOND.len() + Terms::MAX_ENCODED_SIZE,
+            TERMS_WORK_PAYMENT.len() + Terms::MAX_ENCODED_SIZE,
+            TERMS_WORK_STAKE_BOND.len() + Terms::MAX_ENCODED_SIZE,
             OPEN.len() + EdgeId::MAX_ENCODED_SIZE,
             CLOSE.len()
                 + EdgeId::MAX_ENCODED_SIZE
@@ -497,6 +567,11 @@ mod tests {
                 + ProtocolCode::MAX_ENCODED_SIZE
                 + u8::MAX_ENCODED_SIZE
                 + PayloadHash::MAX_ENCODED_SIZE,
+            REGISTRY_CHUNK_ID.len()
+                + NetworkId::MAX_ENCODED_SIZE
+                + u8::MAX_ENCODED_SIZE
+                + ID_LENGTH
+                + u8::MAX_ENCODED_SIZE,
         ];
         assert!(
             lengths

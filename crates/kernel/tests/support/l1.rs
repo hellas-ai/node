@@ -4,7 +4,10 @@
 //! model-checking tests: two genesis coins (maker 10, taker 5), one
 //! bilateral terms shape, and up to two chained edges.
 
-use super::{FixedStore, coin_id, list, open_tx, placeholder_mutual, placeholder_seal, state};
+use super::{
+    CANARY_REGISTRY_SLOTS, FixedStore, canary_registry_slots, coin_id, list, open_tx,
+    placeholder_mutual, placeholder_seal, state,
+};
 
 use hellas_kernel::{
     BlockHash, BlockHeight, CloseKind, CoinId, Context, Edge, EdgeId, Funding, Genesis, Key, List,
@@ -48,8 +51,8 @@ pub(crate) fn other_terms() -> Terms {
     Terms::basic(OTHER_PROTOCOL, PARTIES, TIMEOUT, payouts())
 }
 
-pub(crate) type TraceState = State<FixedStore<6, 2>>;
-pub(crate) type TraceView = View<6, 2>;
+pub(crate) type TraceState = State<FixedStore<6, 2, CANARY_REGISTRY_SLOTS>>;
+pub(crate) type TraceView = View<6, 2, CANARY_REGISTRY_SLOTS>;
 
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 pub(crate) enum EdgeKey {
@@ -77,7 +80,7 @@ pub(crate) enum ProofKey {
 
 pub(crate) fn initial_state() -> TraceState {
     state(
-        FixedStore::empty(
+        FixedStore::empty_with_registry(
             [
                 MAKER_ID,
                 TAKER_ID,
@@ -87,6 +90,7 @@ pub(crate) fn initial_state() -> TraceState {
                 taker_out(EdgeKey::Second),
             ],
             [edge_id(EdgeKey::First), edge_id(EdgeKey::Second)],
+            canary_registry_slots(),
         ),
         [
             Genesis::coin(MAKER_ID, MAKER, MAKER_VALUE),
@@ -95,9 +99,9 @@ pub(crate) fn initial_state() -> TraceState {
     )
 }
 
-pub(crate) fn genesis<const C: usize, const E: usize>(
-    store: FixedStore<C, E>,
-) -> State<FixedStore<C, E>> {
+pub(crate) fn genesis<const C: usize, const E: usize, const R: usize>(
+    store: FixedStore<C, E, R>,
+) -> State<FixedStore<C, E, R>> {
     state(
         store,
         [
@@ -170,7 +174,9 @@ pub(crate) const fn edge_value(edge: Edge) -> u64 {
     edge.value()
 }
 
-pub(crate) fn live_value<const C: usize, const E: usize>(view: &View<C, E>) -> u64 {
+pub(crate) fn live_value<const C: usize, const E: usize, const R: usize>(
+    view: &View<C, E, R>,
+) -> u64 {
     let mut total = 0_u64;
     for (_, coin) in view.coins() {
         total = total.saturating_add(coin.value());

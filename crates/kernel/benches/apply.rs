@@ -88,10 +88,10 @@ fn apply(c: &mut Criterion) {
             b.iter(|| {
                 let mut state: TraceState = initial_state();
                 for (ctx, op) in ops {
-                    let event = state
+                    let outcome = state
                         .apply(*ctx, &FAKE_VERIFIER, op)
                         .expect("model fixture rejected by kernel");
-                    core::hint::black_box(event.kind());
+                    core::hint::black_box(outcome.public_event());
                 }
                 core::hint::black_box(state);
             });

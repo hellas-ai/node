@@ -6,7 +6,10 @@
 //! exercises `check_stake_bond_open` and `check_violation_payouts`
 //! rather than a paraphrase of them.
 
-use super::{FixedStore, coin_id, open_tx, placeholder_mutual, placeholder_seal, state};
+use super::{
+    CANARY_REGISTRY_SLOTS, FixedStore, canary_registry_slots, coin_id, open_tx, placeholder_mutual,
+    placeholder_seal, state,
+};
 
 use hellas_kernel::{
     BlockHash, BlockHeight, CoinId, Context, EdgeId, Fees, Funding, Genesis, Key, List,
@@ -34,8 +37,8 @@ pub(crate) const TIMEOUT: BlockHeight = BlockHeight::new(2);
 /// surplus is zero and the client's slash payout is exactly the award.
 pub(crate) const FEES: Fees = Fees::new(0, 0, 0, 0);
 
-pub(crate) type TraceState = State<FixedStore<5, 2>>;
-pub(crate) type TraceView = View<5, 2>;
+pub(crate) type TraceState = State<FixedStore<5, 2, CANARY_REGISTRY_SLOTS>>;
+pub(crate) type TraceView = View<5, 2, CANARY_REGISTRY_SLOTS>;
 
 /// Mirrors `TermsVariant` in `models/l1_stake.qnt`: one well-formed
 /// bond plus a witness for each open rejection the kernel raises.
@@ -183,7 +186,7 @@ pub(crate) fn context(height: i64) -> Context {
 pub(crate) fn initial_state() -> TraceState {
     let edge = edge_id(Variant::Valid);
     state(
-        FixedStore::empty(
+        FixedStore::empty_with_registry(
             [
                 PROVIDER_COIN,
                 Payout::new(CLIENT, 0).id(edge, 0),
@@ -192,6 +195,7 @@ pub(crate) fn initial_state() -> TraceState {
                 Payout::new(CLIENT, 0).id(edge, 1),
             ],
             [edge, edge_id(Variant::StakeMismatch)],
+            canary_registry_slots(),
         ),
         [Genesis::coin(PROVIDER_COIN, PROVIDER, STAKE)],
     )
