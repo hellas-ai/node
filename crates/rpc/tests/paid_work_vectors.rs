@@ -13,8 +13,9 @@
 #![cfg(feature = "work")]
 
 use hellas_kernel::{
-    BlockHeight, EarnedCertificate, EdgeId, List, NetworkId, Parties, Payout, Secp256k1Signer,
-    Secp256k1Verifier, SigVerifier, TermsHash, WorkPaymentTerms, WorkStakeBondTerms,
+    BlockHeight, EarnedCertificate, EdgeId, EdgeValues, Fees, List, NetworkId, Parties, Payout,
+    Secp256k1Signer, Secp256k1Verifier, SigVerifier, TermsHash, WorkPaymentSettlement,
+    WorkPaymentTerms, WorkStakeBondTerms, work_payment_settlement,
 };
 use hellas_rpc::evaluate::{EvaluateStopReason, EvaluateTerminal, EvaluateUsage};
 use hellas_rpc::protocol::artifacts::{
@@ -39,7 +40,18 @@ use hellas_rpc::{
 
 const NETWORK: &str = "hellas-devnet-1";
 const OTHER_NETWORK: &str = "hellas-devnet-22";
-const CAPACITY: u64 = 1_000_000;
+/// The channel's certificate capacity, from the kernel's own settlement
+/// arithmetic over an edge that locks a million and reserves nothing.
+fn capacity() -> WorkPaymentSettlement {
+    let Some(settlement) = work_payment_settlement(
+        EdgeValues::new(1_000_000 + payment_terms().omission_bond, 0, Fees::ZERO),
+        payment_terms().omission_bond,
+    ) else {
+        panic!("a funded edge prices both exits");
+    };
+    assert_eq!(settlement.capacity(), 1_000_000);
+    settlement
+}
 const SALT: [u8; 32] = [0x5a; 32];
 
 fn evaluate_request_bytes_of() -> Vec<u8> {
@@ -522,24 +534,66 @@ fn golden_digests_bind_the_encoded_network() {
 #[test]
 fn records_do_not_cross_channels() {
     let here = channel();
-    let there = PaidChannel::new(
+    let sibling = PaidChannel::new(network(), EdgeId::from_bytes([0xe2; 32]), payment_terms());
+    let elsewhere = PaidChannel::new(
         NetworkId::new(OTHER_NETWORK).expect("legal network id"),
         here.payment_edge(),
         payment_terms(),
     );
     let authorization = authorization();
+    let result = job_result(work_id(&here, &authorization));
+    let entry = InvoiceEntryV1 {
+        channel_id: here.id(),
+        invoice_seq: 1,
+        work_id: result.work_id,
+        result_digest: result_digest(&here, &result),
+        price: 250,
+        cumulative_before: 0,
+        cumulative_after: 250,
+    };
+    let allocation = allocation_over(&[entry], &earned(250));
 
-    assert_ne!(
-        work_id(&here, &authorization),
-        work_id(&there, &authorization)
-    );
-    // MUTATION: replay this channel's authorization on another channel.
-    assert_eq!(
-        check_authorization(&there, &authorization, &execution_policy(), 900),
-        Err(PaidWorkError::Mismatch {
-            field: "channel_id"
-        })
-    );
+    assert_ne!(here.id(), sibling.id());
+    for (label, other) in [("sibling", &sibling), ("elsewhere", &elsewhere)] {
+        assert_ne!(
+            work_id(&here, &authorization),
+            work_id(other, &authorization),
+            "{label} shares this channel's work_id"
+        );
+        assert_ne!(
+            result_digest(&here, &result),
+            result_digest(other, &result),
+            "{label} shares this channel's result digest"
+        );
+        assert_ne!(
+            invoice_digest(&here, &entry),
+            invoice_digest(other, &entry),
+            "{label} shares this channel's invoice digest"
+        );
+        assert_ne!(
+            allocation_digest(&here, &allocation),
+            allocation_digest(other, &allocation),
+            "{label} shares this channel's allocation digest"
+        );
+        assert_ne!(
+            execution_policy_digest(&here, &execution_policy()),
+            execution_policy_digest(other, &execution_policy()),
+            "{label} shares this channel's policy digest"
+        );
+        assert_ne!(
+            prepared_input_digest(&here, &bundle()),
+            prepared_input_digest(other, &bundle()),
+            "{label} shares this channel's prepared input digest"
+        );
+        // MUTATION: replay this channel's authorization on another one.
+        assert_eq!(
+            check_authorization(other, &authorization, &execution_policy(), 900),
+            Err(PaidWorkError::Mismatch {
+                field: "channel_id"
+            }),
+            "{label} accepted a foreign authorization"
+        );
+    }
 }
 
 // ── Prepared input bundle ─────────────────────────────────────────────
@@ -717,6 +771,46 @@ fn streaming_hash_matches_one_shot_under_every_segmentation() {
         hasher.finalize()
     });
     assert!(panicked.is_err());
+}
+
+/// A legal bundle can be far larger than the single-chunk limit, and its
+/// digest is computed anyway.
+///
+/// This is the test that makes the choice of hasher load-bearing: a
+/// prompt of a few thousand tokens puts the prepared-input preimage past
+/// [`hellas_xet::MIN_CHUNK_SIZE`], where the single-chunk hasher asserts.
+#[test]
+fn a_bundle_over_the_single_chunk_limit_still_hashes() {
+    let long_prompt = TokenIds::from_u32s(0..4_000);
+    let execution = TextExecution::new(
+        SourceRef::output(identity_artifact().output_id()),
+        long_prompt.output_id(),
+        text_policy().output_id(),
+    );
+    let request = EvaluateRequest {
+        text_execution: execution.input_id().digest(),
+        ..evaluate_request()
+    };
+    let large = PreparedPaidInputV1::new(
+        &request,
+        &manifest(),
+        &execution,
+        &long_prompt,
+        &text_policy(),
+        &identity_artifact(),
+    );
+    assert!(
+        large.encode().len() > hellas_xet::MIN_CHUNK_SIZE,
+        "the fixture must exceed the single-chunk limit to be a test of it",
+    );
+    let digest = prepared_input_digest(&channel(), &large);
+    assert_ne!(digest, prepared_input_digest(&channel(), &bundle()));
+
+    // The same bundle over a channel-sized budget still decodes, and its
+    // digest survives the round trip.
+    let encoded = large.encode();
+    let decoded = PreparedPaidInputV1::decode(&encoded, 1_048_576).expect("legal bundle");
+    assert_eq!(prepared_input_digest(&channel(), &decoded), digest);
 }
 
 /// Every fixed-record preimage is measured, not assumed, to be under the
@@ -1238,6 +1332,139 @@ fn prepared_input_graph_is_checked_not_assumed() {
     );
 }
 
+/// Each binding in the bundle's graph is broken on its own.
+///
+/// Mutating a component and the record that names it together proves
+/// only that *some* check fired. Here every case leaves the rest of the
+/// graph intact and recomputes the bundle digest, so the named check is
+/// the only thing that can refuse it — which is what makes the check's
+/// removal a test failure rather than a silent loss.
+#[test]
+fn each_graph_binding_is_checked_on_its_own() {
+    let channel = channel();
+    let policy = execution_policy();
+    let base = authorization();
+
+    // A prompt body the execution does not name.
+    let other_prompt = TokenIds::from([5, 5, 5, 5]);
+    assert_ne!(other_prompt.output_id(), prompt_tokens().output_id());
+    let mismatched_prompt = PreparedPaidInputV1::new(
+        &evaluate_request(),
+        &manifest(),
+        &text_execution(),
+        &other_prompt,
+        &text_policy(),
+        &identity_artifact(),
+    );
+    let mut authorization = base;
+    authorization.prepared_input_digest = prepared_input_digest(&channel, &mismatched_prompt);
+    assert_eq!(
+        check_prepared_input(&channel, &authorization, &policy, &mismatched_prompt),
+        Err(PaidWorkError::Mismatch {
+            field: "prompt_tokens id"
+        })
+    );
+
+    // A generation policy the execution does not name.
+    let other_policy = TextPolicy::from_u32_stop_tokens(32, [3]);
+    assert_ne!(other_policy.output_id(), text_policy().output_id());
+    let mismatched_policy = PreparedPaidInputV1::new(
+        &evaluate_request(),
+        &manifest(),
+        &text_execution(),
+        &prompt_tokens(),
+        &other_policy,
+        &identity_artifact(),
+    );
+    let mut authorization = base;
+    authorization.prepared_input_digest = prepared_input_digest(&channel, &mismatched_policy);
+    assert_eq!(
+        check_prepared_input(&channel, &authorization, &policy, &mismatched_policy),
+        Err(PaidWorkError::Mismatch {
+            field: "text_policy id"
+        })
+    );
+
+    // A manifest that is not the environment the request commits to.
+    let other_manifest = ProgramManifest::Evaluate(EvaluateProgramManifest {
+        graph: ContentId::from_bytes([0x99; 32]),
+        ..match manifest() {
+            ProgramManifest::Evaluate(evaluate) => evaluate,
+            ProgramManifest::Fetch(_) => panic!("the fixture manifest is an evaluate manifest"),
+        }
+    });
+    assert_ne!(other_manifest.content_id(), manifest().content_id());
+    let mismatched_manifest = PreparedPaidInputV1::new(
+        &evaluate_request(),
+        &other_manifest,
+        &text_execution(),
+        &prompt_tokens(),
+        &text_policy(),
+        &identity_artifact(),
+    );
+    let mut authorization = base;
+    authorization.prepared_input_digest = prepared_input_digest(&channel, &mismatched_manifest);
+    assert_eq!(
+        check_prepared_input(&channel, &authorization, &policy, &mismatched_manifest),
+        Err(PaidWorkError::Mismatch {
+            field: "manifest content id"
+        })
+    );
+
+    // A request commitment the authorization does not carry.
+    let mut restamped = base;
+    restamped.request_commitment = RequestCommitment::from_digest(Digest::from_bytes([0x88; 32]));
+    assert_eq!(
+        check_prepared_input(&channel, &restamped, &policy, &bundle()),
+        Err(PaidWorkError::Mismatch {
+            field: "request_commitment"
+        })
+    );
+
+    // An environment commitment the request does not name.
+    let mut reenvironed = base;
+    reenvironed.environment_commitment = ContentId::from_bytes([0x87; 32]);
+    assert_eq!(
+        check_prepared_input(&channel, &reenvironed, &policy, &bundle()),
+        Err(PaidWorkError::Mismatch {
+            field: "environment_commitment"
+        })
+    );
+
+    // A policy pinned to a generation policy this bundle does not carry.
+    let mut repinned = policy;
+    repinned.generation_policy_digest = Digest::from_bytes([0x86; 32]);
+    assert_eq!(
+        check_prepared_input(&channel, &base, &repinned, &bundle()),
+        Err(PaidWorkError::Mismatch {
+            field: "generation_policy_digest"
+        })
+    );
+
+    // A policy pinned to an identity artifact this bundle does not
+    // carry.
+    let mut resourced = policy;
+    resourced.identity_source_digest = Digest::from_bytes([0x85; 32]);
+    assert_eq!(
+        check_prepared_input(&channel, &base, &resourced, &bundle()),
+        Err(PaidWorkError::Mismatch {
+            field: "identity_source_digest"
+        })
+    );
+
+    // A bundle whose digest is not the one the authorization named at
+    // all: the cheapest check, and the one that must not be the only
+    // one.
+    let mut unbound = base;
+    unbound.prepared_input_digest = Digest::from_bytes([0x84; 32]);
+    assert_eq!(
+        check_prepared_input(&channel, &unbound, &policy, &bundle()),
+        Err(PaidWorkError::Mismatch {
+            field: "prepared_input_digest"
+        })
+    );
+}
+
 // ── Result, invoice, allocation ───────────────────────────────────────
 
 /// A result answers one job. Swapping two provider-signed results
@@ -1256,16 +1483,16 @@ fn results_cannot_be_swapped_between_jobs() {
     let first_result = job_result(first_id);
     let second_result = job_result(second_id);
 
-    assert!(next_invoice_entry(&channel, &first, &first_result, 1, 0, CAPACITY).is_ok());
-    assert!(next_invoice_entry(&channel, &second, &second_result, 1, 0, CAPACITY).is_ok());
+    assert!(next_invoice_entry(&channel, &first, &first_result, 1, 0, capacity()).is_ok());
+    assert!(next_invoice_entry(&channel, &second, &second_result, 1, 0, capacity()).is_ok());
 
     // MUTATION: pay the first job with the second job's result.
     assert_eq!(
-        next_invoice_entry(&channel, &first, &second_result, 1, 0, CAPACITY),
+        next_invoice_entry(&channel, &first, &second_result, 1, 0, capacity()),
         Err(PaidWorkError::Mismatch { field: "work_id" })
     );
     assert_eq!(
-        next_invoice_entry(&channel, &second, &first_result, 1, 0, CAPACITY),
+        next_invoice_entry(&channel, &second, &first_result, 1, 0, capacity()),
         Err(PaidWorkError::Mismatch { field: "work_id" })
     );
 }
@@ -1302,7 +1529,7 @@ fn invoice_transition_is_checked_arithmetic() {
     let authorization = authorization();
     let result = job_result(work_id(&channel, &authorization));
 
-    let first = next_invoice_entry(&channel, &authorization, &result, 1, 0, CAPACITY)
+    let first = next_invoice_entry(&channel, &authorization, &result, 1, 0, capacity())
         .expect("a legal first invoice");
     assert_eq!(first.invoice_seq, 1);
     assert_eq!(first.cumulative_before, 0);
@@ -1310,7 +1537,7 @@ fn invoice_transition_is_checked_arithmetic() {
 
     // MUTATION: zero-based sequence numbering.
     assert_eq!(
-        next_invoice_entry(&channel, &authorization, &result, 0, 0, CAPACITY),
+        next_invoice_entry(&channel, &authorization, &result, 0, 0, capacity()),
         Err(PaidWorkError::InvoiceSequence {
             expected: 1,
             actual: 0
@@ -1318,8 +1545,12 @@ fn invoice_transition_is_checked_arithmetic() {
     );
 
     // MUTATION: a transition that would exceed the edge's capacity.
+    let Some(thin) = work_payment_settlement(EdgeValues::new(400, 0, Fees::ZERO), 100) else {
+        panic!("a funded edge prices both exits");
+    };
+    assert_eq!(thin.capacity(), 300);
     assert_eq!(
-        next_invoice_entry(&channel, &authorization, &result, 2, 100, 300),
+        next_invoice_entry(&channel, &authorization, &result, 2, 100, thin),
         Err(PaidWorkError::OverCapacity {
             cumulative: 350,
             capacity: 300
@@ -1327,8 +1558,11 @@ fn invoice_transition_is_checked_arithmetic() {
     );
 
     // MUTATION: a cumulative that would wrap.
+    let Some(widest) = work_payment_settlement(EdgeValues::new(u64::MAX, 0, Fees::ZERO), 0) else {
+        panic!("the largest edge is representable");
+    };
     assert_eq!(
-        next_invoice_entry(&channel, &authorization, &result, 2, u64::MAX, u64::MAX),
+        next_invoice_entry(&channel, &authorization, &result, 2, u64::MAX, widest),
         Err(PaidWorkError::Overflow {
             field: "cumulative_after"
         })
@@ -1363,7 +1597,7 @@ fn three_entries() -> Vec<InvoiceEntryV1> {
             &result,
             index + 1,
             cumulative,
-            CAPACITY,
+            capacity(),
         )
         .expect("a legal invoice");
         cumulative = entry.cumulative_after;
@@ -1623,6 +1857,44 @@ fn allocation_digest_binds_every_field() {
     let moved_payload =
         hellas_kernel::PayloadHash::from_bytes(allocation_digest(&channel, &moved).into_bytes());
     assert!(!Secp256k1Verifier.verify_sig(signature, channel.client_key(), moved_payload));
+}
+
+/// The invoice tree's leaf and node preimages, rebuilt by hand.
+///
+/// The width `n` is why this test exists. An honest builder derives `k`
+/// from `n` and both subtrees from the entries, so no pair of legal
+/// allocations differs in `n` alone — dropping it from the preimage
+/// changes no root any other test computes. It is pinned here instead,
+/// because the field is what a later inclusion proof would be checked
+/// against, and a preimage nothing can fail is a preimage nothing keeps.
+#[test]
+fn invoice_tree_preimages_are_reproducible_by_hand() {
+    let channel = channel();
+    let entries = three_entries();
+    let pair = &entries[..2];
+
+    let leaf = |seq: u64, entry: &InvoiceEntryV1| {
+        let mut preimage = b"hellas.work.private-invoice-leaf.v1".to_vec();
+        preimage.extend_from_slice(&seq.to_be_bytes());
+        preimage.extend_from_slice(invoice_digest(&channel, entry).as_bytes());
+        Digest::hash(&preimage)
+    };
+
+    let mut preimage = b"hellas.work.private-invoice-node.v1".to_vec();
+    preimage.extend_from_slice(&1_u64.to_be_bytes()); // start
+    preimage.extend_from_slice(&2_u16.to_be_bytes()); // n
+    preimage.extend_from_slice(&1_u16.to_be_bytes()); // k
+    preimage.extend_from_slice(leaf(1, &pair[0]).as_bytes());
+    preimage.extend_from_slice(leaf(2, &pair[1]).as_bytes());
+    assert_eq!(preimage.len(), 35 + 8 + 2 + 2 + 64);
+    assert_eq!(
+        Digest::hash(&preimage),
+        invoice_entries_root(&channel, pair).expect("legal allocation")
+    );
+
+    let mut empty = b"hellas.work.private-invoice-empty.v1".to_vec();
+    empty.push(0);
+    assert_eq!(Digest::hash(&empty), invoice_empty_root());
 }
 
 // ── Canonical output ──────────────────────────────────────────────────

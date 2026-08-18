@@ -58,7 +58,7 @@
 
 use hellas_kernel::{
     BufferWriter, EarnedCertificate, EdgeId, Encode, Key, NetworkId, PayloadHash, Terms, TermsHash,
-    WorkPaymentTerms,
+    WorkPaymentSettlement, WorkPaymentTerms,
 };
 use hellas_xet::{MIN_CHUNK_SIZE, SingleChunkHasher, XetFileHasher};
 
@@ -1488,17 +1488,19 @@ pub fn check_result(
 /// A rule enforced by construction cannot be enforced differently by the
 /// two endpoints.
 ///
-/// `capacity` is the payment edge's certificate capacity, which is
-/// `min(close_total(Freeze), close_total(Adjudicated)) - omission_bond`
-/// and not `EdgeState.value`. It comes from the kernel; this module does
-/// not reimplement it.
+/// The capacity bound is the kernel's own
+/// [`WorkPaymentSettlement`], not a number this module derives: a
+/// certificate above `min(close_total(Freeze), close_total(Adjudicated))
+/// - omission_bond` is one no close will pay, and `EdgeState.value` is
+/// not that bound. Taking the settlement rather than a bare integer is
+/// what stops an endpoint from supplying its own arithmetic here.
 pub fn next_invoice_entry(
     channel: &PaidChannel,
     authorization: &PaidJobAuthorizationV1,
     result: &PaidJobResultV1,
     next_invoice_seq: u64,
     cumulative_before: u64,
-    capacity: u64,
+    settlement: WorkPaymentSettlement,
 ) -> Result<InvoiceEntryV1, PaidWorkError> {
     if next_invoice_seq == 0 {
         return Err(PaidWorkError::InvoiceSequence {
@@ -1514,10 +1516,10 @@ pub fn next_invoice_entry(
             .ok_or(PaidWorkError::Overflow {
                 field: "cumulative_after",
             })?;
-    if cumulative_after > capacity {
+    if cumulative_after > settlement.capacity() {
         return Err(PaidWorkError::OverCapacity {
             cumulative: cumulative_after,
-            capacity,
+            capacity: settlement.capacity(),
         });
     }
     Ok(InvoiceEntryV1 {
