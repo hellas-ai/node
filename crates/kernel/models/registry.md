@@ -64,8 +64,9 @@ These properties are **not** established by any abstract model today:
    on one length and record kind is enforced only by
    `View::registry_value` and tested only in `tests/view.rs`.
 2. **No abstract atomicity claim covers a registry write.** The models
-   capture atomicity by updating primed vars in one `action` block
-   (`deps/assumptions.qnt`). A registry write is outside that block, so
+   capture atomicity by updating primed vars in one `action` block, and
+   `src/store.rs` records that as a premise the implementation must
+   honour. A registry write is outside that block, so
    "the chunk write and the edge effect commit together" is a Rust-side
    property, checked in `crates/chain/src/execution/kernel.rs` where
    both halves are replayed into one QMDB batch.
@@ -137,6 +138,65 @@ registry-free for every profile, and the assertion above has moved with
 it: `tests/channel.rs` fails any *ordinary* open or close that writes a
 chunk, while a payment open is applied through a helper that requires
 exactly the two lease writes.
+
+## What the directory holds now, and what it dropped
+
+Four executable modules and their shared vocabulary. `l1.qnt` and
+`l1_fees.qnt` are the roots: typechecked, `quint test`ed, `quint run`
+with named invariants, `quint verify`ed by Apalache, and — this is the
+part that makes them evidence rather than decoration — exported as ITF
+traces and replayed against the kernel by `tests/itf.rs`, which compares
+coin owners and values, edge value, reserve, committed close fee,
+timeout, parties and terms hash, the emitted event, and the rejection of
+every input the model refused. `types.qnt`, `verifier.qnt`,
+`accounting.qnt`, `terms.qnt`, `bounds.qnt` and `rules/invariants.qnt`
+are their vocabulary and are reached through them.
+
+Three things were removed because they modelled a system that does not
+exist, and the removal is recorded here rather than only in a commit
+message:
+
+- **`proof_lifetime.qnt`.** Its close vocabulary was
+  `SelfContainedLatestProof`, `ViolationProof`, `BareSignedReceipt`,
+  `StaleReceipt`. No kernel has ever had a self-contained latest-state
+  proof; `Violation` was deleted with the seal apparatus; and a receipt
+  is not a `Proof` variant at all, so "a stale receipt is not
+  admissible" was a statement about a type the kernel cannot even
+  decode. Its `liveWithinPaidLifetime` invariant forced a close at the
+  horizon, which the kernel does not do — an edge stays live past its
+  timeout until somebody submits a close.
+- **`lifetime.qnt`.** It compared permanent, budgeted and bonded
+  lifetime policies, a per-block rent bucket that a `tick` drained, a
+  state bond, and a third-party collector paid out of the expired
+  slot's value. The kernel charges one prepaid lifetime fee at open,
+  priced from the committed timeout height, and has no rent, no state
+  bond, and no collector.
+- **`deps/assumptions.qnt`.** Not stale in content — every premise in it
+  is real — but it was imported by no module, so it was never
+  typechecked and never run, while `lib.rs` listed it in the
+  correspondence table beside modules that are. Its premises now live
+  with their consumers: `src/context.rs` (monotone height, network
+  separation), `src/block.rs` (deterministic block order), `src/store.rs`
+  (transaction atomicity, read isolation), `src/object.rs`
+  (operator-trusted genesis), and the head of `verifier.qnt` (verifier
+  soundness and determinism).
+
+Nothing real was dropped with them. Value accounting, the close
+reserve, the absence of a marginal close fee, close pricing at the
+schedule committed at open, `Mutual` expiry, `Timeout` liveness, and the
+timeout payout binding all live in `l1.qnt` / `l1_fees.qnt` over the same
+buckets, and each one has been shown to fail under a kernel mutation
+that should break it. The one assertion the deleted pair held that
+`l1_fees.qnt` did not is now in `feeRaiseDoesNotStrandCloseTest`: after a
+fee raise the current fee genuinely exceeds the whole reserve and the
+close is still available.
+
+Two value domains went with them and are worth naming, because their
+absence is now a claim. `EconomicTerms` used to carry a
+`stateBudgetRefund`, a `stateBondRefund` and a `slashExposure`; after
+`lifetime.qnt` and the seal apparatus went, every caller passed zero for
+all three. They are deleted rather than zeroed: a value domain nothing
+can make nonzero is a domain a reader will believe the kernel has.
 
 ## When this file should be deleted
 

@@ -89,8 +89,36 @@
 //! | Live objects         | [`Coin`] / [`Edge`] / ids       | `models/types.qnt`                   |
 //! | Block context        | [`Context`]                     | `models/l1.qnt` (`height` var)       |
 //! | Established rules    | [`Diff`], [`View`]              | `models/rules/invariants.qnt`        |
-//! | Assumed dependencies | [`Store`], verifier traits      | `models/deps/assumptions.qnt`        |
 //! | Fees / reserve        | [`Fees`], [`Cost`]             | `models/l1_fees.qnt`                 |
+//!
+//! Every module named there is typechecked, run, symbolically verified,
+//! and — for `l1` and `l1_fees` — replayed against this kernel by
+//! `tests/itf.rs`. There is deliberately no row for the premises the
+//! kernel takes on faith. `models/deps/assumptions.qnt` used to hold
+//! them and used to occupy a row here, which read as though a Quint
+//! module checked them; nothing imported it, so nothing typechecked or
+//! ran it. Each premise now sits with the code that relies on it —
+//! monotone height and network separation on [`Context`], deterministic
+//! block order on [`Block`], atomicity and read isolation on [`Store`],
+//! operator-trusted seeding on [`Genesis`] — and verifier soundness and
+//! determinism at the top of `models/verifier.qnt`.
+//!
+//! Two standalone models were deleted with their subjects, not folded
+//! in. `models/proof_lifetime.qnt` admitted a *self-contained
+//! latest-state proof*, a violation proof, and bare/stale receipts: no
+//! kernel ever had any of them, and it forced a close at the horizon
+//! that this one does not force either. `models/lifetime.qnt` explored
+//! permanent, budgeted and bonded lifetime policies against a
+//! per-block rent bucket and a third-party collector reward; the kernel
+//! charges one prepaid lifetime fee at open and has no rent, no state
+//! bond, and no collector. Both replayed green while modelling a system
+//! that does not exist. Every assertion of theirs that *was* about this
+//! kernel — value accounting, the close reserve, no marginal close fee,
+//! close pricing at the schedule committed at open, `Mutual` expiry,
+//! `Timeout` liveness, and the timeout payout binding — is in
+//! `models/l1.qnt` or `models/l1_fees.qnt`, over the same buckets, and
+//! is asserted against this kernel by the ITF replay rather than only
+//! inside Quint.
 //!
 //! The table is authoritative for the coin and edge state above and for
 //! nothing else. Registry state — [`RegistryChunk`], [`RegistryDiff`],
