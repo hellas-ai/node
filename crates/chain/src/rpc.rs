@@ -1,6 +1,9 @@
 //! Local implementation of the light-client query interface.
 
-use crate::domain::{Coin, Object, ObjectId, ObjectKind, SettlementKey, Transaction};
+use crate::domain::{
+    Coin, Object, ObjectId, ObjectKind, SettlementKey, Transaction, edge_object_id,
+    registry_chunk_object_id,
+};
 use crate::{
     app::Mempool,
     execution::store::UtxoDatabase,
@@ -10,8 +13,10 @@ use crate::{
         LatestBlock, LightClient, OwnerCoins, OwnerEdges, QueryError,
     },
     owner_index::{OwnerIndex, OwnerIndexError},
+    work_view::{FinalizedWorkView, WorkChannelQuery, WorkChannelSnapshot},
 };
 use commonware_cryptography::sha256::Digest;
+use hellas_kernel::{NetworkId, bond_lease_slots, pending_payment_close_slot};
 
 /// In-process [`LightClient`] backed by the local application handle.
 #[derive(Clone)]
@@ -126,6 +131,133 @@ async fn get_coin_at(
     let floor_height = finalized_floor_height(chain_indexer, payload).await?;
     require_finalized_floor(floor_height, cursor.height)?;
     coin.map_err(owner_lookup_error)
+}
+
+/// Reads every object of one work channel under one database snapshot.
+///
+/// The reader is taken once and every object comes out of it, which is
+/// the whole point: four separate `get` calls would answer from up to
+/// four states, and the combinations that produces read as healthy
+/// channels that never existed.
+///
+/// The state the reader holds is the state the owner index has applied
+/// up to, so the finalized block reported beside the objects is that
+/// index's cursor. If the two have drifted apart between the two reads
+/// the whole snapshot is refused rather than reported at a block it was
+/// not read at.
+async fn work_channel_snapshot_at(
+    databases: &UtxoDatabase<commonware_runtime::tokio::Context>,
+    owner_index: &OwnerIndex,
+    chain_indexer: &ChainIndexer,
+    network: NetworkId,
+    query: WorkChannelQuery,
+) -> Result<Option<WorkChannelSnapshot>, QueryError> {
+    if owner_index.cursor().height == 0 {
+        return Ok(None);
+    }
+
+    let reader = databases.read().await;
+    let state_root = reader.root();
+    let cursor = owner_index.cursor();
+    if cursor.height == 0 {
+        return Ok(None);
+    }
+    if cursor.state_root != state_root {
+        return Err(QueryError::StateUnavailable(
+            "owner index and application state are not synchronized".to_string(),
+        ));
+    }
+    let Some(finalization) = chain_indexer.get_finalization(cursor.payload).await? else {
+        return Err(QueryError::StateUnavailable(
+            "owner index cursor finalization is unavailable".to_string(),
+        ));
+    };
+
+    let mut bond = None;
+    let mut payment = None;
+    for (slot, edge) in [
+        (&mut bond, query.bond_edge),
+        (&mut payment, query.payment_edge),
+    ] {
+        *slot =
+            match reader.get(&edge_object_id(edge)).await.map_err(|error| {
+                QueryError::StateUnavailable(format!("edge read failed: {error:?}"))
+            })? {
+                Some(Object::Edge(edge)) => Some(edge),
+                Some(object) => {
+                    return Err(QueryError::WrongObjectKind {
+                        expected: ObjectKind::Edge,
+                        actual: object.kind(),
+                    });
+                }
+                None => None,
+            };
+    }
+
+    let [first_lease, second_lease] = bond_lease_slots(network, query.bond_edge);
+    let mut registry = [None, None, None];
+    for (stored, id) in registry.iter_mut().zip([
+        first_lease,
+        second_lease,
+        pending_payment_close_slot(network, query.payment_edge),
+    ]) {
+        *stored = match reader
+            .get(&registry_chunk_object_id(id))
+            .await
+            .map_err(|error| {
+                QueryError::StateUnavailable(format!("registry read failed: {error:?}"))
+            })? {
+            Some(Object::RegistryChunk(chunk)) => Some(chunk),
+            Some(object) => {
+                return Err(QueryError::WrongObjectKind {
+                    expected: ObjectKind::RegistryChunk,
+                    actual: object.kind(),
+                });
+            }
+            None => None,
+        };
+    }
+    let [lease_first, lease_second, pending_slot] = registry;
+
+    Ok(Some(WorkChannelSnapshot::new(
+        query,
+        LatestBlock {
+            height: cursor.height,
+            payload: cursor.payload,
+            state_root,
+            finalization,
+        },
+        bond,
+        payment,
+        [lease_first, lease_second],
+        pending_slot,
+    )))
+}
+
+impl FinalizedWorkView for LocalLightClient {
+    async fn work_channel_snapshot(
+        &self,
+        query: WorkChannelQuery,
+    ) -> Result<Option<WorkChannelSnapshot>, QueryError> {
+        // The registry slots are keyed by network, so a node whose
+        // genesis names an id the kernel cannot carry cannot derive
+        // them. Answering with slots derived from some other id would
+        // be answering about a different chain's channel.
+        let Some(network) = NetworkId::new(&self.consensus_info.network_id) else {
+            return Err(QueryError::StateUnavailable(format!(
+                "network id `{}` does not fit a kernel NetworkId",
+                self.consensus_info.network_id
+            )));
+        };
+        work_channel_snapshot_at(
+            &self.databases,
+            &self.owner_index,
+            &self.chain_indexer,
+            network,
+            query,
+        )
+        .await
+    }
 }
 
 impl LightClient for LocalLightClient {
@@ -314,6 +446,324 @@ mod tests {
                 actual: ObjectKind::Edge,
             }
         ));
+    }
+
+    /// One work channel, opened for real, read back as one answer.
+    ///
+    /// Everything here comes from one QMDB reader at one finalized
+    /// block: both edges, both lease slots, and the pending-close slot.
+    /// The lease is `Present` because a payment open wrote it, not
+    /// because this test wrote a chunk that looks like one — which is
+    /// the only way to find out that the endpoint derives the same slots
+    /// the kernel does.
+    #[test]
+    fn work_channel_snapshot_reads_every_object_at_one_finalized_block() {
+        use hellas_kernel::{
+            Auth, BlockHeight, CoinId, Funding, LeaseSlots, List, MAX_EDGE_OUTPUTS,
+            MAX_PARTY_INPUTS, Parties, Payout, PendingSlot, Secp256k1Signer, Terms as KernelTerms,
+            Tx as KernelTx, WorkPaymentTerms, WorkStakeBondTerms,
+        };
+
+        const FUNDING: u64 = 100;
+        const STAKE: u64 = 12;
+        const HORIZON: u64 = 500;
+
+        let network = crate::domain::TEST_NETWORK;
+        let Ok(client) = Secp256k1Signer::from_secret_scalar([0x21; 32]) else {
+            panic!("client key");
+        };
+        let Ok(provider) = Secp256k1Signer::from_secret_scalar([0x22; 32]) else {
+            panic!("provider key");
+        };
+        let client_key = client.party_key();
+        let provider_key = provider.party_key();
+
+        let bond = WorkStakeBondTerms {
+            parties: Parties::new(provider_key, client_key),
+            timeout: BlockHeight::new(HORIZON),
+            timeout_outputs: List::take([Payout::new(provider_key, STAKE); MAX_EDGE_OUTPUTS], 1),
+            max_job_price: 4,
+        };
+        let bond_terms = KernelTerms::work_stake_bond(bond.clone());
+        let bond_funding = Funding::new(
+            List::take(
+                [CoinId::from_bytes(genesis_object_id(1).into()); MAX_PARTY_INPUTS],
+                1,
+            ),
+            List::take(
+                [CoinId::from_bytes([0; CoinId::LENGTH]); MAX_PARTY_INPUTS],
+                0,
+            ),
+        );
+        let bond_edge = KernelTx::edge_id_of(&bond_funding, &bond_terms);
+        let bond_open_hash = KernelTx::open_hash(network, &bond_funding, &bond_terms);
+        let bond_open = KernelTx::open(
+            bond_funding,
+            bond_terms,
+            Auth::native(provider.sign(bond_open_hash)),
+            Auth::native(client.sign(bond_open_hash)),
+        );
+
+        let payment_terms = KernelTerms::work_payment(WorkPaymentTerms {
+            bond_edge,
+            bond_terms: bond,
+            private_policy_commitment: [0x25; 32],
+            omit_response_blocks: hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
+            start_validity_blocks: 8,
+            omission_bond: 2,
+        });
+        let payment_funding = Funding::new(
+            List::take(
+                [CoinId::from_bytes(genesis_object_id(0).into()); MAX_PARTY_INPUTS],
+                1,
+            ),
+            List::take(
+                [CoinId::from_bytes([0; CoinId::LENGTH]); MAX_PARTY_INPUTS],
+                0,
+            ),
+        );
+        let payment_edge = KernelTx::edge_id_of(&payment_funding, &payment_terms);
+        let payment_open_hash = KernelTx::open_hash(network, &payment_funding, &payment_terms);
+        let payment_open = KernelTx::open(
+            payment_funding,
+            payment_terms,
+            Auth::native(client.sign(payment_open_hash)),
+            Auth::native(provider.sign(payment_open_hash)),
+        );
+
+        let query = WorkChannelQuery {
+            bond_edge,
+            payment_edge,
+        };
+
+        run_qmdb(|runtime| async move {
+            let indexer_context = runtime.child("chain_indexer");
+            let config = utxo_db_config(&runtime, "rpc_work_snapshot", 1024, 8);
+            let database = <UtxoDatabase<_> as DatabaseSet<_>>::init(runtime, config).await;
+            let allocations = vec![
+                (SettlementKey::from(client_key), FUNDING),
+                (SettlementKey::from(provider_key), STAKE),
+                // A third allocation, left unspent: the wrong-kind case
+                // below needs a coin that still exists after both opens
+                // have consumed the first two.
+                (SettlementKey::from(legacy_address(41)), 7),
+            ];
+            let genesis = index_genesis();
+
+            // Block one: the genesis allocations alone.
+            let floor_root = apply(&database, &allocations, 1, &[]).await;
+            let floor_block = index_block(&genesis, floor_root, Vec::new());
+
+            // Block two: the two opens, in the order setup requires.
+            let transactions = vec![
+                Transaction::Kernel(bond_open),
+                Transaction::Kernel(payment_open),
+            ];
+            let open_root = apply(&database, &allocations, 2, &transactions).await;
+            let open_block = index_block(&floor_block, open_root, transactions);
+
+            let fixture = consensus_fixture(93);
+            let (chain_indexer, _handle) = spawn_follower_indexer(
+                indexer_context,
+                "rpc_work_snapshot",
+                Config {
+                    mailbox_size: 32,
+                    replay_buffer: 32,
+                    write_buffer: 32,
+                    page_cache_size: 1024,
+                    page_cache_count: 8,
+                    ..Config::default()
+                },
+                fixture.verifier.clone(),
+                genesis.clone(),
+            )
+            .await
+            .expect("chain indexer");
+            for block in [&floor_block, &open_block] {
+                chain_indexer
+                    .ingest_finalized(block.clone(), finalization(&fixture, block))
+                    .await
+                    .expect("finalized ingest");
+            }
+
+            let behind_allocations = allocations.clone();
+            let index = OwnerIndex::new(network, &genesis, allocations);
+
+            // Before either block is applied there is no finalized state
+            // to answer from, which is not the same fact as "this is not
+            // a channel".
+            assert!(matches!(
+                work_channel_snapshot_at(&database, &index, &chain_indexer, network, query).await,
+                Ok(None),
+            ));
+
+            assert_eq!(
+                index.apply_finalized(&floor_block),
+                Ok(ApplyOutcome::Applied)
+            );
+            assert_eq!(
+                index.apply_finalized(&open_block),
+                Ok(ApplyOutcome::Applied)
+            );
+
+            let snapshot =
+                work_channel_snapshot_at(&database, &index, &chain_indexer, network, query)
+                    .await
+                    .expect("work channel snapshot")
+                    .expect("finalized state is available");
+
+            assert_eq!(snapshot.query(), query);
+            assert_eq!(
+                snapshot.height(),
+                commonware_consensus::Heightable::height(&open_block).get()
+            );
+            assert_eq!(snapshot.state_root(), open_root);
+            assert_eq!(snapshot.block().payload, open_block.digest());
+            assert_eq!(snapshot.state_root(), database.read().await.root());
+
+            let bond_state = snapshot.bond().expect("the bond edge is live");
+            assert_eq!(bond_state.value(), STAKE);
+            let payment_state = snapshot.payment().expect("the payment edge is live");
+            assert_eq!(payment_state.value(), FUNDING);
+
+            // The lease the payment open wrote, read out of the slots
+            // the kernel derives.
+            let LeaseSlots::Present(lease) = snapshot.lease() else {
+                panic!("an open payment channel holds its bond's lease");
+            };
+            assert_eq!(lease.bond_edge(), bond_edge);
+            assert_eq!(lease.payment_edge(), payment_edge);
+            assert_eq!(lease.admission_horizon(), HORIZON);
+            assert_eq!(snapshot.pending(), PendingSlot::Absent);
+
+            // The same answer, through the wire, byte for byte. The
+            // response carries canonical kernel objects, so what comes
+            // back is the object consensus stored and not a re-spelling
+            // of its fields — and a re-spelling is exactly what the
+            // equality below would not catch if the wire carried one.
+            let encoded = crate::server::work_channel_snapshot_response(Some(snapshot.clone()));
+            assert_eq!(
+                crate::client::work_channel_snapshot_from_proto(query, encoded.clone(), None)
+                    .expect("the wire carries a decodable snapshot"),
+                Some(snapshot.clone()),
+            );
+
+            // One lease slot dropped. Reading its absence as an empty
+            // slot would report a live lease as absent, so the count is
+            // exact rather than padded.
+            let mut short = encoded.clone();
+            short.lease_slots.truncate(1);
+            assert!(matches!(
+                crate::client::work_channel_snapshot_from_proto(query, short, None),
+                Err(QueryError::Remote(_)),
+            ));
+
+            // One lease slot's bytes truncated. A chunk that does not
+            // decode is not an empty slot either.
+            let mut corrupt = encoded;
+            if let Some(slot) = corrupt.lease_slots.first_mut()
+                && let Some(chunk) = slot.chunk.as_mut()
+            {
+                chunk.pop();
+            }
+            assert!(matches!(
+                crate::client::work_channel_snapshot_from_proto(query, corrupt, None),
+                Err(QueryError::Remote(_)),
+            ));
+
+            // An index one block behind the database it is reporting
+            // for. Its cursor block is finalized and its finalization
+            // is available, so nothing but the root disagrees — and a
+            // snapshot reported at that cursor would carry objects read
+            // from a state the cursor never named.
+            let behind = OwnerIndex::new(network, &genesis, behind_allocations);
+            assert_eq!(
+                behind.apply_finalized(&floor_block),
+                Ok(ApplyOutcome::Applied)
+            );
+            assert_ne!(behind.cursor().state_root, database.read().await.root());
+            assert!(
+                chain_indexer
+                    .get_finalization(behind.cursor().payload)
+                    .await
+                    .expect("finalization query")
+                    .is_some(),
+                "the behind cursor's own block is finalized, so only the root disagrees",
+            );
+            assert!(matches!(
+                work_channel_snapshot_at(&database, &behind, &chain_indexer, network, query).await,
+                Err(QueryError::StateUnavailable(_)),
+            ));
+
+            // A channel naming a bond nobody opened is absent, not
+            // faulty, and its edges are absent too.
+            let absent = work_channel_snapshot_at(
+                &database,
+                &index,
+                &chain_indexer,
+                network,
+                WorkChannelQuery {
+                    bond_edge: hellas_kernel::EdgeId::from_bytes([0xa7; 32]),
+                    payment_edge: hellas_kernel::EdgeId::from_bytes([0xa8; 32]),
+                },
+            )
+            .await
+            .expect("absent channel snapshot")
+            .expect("finalized state is available");
+            assert!(absent.bond().is_none());
+            assert!(absent.payment().is_none());
+            assert_eq!(absent.lease(), LeaseSlots::Absent);
+            assert_eq!(absent.pending(), PendingSlot::Absent);
+
+            // A coin where an edge was asked for is a typed refusal, not
+            // an absent edge.
+            assert!(matches!(
+                work_channel_snapshot_at(
+                    &database,
+                    &index,
+                    &chain_indexer,
+                    network,
+                    WorkChannelQuery {
+                        bond_edge: hellas_kernel::EdgeId::from_bytes(genesis_object_id(2).into()),
+                        payment_edge,
+                    },
+                )
+                .await,
+                Err(QueryError::WrongObjectKind {
+                    expected: ObjectKind::Edge,
+                    actual: ObjectKind::Coin,
+                }),
+            ));
+        });
+    }
+
+    /// Executes one block's transactions and finalizes the result,
+    /// returning the state root they produce.
+    async fn apply(
+        database: &UtxoDatabase<commonware_runtime::tokio::Context>,
+        allocations: &[(SettlementKey, u64)],
+        height: u64,
+        transactions: &[Transaction],
+    ) -> Digest {
+        let batches = database.new_batches().await;
+        let batches = execute_all(
+            KernelContext::with_fees(
+                crate::domain::TEST_NETWORK,
+                BlockHeight::new(height),
+                BlockHash::from_bytes([0; BlockHash::LENGTH]),
+                KERNEL_FEES,
+            ),
+            &ChainVerifier::new(),
+            transactions,
+            allocations,
+            batches,
+        )
+        .await
+        .expect("block executes");
+        let merkleized = batches.merkleize().await.expect("state merkleizes");
+        let root = merkleized.root();
+        database.finalize(merkleized).await;
+        root
     }
 
     #[test]

@@ -3,12 +3,13 @@ use crate::domain::{
     Address, Coin, DecodeExt, Digest, MAX_MERGE_INPUTS, ObjectId, SettlementKey, Transaction,
     UserPublicKey, UserSignature, WebAuthnSignature,
 };
+use crate::work_view::{FinalizedWorkView, WorkChannelQuery, WorkChannelSnapshot};
 use crate::{
     ConsensusActivity, ConsensusInfo, EdgeLookup, EdgeState, FinalizedBlock, FinalizedBlockQuery,
     LatestBlock, LightClient as LightClientApi, OwnerEdges, ProposalInfo,
 };
 use futures_util::{Stream, StreamExt as _};
-use hellas_kernel::{Decode as _, Tx as KernelTx};
+use hellas_kernel::{Decode as _, EdgeId, Tx as KernelTx};
 use hellas_rpc::pb::{
     chain::{
         self as pb, ActivityEvent, CoinEntry, EdgeEntry, EdgeState as ProtoEdgeState,
@@ -16,9 +17,10 @@ use hellas_rpc::pb::{
         GetCoinResponse, GetCoinsByOwnerResponse, GetConsensusInfoResponse, GetEdgeResponse,
         GetEdgesByOwnerResponse, GetFinalizationResponse, GetFinalizedBlockResponse,
         GetLatestBlockResponse, GetProofResponse, GetRelayInfoResponse, GetStateRootResponse,
-        GetValidatorsResponse, KernelFees, MergeCoinTx, NotarizationEvent, NotarizeEvent,
-        NullificationEvent, NullifyEvent, SubmitTxResponse, TransferTx,
-        WebAuthnSignature as ProtoWebAuthnSignature, activity_event, submit_tx_request,
+        GetValidatorsResponse, GetWorkChannelSnapshotResponse, KernelFees, MergeCoinTx,
+        NotarizationEvent, NotarizeEvent, NullificationEvent, NullifyEvent, RegistrySlot,
+        SubmitTxResponse, TransferTx, WebAuthnSignature as ProtoWebAuthnSignature, activity_event,
+        submit_tx_request,
     },
     services::light_client::{LightClientHandler, LightClientServer},
 };
@@ -64,7 +66,7 @@ pub async fn spawn_light_client_server<T>(
     activity_tx: broadcast::Sender<ConsensusActivity>,
 ) -> io::Result<JoinHandle<()>>
 where
-    T: LightClientApi,
+    T: LightClientApi + FinalizedWorkView,
 {
     let listener = TcpListener::bind(addr).await?;
     Ok(tokio::spawn(async move {
@@ -92,7 +94,7 @@ async fn serve_connection<T>(
     service: LightClientRpc<T>,
 ) -> Result<(), LightClientServerError>
 where
-    T: LightClientApi,
+    T: LightClientApi + FinalizedWorkView,
 {
     let ws = accept_async(stream).await?;
     let transport = hellas_wire::ws::accept_upgraded(ws, None);
@@ -112,7 +114,7 @@ where
     T::Stream: 'static,
     <T::Stream as hellas_wire::Stream>::RecvHalf: 'static,
     <T::Stream as hellas_wire::Stream>::SendHalf: 'static,
-    C: LightClientApi,
+    C: LightClientApi + FinalizedWorkView,
 {
     let mut calls = tokio::task::JoinSet::new();
     while let Some(inbound) = transport.accept().await? {
@@ -146,7 +148,7 @@ where
 #[allow(refining_impl_trait)]
 impl<T> LightClientHandler for LightClientRpc<T>
 where
-    T: LightClientApi,
+    T: LightClientApi + FinalizedWorkView,
 {
     fn get_state_root(
         &self,
@@ -205,6 +207,24 @@ where
                 .await
                 .map_err(WireStatus::from)?;
             Ok(edge_response(edge))
+        }
+    }
+
+    fn get_work_channel_snapshot(
+        &self,
+        request: pb::GetWorkChannelSnapshotRequest,
+    ) -> impl Future<Output = Result<GetWorkChannelSnapshotResponse, WireStatus>> + Send {
+        let client = self.client.clone();
+        async move {
+            let query = WorkChannelQuery {
+                bond_edge: edge_id_from_bytes(request.bond_edge, "bond_edge")?,
+                payment_edge: edge_id_from_bytes(request.payment_edge, "payment_edge")?,
+            };
+            let snapshot = client
+                .work_channel_snapshot(query)
+                .await
+                .map_err(WireStatus::from)?;
+            Ok(work_channel_snapshot_response(snapshot))
         }
     }
 
@@ -538,6 +558,57 @@ fn edge_response(lookup: Option<EdgeLookup>) -> GetEdgeResponse {
     }
 }
 
+pub(crate) fn work_channel_snapshot_response(
+    snapshot: Option<WorkChannelSnapshot>,
+) -> GetWorkChannelSnapshotResponse {
+    match snapshot {
+        Some(snapshot) => GetWorkChannelSnapshotResponse {
+            snapshot: Some(latest_block_to_proto(snapshot.block().clone())),
+            bond_edge: snapshot.bond().map(kernel_bytes),
+            payment_edge: snapshot.payment().map(kernel_bytes),
+            lease_slots: snapshot
+                .lease_slots()
+                .iter()
+                .map(|slot| RegistrySlot {
+                    chunk: slot.as_ref().map(kernel_bytes),
+                })
+                .collect(),
+            pending_slot: Some(RegistrySlot {
+                chunk: snapshot.pending_slot().as_ref().map(kernel_bytes),
+            }),
+        },
+        None => GetWorkChannelSnapshotResponse {
+            snapshot: None,
+            bond_edge: None,
+            payment_edge: None,
+            lease_slots: Vec::new(),
+            pending_slot: None,
+        },
+    }
+}
+
+/// Returns one kernel object's canonical bytes.
+///
+/// The wire carries exactly what consensus stored rather than a
+/// re-spelling of its fields, so a caller decodes the object with the
+/// kernel's own decoder and there is no second definition of an edge on
+/// this path.
+fn kernel_bytes<E: hellas_kernel::Encode>(value: &E) -> Vec<u8> {
+    let mut buf = vec![0_u8; value.encoded_size()];
+    let written = value.write_to(&mut buf);
+    buf.truncate(written);
+    buf
+}
+
+fn edge_id_from_bytes(bytes: Vec<u8>, field: &'static str) -> Result<EdgeId, WireStatus> {
+    EdgeId::decode_exact(&bytes).map_err(|_| {
+        WireStatus::new(
+            WireCode::InvalidArgument,
+            format!("{field} was not {} canonical bytes", EdgeId::LENGTH),
+        )
+    })
+}
+
 fn edge_state_to_proto(edge: EdgeState) -> ProtoEdgeState {
     ProtoEdgeState {
         value: edge.value,
@@ -724,6 +795,16 @@ mod tests {
         mempool: Mempool,
         edge_result: Option<Result<Option<EdgeLookup>, QueryError>>,
         owner_edges_result: Option<Result<Option<OwnerEdges>, QueryError>>,
+        snapshot_result: Option<WorkChannelSnapshot>,
+    }
+
+    impl FinalizedWorkView for MempoolClient {
+        async fn work_channel_snapshot(
+            &self,
+            _query: WorkChannelQuery,
+        ) -> Result<Option<WorkChannelSnapshot>, QueryError> {
+            Ok(self.snapshot_result.clone())
+        }
     }
 
     impl LightClientApi for MempoolClient {
@@ -798,6 +879,45 @@ mod tests {
         pb::SubmitTxRequest {
             tx: Some(submit_tx_request::Tx::KernelTx(bytes)),
         }
+    }
+
+    /// The endpoint's two boundary answers: an argument that is not an
+    /// edge id, and a node with no finalized state to answer from.
+    ///
+    /// Absence is reported as an absent snapshot rather than an empty
+    /// one, because an empty snapshot would read as "this channel does
+    /// not exist" — a different fact, and the one that would let an
+    /// endpoint conclude a live lease was gone.
+    #[tokio::test]
+    async fn work_channel_snapshot_endpoint_separates_a_bad_argument_from_no_state() {
+        let rpc = LightClientRpc::new(MempoolClient::default(), broadcast::channel(4).0);
+        let ok = EdgeId::from_bytes([0x11; EdgeId::LENGTH])
+            .to_bytes()
+            .to_vec();
+
+        let short = LightClientHandler::get_work_channel_snapshot(
+            &rpc,
+            pb::GetWorkChannelSnapshotRequest {
+                bond_edge: ok[..EdgeId::LENGTH - 1].to_vec(),
+                payment_edge: ok.clone(),
+            },
+        )
+        .await
+        .expect_err("a 31-byte edge id is not an edge id");
+        assert_eq!(short.code(), WireCode::InvalidArgument);
+
+        let absent = LightClientHandler::get_work_channel_snapshot(
+            &rpc,
+            pb::GetWorkChannelSnapshotRequest {
+                bond_edge: ok.clone(),
+                payment_edge: ok,
+            },
+        )
+        .await
+        .expect("an absent snapshot is an answer");
+        assert!(absent.snapshot.is_none());
+        assert!(absent.lease_slots.is_empty());
+        assert!(absent.pending_slot.is_none());
     }
 
     #[tokio::test]

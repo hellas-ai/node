@@ -72,6 +72,16 @@ let
       mk "check-rpc-work"
         "cargo test -p hellas-rpc --features work && cargo clippy -p hellas-rpc --features work --all-targets -- -D warnings"
         (cargoEnv rustToolchain);
+    # The chain service's wire-id pins compile only under `chain`, which
+    # `work` does not pull in. `check-validator` links hellas-rpc with
+    # that feature but runs hellas-chain's tests, not hellas-rpc's, so
+    # until this line existed the light-client service and method ids
+    # were pinned by a test no gate ran. A rotated chain id would have
+    # reached deployed nodes with every check green.
+    rpc-chain =
+      mk "check-rpc-chain"
+        "cargo test -p hellas-rpc --features chain && cargo clippy -p hellas-rpc --features chain --all-targets -- -D warnings"
+        (cargoEnv rustToolchain);
     validator =
       mk "check-validator" "cargo test -p hellas-chain --no-default-features --features validator"
         (cargoEnv rustToolchain);

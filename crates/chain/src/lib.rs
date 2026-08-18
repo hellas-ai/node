@@ -30,6 +30,8 @@ pub mod rpc;
 pub mod server;
 #[cfg(feature = "validator")]
 pub mod validator;
+#[cfg(any(feature = "client-core", feature = "server"))]
+pub mod work_view;
 
 #[cfg(any(feature = "client-core", feature = "indexer", feature = "validator"))]
 pub const CONSENSUS_NAMESPACE: &[u8] = b"hellas";
@@ -59,3 +61,5 @@ pub use owner_index::{ApplyOutcome, OwnerCursor, OwnerIndex, OwnerIndexError};
 pub use server::{
     LightClientRpc, LightClientServerError, serve_light_client_transport, spawn_light_client_server,
 };
+#[cfg(any(feature = "client-core", feature = "server"))]
+pub use work_view::{FinalizedWorkView, WorkChannelQuery, WorkChannelSnapshot};

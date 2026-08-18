@@ -112,7 +112,7 @@ pub async fn serve_light_client_relay<C>(
     activity_tx: broadcast::Sender<crate::ConsensusActivity>,
 ) -> Result<(), RelayConnectError>
 where
-    C: LightClient,
+    C: LightClient + crate::work_view::FinalizedWorkView,
 {
     let timestamp_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

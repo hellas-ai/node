@@ -2,12 +2,13 @@ use crate::domain::{
     Coin, Digest, Encode, ObjectId, SettlementKey, Transaction,
     WebAuthnSignature as DomainWebAuthnSignature,
 };
+use crate::work_view::{FinalizedWorkView, WorkChannelQuery, WorkChannelSnapshot};
 use crate::{
     ConsensusInfo, ConsensusVerifier, EdgeLookup, EdgeRecord, EdgeState, FinalizedBlock,
     FinalizedBlockQuery, LatestBlock, LightClient, OwnerCoins, OwnerEdges, QueryError,
 };
 use commonware_cryptography::{Hasher, Sha256};
-use hellas_kernel::{Decode as _, Encode as _};
+use hellas_kernel::{BOND_LEASE_CHUNKS, Decode as _, Edge, Encode as _, RegistryChunk};
 use hellas_rpc::{
     call::StreamingCall,
     pb::{chain::*, services::light_client::LightClientClientImpl},
@@ -370,6 +371,90 @@ fn owner_edges_from_proto(
         edges.push(edge);
     }
     Ok(Some(OwnerEdges { snapshot, edges }))
+}
+
+impl FinalizedWorkView for RemoteLightClient {
+    fn work_channel_snapshot(
+        &self,
+        query: WorkChannelQuery,
+    ) -> impl Future<Output = Result<Option<WorkChannelSnapshot>, QueryError>> + Send {
+        let client = self.client.clone();
+        let verifier = self.verifier.clone();
+        async move {
+            let response = client
+                .get_work_channel_snapshot(GetWorkChannelSnapshotRequest {
+                    bond_edge: query.bond_edge.to_bytes().to_vec(),
+                    payment_edge: query.payment_edge.to_bytes().to_vec(),
+                })
+                .await
+                .map_err(QueryError::from)?;
+            work_channel_snapshot_from_proto(query, response, verifier.as_ref())
+        }
+    }
+}
+
+/// Reads one channel snapshot off the wire.
+///
+/// The chunk count is checked exactly rather than padded or truncated: a
+/// reply carrying one lease slot is not a lease half-read, it is a peer
+/// answering a question this build did not ask, and treating its missing
+/// slot as empty would read a live lease as absent.
+pub(crate) fn work_channel_snapshot_from_proto(
+    query: WorkChannelQuery,
+    response: GetWorkChannelSnapshotResponse,
+    verifier: Option<&ConsensusVerifier>,
+) -> Result<Option<WorkChannelSnapshot>, QueryError> {
+    let Some(snapshot) = response.snapshot else {
+        return Ok(None);
+    };
+    let block = verified_latest_block_from_proto(snapshot, verifier)?;
+
+    let slots = response.lease_slots.len();
+    let expected = usize::from(BOND_LEASE_CHUNKS);
+    if slots != expected {
+        return Err(QueryError::Remote(format!(
+            "work channel snapshot carried {slots} lease slots, expected {expected}"
+        )));
+    }
+    let mut lease_slots = [None, None];
+    for (slot, wire) in lease_slots.iter_mut().zip(response.lease_slots) {
+        *slot = registry_chunk_from_wire(wire.chunk, "lease slot")?;
+    }
+    let pending_slot = registry_chunk_from_wire(
+        response.pending_slot.and_then(|slot| slot.chunk),
+        "pending-close slot",
+    )?;
+
+    Ok(Some(WorkChannelSnapshot::new(
+        query,
+        block,
+        edge_from_wire(response.bond_edge, "bond edge")?,
+        edge_from_wire(response.payment_edge, "payment edge")?,
+        lease_slots,
+        pending_slot,
+    )))
+}
+
+fn edge_from_wire(bytes: Option<Vec<u8>>, field: &'static str) -> Result<Option<Edge>, QueryError> {
+    bytes
+        .map(|bytes| {
+            Edge::decode_exact(&bytes)
+                .map_err(|_| QueryError::Remote(format!("{field} was not a canonical kernel edge")))
+        })
+        .transpose()
+}
+
+fn registry_chunk_from_wire(
+    bytes: Option<Vec<u8>>,
+    field: &'static str,
+) -> Result<Option<RegistryChunk>, QueryError> {
+    bytes
+        .map(|bytes| {
+            RegistryChunk::decode_exact(&bytes).map_err(|_| {
+                QueryError::Remote(format!("{field} was not a canonical registry chunk"))
+            })
+        })
+        .transpose()
 }
 
 fn digest_from_wire(bytes: Vec<u8>, field: &'static str) -> Result<Digest, QueryError> {
