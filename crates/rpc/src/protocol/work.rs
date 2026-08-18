@@ -20,6 +20,14 @@
 //!   -> kernel payout
 //! ```
 //!
+//! A chain of digests is not by itself a ledger: every link above can be
+//! rebuilt truthfully for a job that was already paid for, at a fresh
+//! sequence and a fresh cumulative, and read alone it is indistinguishable
+//! from a second job. [`CreditLedger`] is what makes it a ledger. It holds
+//! the whole of the cross-call state — the next sequence, the credited
+//! amount, and the jobs already paid for — and it is the only thing here
+//! that says a job is paid for at most once.
+//!
 //! None of it is consensus input, and none of it is on L1. It lives here,
 //! in the neutral protocol crate, so the provider and the client have one
 //! implementation of these digests rather than two that agree until they
@@ -42,11 +50,13 @@
 //! Every fixed record is hashed with [`SingleChunkHasher`], which
 //! *asserts* rather than errors once a preimage reaches
 //! [`hellas_xet::MIN_CHUNK_SIZE`]. Each body here is fixed-width, so each
-//! complete preimage has a compile-time maximum, and each maximum is
-//! asserted below. The two variable-length preimages — the prepared input
-//! bundle and the canonical output — use the streaming
-//! [`XetFileHasher`] instead, which has no such limit and which agrees
-//! with one-shot [`Digest::hash`] under every write segmentation.
+//! complete preimage has a compile-time maximum, and every preimage
+//! shape — record, channel id, invoice leaf, invoice node, empty tree —
+//! is asserted below. The four variable-length preimages — the
+//! generation policy, the identity artifact, the prepared input bundle,
+//! and the canonical output — use the streaming [`XetFileHasher`]
+//! instead, which has no such limit and which agrees with one-shot
+//! [`Digest::hash`] under every write segmentation.
 //!
 //! # Signatures
 //!
@@ -55,6 +65,8 @@
 //! authorization, the allocation, and the kernel's earned digest. Every
 //! digest below binds the network and the channel, so a body lifted from
 //! one channel is not a body in another.
+
+use std::collections::BTreeSet;
 
 use hellas_kernel::{
     BufferWriter, EarnedCertificate, EdgeId, Encode, Key, NetworkId, PayloadHash, Terms, TermsHash,
@@ -249,8 +261,8 @@ pub enum PaidWorkError {
         /// Number of entries offered.
         count: usize,
     },
-    /// One accepted job or result was invoiced twice.
-    #[error("{field} appears in more than one invoice entry of this allocation")]
+    /// One accepted job was invoiced twice on this channel.
+    #[error("{field} appears in more than one credited invoice entry of this channel")]
     Duplicate {
         /// Which identifier repeated.
         field: &'static str,
@@ -322,6 +334,13 @@ pub trait PrivateRecord: Sized {
         }
         let mut reader = BodyReader { bytes: body };
         let record = Self::decode_body(&mut reader)?;
+        // Unreachable while every `decode_body` reads exactly
+        // `BODY_SIZE` bytes, which is what the length check above
+        // already guaranteed it was handed. It is kept because that is a
+        // property of six separate implementations rather than of this
+        // one: a field dropped from a `decode_body` whose `BODY_SIZE`
+        // was left alone leaves bytes here, and this is the only place
+        // that would notice. No test isolates it, and none claims to.
         if reader.bytes.is_empty() {
             Ok(record)
         } else {
@@ -469,6 +488,15 @@ pub struct PaidJobAuthorizationV1 {
     /// Commitment to the prepared input bundle.
     pub prepared_input_digest: Digest,
     /// Client-chosen nonce making this proposal unique.
+    ///
+    /// Freshness is the client's own duty, and cannot be anything else:
+    /// nothing in one authorization distinguishes a fresh nonce from a
+    /// repeated one, and by the time a ledger could say, the job is
+    /// already accepted. Repeating it is not a payment risk — two
+    /// proposals identical in every field are one `work_id`, and
+    /// [`CreditLedger`] pays a `work_id` once — it is a delivery risk:
+    /// the client has ordered one job and will be paid one job's
+    /// answer.
     pub proposal_nonce: u64,
     /// Last height at which this authorization may be signed.
     pub acceptance_deadline: u64,
@@ -733,8 +761,17 @@ impl EncodedNetwork {
         Self { bytes, len }
     }
 
+    /// Returns the encoded id, and nothing else.
+    ///
+    /// The index cannot be out of range: `BufferWriter` never reports a
+    /// position past the buffer it was given. It is written as an index
+    /// rather than a `get(..len).unwrap_or(&self.bytes)` because the
+    /// fallback in that spelling is a *different preimage* — the whole
+    /// zero-padded buffer — and every digest in this module would move
+    /// silently under it. A bug that cannot happen should not have a
+    /// second answer ready.
     fn as_slice(&self) -> &[u8] {
-        self.bytes.get(..self.len).unwrap_or(&self.bytes)
+        &self.bytes[..self.len]
     }
 }
 
@@ -768,35 +805,65 @@ fn xfh(domain: &[u8], fields: &[&[u8]]) -> Digest {
     hasher.finalize()
 }
 
+const fn wider(a: usize, b: usize) -> usize {
+    if a > b { a } else { b }
+}
+
+/// Widest of the six records, taken rather than named.
+const WIDEST_RECORD: usize = wider(
+    wider(
+        wider(
+            PaidChannelPolicyV1::ENCODED_SIZE,
+            PaidExecutionPolicyV1::ENCODED_SIZE,
+        ),
+        wider(
+            PaidJobAuthorizationV1::ENCODED_SIZE,
+            PaidJobResultV1::ENCODED_SIZE,
+        ),
+    ),
+    wider(
+        InvoiceEntryV1::ENCODED_SIZE,
+        CertificateAllocationV1::ENCODED_SIZE,
+    ),
+);
+/// Longest of the domain strings, likewise taken rather than named.
+const LONGEST_DOMAIN: usize = PRIVATE_CERTIFICATE_ALLOCATION.len();
+const ENCODED_NETWORK: usize = <NetworkId as Encode>::MAX_ENCODED_SIZE;
+
 /// Largest complete `XH` preimage this module can produce.
 ///
-/// Every fixed record is smaller than the authorization, and every `XH`
-/// preimage is `domain || network || channel_id || record`. The longest
-/// domain string is measured rather than guessed.
-const LONGEST_DOMAIN: usize = PRIVATE_CERTIFICATE_ALLOCATION.len();
-const WIDEST_XH_PREIMAGE: usize = LONGEST_DOMAIN
-    + <NetworkId as Encode>::MAX_ENCODED_SIZE
-    + 32
-    + PaidJobAuthorizationV1::ENCODED_SIZE;
+/// Every `XH` preimage has one of five shapes, and every one of the five
+/// is bounded below rather than assumed to be covered by another. The
+/// record-shaped preimages — `domain || network || channel_id || record`
+/// — take the widest record and the longest domain from the sets above,
+/// so a seventh record, or one that grew, cannot invalidate this bound
+/// by being overlooked.
+const WIDEST_XH_PREIMAGE: usize = LONGEST_DOMAIN + ENCODED_NETWORK + 32 + WIDEST_RECORD;
 
 const _: () = assert!(
     WIDEST_XH_PREIMAGE < MIN_CHUNK_SIZE,
     "a single-chunk preimage that reaches MIN_CHUNK_SIZE panics the hasher"
 );
-// The invoice-tree nodes are the only XH preimages that are not
-// domain-network-channel-record shaped, so they are bounded separately
-// rather than assumed to be covered by the record above.
+// `domain || network || payment_edge || payment_terms || bond_edge ||
+// bond_terms`: the channel id is derived before a channel id exists, so
+// it is the one preimage with no channel field.
+const _: () = assert!(
+    CHANNEL.len() + ENCODED_NETWORK + 4 * 32 < MIN_CHUNK_SIZE,
+    "channel id preimage must stay under MIN_CHUNK_SIZE"
+);
+// The invoice tree's three shapes. They carry no network and no channel:
+// their entries' own digests already do.
+const _: () = assert!(
+    PRIVATE_INVOICE_LEAF.len() + 8 + 32 < MIN_CHUNK_SIZE,
+    "invoice leaf preimage must stay under MIN_CHUNK_SIZE"
+);
 const _: () = assert!(
     PRIVATE_INVOICE_NODE.len() + 8 + 2 + 2 + 32 + 32 < MIN_CHUNK_SIZE,
     "invoice node preimage must stay under MIN_CHUNK_SIZE"
 );
 const _: () = assert!(
-    PAID_CHANNEL_POLICY.len()
-        + <NetworkId as Encode>::MAX_ENCODED_SIZE
-        + 32
-        + PaidChannelPolicyV1::ENCODED_SIZE
-        < MIN_CHUNK_SIZE,
-    "channel policy preimage must stay under MIN_CHUNK_SIZE"
+    PRIVATE_INVOICE_EMPTY.len() + 1 < MIN_CHUNK_SIZE,
+    "empty invoice root preimage must stay under MIN_CHUNK_SIZE"
 );
 
 // ── The channel ───────────────────────────────────────────────────────
@@ -814,17 +881,40 @@ pub struct PaidChannel {
     payment_edge: EdgeId,
     payment_terms: WorkPaymentTerms,
     payment_terms_hash: TermsHash,
+    channel_policy: PaidChannelPolicyV1,
     id: Digest,
 }
 
 impl PaidChannel {
-    /// Derives a channel from its payment edge and that edge's terms.
+    /// Derives a channel from its payment edge, that edge's terms, and
+    /// the credit policy those terms commit to.
     ///
     /// The bond edge and bond terms hash are read out of the payment
     /// terms rather than passed in: the payment body already embeds the
     /// complete bond, so a separately supplied bond could only ever be
     /// the wrong one.
-    pub fn new(network: NetworkId, payment_edge: EdgeId, payment_terms: WorkPaymentTerms) -> Self {
+    ///
+    /// The credit policy is opened here, once, against
+    /// `private_policy_commitment`, and then travels with the channel.
+    /// A policy checked at a call site is a policy some other call site
+    /// can decline to check; a channel that cannot be constructed
+    /// without opening its own commitment has no such call site. The
+    /// commitment is salted because the credit domain is small enough to
+    /// enumerate.
+    pub fn new(
+        network: NetworkId,
+        payment_edge: EdgeId,
+        payment_terms: WorkPaymentTerms,
+        salt: &[u8; 32],
+        channel_policy: PaidChannelPolicyV1,
+    ) -> Result<Self, PaidWorkError> {
+        if private_policy_commitment(network, salt, &channel_policy)
+            != payment_terms.private_policy_commitment
+        {
+            return Err(PaidWorkError::Mismatch {
+                field: "private_policy_commitment",
+            });
+        }
         let payment_terms_hash = Terms::work_payment(payment_terms.clone()).hash();
         let bond_terms_hash = payment_terms.bond_terms_hash();
         let network_bytes = EncodedNetwork::new(network);
@@ -838,13 +928,14 @@ impl PaidChannel {
                 bond_terms_hash.as_bytes(),
             ],
         );
-        Self {
+        Ok(Self {
             network,
             payment_edge,
             payment_terms,
             payment_terms_hash,
+            channel_policy,
             id,
-        }
+        })
     }
 
     /// Returns the channel id: the value every record carries and every
@@ -871,6 +962,11 @@ impl PaidChannel {
     /// Returns the payment terms.
     pub const fn payment_terms(&self) -> &WorkPaymentTerms {
         &self.payment_terms
+    }
+
+    /// Returns the credit policy this channel's terms commit to.
+    pub const fn channel_policy(&self) -> &PaidChannelPolicyV1 {
+        &self.channel_policy
     }
 
     /// Returns the client's settlement key: the payment edge's maker.
@@ -912,33 +1008,47 @@ pub fn private_policy_commitment(
 /// Returns the commitment to a canonical generation-policy body.
 ///
 /// Length-prefixed and streamed: a generation policy is variable-length,
-/// so this is one of the two digests that must not use the single-chunk
+/// so this is one of the four digests that must not use the single-chunk
 /// hasher.
-pub fn generation_policy_digest(canonical_text_policy_bytes: &[u8]) -> Digest {
-    xfh(
+pub fn generation_policy_digest(
+    canonical_text_policy_bytes: &[u8],
+) -> Result<Digest, PaidWorkError> {
+    Ok(xfh(
         GENERATION_POLICY,
         &[
-            &length_prefix(canonical_text_policy_bytes),
+            &length_prefix(canonical_text_policy_bytes, "generation policy length")?,
             canonical_text_policy_bytes,
         ],
-    )
+    ))
 }
 
 /// Returns the commitment to a canonical identity-artifact body.
-pub fn identity_source_digest(canonical_identity_artifact_bytes: &[u8]) -> Digest {
-    xfh(
+pub fn identity_source_digest(
+    canonical_identity_artifact_bytes: &[u8],
+) -> Result<Digest, PaidWorkError> {
+    Ok(xfh(
         IDENTITY_SOURCE,
         &[
-            &length_prefix(canonical_identity_artifact_bytes),
+            &length_prefix(
+                canonical_identity_artifact_bytes,
+                "identity artifact length",
+            )?,
             canonical_identity_artifact_bytes,
         ],
-    )
+    ))
 }
 
-fn length_prefix(bytes: &[u8]) -> [u8; 4] {
-    #[allow(clippy::cast_possible_truncation)]
-    let len = bytes.len() as u32;
-    len.to_be_bytes()
+/// Returns the four-byte length prefix that separates a body from
+/// whatever follows it.
+///
+/// The prefix is what stops one body's tail from being read as the next
+/// body's head, so a length that did not fit it would be a prefix that
+/// separates nothing. A body that large is unreachable through any
+/// bounded decoder here; it is refused rather than truncated because a
+/// truncated prefix is a second legal spelling of the same bytes.
+fn length_prefix(bytes: &[u8], field: &'static str) -> Result<[u8; 4], PaidWorkError> {
+    let len = u32::try_from(bytes.len()).map_err(|_| PaidWorkError::Overflow { field })?;
+    Ok(len.to_be_bytes())
 }
 
 /// Returns the digest an authorization names as its execution policy.
@@ -956,18 +1066,21 @@ pub fn execution_policy_digest(channel: &PaidChannel, policy: &PaidExecutionPoli
 
 /// Returns the digest an authorization names as its prepared input.
 ///
-/// Streamed, because the bundle carries whole artifact bodies and is the
-/// one paid-work preimage with no fixed width.
-pub fn prepared_input_digest(channel: &PaidChannel, bundle: &PreparedPaidInputV1) -> Digest {
+/// Streamed, because the bundle carries whole artifact bodies and is
+/// the widest of the four preimages with no fixed width.
+pub fn prepared_input_digest(
+    channel: &PaidChannel,
+    bundle: &PreparedPaidInputV1,
+) -> Result<Digest, PaidWorkError> {
     let network_bytes = channel.network_bytes();
-    xfh(
+    Ok(xfh(
         PREPARED_INPUT,
         &[
             network_bytes.as_slice(),
             channel.id.as_bytes(),
-            &bundle.encode(),
+            &bundle.encode()?,
         ],
-    )
+    ))
 }
 
 /// Returns the `work_id`: the digest both parties sign to accept a job.
@@ -1081,6 +1194,13 @@ fn subtree(
         count: entries.len(),
     })?;
     match entries {
+        // Unreachable: `invoice_entries_root` refuses an empty
+        // allocation, and every split below leaves both halves
+        // non-empty. It is written anyway because it states the tree's
+        // own definition — the empty tree is the empty root — and
+        // because the alternative is not a smaller function but a slice
+        // split that would panic on the input it cannot receive. No test
+        // isolates it, and none claims to.
         [] => Ok(invoice_empty_root()),
         [entry] => Ok(invoice_leaf(start, invoice_digest(channel, entry))),
         _ => {
@@ -1165,46 +1285,18 @@ pub fn canonical_output_digest(
 
 // ── Checks ────────────────────────────────────────────────────────────
 
-/// Checks the static channel policy against the terms that commit to it.
-///
-/// Run at setup, before any job exists. The credit rule is the profile's:
-/// a defaulting client's gain is bounded by these two limits, so a limit
-/// below one job's price would let a client take a job's worth of value
-/// the ledger never accounted for.
-pub fn check_channel_policy(
-    network: NetworkId,
-    terms: &WorkPaymentTerms,
-    salt: &[u8; 32],
-    channel_policy: &PaidChannelPolicyV1,
-    execution_policy: &PaidExecutionPolicyV1,
-) -> Result<(), PaidWorkError> {
-    if private_policy_commitment(network, salt, channel_policy) != terms.private_policy_commitment {
-        return Err(PaidWorkError::Mismatch {
-            field: "private_policy_commitment",
-        });
-    }
-    if channel_policy.compute_credit_limit < execution_policy.fixed_price {
-        return Err(PaidWorkError::OverEnvelope {
-            field: "fixed_price against compute_credit_limit",
-            actual: execution_policy.fixed_price,
-            limit: channel_policy.compute_credit_limit,
-        });
-    }
-    if channel_policy.delivery_credit_limit < execution_policy.fixed_price {
-        return Err(PaidWorkError::OverEnvelope {
-            field: "fixed_price against delivery_credit_limit",
-            actual: execution_policy.fixed_price,
-            limit: channel_policy.delivery_credit_limit,
-        });
-    }
-    Ok(())
-}
-
 /// Checks that an execution policy is a usable profile at all.
 ///
 /// A zero here is not a small bound, it is an absent one: a zero margin
-/// gives a deadline no time to be met in, and a zero price is a job
-/// nobody is paid for.
+/// gives a deadline no time to be met in, a zero spool is a result the
+/// provider may not retain long enough to deliver, and a zero price is a
+/// job nobody is paid for.
+///
+/// `max_stop_token_ids` is the one bound that may be zero, and is
+/// therefore deliberately absent from this list: a channel that admits
+/// no stop tokens is a channel whose jobs run to `max_new_tokens`, which
+/// is a usable channel. Zero reads there as the limit it is, not as an
+/// unset field.
 pub fn check_execution_policy(policy: &PaidExecutionPolicyV1) -> Result<(), PaidWorkError> {
     for (field, value) in [
         ("fixed_price", policy.fixed_price),
@@ -1214,6 +1306,7 @@ pub fn check_execution_policy(policy: &PaidExecutionPolicyV1) -> Result<(), Paid
             "max_canonical_output_bytes",
             policy.max_canonical_output_bytes,
         ),
+        ("max_spool_bytes", policy.max_spool_bytes),
         (
             "max_encoded_result_frame",
             u64::from(policy.max_encoded_result_frame),
@@ -1239,8 +1332,9 @@ pub fn check_execution_policy(policy: &PaidExecutionPolicyV1) -> Result<(), Paid
 /// Both parties run this before signing, and both run it from their own
 /// locally hash-verified terms. What it establishes is that signing the
 /// authorization digest is the same act for both of them: the same
-/// channel, the same bond cover, the same policy, the same price, and a
-/// window that has not already closed.
+/// channel, the same bond cover, the same policy, the same price, a
+/// price the channel's own credit limits cover, and a window that has
+/// not already closed.
 pub fn check_authorization(
     channel: &PaidChannel,
     authorization: &PaidJobAuthorizationV1,
@@ -1299,6 +1393,34 @@ pub fn check_authorization(
         return Err(PaidWorkError::Mismatch { field: "price" });
     }
 
+    // The execution policy is per-authorization and only its digest is
+    // signed, so a channel may see many of them. The credit limits are
+    // per-channel and are opened once, at construction. That is why the
+    // two are compared here, against this job's price, rather than once
+    // at setup against whichever policy happened to be in hand: a
+    // defaulting client's gain is bounded by these two limits, so a
+    // limit below one job's price is a job's worth of value the ledger
+    // never accounted for.
+    let credit = channel.channel_policy();
+    for (field, limit) in [
+        (
+            "price against compute_credit_limit",
+            credit.compute_credit_limit,
+        ),
+        (
+            "price against delivery_credit_limit",
+            credit.delivery_credit_limit,
+        ),
+    ] {
+        if limit < authorization.price {
+            return Err(PaidWorkError::OverEnvelope {
+                field,
+                actual: authorization.price,
+                limit,
+            });
+        }
+    }
+
     if finalized_height > authorization.acceptance_deadline {
         return Err(PaidWorkError::AcceptanceExpired {
             height: finalized_height,
@@ -1336,7 +1458,7 @@ pub fn check_prepared_input(
     policy: &PaidExecutionPolicyV1,
     bundle: &PreparedPaidInputV1,
 ) -> Result<(), PaidWorkError> {
-    let encoded = bundle.encode();
+    let encoded = bundle.encode()?;
     let limit = u64::from(policy.max_encoded_quote_response);
     let actual = u64::try_from(encoded.len()).map_err(|_| PaidWorkError::Overflow {
         field: "prepared input length",
@@ -1348,7 +1470,7 @@ pub fn check_prepared_input(
             limit,
         });
     }
-    if prepared_input_digest(channel, bundle).as_bytes()
+    if prepared_input_digest(channel, bundle)?.as_bytes()
         != authorization.prepared_input_digest.as_bytes()
     {
         return Err(PaidWorkError::Mismatch {
@@ -1415,12 +1537,12 @@ pub fn check_prepared_input(
         ),
         (
             "generation_policy_digest",
-            generation_policy_digest(&parts.text_policy.canonical_bytes()).as_bytes()
+            generation_policy_digest(&parts.text_policy.canonical_bytes())?.as_bytes()
                 == policy.generation_policy_digest.as_bytes(),
         ),
         (
             "identity_source_digest",
-            identity_source_digest(&parts.identity_artifact.canonical_bytes()).as_bytes()
+            identity_source_digest(&parts.identity_artifact.canonical_bytes())?.as_bytes()
                 == policy.identity_source_digest.as_bytes(),
         ),
     ];
@@ -1483,10 +1605,16 @@ pub fn check_result(
 
 /// Builds the one invoice entry a delivered result may produce.
 ///
-/// This is the only way an entry is made, on either side: the provider
-/// builds the entry it signs, and the client rebuilds it and compares.
-/// A rule enforced by construction cannot be enforced differently by the
-/// two endpoints.
+/// This is the only way an entry is made: the provider builds the entry
+/// it signs, and a rule enforced by construction cannot be enforced
+/// differently by the two endpoints.
+///
+/// It builds an entry for whatever sequence and cumulative it is given,
+/// and will therefore build a second entry for a job that already has
+/// one — the identifiers it recomputes are a function of the job alone.
+/// Nothing here can tell the two apart, and nothing here tries:
+/// [`CreditLedger::credit_allocation`] is where a job is paid for at
+/// most once.
 ///
 /// The capacity bound is the kernel's own [`WorkPaymentSettlement`], not
 /// a number this module derives. A certificate above the smaller of the
@@ -1533,140 +1661,236 @@ pub fn next_invoice_entry(
     })
 }
 
-/// Checks that a certificate and its allocation pay for exactly the
-/// invoice entries offered.
+/// One invoiced job as the endpoint crediting it holds it.
 ///
-/// This is the join between the private ledger and the one number
-/// consensus sees. It establishes that the certificate the client is
-/// about to sign — or has signed — settles this contiguous prefix of
-/// this channel's invoices, at these prices, for these accepted jobs and
-/// these delivered results, and nothing else.
-pub fn check_allocation(
-    channel: &PaidChannel,
-    allocation: &CertificateAllocationV1,
-    entries: &[InvoiceEntryV1],
-    certificate: &EarnedCertificate,
+/// The three travel together because the only thing that makes an entry
+/// evidence is its agreement with the other two: an entry names a job
+/// this client authorized, a result the provider signed for exactly that
+/// job, and the price that authorization fixed. An entry alone is three
+/// numbers and two digests that nothing local can contradict.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InvoicedJob {
+    /// The authorization both parties signed.
+    pub authorization: PaidJobAuthorizationV1,
+    /// The result the provider signed for it.
+    pub result: PaidJobResultV1,
+    /// The invoice entry the provider signed for that pair.
+    pub entry: InvoiceEntryV1,
+}
+
+/// What one endpoint has already credited on one channel.
+///
+/// Three values that only ever move together: the sequence the next
+/// invoice must carry, the cumulative amount already credited, and the
+/// jobs already paid for. They are one value rather than three arguments
+/// because they are the whole of the cross-call state, and an endpoint
+/// that advanced two of them and forgot the third is an endpoint that
+/// pays for a job twice. Nothing but [`Self::credit_allocation`] moves
+/// them, and it moves them only over an allocation it has just accepted.
+///
+/// The set of credited jobs grows by one digest per paid job, and a
+/// channel admits at most `capacity / price` of those, so it is bounded
+/// by the same edge that bounds the money.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreditLedger {
+    next_invoice_seq: u64,
     credited_invoice_high_water: u64,
-) -> Result<(), PaidWorkError> {
-    let count = entries.len();
-    if count == 0 || count > MAX_ALLOCATION_ENTRIES {
-        return Err(PaidWorkError::AllocationSize { count });
-    }
-    let first = entries
-        .first()
-        .ok_or(PaidWorkError::AllocationSize { count })?;
-    let last = entries
-        .last()
-        .ok_or(PaidWorkError::AllocationSize { count })?;
+    credited_work_ids: BTreeSet<Digest>,
+}
 
-    let mut expected_seq = first.invoice_seq;
-    let mut expected_before = credited_invoice_high_water;
-    for entry in entries {
-        if entry.channel_id.as_bytes() != channel.id.as_bytes() {
-            return Err(PaidWorkError::Mismatch {
-                field: "invoice channel_id",
-            });
+impl Default for CreditLedger {
+    /// The default ledger is a new channel's, not a zeroed struct: a
+    /// derived `Default` would start at sequence 0, which is the one
+    /// sequence no invoice may carry.
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CreditLedger {
+    /// A channel that has credited nothing.
+    ///
+    /// Its first invoice therefore carries `invoice_seq = 1` and
+    /// `cumulative_before = 0`; no endpoint may choose zero-based
+    /// sequence numbering from local convention.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            next_invoice_seq: 1,
+            credited_invoice_high_water: 0,
+            credited_work_ids: BTreeSet::new(),
         }
-        if entry.invoice_seq != expected_seq {
-            return Err(PaidWorkError::InvoiceSequence {
-                expected: expected_seq,
-                actual: entry.invoice_seq,
-            });
+    }
+
+    /// Returns the sequence the next invoice entry must carry.
+    pub const fn next_invoice_seq(&self) -> u64 {
+        self.next_invoice_seq
+    }
+
+    /// Returns the cumulative amount already credited.
+    pub const fn credited_invoice_high_water(&self) -> u64 {
+        self.credited_invoice_high_water
+    }
+
+    /// Checks that a certificate and its allocation pay for exactly
+    /// these invoiced jobs, and credits them if they do.
+    ///
+    /// This is the join between the private ledger and the one number
+    /// consensus sees, and it is the only place the two meet. It
+    /// establishes that the certificate the client is about to sign
+    /// settles the next contiguous run of this channel's invoices, at
+    /// the prices those jobs' own authorizations fix, for results the
+    /// provider signed against exactly those jobs, and for no job this
+    /// ledger has already paid for.
+    ///
+    /// The prefix is contiguous *across calls*, not merely within one:
+    /// the first entry must carry [`Self::next_invoice_seq`] and the
+    /// first `cumulative_before` must equal
+    /// [`Self::credited_invoice_high_water`], so a second allocation
+    /// cannot start wherever it likes. That alone does not stop a job
+    /// from being billed again at a fresh sequence, which is what the
+    /// credited-job set is for.
+    ///
+    /// What the caller still owns: keeping this ledger — one per
+    /// channel, across restarts — and verifying the provider's
+    /// signatures over each entry and each result. This function reads
+    /// bodies, never signatures.
+    pub fn credit_allocation(
+        &mut self,
+        channel: &PaidChannel,
+        allocation: &CertificateAllocationV1,
+        jobs: &[InvoicedJob],
+        certificate: &EarnedCertificate,
+    ) -> Result<(), PaidWorkError> {
+        let count = jobs.len();
+        if count == 0 || count > MAX_ALLOCATION_ENTRIES {
+            return Err(PaidWorkError::AllocationSize { count });
         }
-        if entry.cumulative_before != expected_before {
-            return Err(PaidWorkError::Mismatch {
-                field: "cumulative_before",
-            });
-        }
-        let after =
-            entry
-                .cumulative_before
-                .checked_add(entry.price)
-                .ok_or(PaidWorkError::Overflow {
-                    field: "cumulative_after",
-                })?;
-        if entry.cumulative_after != after {
-            return Err(PaidWorkError::Mismatch {
-                field: "cumulative_after",
-            });
-        }
-        expected_seq = entry.invoice_seq.checked_add(1).ok_or({
-            PaidWorkError::Overflow {
-                field: "invoice_seq",
+
+        let mut expected_seq = self.next_invoice_seq;
+        let mut expected_before = self.credited_invoice_high_water;
+        let mut credited = BTreeSet::new();
+        let mut entries = Vec::with_capacity(count);
+        for job in jobs {
+            let entry = &job.entry;
+            if entry.channel_id.as_bytes() != channel.id.as_bytes() {
+                return Err(PaidWorkError::Mismatch {
+                    field: "invoice channel_id",
+                });
             }
-        })?;
-        expected_before = entry.cumulative_after;
-    }
 
-    for (index, entry) in entries.iter().enumerate() {
-        if entries
-            .iter()
-            .skip(index.saturating_add(1))
-            .any(|other| other.work_id.as_bytes() == entry.work_id.as_bytes())
-        {
-            return Err(PaidWorkError::Duplicate { field: "work_id" });
-        }
-        if entries
-            .iter()
-            .skip(index.saturating_add(1))
-            .any(|other| other.result_digest.as_bytes() == entry.result_digest.as_bytes())
-        {
-            return Err(PaidWorkError::Duplicate {
-                field: "result_digest",
-            });
-        }
-    }
+            // What the entry says it billed, against what this endpoint
+            // authorized and was delivered. Without these three an entry
+            // may name an honest job at any price it likes.
+            let work_id = work_id(channel, &job.authorization);
+            if entry.work_id.as_bytes() != work_id.as_bytes() {
+                return Err(PaidWorkError::Mismatch {
+                    field: "invoice work_id",
+                });
+            }
+            let result_digest = check_result(channel, work_id, &job.result)?;
+            if entry.result_digest.as_bytes() != result_digest.as_bytes() {
+                return Err(PaidWorkError::Mismatch {
+                    field: "invoice result_digest",
+                });
+            }
+            if entry.price != job.authorization.price {
+                return Err(PaidWorkError::Mismatch {
+                    field: "invoice price",
+                });
+            }
 
-    let span = u64::try_from(count).map_err(|_| PaidWorkError::AllocationSize { count })?;
-    let expected_last = first
-        .invoice_seq
-        .checked_add(span)
-        .and_then(|end| end.checked_sub(1))
-        .ok_or(PaidWorkError::Overflow {
-            field: "last_invoice_seq",
-        })?;
+            // One work id is one payment, here and in every earlier
+            // allocation. The result digest needs no rule of its own:
+            // the result body carries its work id, so two entries
+            // sharing a result digest share a work id and are refused
+            // by this one.
+            if self.credited_work_ids.contains(&work_id) || !credited.insert(work_id) {
+                return Err(PaidWorkError::Duplicate { field: "work_id" });
+            }
 
-    let bindings = [
-        (
-            "allocation channel_id",
-            allocation.channel_id.as_bytes() == channel.id.as_bytes(),
-        ),
-        (
-            "first_invoice_seq",
-            allocation.first_invoice_seq == first.invoice_seq,
-        ),
-        (
-            "last_invoice_seq",
-            allocation.last_invoice_seq == last.invoice_seq
-                && allocation.last_invoice_seq == expected_last,
-        ),
-        (
-            "invoice_entries_root",
-            allocation.invoice_entries_root.as_bytes()
-                == invoice_entries_root(channel, entries)?.as_bytes(),
-        ),
-        (
-            "certificate_digest",
-            allocation.certificate_digest.as_bytes()
-                == certificate.digest(channel.network).as_bytes(),
-        ),
-        (
-            "certificate payment_edge",
-            certificate.payment_edge().as_bytes() == channel.payment_edge.as_bytes(),
-        ),
-        (
-            "certificate payment_terms_hash",
-            certificate.payment_terms_hash().as_bytes() == channel.payment_terms_hash.as_bytes(),
-        ),
-        (
-            "certificate earned_cumulative",
-            certificate.earned_cumulative() == last.cumulative_after,
-        ),
-    ];
-    for (field, holds) in bindings {
-        if !holds {
-            return Err(PaidWorkError::Mismatch { field });
+            if entry.invoice_seq != expected_seq {
+                return Err(PaidWorkError::InvoiceSequence {
+                    expected: expected_seq,
+                    actual: entry.invoice_seq,
+                });
+            }
+            if entry.cumulative_before != expected_before {
+                return Err(PaidWorkError::Mismatch {
+                    field: "cumulative_before",
+                });
+            }
+            let after = entry.cumulative_before.checked_add(entry.price).ok_or(
+                PaidWorkError::Overflow {
+                    field: "cumulative_after",
+                },
+            )?;
+            if entry.cumulative_after != after {
+                return Err(PaidWorkError::Mismatch {
+                    field: "cumulative_after",
+                });
+            }
+            expected_seq = entry.invoice_seq.checked_add(1).ok_or({
+                PaidWorkError::Overflow {
+                    field: "invoice_seq",
+                }
+            })?;
+            expected_before = entry.cumulative_after;
+            entries.push(*entry);
         }
+
+        let first = entries
+            .first()
+            .ok_or(PaidWorkError::AllocationSize { count })?;
+        let last = entries
+            .last()
+            .ok_or(PaidWorkError::AllocationSize { count })?;
+        let bindings = [
+            (
+                "allocation channel_id",
+                allocation.channel_id.as_bytes() == channel.id.as_bytes(),
+            ),
+            (
+                "first_invoice_seq",
+                allocation.first_invoice_seq == first.invoice_seq,
+            ),
+            (
+                "last_invoice_seq",
+                allocation.last_invoice_seq == last.invoice_seq,
+            ),
+            (
+                "invoice_entries_root",
+                allocation.invoice_entries_root.as_bytes()
+                    == invoice_entries_root(channel, &entries)?.as_bytes(),
+            ),
+            (
+                "certificate_digest",
+                allocation.certificate_digest.as_bytes()
+                    == certificate.digest(channel.network).as_bytes(),
+            ),
+            (
+                "certificate payment_edge",
+                certificate.payment_edge().as_bytes() == channel.payment_edge.as_bytes(),
+            ),
+            (
+                "certificate payment_terms_hash",
+                certificate.payment_terms_hash().as_bytes()
+                    == channel.payment_terms_hash.as_bytes(),
+            ),
+            (
+                "certificate earned_cumulative",
+                certificate.earned_cumulative() == last.cumulative_after,
+            ),
+        ];
+        for (field, holds) in bindings {
+            if !holds {
+                return Err(PaidWorkError::Mismatch { field });
+            }
+        }
+
+        self.next_invoice_seq = expected_seq;
+        self.credited_invoice_high_water = last.cumulative_after;
+        self.credited_work_ids.append(&mut credited);
+        Ok(())
     }
-    Ok(())
 }

@@ -676,15 +676,26 @@ impl PreparedPaidInputV1 {
 
     /// Returns the canonical encoding: six unsigned big-endian `u32`
     /// lengths, each immediately followed by that many body bytes.
-    pub fn encode(&self) -> Vec<u8> {
+    ///
+    /// Fallible for one reason: a body whose length does not fit its
+    /// `u32` prefix has no encoding here. Truncating the prefix would
+    /// give that body a second, shorter spelling whose digest is a
+    /// different bundle's, so it is refused instead. No bounded decoder
+    /// can produce such a body — [`Self::decode`] reads each length as a
+    /// `u32` — but [`Self::new`] takes whatever it is handed.
+    pub fn encode(&self) -> Result<Vec<u8>, CanonicalDecodeError> {
         let mut bytes = Vec::new();
         for body in self.bodies() {
-            #[allow(clippy::cast_possible_truncation)]
-            let len = body.len() as u32;
+            let len = u32::try_from(body.len()).map_err(|_| {
+                CanonicalDecodeError::new(format!(
+                    "prepared input body is {} bytes, over the u32 length prefix",
+                    body.len()
+                ))
+            })?;
             bytes.extend_from_slice(&len.to_be_bytes());
             bytes.extend_from_slice(body);
         }
-        bytes
+        Ok(bytes)
     }
 
     /// Decodes a bundle, refusing anything that does not fit `budget`.

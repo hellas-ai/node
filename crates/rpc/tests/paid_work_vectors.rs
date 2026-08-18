@@ -20,13 +20,13 @@ use hellas_kernel::{
 use hellas_rpc::evaluate::{EvaluateStopReason, EvaluateTerminal, EvaluateUsage};
 use hellas_rpc::protocol::artifacts::{
     BoundTermId, Canonical, InputAddressed, OutputAddressed, PreparedPaidInputV1, SourceRef,
-    TextArtifact, TextExecution, TextPolicy, TokenIds,
+    TextArtifact, TextExecution, TextPolicy, TextState, TokenIds,
 };
 use hellas_rpc::protocol::work::{
-    CertificateAllocationV1, InvoiceEntryV1, MAX_ALLOCATION_ENTRIES, PaidChannel,
-    PaidChannelPolicyV1, PaidExecutionPolicyV1, PaidJobAuthorizationV1, PaidJobResultV1,
-    PaidWorkError, PrivateRecord, allocation_digest, canonical_output_digest, check_allocation,
-    check_authorization, check_channel_policy, check_prepared_input, check_result,
+    CertificateAllocationV1, CreditLedger, InvoiceEntryV1, InvoicedJob, MAX_ALLOCATION_ENTRIES,
+    PaidChannel, PaidChannelPolicyV1, PaidExecutionPolicyV1, PaidJobAuthorizationV1,
+    PaidJobResultV1, PaidWorkError, PrivateRecord, allocation_digest, canonical_output_digest,
+    check_authorization, check_execution_policy, check_prepared_input, check_result,
     execution_policy_digest, generation_policy_digest, identity_source_digest, invoice_digest,
     invoice_empty_root, invoice_entries_root, next_invoice_entry, prepared_input_digest,
     private_policy_commitment, result_digest, work_id,
@@ -73,6 +73,23 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+/// The three fallible digests over variable-length bodies, unwrapped.
+///
+/// Every fixture body here is a few hundred bytes, so the only error
+/// these can return — a body too long for its `u32` length prefix — is
+/// noise at each of their sixteen call sites.
+fn input_digest(channel: &PaidChannel, bundle: &PreparedPaidInputV1) -> Digest {
+    prepared_input_digest(channel, bundle).expect("a representable bundle")
+}
+
+fn policy_digest_of(policy: &TextPolicy) -> Digest {
+    generation_policy_digest(&policy.canonical_bytes()).expect("a representable policy body")
+}
+
+fn identity_digest_of(artifact: &TextArtifact) -> Digest {
+    identity_source_digest(&artifact.canonical_bytes()).expect("a representable artifact body")
+}
+
 fn network() -> NetworkId {
     NetworkId::new(NETWORK).expect("legal network id")
 }
@@ -113,7 +130,28 @@ fn payment_terms() -> WorkPaymentTerms {
 }
 
 fn channel() -> PaidChannel {
-    PaidChannel::new(network(), EdgeId::from_bytes([0xe1; 32]), payment_terms())
+    PaidChannel::new(
+        network(),
+        EdgeId::from_bytes([0xe1; 32]),
+        payment_terms(),
+        &SALT,
+        channel_policy(),
+    )
+    .expect("terms that commit to this credit policy")
+}
+
+/// A channel on another network, or another payment edge.
+///
+/// The credit commitment binds the network, so terms minted for one
+/// network do not open on another: a foreign channel is built from
+/// foreign terms, which is what a foreign channel is.
+fn channel_on(network: NetworkId, payment_edge: EdgeId) -> PaidChannel {
+    let terms = WorkPaymentTerms {
+        private_policy_commitment: private_policy_commitment(network, &SALT, &channel_policy()),
+        ..payment_terms()
+    };
+    PaidChannel::new(network, payment_edge, terms, &SALT, channel_policy())
+        .expect("terms that commit to this credit policy")
 }
 
 fn channel_policy() -> PaidChannelPolicyV1 {
@@ -186,8 +224,8 @@ fn bundle() -> PreparedPaidInputV1 {
 fn execution_policy() -> PaidExecutionPolicyV1 {
     PaidExecutionPolicyV1 {
         allowed_environment: manifest().content_id(),
-        generation_policy_digest: generation_policy_digest(&text_policy().canonical_bytes()),
-        identity_source_digest: identity_source_digest(&identity_artifact().canonical_bytes()),
+        generation_policy_digest: policy_digest_of(&text_policy()),
+        identity_source_digest: identity_digest_of(&identity_artifact()),
         max_prompt_tokens: 8,
         max_new_tokens: 64,
         max_stop_token_ids: 4,
@@ -212,7 +250,7 @@ fn authorization() -> PaidJobAuthorizationV1 {
         payment_edge: channel.payment_edge(),
         payment_terms_hash: channel.payment_terms_hash(),
         execution_policy_digest: execution_policy_digest(&channel, &execution_policy()),
-        prepared_input_digest: prepared_input_digest(&channel, &bundle()),
+        prepared_input_digest: input_digest(&channel, &bundle()),
         proposal_nonce: 0x0102_0304_0506_0708,
         acceptance_deadline: 1_000,
         request_commitment: Evaluate::commit_request(&evaluate_request()),
@@ -481,21 +519,49 @@ fn envelope_and_length_mutations_reject() {
 }
 
 /// A paid-work body must not decode as another paid-work record.
+///
+/// No two of the six records share a length — asserted here, because it
+/// is what this test rests on — so a body relabelled as another record
+/// never reaches the tag rule: the length refuses it first, whether or
+/// not the tag byte was changed with it. The tag rule is exercised where
+/// a record's own length is intact, in
+/// `envelope_and_length_mutations_reject`.
 #[test]
 fn a_body_cannot_be_reinterpreted_under_another_record() {
-    let policy = execution_policy().encode();
-    assert!(matches!(
-        PaidJobAuthorizationV1::decode(&policy),
-        Err(PaidWorkError::RecordLength { .. })
-    ));
+    let sizes = [
+        PaidChannelPolicyV1::ENCODED_SIZE,
+        PaidExecutionPolicyV1::ENCODED_SIZE,
+        PaidJobAuthorizationV1::ENCODED_SIZE,
+        PaidJobResultV1::ENCODED_SIZE,
+        InvoiceEntryV1::ENCODED_SIZE,
+        CertificateAllocationV1::ENCODED_SIZE,
+    ];
+    for (index, size) in sizes.iter().enumerate() {
+        for other in sizes.iter().skip(index + 1) {
+            assert_ne!(size, other, "two records share a length");
+        }
+    }
 
-    // Same length, different tag: the tag is what refuses, not the size.
+    let policy = execution_policy().encode();
+    assert_eq!(
+        PaidJobAuthorizationV1::decode(&policy),
+        Err(PaidWorkError::RecordLength {
+            expected: 330,
+            actual: 164
+        })
+    );
+
+    // The tag relabelled too, which changes nothing: the length is read
+    // before the envelope is.
     let mut disguised = policy.clone();
     disguised[1] = 2;
-    assert!(matches!(
+    assert_eq!(
         PaidJobAuthorizationV1::decode(&disguised),
-        Err(PaidWorkError::RecordLength { .. })
-    ));
+        Err(PaidWorkError::RecordLength {
+            expected: 330,
+            actual: 164
+        })
+    );
 }
 
 // ── Golden digests ────────────────────────────────────────────────────
@@ -517,15 +583,25 @@ fn golden_digests_bind_the_encoded_network() {
         "c11e6d67bc0781f0f18e1c50e5de3e38eb02d191aad4e10c28c262ed33132f3b"
     );
 
-    let other = PaidChannel::new(
+    let other = channel_on(
         NetworkId::new(OTHER_NETWORK).expect("legal network id"),
         EdgeId::from_bytes([0xe1; 32]),
-        payment_terms(),
     );
     assert_ne!(channel.id(), other.id());
+    // Rebuilt by hand rather than by the module that is being pinned:
+    // the domain, the one-byte length prefix, and the four commitments,
+    // hashed through the crate's other entry point.
+    let mut preimage = b"hellas.work.channel.v2".to_vec();
+    preimage.push(OTHER_NETWORK.len() as u8);
+    preimage.extend_from_slice(OTHER_NETWORK.as_bytes());
+    preimage.extend_from_slice(other.payment_edge().as_bytes());
+    preimage.extend_from_slice(other.payment_terms_hash().as_bytes());
+    preimage.extend_from_slice(other.payment_terms().bond_edge.as_bytes());
+    preimage.extend_from_slice(other.payment_terms().bond_terms_hash().as_bytes());
+    assert_eq!(Digest::hash(&preimage), other.id());
     assert_eq!(
         hex(other.id().as_bytes()),
-        "d5374dc12bc1cc173abc29b4b19873758d5098303c01d7a3654f0180f7dc1cc3"
+        "2242df9d621b8156cec0a1903919d46739dd79665df31e04e5bb5499174e5191"
     );
 }
 
@@ -534,11 +610,10 @@ fn golden_digests_bind_the_encoded_network() {
 #[test]
 fn records_do_not_cross_channels() {
     let here = channel();
-    let sibling = PaidChannel::new(network(), EdgeId::from_bytes([0xe2; 32]), payment_terms());
-    let elsewhere = PaidChannel::new(
+    let sibling = channel_on(network(), EdgeId::from_bytes([0xe2; 32]));
+    let elsewhere = channel_on(
         NetworkId::new(OTHER_NETWORK).expect("legal network id"),
         here.payment_edge(),
-        payment_terms(),
     );
     let authorization = authorization();
     let result = job_result(work_id(&here, &authorization));
@@ -581,8 +656,8 @@ fn records_do_not_cross_channels() {
             "{label} shares this channel's policy digest"
         );
         assert_ne!(
-            prepared_input_digest(&here, &bundle()),
-            prepared_input_digest(other, &bundle()),
+            input_digest(&here, &bundle()),
+            input_digest(other, &bundle()),
             "{label} shares this channel's prepared input digest"
         );
         // MUTATION: replay this channel's authorization on another one.
@@ -604,7 +679,7 @@ fn records_do_not_cross_channels() {
 #[test]
 fn prepared_input_is_reproducible_from_its_components() {
     let bundle = bundle();
-    let encoded = bundle.encode();
+    let encoded = bundle.encode().expect("a representable bundle");
 
     let expected = assemble(&[
         &evaluate_request_bytes_of(),
@@ -619,8 +694,8 @@ fn prepared_input_is_reproducible_from_its_components() {
     let decoded = PreparedPaidInputV1::decode(&encoded, 1_048_576).expect("legal bundle");
     assert_eq!(decoded, bundle);
     assert_eq!(
-        prepared_input_digest(&channel(), &decoded),
-        prepared_input_digest(&channel(), &bundle)
+        input_digest(&channel(), &decoded),
+        input_digest(&channel(), &bundle)
     );
 }
 
@@ -628,7 +703,7 @@ fn prepared_input_is_reproducible_from_its_components() {
 /// producing a second acceptable spelling of the same job.
 #[test]
 fn prepared_input_mutations_reject() {
-    let encoded = bundle().encode();
+    let encoded = bundle().encode().expect("a representable bundle");
     let budget = 1_048_576;
     assert!(PreparedPaidInputV1::decode(&encoded, budget).is_ok());
 
@@ -724,7 +799,7 @@ fn prepared_input_mutations_reject() {
 /// against the budget, and not in aggregate.
 #[test]
 fn prepared_input_lengths_are_bounded_before_allocation() {
-    let encoded = bundle().encode();
+    let encoded = bundle().encode().expect("a representable bundle");
 
     // MUTATION: u32::MAX in the first length.
     let mut huge = encoded.clone();
@@ -800,26 +875,63 @@ fn a_bundle_over_the_single_chunk_limit_still_hashes() {
         &identity_artifact(),
     );
     assert!(
-        large.encode().len() > hellas_xet::MIN_CHUNK_SIZE,
+        large.encode().expect("a representable bundle").len() > hellas_xet::MIN_CHUNK_SIZE,
         "the fixture must exceed the single-chunk limit to be a test of it",
     );
-    let digest = prepared_input_digest(&channel(), &large);
-    assert_ne!(digest, prepared_input_digest(&channel(), &bundle()));
+    let digest = input_digest(&channel(), &large);
+    assert_ne!(digest, input_digest(&channel(), &bundle()));
 
     // The same bundle over a channel-sized budget still decodes, and its
     // digest survives the round trip.
-    let encoded = large.encode();
+    let encoded = large.encode().expect("a representable bundle");
     let decoded = PreparedPaidInputV1::decode(&encoded, 1_048_576).expect("legal bundle");
-    assert_eq!(prepared_input_digest(&channel(), &decoded), digest);
+    assert_eq!(input_digest(&channel(), &decoded), digest);
 }
 
 /// Every fixed-record preimage is measured, not assumed, to be under the
 /// single-chunk limit.
+///
+/// The widest is `longest domain || network || channel || widest record`.
+/// Both maxima are taken over the whole set rather than named, so the
+/// record and the domain that happen to be widest today are asserted to
+/// be the widest rather than assumed to stay so.
 #[test]
 fn widest_fixed_preimage_is_measured() {
     let longest_network =
         NetworkId::new(&"n".repeat(hellas_kernel::MAX_NETWORK_ID_LENGTH)).expect("legal id");
     let encoded_network = 1 + hellas_kernel::MAX_NETWORK_ID_LENGTH;
+    for size in [
+        PaidChannelPolicyV1::ENCODED_SIZE,
+        PaidExecutionPolicyV1::ENCODED_SIZE,
+        PaidJobResultV1::ENCODED_SIZE,
+        InvoiceEntryV1::ENCODED_SIZE,
+        CertificateAllocationV1::ENCODED_SIZE,
+    ] {
+        assert!(
+            size <= PaidJobAuthorizationV1::ENCODED_SIZE,
+            "{size} is wider than the record the bound is taken over"
+        );
+    }
+    for domain in [
+        "hellas.work.channel.v2",
+        "hellas.work.paid-channel-policy.v1",
+        "hellas.work.generation-policy.v1",
+        "hellas.work.identity-source.v1",
+        "hellas.work.execution-policy.v1",
+        "hellas.work.prepared-input.v1",
+        "hellas.work.paid-job-authorize.v1",
+        "hellas.work.paid-job-result.v1",
+        "hellas.work.private-invoice.v1",
+        "hellas.work.private-invoice-empty.v1",
+        "hellas.work.private-invoice-leaf.v1",
+        "hellas.work.private-invoice-node.v1",
+        "hellas.work.evaluate-output.v1",
+    ] {
+        assert!(
+            domain.len() <= "hellas.work.private-certificate-allocation.v1".len(),
+            "{domain} is longer than the domain the bound is taken over"
+        );
+    }
     let widest = "hellas.work.private-certificate-allocation.v1".len()
         + encoded_network
         + 32
@@ -828,13 +940,23 @@ fn widest_fixed_preimage_is_measured() {
     assert_eq!(widest, 471);
     assert!(widest < hellas_xet::MIN_CHUNK_SIZE);
 
+    // The four shapes that are not record-shaped are bounded too: the
+    // channel id, which has no channel field, and the invoice tree's
+    // three nodes, which carry neither network nor channel.
+    assert_eq!(
+        "hellas.work.channel.v2".len() + encoded_network + 4 * 32,
+        214
+    );
+    assert_eq!("hellas.work.private-invoice-leaf.v1".len() + 8 + 32, 75);
+    assert_eq!(
+        "hellas.work.private-invoice-node.v1".len() + 8 + 2 + 2 + 64,
+        111
+    );
+    assert_eq!("hellas.work.private-invoice-empty.v1".len() + 1, 37);
+
     // The widest preimage is also a preimage that must hash rather than
     // panic, so it is actually hashed here.
-    let channel = PaidChannel::new(
-        longest_network,
-        EdgeId::from_bytes([0xe1; 32]),
-        payment_terms(),
-    );
+    let channel = channel_on(longest_network, EdgeId::from_bytes([0xe1; 32]));
     let _ = work_id(&channel, &authorization());
 }
 
@@ -1141,51 +1263,221 @@ fn every_execution_policy_field_moves_its_digest() {
     }
 }
 
-/// The static channel policy is checked at setup, and every way of
-/// changing it fails there.
+/// The channel opens its own credit commitment, so a policy the terms do
+/// not commit to is a channel that cannot be built.
 #[test]
-fn channel_policy_mutations_fail_setup() {
+fn a_channel_cannot_be_built_on_an_uncommitted_credit_policy() {
     let terms = payment_terms();
-    let policy = channel_policy();
-    let execution = execution_policy();
-    assert!(check_channel_policy(network(), &terms, &SALT, &policy, &execution).is_ok());
+    let edge = EdgeId::from_bytes([0xe1; 32]);
+    let build = |network: NetworkId, salt: &[u8; 32], policy: PaidChannelPolicyV1| {
+        PaidChannel::new(network, edge, terms.clone(), salt, policy)
+    };
+    assert!(build(network(), &SALT, channel_policy()).is_ok());
 
     // MUTATION: a different compute credit limit under the same salt.
-    let mut compute = policy;
+    let mut compute = channel_policy();
     compute.compute_credit_limit += 1;
     assert_eq!(
-        check_channel_policy(network(), &terms, &SALT, &compute, &execution),
-        Err(PaidWorkError::Mismatch {
+        build(network(), &SALT, compute).err(),
+        Some(PaidWorkError::Mismatch {
             field: "private_policy_commitment"
         })
     );
 
     // MUTATION: a different delivery credit limit.
-    let mut delivery = policy;
+    let mut delivery = channel_policy();
     delivery.delivery_credit_limit += 1;
-    assert!(check_channel_policy(network(), &terms, &SALT, &delivery, &execution).is_err());
+    assert!(build(network(), &SALT, delivery).is_err());
 
     // MUTATION: the same body under a different salt.
-    assert!(check_channel_policy(network(), &terms, &[0x5b; 32], &policy, &execution).is_err());
+    assert!(build(network(), &[0x5b; 32], channel_policy()).is_err());
 
     // MUTATION: the same body and salt on a different network.
     let other = NetworkId::new(OTHER_NETWORK).expect("legal id");
-    assert!(check_channel_policy(other, &terms, &SALT, &policy, &execution).is_err());
+    assert!(build(other, &SALT, channel_policy()).is_err());
 
-    // MUTATION: a credit limit below one job's price.
+    // The policy the channel opened is the policy it carries.
+    let channel = channel();
+    assert_eq!(*channel.channel_policy(), channel_policy());
+}
+
+/// A job priced above what the channel's credit limits cover is refused
+/// at authorization, under the policy that actually prices the job.
+///
+/// The limits are per-channel and the price is per-authorization, so a
+/// comparison made once at setup compares against whichever execution
+/// policy happened to be in hand. This one compares against this job's.
+#[test]
+fn a_price_above_the_channel_credit_limits_is_refused() {
+    let policy = execution_policy();
+    let base = authorization();
+    assert!(check_authorization(&channel(), &base, &policy, 900).is_ok());
+
+    // A second execution policy on the same channel, priced above the
+    // compute credit limit and still inside `max_job_price`. The channel
+    // committed to neither price: it committed to two limits.
     let thin = PaidChannelPolicyV1 {
-        compute_credit_limit: 249,
+        compute_credit_limit: 300,
         delivery_credit_limit: 800,
     };
-    let mut thin_terms = terms.clone();
-    thin_terms.private_policy_commitment = private_policy_commitment(network(), &SALT, &thin);
+    let terms = WorkPaymentTerms {
+        private_policy_commitment: private_policy_commitment(network(), &SALT, &thin),
+        ..payment_terms()
+    };
+    let channel = PaidChannel::new(
+        network(),
+        EdgeId::from_bytes([0xe1; 32]),
+        terms,
+        &SALT,
+        thin,
+    )
+    .expect("terms that commit to this credit policy");
+
+    let mut dear = execution_policy();
+    dear.fixed_price = 500;
+    let mut authorization = authorization();
+    authorization.channel_id = channel.id();
+    authorization.payment_terms_hash = channel.payment_terms_hash();
+    authorization.price = 500;
+    authorization.execution_policy_digest = execution_policy_digest(&channel, &dear);
+    authorization.prepared_input_digest = input_digest(&channel, &bundle());
+
     assert_eq!(
-        check_channel_policy(network(), &thin_terms, &SALT, &thin, &execution),
+        check_authorization(&channel, &authorization, &dear, 900),
         Err(PaidWorkError::OverEnvelope {
-            field: "fixed_price against compute_credit_limit",
-            actual: 250,
-            limit: 249
+            field: "price against compute_credit_limit",
+            actual: 500,
+            limit: 300
         })
+    );
+
+    // MUTATION: raise the compute limit alone. The delivery limit is a
+    // separate rule and refuses on its own.
+    let both = PaidChannelPolicyV1 {
+        compute_credit_limit: 500,
+        delivery_credit_limit: 499,
+    };
+    let terms = WorkPaymentTerms {
+        private_policy_commitment: private_policy_commitment(network(), &SALT, &both),
+        ..payment_terms()
+    };
+    let channel = PaidChannel::new(
+        network(),
+        EdgeId::from_bytes([0xe1; 32]),
+        terms,
+        &SALT,
+        both,
+    )
+    .expect("terms that commit to this credit policy");
+    authorization.payment_terms_hash = channel.payment_terms_hash();
+    authorization.channel_id = channel.id();
+    authorization.execution_policy_digest = execution_policy_digest(&channel, &dear);
+    assert_eq!(
+        check_authorization(&channel, &authorization, &dear, 900),
+        Err(PaidWorkError::OverEnvelope {
+            field: "price against delivery_credit_limit",
+            actual: 500,
+            limit: 499
+        })
+    );
+}
+
+/// Every bound the profile requires to be positive is refused at zero,
+/// one field at a time.
+#[test]
+fn an_absent_execution_policy_bound_is_refused() {
+    let base = execution_policy();
+    assert!(check_execution_policy(&base).is_ok());
+
+    let zeroed: Vec<(&str, PaidExecutionPolicyV1)> = vec![
+        (
+            "fixed_price",
+            PaidExecutionPolicyV1 {
+                fixed_price: 0,
+                ..base
+            },
+        ),
+        (
+            "max_prompt_tokens",
+            PaidExecutionPolicyV1 {
+                max_prompt_tokens: 0,
+                ..base
+            },
+        ),
+        (
+            "max_new_tokens",
+            PaidExecutionPolicyV1 {
+                max_new_tokens: 0,
+                ..base
+            },
+        ),
+        (
+            "max_canonical_output_bytes",
+            PaidExecutionPolicyV1 {
+                max_canonical_output_bytes: 0,
+                ..base
+            },
+        ),
+        (
+            "max_spool_bytes",
+            PaidExecutionPolicyV1 {
+                max_spool_bytes: 0,
+                ..base
+            },
+        ),
+        (
+            "max_encoded_result_frame",
+            PaidExecutionPolicyV1 {
+                max_encoded_result_frame: 0,
+                ..base
+            },
+        ),
+        (
+            "max_encoded_quote_response",
+            PaidExecutionPolicyV1 {
+                max_encoded_quote_response: 0,
+                ..base
+            },
+        ),
+        (
+            "dispatch_margin_blocks",
+            PaidExecutionPolicyV1 {
+                dispatch_margin_blocks: 0,
+                ..base
+            },
+        ),
+        (
+            "delivery_margin_blocks",
+            PaidExecutionPolicyV1 {
+                delivery_margin_blocks: 0,
+                ..base
+            },
+        ),
+        (
+            "oracle_grace_blocks",
+            PaidExecutionPolicyV1 {
+                oracle_grace_blocks: 0,
+                ..base
+            },
+        ),
+    ];
+    assert_eq!(zeroed.len(), 10, "every required bound must be zeroed");
+    for (field, policy) in zeroed {
+        assert_eq!(
+            check_execution_policy(&policy),
+            Err(PaidWorkError::PolicyZero { field }),
+            "{field} was accepted at zero"
+        );
+    }
+
+    // `max_stop_token_ids` is the one bound that may be zero: a channel
+    // that admits no stop tokens is a usable channel.
+    assert!(
+        check_execution_policy(&PaidExecutionPolicyV1 {
+            max_stop_token_ids: 0,
+            ..base
+        })
+        .is_ok()
     );
 }
 
@@ -1217,7 +1509,7 @@ fn prepared_input_graph_is_checked_not_assumed() {
         &identity_artifact(),
     );
     let mut repointed = authorization;
-    repointed.prepared_input_digest = prepared_input_digest(&channel, &other_bundle);
+    repointed.prepared_input_digest = input_digest(&channel, &other_bundle);
     assert_eq!(
         check_prepared_input(&channel, &repointed, &policy, &other_bundle),
         Err(PaidWorkError::Mismatch {
@@ -1245,7 +1537,7 @@ fn prepared_input_graph_is_checked_not_assumed() {
         &identity_artifact(),
     );
     let mut long_auth = authorization;
-    long_auth.prepared_input_digest = prepared_input_digest(&channel, &long_bundle);
+    long_auth.prepared_input_digest = input_digest(&channel, &long_bundle);
     long_auth.request_commitment = Evaluate::commit_request(&long_request);
     assert_eq!(
         check_prepared_input(&channel, &long_auth, &policy, &long_bundle),
@@ -1276,7 +1568,7 @@ fn prepared_input_graph_is_checked_not_assumed() {
         &identity_artifact(),
     );
     let mut resumed_auth = authorization;
-    resumed_auth.prepared_input_digest = prepared_input_digest(&channel, &resumed_bundle);
+    resumed_auth.prepared_input_digest = input_digest(&channel, &resumed_bundle);
     resumed_auth.request_commitment = Evaluate::commit_request(&resumed_request);
     assert_eq!(
         check_prepared_input(&channel, &resumed_auth, &policy, &resumed_bundle),
@@ -1299,7 +1591,7 @@ fn prepared_input_graph_is_checked_not_assumed() {
         &identity_artifact(),
     );
     let mut attested_auth = authorization;
-    attested_auth.prepared_input_digest = prepared_input_digest(&channel, &attested_bundle);
+    attested_auth.prepared_input_digest = input_digest(&channel, &attested_bundle);
     attested_auth.request_commitment = Evaluate::commit_request(&attested);
     assert_eq!(
         check_prepared_input(&channel, &attested_auth, &policy, &attested_bundle),
@@ -1322,7 +1614,7 @@ fn prepared_input_graph_is_checked_not_assumed() {
         &identity_artifact(),
     );
     let mut delegated_auth = authorization;
-    delegated_auth.prepared_input_digest = prepared_input_digest(&channel, &delegated_bundle);
+    delegated_auth.prepared_input_digest = input_digest(&channel, &delegated_bundle);
     delegated_auth.request_commitment = Evaluate::commit_request(&delegated);
     assert_eq!(
         check_prepared_input(&channel, &delegated_auth, &policy, &delegated_bundle),
@@ -1357,7 +1649,7 @@ fn each_graph_binding_is_checked_on_its_own() {
         &identity_artifact(),
     );
     let mut authorization = base;
-    authorization.prepared_input_digest = prepared_input_digest(&channel, &mismatched_prompt);
+    authorization.prepared_input_digest = input_digest(&channel, &mismatched_prompt);
     assert_eq!(
         check_prepared_input(&channel, &authorization, &policy, &mismatched_prompt),
         Err(PaidWorkError::Mismatch {
@@ -1377,7 +1669,7 @@ fn each_graph_binding_is_checked_on_its_own() {
         &identity_artifact(),
     );
     let mut authorization = base;
-    authorization.prepared_input_digest = prepared_input_digest(&channel, &mismatched_policy);
+    authorization.prepared_input_digest = input_digest(&channel, &mismatched_policy);
     assert_eq!(
         check_prepared_input(&channel, &authorization, &policy, &mismatched_policy),
         Err(PaidWorkError::Mismatch {
@@ -1403,7 +1695,7 @@ fn each_graph_binding_is_checked_on_its_own() {
         &identity_artifact(),
     );
     let mut authorization = base;
-    authorization.prepared_input_digest = prepared_input_digest(&channel, &mismatched_manifest);
+    authorization.prepared_input_digest = input_digest(&channel, &mismatched_manifest);
     assert_eq!(
         check_prepared_input(&channel, &authorization, &policy, &mismatched_manifest),
         Err(PaidWorkError::Mismatch {
@@ -1461,6 +1753,167 @@ fn each_graph_binding_is_checked_on_its_own() {
         check_prepared_input(&channel, &unbound, &policy, &bundle()),
         Err(PaidWorkError::Mismatch {
             field: "prepared_input_digest"
+        })
+    );
+}
+
+/// Each bound of the resource envelope refuses on its own.
+///
+/// Every case here recomputes the bundle digest and leaves the rest of
+/// the graph intact, so the named bound is the only thing that can
+/// refuse it: deleting any one of them makes exactly one of these
+/// assertions return `Ok`.
+#[test]
+fn each_envelope_bound_is_checked_on_its_own() {
+    let channel = channel();
+    let base = execution_policy();
+    let authorization = authorization();
+    assert!(check_prepared_input(&channel, &authorization, &base, &bundle()).is_ok());
+
+    // A bundle larger than the complete quote response this channel
+    // agreed to hold. Refused before its digest is even computed: an
+    // endpoint does not hash a body it has not agreed to receive.
+    let encoded = bundle().encode().expect("a representable bundle");
+    let cramped = PaidExecutionPolicyV1 {
+        max_encoded_quote_response: 100,
+        ..base
+    };
+    assert_eq!(
+        check_prepared_input(&channel, &authorization, &cramped, &bundle()),
+        Err(PaidWorkError::OverEnvelope {
+            field: "prepared input length",
+            actual: encoded.len() as u64,
+            limit: 100
+        })
+    );
+    // The exact length is legal; one byte less is not.
+    let exact = PaidExecutionPolicyV1 {
+        max_encoded_quote_response: encoded.len() as u32,
+        ..base
+    };
+    assert!(check_prepared_input(&channel, &authorization, &exact, &bundle()).is_ok());
+
+    // A generation longer than the policy admits.
+    let short = PaidExecutionPolicyV1 {
+        max_new_tokens: 63,
+        ..base
+    };
+    assert_eq!(
+        check_prepared_input(&channel, &authorization, &short, &bundle()),
+        Err(PaidWorkError::OverEnvelope {
+            field: "max_new_tokens",
+            actual: 64,
+            limit: 63
+        })
+    );
+
+    // More stop tokens than the policy admits.
+    let few = PaidExecutionPolicyV1 {
+        max_stop_token_ids: 1,
+        ..base
+    };
+    assert_eq!(
+        check_prepared_input(&channel, &authorization, &few, &bundle()),
+        Err(PaidWorkError::OverEnvelope {
+            field: "stop token ids",
+            actual: 2,
+            limit: 1
+        })
+    );
+
+    // A request authorized to generate nothing. Zero is inside every
+    // bound above it, so nothing but its own rule refuses it.
+    let silent = TextPolicy::from_u32_stop_tokens(0, [2, 1]);
+    let (silent_bundle, silent_auth) = bundle_with_policy(&channel, &silent);
+    let admits_silence = PaidExecutionPolicyV1 {
+        generation_policy_digest: policy_digest_of(&silent),
+        ..base
+    };
+    assert_eq!(
+        check_prepared_input(&channel, &silent_auth, &admits_silence, &silent_bundle),
+        Err(PaidWorkError::PolicyZero {
+            field: "request max_new_tokens"
+        })
+    );
+}
+
+/// Rebuilds the bundle and the authorization around one replacement
+/// generation policy, leaving every other binding intact.
+fn bundle_with_policy(
+    channel: &PaidChannel,
+    policy: &TextPolicy,
+) -> (PreparedPaidInputV1, PaidJobAuthorizationV1) {
+    let execution = TextExecution::new(
+        SourceRef::output(identity_artifact().output_id()),
+        prompt_tokens().output_id(),
+        policy.output_id(),
+    );
+    let request = EvaluateRequest {
+        text_execution: execution.input_id().digest(),
+        ..evaluate_request()
+    };
+    let bundle = PreparedPaidInputV1::new(
+        &request,
+        &manifest(),
+        &execution,
+        &prompt_tokens(),
+        policy,
+        &identity_artifact(),
+    );
+    let authorization = PaidJobAuthorizationV1 {
+        prepared_input_digest: input_digest(channel, &bundle),
+        request_commitment: Evaluate::commit_request(&request),
+        ..authorization()
+    };
+    (bundle, authorization)
+}
+
+/// This profile starts from the identity artifact and nothing else.
+///
+/// A job resumed from a previous output would be paid for work whose
+/// input the bundle does not carry. The policy here is repinned to the
+/// output artifact and the execution names it as its source, so the two
+/// neighbouring rules — the source check and the identity commitment —
+/// both pass, and only the artifact's kind refuses it.
+#[test]
+fn only_the_identity_artifact_may_start_a_paid_job() {
+    let channel = channel();
+    let resumed = TextArtifact::output(
+        text_execution().input_id(),
+        4,
+        TextState::new(prompt_tokens().output_id()).output_id(),
+        prompt_tokens().output_id(),
+    );
+    let execution = TextExecution::new(
+        SourceRef::output(resumed.output_id()),
+        prompt_tokens().output_id(),
+        text_policy().output_id(),
+    );
+    let request = EvaluateRequest {
+        text_execution: execution.input_id().digest(),
+        ..evaluate_request()
+    };
+    let bundle = PreparedPaidInputV1::new(
+        &request,
+        &manifest(),
+        &execution,
+        &prompt_tokens(),
+        &text_policy(),
+        &resumed,
+    );
+    let authorization = PaidJobAuthorizationV1 {
+        prepared_input_digest: input_digest(&channel, &bundle),
+        request_commitment: Evaluate::commit_request(&request),
+        ..authorization()
+    };
+    let policy = PaidExecutionPolicyV1 {
+        identity_source_digest: identity_digest_of(&resumed),
+        ..execution_policy()
+    };
+    assert_eq!(
+        check_prepared_input(&channel, &authorization, &policy, &bundle),
+        Err(PaidWorkError::Mismatch {
+            field: "identity_artifact kind"
         })
     );
 }
@@ -1583,9 +2036,10 @@ fn allocation_over(
     }
 }
 
-fn three_entries() -> Vec<InvoiceEntryV1> {
+/// Three distinct jobs, invoiced at sequences 1, 2 and 3.
+fn three_jobs() -> Vec<InvoicedJob> {
     let channel = channel();
-    let mut entries = Vec::new();
+    let mut jobs = Vec::new();
     let mut cumulative = 0;
     for index in 0..3_u64 {
         let mut authorization = authorization();
@@ -1601,9 +2055,25 @@ fn three_entries() -> Vec<InvoiceEntryV1> {
         )
         .expect("a legal invoice");
         cumulative = entry.cumulative_after;
-        entries.push(entry);
+        jobs.push(InvoicedJob {
+            authorization,
+            result,
+            entry,
+        });
     }
-    entries
+    jobs
+}
+
+fn entries_of(jobs: &[InvoicedJob]) -> Vec<InvoiceEntryV1> {
+    jobs.iter().map(|job| job.entry).collect()
+}
+
+fn three_entries() -> Vec<InvoiceEntryV1> {
+    entries_of(&three_jobs())
+}
+
+fn allocation_of(jobs: &[InvoicedJob], certificate: &EarnedCertificate) -> CertificateAllocationV1 {
+    allocation_over(&entries_of(jobs), certificate)
 }
 
 /// The allocation binds one certificate to exactly one contiguous
@@ -1611,21 +2081,20 @@ fn three_entries() -> Vec<InvoiceEntryV1> {
 #[test]
 fn allocation_binds_the_certificate_to_its_prefix() {
     let channel = channel();
-    let entries = three_entries();
+    let jobs = three_jobs();
     let certificate = earned(750);
-    let allocation = allocation_over(&entries, &certificate);
+    let allocation = allocation_of(&jobs, &certificate);
 
-    check_allocation(&channel, &allocation, &entries, &certificate, 0).expect("a legal allocation");
-    // Replaying the same evidence is the same answer: this transition is
-    // a function of its inputs and retires nothing by being run twice.
-    check_allocation(&channel, &allocation, &entries, &certificate, 0).expect("idempotent");
+    CreditLedger::new()
+        .credit_allocation(&channel, &allocation, &jobs, &certificate)
+        .expect("a legal allocation");
 
     // MUTATION: a certificate for a different total.
     let short = earned(500);
     let mut short_allocation = allocation;
     short_allocation.certificate_digest = short.digest(channel.network());
     assert_eq!(
-        check_allocation(&channel, &short_allocation, &entries, &short, 0),
+        CreditLedger::new().credit_allocation(&channel, &short_allocation, &jobs, &short),
         Err(PaidWorkError::Mismatch {
             field: "certificate earned_cumulative"
         })
@@ -1635,7 +2104,7 @@ fn allocation_binds_the_certificate_to_its_prefix() {
     let mut wrong_digest = allocation;
     wrong_digest.certificate_digest = hellas_kernel::PayloadHash::from_bytes([0; 32]);
     assert_eq!(
-        check_allocation(&channel, &wrong_digest, &entries, &certificate, 0),
+        CreditLedger::new().credit_allocation(&channel, &wrong_digest, &jobs, &certificate),
         Err(PaidWorkError::Mismatch {
             field: "certificate_digest"
         })
@@ -1652,84 +2121,384 @@ fn allocation_binds_the_certificate_to_its_prefix() {
     swapped_root.invoice_entries_root =
         invoice_entries_root(&channel, &later).expect("legal allocation");
     assert_eq!(
-        check_allocation(&channel, &swapped_root, &entries, &certificate, 0),
+        CreditLedger::new().credit_allocation(&channel, &swapped_root, &jobs, &certificate),
         Err(PaidWorkError::Mismatch {
             field: "invoice_entries_root"
         })
     );
 
-    // MUTATION: start the allocation somewhere other than the next
-    // unpaid sequence.
-    assert_eq!(
-        check_allocation(&channel, &allocation, &entries, &certificate, 250),
-        Err(PaidWorkError::Mismatch {
-            field: "cumulative_before"
-        })
-    );
-
     // MUTATION: a gap in the sequence.
-    let mut gapped = entries.clone();
-    gapped[2].invoice_seq = 4;
-    let gapped_allocation = allocation_over(&gapped, &certificate);
+    let mut gapped = jobs.clone();
+    gapped[2].entry.invoice_seq = 4;
+    let gapped_allocation = allocation_of(&gapped, &certificate);
     assert_eq!(
-        check_allocation(&channel, &gapped_allocation, &gapped, &certificate, 0),
+        CreditLedger::new().credit_allocation(&channel, &gapped_allocation, &gapped, &certificate),
         Err(PaidWorkError::InvoiceSequence {
             expected: 3,
             actual: 4
         })
     );
 
-    // MUTATION: a repriced entry whose successor was not repriced.
-    let mut repriced = entries.clone();
-    repriced[1].price = 251;
-    let repriced_allocation = allocation_over(&repriced, &certificate);
+    // MUTATION: a cumulative that does not continue its predecessor's.
+    let mut skipped = jobs.clone();
+    skipped[1].entry.cumulative_before += 1;
+    skipped[1].entry.cumulative_after += 1;
+    skipped[2].entry.cumulative_before += 1;
+    skipped[2].entry.cumulative_after += 1;
+    let skipped_allocation = allocation_of(&skipped, &earned(751));
     assert_eq!(
-        check_allocation(&channel, &repriced_allocation, &repriced, &certificate, 0),
+        CreditLedger::new().credit_allocation(
+            &channel,
+            &skipped_allocation,
+            &skipped,
+            &earned(751)
+        ),
+        Err(PaidWorkError::Mismatch {
+            field: "cumulative_before"
+        })
+    );
+
+    // MUTATION: a transition that is not its own two endpoints. The
+    // price still matches the authorization, so only the arithmetic can
+    // refuse it.
+    let mut widened = jobs.clone();
+    widened[1].entry.cumulative_after += 1;
+    widened[2].entry.cumulative_before += 1;
+    widened[2].entry.cumulative_after += 1;
+    let widened_allocation = allocation_of(&widened, &earned(751));
+    assert_eq!(
+        CreditLedger::new().credit_allocation(
+            &channel,
+            &widened_allocation,
+            &widened,
+            &earned(751)
+        ),
         Err(PaidWorkError::Mismatch {
             field: "cumulative_after"
         })
     );
 
-    // MUTATION: the same job invoiced twice.
-    let mut duplicated = entries.clone();
-    duplicated[2].work_id = duplicated[0].work_id;
-    let duplicated_allocation = allocation_over(&duplicated, &certificate);
+    // MUTATION: the same job invoiced twice inside one allocation.
+    let mut duplicated = jobs.clone();
+    duplicated[2].authorization = duplicated[0].authorization;
+    duplicated[2].result = duplicated[0].result;
+    duplicated[2].entry.work_id = duplicated[0].entry.work_id;
+    duplicated[2].entry.result_digest = duplicated[0].entry.result_digest;
+    let duplicated_allocation = allocation_of(&duplicated, &certificate);
     assert_eq!(
-        check_allocation(
+        CreditLedger::new().credit_allocation(
             &channel,
             &duplicated_allocation,
             &duplicated,
-            &certificate,
-            0
+            &certificate
         ),
         Err(PaidWorkError::Duplicate { field: "work_id" })
     );
 
     // MUTATION: an allocation over no entries at all.
     assert_eq!(
-        check_allocation(&channel, &allocation, &[], &certificate, 0),
+        CreditLedger::new().credit_allocation(&channel, &allocation, &[], &certificate),
         Err(PaidWorkError::AllocationSize { count: 0 })
     );
 }
 
-/// The certificate must name this channel's edge and terms.
+/// A job this ledger has already paid for cannot be billed again, at any
+/// later sequence.
+///
+/// The two entries are byte-identical in everything the invoice binds to
+/// the job — the same `work_id`, the same `result_digest`, the same
+/// price — and differ only in the sequence and the cumulative pair that
+/// an honest second job would also have moved. A prefix rule alone
+/// accepts the second one, because it *is* the next prefix; only a
+/// ledger that remembers the first refuses it.
 #[test]
-fn allocation_rejects_a_certificate_from_another_edge() {
+fn a_credited_job_cannot_be_billed_again_at_a_fresh_sequence() {
     let channel = channel();
-    let entries = three_entries();
-    let foreign = EarnedCertificate::new(
+    let authorization = authorization();
+    let result = job_result(work_id(&channel, &authorization));
+
+    let first = next_invoice_entry(&channel, &authorization, &result, 1, 0, capacity())
+        .expect("a legal invoice");
+    let again = next_invoice_entry(&channel, &authorization, &result, 2, 250, capacity())
+        .expect("the builder recomputes one job's identifiers");
+    assert_eq!(first.work_id, again.work_id);
+    assert_eq!(first.result_digest, again.result_digest);
+
+    let paid = InvoicedJob {
+        authorization,
+        result,
+        entry: first,
+    };
+    let rebilled = InvoicedJob {
+        authorization,
+        result,
+        entry: again,
+    };
+
+    let mut ledger = CreditLedger::new();
+    ledger
+        .credit_allocation(
+            &channel,
+            &allocation_of(&[paid], &earned(250)),
+            &[paid],
+            &earned(250),
+        )
+        .expect("a legal allocation");
+    assert_eq!(ledger.next_invoice_seq(), 2);
+    assert_eq!(ledger.credited_invoice_high_water(), 250);
+
+    // MUTATION: the same job, re-invoiced at the sequence the ledger is
+    // now waiting for, at the cumulative it is now waiting for.
+    assert_eq!(
+        ledger.credit_allocation(
+            &channel,
+            &allocation_of(&[rebilled], &earned(500)),
+            &[rebilled],
+            &earned(500),
+        ),
+        Err(PaidWorkError::Duplicate { field: "work_id" })
+    );
+    // The refusal credited nothing.
+    assert_eq!(ledger.next_invoice_seq(), 2);
+    assert_eq!(ledger.credited_invoice_high_water(), 250);
+}
+
+/// One allocation continues the last one; it does not start wherever it
+/// likes.
+///
+/// Seeding the expected sequence from the allocation's own first entry
+/// makes every allocation a prefix of itself, which is no rule at all.
+#[test]
+fn an_allocation_must_continue_the_credited_prefix() {
+    let channel = channel();
+    let jobs = three_jobs();
+    let certificate = earned(750);
+    let mut ledger = CreditLedger::new();
+    ledger
+        .credit_allocation(
+            &channel,
+            &allocation_of(&jobs, &certificate),
+            &jobs,
+            &certificate,
+        )
+        .expect("a legal allocation");
+    assert_eq!(ledger.next_invoice_seq(), 4);
+
+    // MUTATION: a second allocation that begins nowhere near sequence 4,
+    // and is internally contiguous and internally correct.
+    let mut far = three_jobs();
+    let mut cumulative = 750;
+    for (index, job) in far.iter_mut().enumerate() {
+        job.authorization.proposal_nonce = 0xf0 + index as u64;
+        job.result = job_result(work_id(&channel, &job.authorization));
+        job.entry = next_invoice_entry(
+            &channel,
+            &job.authorization,
+            &job.result,
+            900_000 + index as u64,
+            cumulative,
+            capacity(),
+        )
+        .expect("a legal invoice");
+        cumulative = job.entry.cumulative_after;
+    }
+    let far_certificate = earned(1_500);
+    assert_eq!(
+        ledger.credit_allocation(
+            &channel,
+            &allocation_of(&far, &far_certificate),
+            &far,
+            &far_certificate
+        ),
+        Err(PaidWorkError::InvoiceSequence {
+            expected: 4,
+            actual: 900_000
+        })
+    );
+
+    // MUTATION: the right sequence, the wrong cumulative — an allocation
+    // that skips the amount the ledger has already credited.
+    let mut restated = three_jobs();
+    cumulative = 0;
+    for (index, job) in restated.iter_mut().enumerate() {
+        job.authorization.proposal_nonce = 0xe0 + index as u64;
+        job.result = job_result(work_id(&channel, &job.authorization));
+        job.entry = next_invoice_entry(
+            &channel,
+            &job.authorization,
+            &job.result,
+            4 + index as u64,
+            cumulative,
+            capacity(),
+        )
+        .expect("a legal invoice");
+        cumulative = job.entry.cumulative_after;
+    }
+    assert_eq!(
+        ledger.credit_allocation(
+            &channel,
+            &allocation_of(&restated, &certificate),
+            &restated,
+            &certificate
+        ),
+        Err(PaidWorkError::Mismatch {
+            field: "cumulative_before"
+        })
+    );
+}
+
+/// An entry is checked against the job it claims to bill, not merely
+/// against the entry before it.
+///
+/// Arithmetic alone accepts an honest `work_id` at ten times its price,
+/// because the price↔authorization binding lives in the builder, and a
+/// rule that holds only on the honest path holds only for honest
+/// providers.
+#[test]
+fn an_entry_must_name_the_job_and_the_price_it_was_authorized_for() {
+    let channel = channel();
+    let jobs = three_jobs();
+    let certificate = earned(750);
+
+    // MUTATION: an honest job at ten times its authorized price, with
+    // every cumulative and the certificate moved to agree.
+    let mut dear = jobs.clone();
+    dear[1].entry.price = 2_500;
+    dear[1].entry.cumulative_after = dear[1].entry.cumulative_before + 2_500;
+    dear[2].entry.cumulative_before = dear[1].entry.cumulative_after;
+    dear[2].entry.cumulative_after = dear[2].entry.cumulative_before + 250;
+    let dear_certificate = earned(3_000);
+    assert_eq!(
+        CreditLedger::new().credit_allocation(
+            &channel,
+            &allocation_of(&dear, &dear_certificate),
+            &dear,
+            &dear_certificate
+        ),
+        Err(PaidWorkError::Mismatch {
+            field: "invoice price"
+        })
+    );
+
+    // MUTATION: an entry naming a job this endpoint never authorized.
+    let mut foreign = jobs.clone();
+    foreign[1].entry.work_id = Digest::from_bytes([0x7a; 32]);
+    assert_eq!(
+        CreditLedger::new().credit_allocation(
+            &channel,
+            &allocation_of(&foreign, &certificate),
+            &foreign,
+            &certificate
+        ),
+        Err(PaidWorkError::Mismatch {
+            field: "invoice work_id"
+        })
+    );
+
+    // MUTATION: an entry billing a result the provider never signed for
+    // this job. The result body still answers the job, so only the
+    // entry's own copy of the digest is wrong.
+    let mut unsigned = jobs.clone();
+    unsigned[1].entry.result_digest = Digest::from_bytes([0x7b; 32]);
+    assert_eq!(
+        CreditLedger::new().credit_allocation(
+            &channel,
+            &allocation_of(&unsigned, &certificate),
+            &unsigned,
+            &certificate
+        ),
+        Err(PaidWorkError::Mismatch {
+            field: "invoice result_digest"
+        })
+    );
+
+    // MUTATION: a result for another job entirely.
+    let mut swapped = jobs.clone();
+    swapped[1].result = swapped[0].result;
+    assert_eq!(
+        CreditLedger::new().credit_allocation(
+            &channel,
+            &allocation_of(&swapped, &certificate),
+            &swapped,
+            &certificate
+        ),
+        Err(PaidWorkError::Mismatch { field: "work_id" })
+    );
+}
+
+/// An entry from another channel is refused, however well it agrees with
+/// everything around it.
+///
+/// The entry's own `channel_id` is the only field that says which
+/// channel it belongs to: the tree recomputes over whatever entries it
+/// is given, and the work id, result digest and price all come from an
+/// authorization that this channel did accept.
+#[test]
+fn an_entry_from_another_channel_is_refused() {
+    let channel = channel();
+    let sibling = channel_on(network(), EdgeId::from_bytes([0xe2; 32]));
+    assert_ne!(channel.id(), sibling.id());
+
+    let mut jobs = three_jobs();
+    jobs[1].entry.channel_id = sibling.id();
+    let certificate = earned(750);
+    assert_eq!(
+        CreditLedger::new().credit_allocation(
+            &channel,
+            &allocation_of(&jobs, &certificate),
+            &jobs,
+            &certificate
+        ),
+        Err(PaidWorkError::Mismatch {
+            field: "invoice channel_id"
+        })
+    );
+}
+
+/// The certificate must name this channel's edge, and its terms.
+///
+/// The terms hash is the sole discriminator between two certificates on
+/// one edge under two different terms: the edge matches, the amount
+/// matches, and the allocation digest is over the certificate offered.
+#[test]
+fn allocation_rejects_a_certificate_from_another_edge_or_other_terms() {
+    let channel = channel();
+    let jobs = three_jobs();
+
+    let other_edge = EarnedCertificate::new(
         EdgeId::from_bytes([0; 32]),
         channel.payment_terms_hash(),
         750,
     );
     let allocation = CertificateAllocationV1 {
-        certificate_digest: foreign.digest(channel.network()),
-        ..allocation_over(&entries, &earned(750))
+        certificate_digest: other_edge.digest(channel.network()),
+        ..allocation_of(&jobs, &earned(750))
     };
     assert_eq!(
-        check_allocation(&channel, &allocation, &entries, &foreign, 0),
+        CreditLedger::new().credit_allocation(&channel, &allocation, &jobs, &other_edge),
         Err(PaidWorkError::Mismatch {
             field: "certificate payment_edge"
+        })
+    );
+
+    // MUTATION: this channel's edge under terms it never agreed to.
+    let other_terms = EarnedCertificate::new(
+        channel.payment_edge(),
+        TermsHash::from_bytes([0x9c; 32]),
+        750,
+    );
+    assert_ne!(
+        other_terms.payment_terms_hash(),
+        channel.payment_terms_hash()
+    );
+    let allocation = CertificateAllocationV1 {
+        certificate_digest: other_terms.digest(channel.network()),
+        ..allocation_of(&jobs, &earned(750))
+    };
+    assert_eq!(
+        CreditLedger::new().credit_allocation(&channel, &allocation, &jobs, &other_terms),
+        Err(PaidWorkError::Mismatch {
+            field: "certificate payment_terms_hash"
         })
     );
 }
