@@ -10,10 +10,24 @@
 //! authenticated root as coins and edges; a second store beside this one
 //! would be state consensus agrees on but does not commit to.
 //!
-//! Abstract counterpart: the store atomicity / read-isolation assumptions
-//! in `models/deps/assumptions.qnt`. The Quint model captures atomicity by
-//! updating all primed variables in one `action` block; this trait is the
-//! Rust contract callers must honor for that abstraction to hold.
+//! # Assumed of the implementation
+//!
+//! Two premises the kernel takes on faith. They are not properties this
+//! crate establishes; they are the contract an implementation must
+//! honour, and every correctness argument that reads this store stops
+//! applying if one is violated.
+//!
+//! - **Transactions are atomic.** All writes staged in one [`Batch`]
+//!   commit together or none commit at all. The kernel relies on this to
+//!   roll back a rejected operation; `models/l1.qnt` captures the same
+//!   thing by updating every primed variable inside one `action` block.
+//!   Violation: a partially applied operation, which no abstract state
+//!   of any model here can represent.
+//! - **Slot reads observe the working transaction.** A read through a
+//!   [`Batch`] sees that batch's own staged writes and no concurrent
+//!   modification from elsewhere. The kernel's two-phase validate-then-
+//!   fold depends on it. The abstract models have no concurrency, so
+//!   this holds there trivially and is checked nowhere.
 
 use crate::{
     error::{InsertError, KernelResult},

@@ -2,9 +2,17 @@
 //!
 //! Abstract counterpart: `models/types.qnt` (the closed-universe `Coin` /
 //! `Edge` ADTs and their canonical wiring) plus the conservation, shape,
-//! and binding rules in `models/rules/invariants.qnt`. Genesis seeding
-//! mirrors the assumed `genesisFunded` predicate in
-//! `models/deps/assumptions.qnt`.
+//! and binding rules in `models/rules/invariants.qnt`.
+//!
+//! # Assumed of genesis
+//!
+//! **Genesis is operator-trusted.** [`Genesis`] accepts caller-supplied
+//! coin ids and values without authentication — it is the one path that
+//! creates value from nothing, and the kernel checks nobody's right to
+//! use it. The models bake the same premise in by initializing
+//! `MakerCoin` / `TakerCoin` to fixed values in `init`, so no model
+//! action can ever exercise a hostile seeding. A deployment must control
+//! the genesis-seeding path itself; nothing here does.
 
 use crate::{
     canonical::{

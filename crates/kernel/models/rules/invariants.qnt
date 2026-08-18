@@ -1,8 +1,10 @@
 // -*- mode: Bluespec; -*-
 //
 // Established invariants — properties the L1 model *guarantees* hold in
-// every reachable state, given that the assumed invariants in
-// `deps/assumptions.qnt` are satisfied.
+// every reachable state, given that the premises the kernel takes on
+// faith are satisfied. Those premises are not modelled: they live with
+// the code that relies on them (`src/context.rs`, `src/block.rs`,
+// `src/store.rs`, `src/object.rs`) and at the top of `verifier.qnt`.
 //
 // Each rule is a `pure def` predicate that takes the relevant state
 // projection and returns a bool. The top-level `l1.qnt` lifts these to

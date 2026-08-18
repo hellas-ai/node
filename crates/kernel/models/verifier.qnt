@@ -8,12 +8,28 @@
 // WebAuthn changes only the witness encoding. The invariant cares that the
 // same party key used for funds/terms authorized the open, with no separate
 // open-auth key namespace.
-// The kernel/crypto seam (`SigVerifier::verify_sig`) is ABSTRACTED AWAY
+// The kernel/crypto seam (`SigVerifier::verify_auth`) is ABSTRACTED AWAY
 // here, not modelled: this module has no `sigOk` predicate, and
-// `proofOk` below is a height guard only. The model therefore cannot distinguish a valid
-// signature from a forged one — witness validity is an assumption
-// (`deps/assumptions.qnt`), and real signature behaviour is pinned by
-// the Rust tests (`tests/secp256k1.rs`, `tests/webauthn.rs`) instead.
+// `proofOk` below is a height guard only. The model therefore cannot
+// distinguish a valid signature from a forged one — real signature
+// behaviour is pinned by the Rust tests (`tests/secp256k1.rs`,
+// `tests/webauthn.rs`) instead.
+//
+// ASSUMED OF THE VERIFIER, and established nowhere in this directory:
+//
+//   1. Soundness. It never admits a witness it should not. If
+//      `proofOk(p, h)` and `payoutsBound(p, mPay, tPay)` both hold, the
+//      abstract close is taken as valid; a verifier that admits an
+//      invalid signature or a non-canonical payout split lets an
+//      unauthorized close drain an edge, and every proof here would
+//      still pass. `openAuthOk` in `types.qnt` makes the same
+//      assumption for opens, abstracting native and WebAuthn witnesses
+//      alike as "the named party authorized this edge".
+//   2. Determinism. Same witness, same answer, every call. The kernel
+//      relies on it to avoid double-checking. `proofOk` and
+//      `payoutsBound` are pure predicates, so determinism holds here by
+//      construction and is therefore not evidence of anything about the
+//      Rust verifiers.
 //
 // Timeout closes need neither — their admissibility is purely
 // structural (terms-hash binding, height guard, payout shape) and lives

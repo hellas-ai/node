@@ -9,8 +9,18 @@
 // Module map:
 //   types.qnt              — ADTs, closed-universe constants, wiring
 //   verifier.qnt           — proofOk, payoutsBound (verification policy)
-//   deps/assumptions.qnt   — what we assume of consensus / verifier / store
 //   rules/invariants.qnt   — what this model establishes
+//
+// What this model ASSUMES rather than establishes is not a module here.
+// `deps/assumptions.qnt` used to collect those premises, and it was
+// never imported, never typechecked and never run — a file shaped like
+// a model, listed as one in the kernel's correspondence table, and
+// checking nothing. Each premise now lives with the thing that relies
+// on it: monotone height and network separation in `src/context.rs`,
+// deterministic block order in `src/block.rs`, store atomicity and read
+// isolation in `src/store.rs`, operator-trusted genesis in
+// `src/object.rs`, and verifier soundness/determinism at the top of
+// `verifier.qnt`.
 //
 // New trace tests added here are picked up automatically by the
 // itf::Runner-based replay in tests/itf.rs (no Rust changes).

@@ -2,8 +2,8 @@
 //
 // Common type vocabulary for the L1 abstract model.
 //
-// These ADTs are pure values shared across `verifier.qnt`, `deps/`, `rules/`,
-// and `l1.qnt` itself. They mirror the Rust kernel's public types one-to-one:
+// These ADTs are pure values shared across `verifier.qnt`, `rules/`, and
+// `l1.qnt` itself. They mirror the Rust kernel's public types one-to-one:
 //
 //   Coin   ↔ src/object.rs::Coin       (live coin id, abstracted to a tag)
 //   Edge   ↔ src/object.rs::Edge       (live edge id, abstracted to a tag)

@@ -1,16 +1,33 @@
 //! Block context and deterministic resource pricing.
 //!
 //! Abstract counterpart: the `height` state var in `models/l1.qnt` (read
-//! by the `proofOk` Timeout guard in `models/verifier.qnt`). The
-//! `heightMonotonic` assumption in `models/deps/assumptions.qnt` is what
-//! lets the kernel trust [`BlockHeight`] without re-checking every apply.
+//! by the `proofOk` Timeout guard in `models/verifier.qnt`).
 //!
-//! [`NetworkId`] has no abstract counterpart: the models are
-//! single-network and do not represent one. That is deliberate and
-//! recorded under "Network" in `models/deps/assumptions.qnt` — cross-
-//! network replay is not reachable by any sequence of actions on one
-//! network, so it is pinned in Rust (`tests/network.rs`) rather than
-//! modelled.
+//! # Assumed of consensus
+//!
+//! **Block height advances monotonically across the chain.** The kernel
+//! reads [`BlockHeight`] off the [`Context`] it is handed and trusts it
+//! without re-checking any apply against the last one it saw. Consensus
+//! guarantees the monotonicity; `models/l1.qnt` gets it by construction,
+//! because `tick` is the only action that moves `height` and it only
+//! ever increments. Violation: a timeout proof fires at the wrong block,
+//! or a `Mutual` close is admitted after its edge expired.
+//!
+//! # Not modelled: the network
+//!
+//! [`NetworkId`] has no abstract counterpart. The models are
+//! single-network and have no notion of a network at all: `openAuthOk`
+//! and `proofOk` say only "the named party authorized this", never
+//! "...here". That is deliberate. Cross-network replay is not a temporal
+//! property — no reachable sequence of actions on one network exhibits
+//! it — so a two-network model would multiply the state space without
+//! making any new property expressible. It is a hash-domain property:
+//! [`crate::Tx::open_hash`] and [`crate::Tx::payload_hash`] commit to
+//! this field, and `tests/network.rs` pins it by replaying an identical
+//! transaction under two networks and requiring the second to be
+//! rejected. Consequence if the domains were *not* separated: every
+//! proof in every model here would still hold, and would still be about
+//! a chain whose witnesses another chain could spend.
 //!
 //! # Deliberately absent
 //!

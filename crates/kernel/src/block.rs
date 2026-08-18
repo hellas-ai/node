@@ -3,9 +3,18 @@
 //! Abstract counterpart: the sequential `step` execution in
 //! `models/l1.qnt`. The model has no explicit "block" — sequential action
 //! application is the model. [`Block`] is the kernel's concrete carrier
-//! for one such ordered batch plus the [`Context`] under which it applies,
-//! and `models/deps/assumptions.qnt` documents the consensus assumption
-//! that finalized blocks arrive in a deterministic order.
+//! for one such ordered batch plus the [`Context`] under which it
+//! applies.
+//!
+//! # Assumed of consensus
+//!
+//! Finalized blocks arrive in a single deterministic order, and the
+//! operations inside one arrive in the order they are listed.
+//! [`crate::State::apply_block`] applies them in exactly that order and
+//! never re-derives it; consensus is assumed to have committed it. This
+//! is a premise, not a property the kernel establishes: no model here
+//! represents two orderings, so nothing abstract could detect a
+//! consensus that supplied a different one to different replicas.
 
 use crate::{
     context::{Context, Cost},
