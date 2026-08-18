@@ -147,9 +147,6 @@ impl BondLease {
     }
 
     /// Returns the payment terms the lease is bound to.
-    ///
-    /// Retained here so a later game or settlement can identify the
-    /// channel even after its edge has been spent.
     #[must_use]
     pub const fn payment_terms_hash(&self) -> TermsHash {
         self.payment_terms_hash
