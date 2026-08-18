@@ -1250,11 +1250,34 @@ pub(crate) fn read_pending_close<B: Batch>(
     network: NetworkId,
     payment_edge: EdgeId,
 ) -> Result<Option<PendingPaymentClose>, PendingCloseFault> {
-    batch
-        .registry_chunk(pending_payment_close_slot(network, payment_edge))
-        .map_or(Ok(None), |chunk| {
-            PendingPaymentClose::from_chunk(chunk, payment_edge).map(Some)
-        })
+    match parse_pending_close(
+        batch.registry_chunk(pending_payment_close_slot(network, payment_edge)),
+        payment_edge,
+    ) {
+        PendingSlot::Absent => Ok(None),
+        PendingSlot::Present(record) => Ok(Some(record)),
+        PendingSlot::Faulty(fault) => Err(fault),
+    }
+}
+
+/// Reads the contest on `payment_edge` out of whatever its derived slot
+/// holds.
+///
+/// Pure, and public, because an endpoint deciding whether a channel may
+/// admit new work asks exactly the question a close asks, and two
+/// answers to it is one answer too many. Callers off the apply path
+/// supply the chunk from wherever they read it;
+/// [`pending_payment_close_slot`] is the one derivation of which slot
+/// that is.
+#[must_use]
+pub fn parse_pending_close(chunk: Option<RegistryChunk>, payment_edge: EdgeId) -> PendingSlot {
+    chunk.map_or(
+        PendingSlot::Absent,
+        |chunk| match PendingPaymentClose::from_chunk(chunk, payment_edge) {
+            Ok(record) => PendingSlot::Present(record),
+            Err(fault) => PendingSlot::Faulty(fault),
+        },
+    )
 }
 
 /// The contest-commitment preimage, field for field as §4.6 of the concurrency design
@@ -1462,12 +1485,14 @@ pub struct StartAuthorization {
     valid_through_height: u64,
 }
 
-/// What an endpoint found in the pending slot while deciding whether to
-/// retire an unincluded start.
+/// What was found in the slot that holds one payment edge's contest.
 ///
 /// Three states, not two. A malformed present chunk is its own answer
 /// precisely because reading it as absence is the mistake this type
-/// exists to make unrepresentable.
+/// exists to make unrepresentable. Absence is a permission twice over:
+/// it lets an endpoint retire an unincluded start
+/// ([`StartAuthorization::may_reopen_gate`]) and it lets a channel admit
+/// new work at all.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 pub enum PendingSlot {
     /// The derived slot is empty.
@@ -2033,6 +2058,74 @@ mod tests {
         assert_eq!(written, PendingPaymentClose::ENCODED_SIZE);
         assert_eq!(chunk.data(), &buf[..written]);
         assert_eq!(PendingPaymentClose::decode_exact(chunk.data()), Ok(record));
+    }
+
+    /// The one answer both a close and an endpoint's readiness gate
+    /// take, over every shape the derived slot can be in.
+    ///
+    /// Each case differs from the accepted one in exactly one way, so no
+    /// case is satisfied by a neighbour's reason for failing.
+    #[test]
+    fn parse_pending_close_separates_absence_from_every_fault() {
+        let record = sample_record();
+        let Some(chunk) = record.to_chunk() else {
+            panic!("the record splits into one chunk");
+        };
+
+        assert_eq!(parse_pending_close(None, edge()), PendingSlot::Absent);
+        assert_eq!(
+            parse_pending_close(Some(chunk), edge()),
+            PendingSlot::Present(record),
+        );
+
+        // A whole readable record, over another payment edge.
+        assert_eq!(
+            parse_pending_close(Some(chunk), EdgeId::from_bytes([0x99; EdgeId::LENGTH])),
+            PendingSlot::Faulty(PendingCloseFault::Edge),
+        );
+
+        // The exact bytes of this record, keyed under the other live
+        // namespace. Only the namespace moves.
+        let mut buf = [0_u8; PendingPaymentClose::ENCODED_SIZE];
+        let written = record.write_to(&mut buf);
+        let Some(value) = buf.get(..written) else {
+            panic!("the record writes its own width");
+        };
+        let Some(misfiled) = RegistryChunk::split(
+            RegistryNamespace::BondLease,
+            RegistryRecordTag::PaymentPending,
+            value,
+            0,
+        ) else {
+            panic!("a fixed-width value always splits");
+        };
+        assert_eq!(
+            parse_pending_close(Some(misfiled), edge()),
+            PendingSlot::Faulty(PendingCloseFault::Shape),
+        );
+
+        // Right namespace, right kind, right width: only the body's
+        // version byte moves, which is what separates `Body` from
+        // `Shape`.
+        let mut corrupt = buf;
+        let version = crate::canonical::ENVELOPE_SIZE;
+        let Some(byte) = corrupt.get_mut(version) else {
+            panic!("the version byte follows the envelope");
+        };
+        assert_eq!(*byte, WORK_CLOSE_VERSION);
+        *byte = WORK_CLOSE_VERSION.wrapping_add(1);
+        let Some(corrupt_chunk) = RegistryChunk::split(
+            RegistryNamespace::PaymentClose,
+            RegistryRecordTag::PaymentPending,
+            &corrupt,
+            0,
+        ) else {
+            panic!("a fixed-width value always splits");
+        };
+        assert_eq!(
+            parse_pending_close(Some(corrupt_chunk), edge()),
+            PendingSlot::Faulty(PendingCloseFault::Body),
+        );
     }
 
     /// The two boolean fields have exactly two spellings each. A third

@@ -225,7 +225,9 @@ pub use error::{
     InvalidOpenReason, InvalidProofReason, KernelResult, PendingCloseFault,
 };
 pub use event::{ApplyOutcome, Diff, Event, EventKind};
-pub use lease::{BOND_LEASE_CHUNKS, BondLease, bond_lease_slot, bond_lease_slots};
+pub use lease::{
+    BOND_LEASE_CHUNKS, BondLease, LeaseSlots, bond_lease_slot, bond_lease_slots, parse_bond_lease,
+};
 pub use list::List;
 pub use network::{MAX_NETWORK_ID_LENGTH, NetworkId};
 pub use object::{Coin, Edge, EdgeValues, Genesis, Parties};
@@ -254,6 +256,6 @@ pub use webauthn::{
 pub use work::{
     EarnedCertificate, PaymentCloseResponse, PaymentCloseStart, PendingPaymentClose, PendingSlot,
     StartAuthorization, StartId, WorkPaymentSettlement, adjudicated_payouts, freeze_digest,
-    freeze_payouts, no_earned_digest, pending_payment_close_slot, response_digest,
-    settlement_commitment, start_digest, start_id, work_payment_settlement,
+    freeze_payouts, no_earned_digest, parse_pending_close, pending_payment_close_slot,
+    response_digest, settlement_commitment, start_digest, start_id, work_payment_settlement,
 };

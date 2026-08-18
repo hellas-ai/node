@@ -271,6 +271,50 @@ pub fn bond_lease_slots(
     ]
 }
 
+/// What was found in the two slots that hold one bond's lease.
+///
+/// Three states, not two. A present pair that is not this bond's whole
+/// lease is its own answer precisely because reading it as absence is
+/// the mistake this type exists to make unrepresentable: absence is a
+/// permission — it lets a payment open take the stake and lets a bond
+/// take its immediate timeout — so anything that could be mistaken for
+/// it has to be a distinct answer.
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+pub enum LeaseSlots {
+    /// Both derived slots are empty.
+    Absent,
+    /// Both derived slots together hold this bond's readable lease.
+    Present(BondLease),
+    /// The slots hold something that is not this bond's whole lease.
+    Faulty(BondLeaseFault),
+}
+
+/// Reads the lease `bond_edge` holds out of the chunks its two derived
+/// slots contain.
+///
+/// Pure, and public, because an endpoint deciding whether a channel is
+/// usable asks exactly the question a bond timeout asks, and two answers
+/// to it is one answer too many. Callers off the apply path supply the
+/// slots from wherever they read them; [`bond_lease_slots`] is the one
+/// derivation of which slots those are.
+#[must_use]
+pub fn parse_bond_lease(
+    slots: [Option<RegistryChunk>; BOND_LEASE_CHUNKS as usize],
+    bond_edge: EdgeId,
+) -> LeaseSlots {
+    match slots {
+        [None, None] => LeaseSlots::Absent,
+        [Some(first), Some(second)] => match BondLease::from_chunks([first, second], bond_edge) {
+            Ok(lease) => LeaseSlots::Present(lease),
+            Err(fault) => LeaseSlots::Faulty(fault),
+        },
+        // A lease is written whole or not at all, so one occupied slot
+        // is not a lease being built: it is state no transition of this
+        // kernel could have produced.
+        [Some(_), None] | [None, Some(_)] => LeaseSlots::Faulty(BondLeaseFault::Partial),
+    }
+}
+
 /// Reads the lease on `bond_edge` from the staged batch.
 ///
 /// Both slots are consulted on every call, and both are charged: the
@@ -283,13 +327,10 @@ pub(crate) fn read_bond_lease<B: Batch>(
     bond_edge: EdgeId,
 ) -> Result<Option<BondLease>, BondLeaseFault> {
     let stored = bond_lease_slots(network, bond_edge).map(|slot| batch.registry_chunk(slot));
-    match stored {
-        [None, None] => Ok(None),
-        [Some(first), Some(second)] => BondLease::from_chunks([first, second], bond_edge).map(Some),
-        // A lease is written whole or not at all, so one occupied slot
-        // is not a lease being built: it is state no transition of this
-        // kernel could have produced.
-        [Some(_), None] | [None, Some(_)] => Err(BondLeaseFault::Partial),
+    match parse_bond_lease(stored, bond_edge) {
+        LeaseSlots::Absent => Ok(None),
+        LeaseSlots::Present(lease) => Ok(Some(lease)),
+        LeaseSlots::Faulty(fault) => Err(fault),
     }
 }
 
@@ -363,6 +404,97 @@ impl Decode for BondLease {
 mod tests {
     use super::*;
     use crate::consts::REGISTRY_CHUNK_DATA_CAPACITY;
+
+    fn bond() -> EdgeId {
+        EdgeId::from_bytes([0x11; EdgeId::LENGTH])
+    }
+
+    fn sample_lease() -> BondLease {
+        BondLease::opened(
+            bond(),
+            EdgeId::from_bytes([0x22; EdgeId::LENGTH]),
+            TermsHash::from_bytes([0x33; TermsHash::LENGTH]),
+            [0x44; HASH_LENGTH],
+            9_000,
+        )
+    }
+
+    fn chunks_of(lease: BondLease) -> [RegistryChunk; BOND_LEASE_CHUNKS as usize] {
+        let Some(chunks) = lease.to_chunks() else {
+            panic!("a fixed-width lease always splits");
+        };
+        chunks
+    }
+
+    /// The one answer both a bond timeout and an endpoint's readiness
+    /// gate take, over every shape the two slots can be in.
+    ///
+    /// Each case differs from the accepted one in exactly one way, so no
+    /// case is satisfied by a neighbour's reason for failing.
+    #[test]
+    fn parse_bond_lease_separates_absence_from_every_fault() {
+        let lease = sample_lease();
+        let [first, second] = chunks_of(lease);
+
+        assert_eq!(parse_bond_lease([None, None], bond()), LeaseSlots::Absent);
+        assert_eq!(
+            parse_bond_lease([Some(first), Some(second)], bond()),
+            LeaseSlots::Present(lease),
+        );
+
+        // One occupied slot: state no transition of this kernel wrote.
+        assert_eq!(
+            parse_bond_lease([Some(first), None], bond()),
+            LeaseSlots::Faulty(BondLeaseFault::Partial),
+        );
+        assert_eq!(
+            parse_bond_lease([None, Some(second)], bond()),
+            LeaseSlots::Faulty(BondLeaseFault::Partial),
+        );
+
+        // Both halves present, in the wrong slots.
+        assert_eq!(
+            parse_bond_lease([Some(second), Some(first)], bond()),
+            LeaseSlots::Faulty(BondLeaseFault::Shape),
+        );
+
+        // A whole readable lease, over another bond.
+        assert_eq!(
+            parse_bond_lease(
+                [Some(first), Some(second)],
+                EdgeId::from_bytes([0x99; EdgeId::LENGTH]),
+            ),
+            LeaseSlots::Faulty(BondLeaseFault::Edge),
+        );
+
+        // Right shape, right width, right slots: only the body's
+        // version byte moves, which is what separates `Body` from
+        // `Shape`.
+        let mut value = [0_u8; BondLease::ENCODED_SIZE];
+        let written = lease.write_to(&mut value);
+        assert_eq!(written, BondLease::ENCODED_SIZE);
+        let version = ENVELOPE_SIZE;
+        let Some(byte) = value.get_mut(version) else {
+            panic!("the version byte follows the envelope");
+        };
+        assert_eq!(*byte, BOND_LEASE_VERSION);
+        *byte = BOND_LEASE_VERSION.wrapping_add(1);
+        let corrupt = [0, 1].map(|index| {
+            let Some(chunk) = RegistryChunk::split(
+                RegistryNamespace::BondLease,
+                RegistryRecordTag::BondLease,
+                &value,
+                index,
+            ) else {
+                panic!("a fixed-width value always splits");
+            };
+            Some(chunk)
+        });
+        assert_eq!(
+            parse_bond_lease(corrupt, bond()),
+            LeaseSlots::Faulty(BondLeaseFault::Body),
+        );
+    }
 
     /// The record's width decides how many slots every reader consults,
     /// so the two have to be derived from one another rather than

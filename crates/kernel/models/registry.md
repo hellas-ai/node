@@ -100,10 +100,14 @@ any abstract model:
 8. **Absence-versus-fault has no abstract counterpart.** The rule that a
    present-but-unreadable pending slot is an invalid transaction rather
    than "no contest is live" is a Rust-side property of
-   `read_pending_close`, mutation-tested in `tests/channel/work.rs`. The
+   `parse_pending_close`, mutation-tested in `tests/channel/work.rs` on
+   the apply path and in `src/work.rs` on the classification itself. The
    same rule over the lease's *two* slots — where absence additionally
    means "this bond may be timed out at once" — is a Rust-side property
-   of `read_bond_lease`, mutation-tested in the same file.
+   of `parse_bond_lease`, mutation-tested in the same two places. Both
+   parsers are public, and the endpoint readiness gate calls them rather
+   than restating the shape rules, so an endpoint and a close cannot
+   disagree about what a slot holds.
 9. **Bond exclusivity is Rust-side only.** That a live tag-4 bond backs
    at most one payment channel, that a payment open refuses an absent,
    spent, or already-leased bond, and that the edge and its lease commit
