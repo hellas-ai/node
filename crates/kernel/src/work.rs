@@ -57,14 +57,14 @@ use crate::{
     },
     consts::{HASH_LENGTH, ID_LENGTH},
     context::Cost,
-    error::PendingCloseFault,
+    error::{InvalidProofReason, PendingCloseFault},
     network::NetworkId,
-    object::Edge,
+    object::{Edge, EdgeValues, Parties},
     primitive::{EdgeId, Party, PayloadHash, Sig, TermsHash},
     registry::{RegistryChunk, RegistryChunkId, RegistryNamespace, RegistryRecordTag},
     store::Batch,
     terms::Terms,
-    tx::{CloseKind, PaymentContestCommitment},
+    tx::{CloseKind, PaymentContestCommitment, Payout},
 };
 
 /// Version byte every work-payment v2 body carries. Decode rejects any
@@ -107,7 +107,7 @@ pub(crate) const fn work_payment_reserve_cost() -> Cost {
 /// dearer one. Reserving the bond on top is what leaves a proved
 /// understatement something to forfeit.
 pub(crate) fn payment_capacity(edge: &Edge, omission_bond: u64) -> Option<u64> {
-    close_route_minimum(edge)?.checked_sub(omission_bond)
+    Some(work_payment_settlement(edge.values(), omission_bond)?.capacity)
 }
 
 /// Returns the smaller of the two values a work-payment close can
@@ -119,6 +119,10 @@ pub(crate) fn payment_capacity(edge: &Edge, omission_bond: u64) -> Option<u64> {
 /// than everything it distributes. They are different mistakes and they
 /// have different fixes.
 pub(crate) fn close_route_minimum(edge: &Edge) -> Option<u64> {
+    route_minimum(edge.values())
+}
+
+fn route_minimum(edge: EdgeValues) -> Option<u64> {
     let freeze = edge.close_value(work_payment_close_cost(CloseKind::Freeze))?;
     let adjudicated = edge.close_value(work_payment_close_cost(CloseKind::Adjudicated))?;
     Some(if freeze < adjudicated {
@@ -126,6 +130,151 @@ pub(crate) fn close_route_minimum(edge: &Edge) -> Option<u64> {
     } else {
         adjudicated
     })
+}
+
+/// What one payment edge's two exits distribute, and the most a
+/// certificate against it may name.
+///
+/// The endpoints need this arithmetic as badly as consensus does — a
+/// client that signs a certificate above capacity has signed something
+/// no close will pay, and a watcher that builds payouts from
+/// `EdgeState.value` builds a close consensus refuses. It is one
+/// calculation, exported, rather than three implementations that agree
+/// until a fee schedule moves.
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+pub struct WorkPaymentSettlement {
+    freeze_total: u64,
+    adjudicated_total: u64,
+    capacity: u64,
+    omission_bond: u64,
+}
+
+impl WorkPaymentSettlement {
+    /// Returns the value a cooperative `Freeze` distributes.
+    #[must_use]
+    pub const fn freeze_total(&self) -> u64 {
+        self.freeze_total
+    }
+
+    /// Returns the value a unilateral `Adjudicated` close distributes.
+    #[must_use]
+    pub const fn adjudicated_total(&self) -> u64 {
+        self.adjudicated_total
+    }
+
+    /// Returns the largest cumulative amount a certificate may name.
+    #[must_use]
+    pub const fn capacity(&self) -> u64 {
+        self.capacity
+    }
+
+    /// Returns the funded omission bond a proved understatement
+    /// forfeits.
+    ///
+    /// Carried rather than derived from the difference between the
+    /// route minimum and the capacity: the payout functions need the
+    /// exact amount, and recovering it by subtraction would be a second
+    /// way to say the same thing.
+    #[must_use]
+    pub const fn omission_bond(&self) -> u64 {
+        self.omission_bond
+    }
+}
+
+/// Returns what a work-payment edge can settle, or `None` when its
+/// reserve does not price both exits or its bond exceeds everything
+/// they distribute.
+///
+/// Takes values rather than an [`Edge`] because the party that most
+/// needs this arithmetic cannot hold one: an endpoint reads a finalized
+/// edge from a light client, not from the kernel's store.
+#[must_use]
+pub fn work_payment_settlement(
+    edge: EdgeValues,
+    omission_bond: u64,
+) -> Option<WorkPaymentSettlement> {
+    let freeze_total = edge.close_value(work_payment_close_cost(CloseKind::Freeze))?;
+    let adjudicated_total = edge.close_value(work_payment_close_cost(CloseKind::Adjudicated))?;
+    let capacity = route_minimum(edge)?.checked_sub(omission_bond)?;
+    Some(WorkPaymentSettlement {
+        freeze_total,
+        adjudicated_total,
+        capacity,
+        omission_bond,
+    })
+}
+
+/// Returns the exact two payouts an `Adjudicated` close must carry.
+///
+/// `final_cumulative` is the scalar the contest ended at, and
+/// `penalty_due` is whether that contest proved an understatement. There
+/// is no route argument: a work-payment edge admits two exits, and the
+/// two functions that build them are the two exits.
+///
+/// # Errors
+///
+/// [`InvalidProofReason::PayoutOverCapacity`] when the provider's total
+/// exceeds what this route distributes, or when adding the forfeited
+/// bond would wrap.
+pub fn adjudicated_payouts(
+    settlement: WorkPaymentSettlement,
+    parties: Parties,
+    final_cumulative: u64,
+    penalty_due: bool,
+) -> Result<[Payout; 2], InvalidProofReason> {
+    let penalty = if penalty_due {
+        settlement.omission_bond
+    } else {
+        0
+    };
+    let provider = final_cumulative
+        .checked_add(penalty)
+        .ok_or(InvalidProofReason::PayoutOverCapacity)?;
+    split_payouts(parties, settlement.adjudicated_total, provider)
+}
+
+/// Returns the exact two payouts a cooperative `Freeze` must carry.
+///
+/// `penalty` is an amount and not a flag because a freeze's penalty is
+/// whatever the contest it ends had already proved, which is zero for
+/// the uncontested close both parties are agreeing to.
+///
+/// # Errors
+///
+/// [`InvalidProofReason::PayoutOverCapacity`] when the provider's total
+/// exceeds what this route distributes, or when adding the penalty
+/// would wrap.
+pub fn freeze_payouts(
+    settlement: WorkPaymentSettlement,
+    parties: Parties,
+    earned: u64,
+    penalty: u64,
+) -> Result<[Payout; 2], InvalidProofReason> {
+    let provider = earned
+        .checked_add(penalty)
+        .ok_or(InvalidProofReason::PayoutOverCapacity)?;
+    split_payouts(parties, settlement.freeze_total, provider)
+}
+
+/// The fixed shape of every work-payment payout: provider first, client
+/// second, summing to exactly what the route distributes.
+///
+/// The one implementation. Consensus compares a close's outputs against
+/// it and the endpoints construct closes from it, so a payout an
+/// endpoint builds and a payout consensus expects cannot be two
+/// different opinions about who is owed what.
+pub(crate) fn split_payouts(
+    parties: Parties,
+    total: u64,
+    provider_total: u64,
+) -> Result<[Payout; 2], InvalidProofReason> {
+    let client_total = total
+        .checked_sub(provider_total)
+        .ok_or(InvalidProofReason::PayoutOverCapacity)?;
+    Ok([
+        Payout::new(parties.taker(), provider_total),
+        Payout::new(parties.maker(), client_total),
+    ])
 }
 
 // ── The certificate ───────────────────────────────────────────────────

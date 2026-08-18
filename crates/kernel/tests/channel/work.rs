@@ -2444,3 +2444,310 @@ fn a_payment_open_at_its_admission_horizon_is_refused() {
     );
     assert!(lease_is_absent(&state), "a refused open takes no lease");
 }
+
+// ── The public settlement arithmetic ──────────────────────────────────
+//
+// The endpoints have to know what a close will pay before they sign the
+// certificate it pays from, and they cannot read an `Edge`: they read a
+// finalized edge's values from a light client. The tests below are the
+// binding between that public arithmetic and the arithmetic consensus
+// actually applies — not a second opinion about it.
+
+use hellas_kernel::{EdgeValues, WorkPaymentSettlement, adjudicated_payouts, freeze_payouts};
+
+/// Returns the settlement projection of the live payment edge.
+fn settlement_of<const C: usize, const E: usize, const R: usize>(
+    state: &State<FixedStore<C, E, R>>,
+    omission_bond: u64,
+) -> WorkPaymentSettlement {
+    let Some(edge) = state.store().edge(payment_edge_id()) else {
+        panic!("the payment edge is live");
+    };
+    let Some(settlement) = hellas_kernel::work_payment_settlement(edge.values(), omission_bond)
+    else {
+        panic!("a live payment edge prices both of its exits");
+    };
+    settlement
+}
+
+/// The payouts the public helper builds are the payouts consensus
+/// accepts, and one unit either way is refused.
+#[test]
+fn the_public_payout_helper_builds_the_close_consensus_accepts() {
+    let mut state = open_payment_state();
+    apply_move(&mut state, CONTEXT, &start_tx(Party::Taker, Some(5)));
+    let Some(record) = pending_record(&state) else {
+        panic!("the start wrote a contest");
+    };
+
+    let settlement = settlement_of(&state, OMISSION_BOND);
+    assert_eq!(settlement.adjudicated_total(), PAYMENT_VALUE);
+    assert_eq!(settlement.capacity(), PAYMENT_CAPACITY);
+    assert_eq!(settlement.omission_bond(), OMISSION_BOND);
+
+    let Ok(outputs) = adjudicated_payouts(settlement, PARTIES, record.final_cumulative(), false)
+    else {
+        panic!("a contest inside capacity has payouts");
+    };
+    let seal = record.contest_commitment(support::NETWORK, payment_edge_id(), payment_terms_hash());
+
+    // MUTATION: one unit of omission bond the edge did not commit. The
+    // endpoint's payout is then a unit over what the contest proved, and
+    // consensus refuses it.
+    let Some(inflated) = hellas_kernel::work_payment_settlement(
+        EdgeValues::new(PAYMENT_VALUE, 0, Fees::ZERO),
+        OMISSION_BOND + 1,
+    ) else {
+        panic!("the inflated settlement is representable");
+    };
+    let Ok(over) = adjudicated_payouts(inflated, PARTIES, record.final_cumulative(), true) else {
+        panic!("the inflated payout is representable");
+    };
+    assert_close_rejected(
+        &mut state,
+        at(RESPONSE_DEADLINE),
+        &Tx::close(payment_edge_id(), Proof::adjudicated(seal), list(&over)),
+        InvalidProofReason::PayoutMismatch,
+    );
+
+    let (provider, client) = apply_payment_close(
+        &mut state,
+        at(RESPONSE_DEADLINE),
+        &Tx::close(payment_edge_id(), Proof::adjudicated(seal), list(&outputs)),
+    );
+    assert_eq!(provider, Some((TAKER, 5)));
+    assert_eq!(client, Some((MAKER, PAYMENT_VALUE - 5)));
+}
+
+/// The penalty branch: a proved understatement pays the forfeited bond
+/// on top, and the helper's `penalty_due` is that same branch.
+#[test]
+fn the_public_payout_helper_covers_both_penalty_values() {
+    let mut state = open_payment_state();
+    apply_move(&mut state, CONTEXT, &start_tx(Party::Maker, Some(3)));
+    let Some(opened) = pending_record(&state) else {
+        panic!("the start wrote a contest");
+    };
+    apply_move(&mut state, at(2), &response_tx(opened.start_id(), 7));
+    let Some(answered) = pending_record(&state) else {
+        panic!("the response advanced the contest");
+    };
+    assert!(answered.penalty_due());
+
+    let settlement = settlement_of(&state, OMISSION_BOND);
+    let Ok(outputs) = adjudicated_payouts(
+        settlement,
+        PARTIES,
+        answered.final_cumulative(),
+        answered.penalty_due(),
+    ) else {
+        panic!("the proved understatement has payouts");
+    };
+
+    // MUTATION: the same contest settled as though nothing were proved.
+    let Ok(unpenalised) =
+        adjudicated_payouts(settlement, PARTIES, answered.final_cumulative(), false)
+    else {
+        panic!("the unpenalised payout is representable");
+    };
+    let seal =
+        answered.contest_commitment(support::NETWORK, payment_edge_id(), payment_terms_hash());
+    assert_close_rejected(
+        &mut state,
+        at(3),
+        &Tx::close(
+            payment_edge_id(),
+            Proof::adjudicated(seal),
+            list(&unpenalised),
+        ),
+        InvalidProofReason::PayoutMismatch,
+    );
+
+    let (provider, client) = apply_payment_close(
+        &mut state,
+        at(3),
+        &Tx::close(payment_edge_id(), Proof::adjudicated(seal), list(&outputs)),
+    );
+    assert_eq!(provider, Some((TAKER, 7 + OMISSION_BOND)));
+    assert_eq!(client, Some((MAKER, PAYMENT_VALUE - 7 - OMISSION_BOND)));
+}
+
+/// The cooperative route has its own total, and the helper knows which.
+#[test]
+fn the_public_freeze_payout_matches_the_cooperative_close() {
+    let mut state = open_payment_state();
+    let settlement = settlement_of(&state, OMISSION_BOND);
+    assert_eq!(settlement.freeze_total(), PAYMENT_VALUE);
+
+    let Ok(outputs) = freeze_payouts(settlement, PARTIES, 6, 0) else {
+        panic!("a freeze inside capacity has payouts");
+    };
+    let validity = (1, 1);
+    let digest = freeze_digest(
+        support::NETWORK,
+        payment_edge_id(),
+        payment_terms_hash(),
+        6,
+        validity,
+    );
+    let (provider, client) = apply_payment_close(
+        &mut state,
+        CONTEXT,
+        &Tx::close(
+            payment_edge_id(),
+            Proof::freeze(
+                6,
+                validity,
+                Sig::placeholder(MAKER, digest),
+                Sig::placeholder(TAKER, digest),
+            ),
+            list(&outputs),
+        ),
+    );
+    assert_eq!(provider, Some((TAKER, 6)));
+    assert_eq!(client, Some((MAKER, PAYMENT_VALUE - 6)));
+}
+
+/// Under a nonzero fee schedule the two routes stop agreeing, and the
+/// public helper is what tells an endpoint which one bounds it.
+///
+/// `Freeze` verifies two signatures where `Adjudicated` verifies none,
+/// so the dearer route distributes less and the capacity that matters is
+/// the smaller of the two. A helper that read `EdgeState.value`, or that
+/// priced only the route it was building, would admit a certificate this
+/// channel cannot pay.
+#[test]
+fn nonzero_fees_separate_the_two_routes_and_the_capacity_they_imply() {
+    const FEES: Fees = Fees::new(1, 0, 1, 0);
+    let priced = Context::with_fees(
+        support::NETWORK,
+        BlockHeight::new(1),
+        BlockHash::from_bytes([0; BlockHash::LENGTH]),
+        FEES,
+    );
+
+    let mut state = bonded_state();
+    let open = open_tx(payment_funding(), payment_terms());
+    let Ok(_outcome) = state.apply(priced, &FAKE_VERIFIER, &open) else {
+        panic!("payment open rejected under a nonzero fee schedule");
+    };
+
+    let Some(edge) = state.store().edge(payment_edge_id()) else {
+        panic!("the payment edge is live");
+    };
+    let settlement = settlement_of(&state, OMISSION_BOND);
+    assert_eq!(edge.close_fees(), FEES);
+    assert!(
+        settlement.freeze_total() < settlement.adjudicated_total(),
+        "the two-signature route must distribute less: {settlement:?}",
+    );
+    assert_eq!(
+        settlement.capacity(),
+        settlement.freeze_total() - OMISSION_BOND,
+    );
+
+    // The capacity boundary the helper reports is the boundary the real
+    // move enforces, exactly.
+    apply_move(
+        &mut state,
+        priced,
+        &start_tx(Party::Taker, Some(settlement.capacity())),
+    );
+    let Some(record) = pending_record(&state) else {
+        panic!("the start wrote a contest");
+    };
+    let Ok(outputs) = adjudicated_payouts(settlement, PARTIES, record.final_cumulative(), false)
+    else {
+        panic!("a contest at capacity has payouts");
+    };
+    let seal = record.contest_commitment(support::NETWORK, payment_edge_id(), payment_terms_hash());
+    let (provider, client) = apply_payment_close(
+        &mut state,
+        Context::with_fees(
+            support::NETWORK,
+            BlockHeight::new(RESPONSE_DEADLINE),
+            BlockHash::from_bytes([0; BlockHash::LENGTH]),
+            FEES,
+        ),
+        &Tx::close(payment_edge_id(), Proof::adjudicated(seal), list(&outputs)),
+    );
+    assert_eq!(provider, Some((TAKER, settlement.capacity())));
+    assert_eq!(
+        client,
+        Some((
+            MAKER,
+            settlement.adjudicated_total() - settlement.capacity()
+        )),
+    );
+}
+
+/// One unit above the reported capacity is refused by the move that
+/// admits certificates, so the helper's number is the consensus number
+/// and not an estimate of it.
+#[test]
+fn a_certificate_one_unit_over_the_reported_capacity_is_refused() {
+    const FEES: Fees = Fees::new(1, 0, 1, 0);
+    let priced = Context::with_fees(
+        support::NETWORK,
+        BlockHeight::new(1),
+        BlockHash::from_bytes([0; BlockHash::LENGTH]),
+        FEES,
+    );
+    let mut state = bonded_state();
+    let open = open_tx(payment_funding(), payment_terms());
+    let Ok(_outcome) = state.apply(priced, &FAKE_VERIFIER, &open) else {
+        panic!("payment open rejected under a nonzero fee schedule");
+    };
+    let settlement = settlement_of(&state, OMISSION_BOND);
+
+    assert_eq!(
+        state.apply(
+            priced,
+            &FAKE_VERIFIER,
+            &start_tx(Party::Taker, Some(settlement.capacity() + 1)),
+        ),
+        Err(ApplyError::InvalidMove {
+            input: payment_edge_id(),
+            reason: InvalidMoveReason::CertificateOverCapacity,
+        }),
+    );
+}
+
+/// An edge whose reserve cannot price its dearer exit has no
+/// settlement, and neither does one whose bond exceeds everything the
+/// close distributes. Both are refusals, not zeroes.
+#[test]
+fn a_settlement_that_cannot_be_priced_is_absent() {
+    let unpayable = EdgeValues::new(100, 0, Fees::new(1, 1, 1, 1));
+    assert_eq!(
+        hellas_kernel::work_payment_settlement(unpayable, 0),
+        None,
+        "a reserve below the committed close fee prices no route",
+    );
+
+    let overbonded = EdgeValues::new(10, 0, Fees::ZERO);
+    assert_eq!(
+        hellas_kernel::work_payment_settlement(overbonded, 11),
+        None,
+        "a bond above everything the close distributes leaves no capacity",
+    );
+    let Some(exact) = hellas_kernel::work_payment_settlement(overbonded, 10) else {
+        panic!("a bond equal to the distributable total leaves zero capacity");
+    };
+    assert_eq!(exact.capacity(), 0);
+
+    let Some(settlement) =
+        hellas_kernel::work_payment_settlement(EdgeValues::new(u64::MAX, 0, Fees::ZERO), 1)
+    else {
+        panic!("the largest edge is representable");
+    };
+    assert_eq!(
+        adjudicated_payouts(settlement, PARTIES, u64::MAX, true),
+        Err(InvalidProofReason::PayoutOverCapacity),
+        "adding the forfeited bond must not wrap",
+    );
+    assert_eq!(
+        adjudicated_payouts(settlement, PARTIES, u64::MAX, false).map(|payouts| payouts[1].value()),
+        Ok(0),
+    );
+}

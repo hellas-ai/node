@@ -217,9 +217,23 @@ impl Edge {
     }
 
     pub(super) fn close_value(self, close_cost: Cost) -> Option<u64> {
-        let fee = self.close_fees.charge(close_cost)?;
-        let surplus = self.reserve.checked_sub(fee)?;
-        self.value.checked_add(surplus)
+        self.values().close_value(close_cost)
+    }
+
+    /// Returns the three numbers a close distributes from.
+    ///
+    /// The projection exists because the work-payment settlement
+    /// arithmetic is public and an endpoint cannot hold an [`Edge`]: it
+    /// reads a finalized edge's values from a light client. Keeping the
+    /// formula on the values, and this type as the only way to reach it,
+    /// is what stops the endpoint's copy from being a second formula.
+    #[must_use]
+    pub const fn values(self) -> EdgeValues {
+        EdgeValues {
+            value: self.value,
+            reserve: self.reserve,
+            close_fees: self.close_fees,
+        }
     }
 
     fn total<const N: usize>(coins: &List<(CoinId, Coin), N>) -> Option<u64> {
@@ -272,6 +286,44 @@ impl Edge {
     #[must_use]
     pub const fn allows(self, kind: CloseKind) -> bool {
         self.allowed.contains(kind)
+    }
+}
+
+/// The locked principal, the close reserve, and the fee schedule that
+/// prices the reserve: everything a close distributes from.
+///
+/// Deliberately not the whole edge. An endpoint reconstructs these three
+/// numbers from a finalized light-client read and asks the kernel what
+/// they settle to; it has no store, no terms body, and no business
+/// forming an [`Edge`].
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+pub struct EdgeValues {
+    value: u64,
+    reserve: u64,
+    close_fees: Fees,
+}
+
+impl EdgeValues {
+    /// Creates the value projection of a finalized edge.
+    #[must_use]
+    pub const fn new(value: u64, reserve: u64, close_fees: Fees) -> Self {
+        Self {
+            value,
+            reserve,
+            close_fees,
+        }
+    }
+
+    /// Returns what a close of this cost distributes: the principal plus
+    /// the part of the open-time reserve that close does not consume.
+    ///
+    /// `None` when the committed reserve does not cover the committed
+    /// fee, or when the sum would wrap. The fee comes from the schedule
+    /// stored at open, so current block fees cannot strand an open edge.
+    pub(crate) fn close_value(self, close_cost: Cost) -> Option<u64> {
+        let fee = self.close_fees.charge(close_cost)?;
+        let surplus = self.reserve.checked_sub(fee)?;
+        self.value.checked_add(surplus)
     }
 }
 

@@ -33,11 +33,12 @@ use crate::{
     registry::{RegistryDiff, RegistryMutation},
     store::Batch,
     terms::{Terms, TermsProfile, WorkPaymentTerms},
-    tx::{CloseKind, PaymentContestCommitment, Payout},
+    tx::{CloseKind, PaymentContestCommitment},
     verifier::SigVerifier,
     work::{
         EarnedCertificate, PaymentCloseResponse, PaymentCloseStart, PendingPaymentClose,
         close_route_minimum, payment_capacity, pending_payment_close_slot, read_pending_close,
+        split_payouts,
     },
 };
 
@@ -619,18 +620,12 @@ fn check_split(
     provider_total: u64,
     outputs: &Payouts,
 ) -> Result<(), InvalidProofReason> {
-    let client_total = total
-        .checked_sub(provider_total)
-        .ok_or(InvalidProofReason::PayoutOverCapacity)?;
-    let [provider, client] = outputs.as_slice() else {
-        return Err(InvalidProofReason::PayoutMismatch);
-    };
-    if *provider != Payout::new(parties.taker(), provider_total)
-        || *client != Payout::new(parties.maker(), client_total)
-    {
-        return Err(InvalidProofReason::PayoutMismatch);
+    let expected = split_payouts(parties, total, provider_total)?;
+    if outputs.as_slice() == expected.as_slice() {
+        Ok(())
+    } else {
+        Err(InvalidProofReason::PayoutMismatch)
     }
-    Ok(())
 }
 
 fn one_mutation(mutation: RegistryMutation) -> KernelResult<RegistryDiff> {
