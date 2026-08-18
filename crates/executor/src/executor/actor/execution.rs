@@ -1,3 +1,34 @@
+//! The executor's execution path: run-ticket validation, backend
+//! dispatch, and the signed event stream a job produces.
+//!
+//! # Owed here by P5: the backend-neutral terminal event commitment
+//!
+//! The cutover deleted the Receipt and Settle handlers, and took with
+//! them the one helper that answered a question neither of them owned:
+//! *what is the terminal event commitment of the provider's own
+//! completed transcript for this request, from whichever engine ran
+//! it?* Nothing in `crates/executor/src` derives that value today, from
+//! a live transcript or from a durable completed record. §2.1 of
+//! `workflows/roadmap/compute-flow-plan.md` required extracting it
+//! before the deletion; it was deleted whole instead, and this note is
+//! the record of that debt rather than a re-added function with no
+//! caller.
+//!
+//! Recover it from `git show
+//! 957162c:crates/executor/src/executor/actor/execution.rs`, the
+//! private `terminal_commitment` method (lines 283–320 there). The
+//! behaviour, precisely: replay the provider's own completed transcript
+//! for a request commitment — Fetch's durable `replay_completed` first,
+//! then Evaluate's replayed `WorkFinished` — take the last output
+//! event, and return its `event_commitment` bytes; refuse when no
+//! completed transcript exists, when one exists but is empty, and when
+//! the replayed terminal event does not decode.
+//!
+//! P5b is what owes it, not P5a: §9 fixes that `PaidJobResultV1` may be
+//! constructed only from the provider's durably recorded terminal
+//! artifact, and that is this value. The Receipt type that used to own
+//! its only caller is gone for good and must not come back with it.
+
 use crate::ExecutorError;
 use crate::StateError;
 use crate::executor::{
