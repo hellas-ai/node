@@ -1,8 +1,15 @@
 use serde::{Deserialize, Serialize};
 
+use crate::protocol::value::{CanonicalDecodeError, CanonicalDecoder};
 use crate::{
     Assurance, ContentId, DagCborEncoder, Digest, PublicKey, RequestCommitment, Retention,
+    SignatureKind,
 };
+
+/// Schema tag of the request commitment preimage. One constant, so the
+/// encoder and the decoder below cannot disagree about which array they
+/// are writing and reading.
+const EVALUATE_REQUEST_SCHEMA: &str = "hellas.evaluate.request.v3";
 
 const fn retain_by_default() -> bool {
     true
@@ -37,7 +44,7 @@ impl EvaluateRequest {
 pub fn evaluate_request_bytes(request: &EvaluateRequest) -> Vec<u8> {
     let mut encoder = DagCborEncoder::new();
     encoder.array(8);
-    encoder.str("hellas.evaluate.request.v3");
+    encoder.str(EVALUATE_REQUEST_SCHEMA);
     encoder.bytes(request.text_execution.as_bytes());
     encoder.bytes(request.execution_environment.as_bytes());
     encoder.bytes(&request.nonce);
@@ -46,6 +53,82 @@ pub fn evaluate_request_bytes(request: &EvaluateRequest) -> Vec<u8> {
     encoder.u64(request.assurance.to_byte() as u64);
     encoder.u64(request.retain as u64);
     encoder.into_bytes()
+}
+
+/// Reads back the exact bytes [`evaluate_request_bytes`] writes.
+///
+/// The last line is the strict part: whatever came out of the decoder is
+/// re-encoded and compared, so the only byte string that survives is the
+/// one this encoder would have produced. A paid-work bundle carrying a
+/// re-spelled request — a wider integer, a reordered field, a trailing
+/// byte — is refused here rather than becoming a second bundle that
+/// commits to the same job.
+pub fn decode_evaluate_request(bytes: &[u8]) -> Result<EvaluateRequest, CanonicalDecodeError> {
+    let mut decoder = CanonicalDecoder::new(bytes);
+    decoder.array_exact(8)?;
+    decoder.expect_str(EVALUATE_REQUEST_SCHEMA)?;
+    let text_execution = Digest::from_bytes(decoder.bytes_32()?);
+    let execution_environment = ContentId::from_bytes(decoder.bytes_32()?);
+    let nonce = decoder.bytes_32()?;
+    let kind = u8::try_from(decoder.u64()?)
+        .map_err(|_| CanonicalDecodeError::new("signature kind exceeds one byte"))?;
+    let key_bytes = decoder.bytes()?;
+    let runner_public_key = public_key(kind, key_bytes)?;
+    let assurance = u8::try_from(decoder.u64()?)
+        .map_err(|_| CanonicalDecodeError::new("assurance exceeds one byte"))
+        .and_then(|byte| {
+            Assurance::from_byte(byte).map_err(|err| CanonicalDecodeError::new(err.to_string()))
+        })?;
+    let retain = match decoder.u64()? {
+        0 => false,
+        1 => true,
+        other => {
+            return Err(CanonicalDecodeError::new(format!(
+                "retain must be 0 or 1, got {other}"
+            )));
+        }
+    };
+    decoder.finish()?;
+
+    let request = EvaluateRequest {
+        text_execution,
+        runner_public_key,
+        execution_environment,
+        nonce,
+        assurance,
+        retain,
+    };
+    if evaluate_request_bytes(&request) != bytes {
+        return Err(CanonicalDecodeError::new(
+            "request is not in canonical evaluate-request form",
+        ));
+    }
+    Ok(request)
+}
+
+fn public_key(kind: u8, bytes: &[u8]) -> Result<PublicKey, CanonicalDecodeError> {
+    let kind =
+        SignatureKind::from_byte(kind).map_err(|err| CanonicalDecodeError::new(err.to_string()))?;
+    let wrong_length = || {
+        CanonicalDecodeError::new(format!(
+            "{kind:?} public key must not be {} bytes",
+            bytes.len()
+        ))
+    };
+    match kind {
+        SignatureKind::Secp256k1 => bytes
+            .try_into()
+            .map(PublicKey::Secp256k1)
+            .map_err(|_| wrong_length()),
+        SignatureKind::Ed25519 => bytes
+            .try_into()
+            .map(PublicKey::Ed25519)
+            .map_err(|_| wrong_length()),
+        SignatureKind::P256 => bytes
+            .try_into()
+            .map(PublicKey::P256)
+            .map_err(|_| wrong_length()),
+    }
 }
 
 pub struct Evaluate;
@@ -97,12 +180,17 @@ mod tests {
             hex,
             concat!(
                 "88",
-                "781a", "68656c6c61732e6576616c756174652e726571756573742e7633",
-                "5820", "0404040404040404040404040404040404040404040404040404040404040404",
-                "5820", "0505050505050505050505050505050505050505050505050505050505050505",
-                "5820", "0606060606060606060606060606060606060606060606060606060606060606",
+                "781a",
+                "68656c6c61732e6576616c756174652e726571756573742e7633",
+                "5820",
+                "0404040404040404040404040404040404040404040404040404040404040404",
+                "5820",
+                "0505050505050505050505050505050505050505050505050505050505050505",
+                "5820",
+                "0606060606060606060606060606060606060606060606060606060606060606",
                 "01",
-                "5821", "031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f",
+                "5821",
+                "031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f",
                 "00",
                 "01",
             )

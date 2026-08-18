@@ -174,9 +174,9 @@ impl<'a> CanonicalDecoder<'a> {
 
     pub fn bytes_32(&mut self) -> Result<[u8; 32], CanonicalDecodeError> {
         let bytes = self.bytes()?;
-        bytes
-            .try_into()
-            .map_err(|_| CanonicalDecodeError::new(format!("expected 32 bytes, got {}", bytes.len())))
+        bytes.try_into().map_err(|_| {
+            CanonicalDecodeError::new(format!("expected 32 bytes, got {}", bytes.len()))
+        })
     }
 
     pub fn bytes(&mut self) -> Result<&'a [u8], CanonicalDecodeError> {
@@ -200,11 +200,13 @@ impl<'a> CanonicalDecoder<'a> {
         let len = usize::try_from(self.read_len(3)?)
             .map_err(|_| CanonicalDecodeError::new("text string length exceeds usize range"))?;
         let bytes = self.read_exact(len)?;
-        str::from_utf8(bytes).map_err(|err| CanonicalDecodeError::new(format!("invalid utf-8: {err}")))
+        str::from_utf8(bytes)
+            .map_err(|err| CanonicalDecodeError::new(format!("invalid utf-8: {err}")))
     }
 
     pub fn u32(&mut self) -> Result<u32, CanonicalDecodeError> {
-        u32::try_from(self.u64()?).map_err(|_| CanonicalDecodeError::new("integer exceeds u32 range"))
+        u32::try_from(self.u64()?)
+            .map_err(|_| CanonicalDecodeError::new("integer exceeds u32 range"))
     }
 
     pub fn u64(&mut self) -> Result<u64, CanonicalDecodeError> {
@@ -246,7 +248,9 @@ impl<'a> CanonicalDecoder<'a> {
             27 => {
                 let value = u64::from_be_bytes(self.read_array()?);
                 if value <= 0xffff_ffff {
-                    return Err(CanonicalDecodeError::new("non-canonical eight-byte integer"));
+                    return Err(CanonicalDecodeError::new(
+                        "non-canonical eight-byte integer",
+                    ));
                 }
                 Ok(value)
             }

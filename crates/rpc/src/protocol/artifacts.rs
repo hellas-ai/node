@@ -21,7 +21,7 @@
 //! under.
 
 use crate::protocol::value::{CanonicalDecodeError, CanonicalDecoder};
-use crate::{DagCborEncoder, Digest};
+use crate::{ContentId, DagCborEncoder, Digest};
 use std::{format, marker::PhantomData, str, string::String, vec::Vec};
 
 const SOURCE_INPUT_SCHEMA: &str = "hellas.evaluate.source.input.v1";
@@ -594,6 +594,202 @@ impl CanonicalDecode for TextArtifact {
     }
 }
 
+// ── The prepared paid-work input bundle ───────────────────────────────
+
+/// The six canonical bodies a paid job is prepared from, in one
+/// length-delimited byte string.
+///
+/// Every field above is content-addressed, and an id is not a body: an
+/// endpoint holding only ids cannot check what it is about to pay for.
+/// This is the bundle that travels with a quote so both endpoints hold
+/// the same six bodies, hash them the same way, and can rebuild every
+/// commitment in the authorization from bytes they possess.
+///
+/// It carries bytes rather than parsed values on purpose. The bytes *are*
+/// the content ids, so a bundle that stored values and re-encoded them
+/// would be asserting that this crate's encoder agrees with whatever
+/// produced the ids. [`Self::parts`] parses them, strictly, when meaning
+/// is needed.
+///
+/// Unlike the fixed paid-work records this bundle carries no envelope:
+/// it is never signed on its own, and the digest that commits to it
+/// supplies its domain separation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedPaidInputV1 {
+    evaluate_request: Vec<u8>,
+    manifest: Vec<u8>,
+    text_execution: Vec<u8>,
+    prompt_tokens: Vec<u8>,
+    text_policy: Vec<u8>,
+    identity_artifact: Vec<u8>,
+}
+
+/// Bytes each nested body's length prefix occupies: unsigned big-endian
+/// `u32`, six of them.
+const LENGTH_PREFIX: usize = 4;
+
+/// The six bodies of a [`PreparedPaidInputV1`], parsed.
+///
+/// The manifest is the one body that arrives as an id rather than a
+/// value: nothing in this milestone reads a field of it, and its content
+/// id is the hash of exactly the bytes carried, so comparing that id to
+/// the environment commitment fixes the bytes as completely as a decoder
+/// would. Giving it a second, unused parser would be inventing an
+/// opinion about manifest bytes that nothing checks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedPaidInputParts {
+    /// The request whose commitment the authorization names.
+    pub evaluate_request: crate::EvaluateRequest,
+    /// Content id of the carried environment manifest bytes.
+    pub manifest: ContentId,
+    /// The execution the request is addressed by.
+    pub text_execution: TextExecution,
+    /// Prompt tokens the execution names.
+    pub prompt_tokens: TokenIds,
+    /// Generation policy the execution names.
+    pub text_policy: TextPolicy,
+    /// Identity artifact the execution starts from.
+    pub identity_artifact: TextArtifact,
+}
+
+impl PreparedPaidInputV1 {
+    /// Builds a bundle from the six values, encoding each body once.
+    pub fn new(
+        evaluate_request: &crate::EvaluateRequest,
+        manifest: &crate::ProgramManifest,
+        text_execution: &TextExecution,
+        prompt_tokens: &TokenIds,
+        text_policy: &TextPolicy,
+        identity_artifact: &TextArtifact,
+    ) -> Self {
+        Self {
+            evaluate_request: crate::protocol::schemes::evaluate::evaluate_request_bytes(
+                evaluate_request,
+            ),
+            manifest: manifest.canonical_bytes(),
+            text_execution: text_execution.canonical_bytes(),
+            prompt_tokens: prompt_tokens.canonical_bytes(),
+            text_policy: text_policy.canonical_bytes(),
+            identity_artifact: identity_artifact.canonical_bytes(),
+        }
+    }
+
+    /// Returns the canonical encoding: six unsigned big-endian `u32`
+    /// lengths, each immediately followed by that many body bytes.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for body in self.bodies() {
+            #[allow(clippy::cast_possible_truncation)]
+            let len = body.len() as u32;
+            bytes.extend_from_slice(&len.to_be_bytes());
+            bytes.extend_from_slice(body);
+        }
+        bytes
+    }
+
+    /// Decodes a bundle, refusing anything that does not fit `budget`.
+    ///
+    /// `budget` is the profile's complete-bundle limit. It is checked
+    /// against the input before the first length is read and against the
+    /// running total after each one, so six individually representable
+    /// lengths cannot add up to a bundle this endpoint never agreed to
+    /// hold. No length is trusted far enough to reserve memory for: each
+    /// body is taken from the input that already exists.
+    pub fn decode(bytes: &[u8], budget: usize) -> Result<Self, CanonicalDecodeError> {
+        if bytes.len() > budget {
+            return Err(CanonicalDecodeError::new(format!(
+                "prepared input is {} bytes, over the {budget}-byte budget",
+                bytes.len()
+            )));
+        }
+        let mut reader = BundleReader {
+            bytes,
+            offset: 0,
+            budget,
+        };
+        let bundle = Self {
+            evaluate_request: reader.body("evaluate_request")?,
+            manifest: reader.body("manifest")?,
+            text_execution: reader.body("text_execution")?,
+            prompt_tokens: reader.body("prompt_tokens")?,
+            text_policy: reader.body("text_policy")?,
+            identity_artifact: reader.body("identity_artifact")?,
+        };
+        if reader.offset != bytes.len() {
+            return Err(CanonicalDecodeError::new(format!(
+                "trailing bytes after prepared input: {}",
+                bytes.len() - reader.offset
+            )));
+        }
+        Ok(bundle)
+    }
+
+    /// Parses all six bodies, rejecting any that is not canonical.
+    pub fn parts(&self) -> Result<PreparedPaidInputParts, CanonicalDecodeError> {
+        Ok(PreparedPaidInputParts {
+            evaluate_request: crate::protocol::schemes::evaluate::decode_evaluate_request(
+                &self.evaluate_request,
+            )?,
+            manifest: ContentId::hash(&self.manifest),
+            text_execution: TextExecution::from_canonical_bytes(&self.text_execution)?,
+            prompt_tokens: TokenIds::from_canonical_bytes(&self.prompt_tokens)?,
+            text_policy: TextPolicy::from_canonical_bytes(&self.text_policy)?,
+            identity_artifact: TextArtifact::from_canonical_bytes(&self.identity_artifact)?,
+        })
+    }
+
+    fn bodies(&self) -> [&[u8]; 6] {
+        [
+            &self.evaluate_request,
+            &self.manifest,
+            &self.text_execution,
+            &self.prompt_tokens,
+            &self.text_policy,
+            &self.identity_artifact,
+        ]
+    }
+}
+
+struct BundleReader<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+    budget: usize,
+}
+
+impl BundleReader<'_> {
+    fn body(&mut self, field: &'static str) -> Result<Vec<u8>, CanonicalDecodeError> {
+        let start = self
+            .offset
+            .checked_add(LENGTH_PREFIX)
+            .ok_or_else(|| CanonicalDecodeError::new("prepared input offset overflow"))?;
+        let prefix = self
+            .bytes
+            .get(self.offset..start)
+            .ok_or_else(|| CanonicalDecodeError::new(format!("{field} length is truncated")))?;
+        let mut length = [0_u8; LENGTH_PREFIX];
+        length.copy_from_slice(prefix);
+        let length = u32::from_be_bytes(length) as usize;
+
+        let end = start
+            .checked_add(length)
+            .ok_or_else(|| CanonicalDecodeError::new("prepared input offset overflow"))?;
+        if end > self.budget {
+            return Err(CanonicalDecodeError::new(format!(
+                "{field} of {length} bytes exceeds the {}-byte budget",
+                self.budget
+            )));
+        }
+        let body = self.bytes.get(start..end).ok_or_else(|| {
+            CanonicalDecodeError::new(format!(
+                "{field} declares {length} bytes but {} remain",
+                self.bytes.len().saturating_sub(start)
+            ))
+        })?;
+        self.offset = end;
+        Ok(body.to_vec())
+    }
+}
+
 fn parse_canonical<T: Canonical>(
     bytes: &[u8],
     decode: fn(&mut CanonicalDecoder<'_>) -> Result<T, CanonicalDecodeError>,
@@ -602,7 +798,9 @@ fn parse_canonical<T: Canonical>(
     let value = decode(&mut decoder)?;
     decoder.finish()?;
     if value.canonical_bytes() != bytes {
-        return Err(CanonicalDecodeError::new("value is not in canonical artifact form"));
+        return Err(CanonicalDecodeError::new(
+            "value is not in canonical artifact form",
+        ));
     }
     Ok(value)
 }
@@ -618,7 +816,9 @@ fn decode_token_ids(decoder: &mut CanonicalDecoder<'_>) -> Result<TokenIds, Cano
     Ok(TokenIds::new(tokens))
 }
 
-fn decode_text_policy(decoder: &mut CanonicalDecoder<'_>) -> Result<TextPolicy, CanonicalDecodeError> {
+fn decode_text_policy(
+    decoder: &mut CanonicalDecoder<'_>,
+) -> Result<TextPolicy, CanonicalDecodeError> {
     decoder.array_exact(3)?;
     decoder.expect_str(TEXT_POLICY_SCHEMA)?;
     let max_new_tokens = decoder.u32()?;
@@ -630,13 +830,17 @@ fn decode_text_policy(decoder: &mut CanonicalDecoder<'_>) -> Result<TextPolicy, 
     Ok(TextPolicy::new(max_new_tokens, stop_token_ids))
 }
 
-fn decode_text_state(decoder: &mut CanonicalDecoder<'_>) -> Result<TextState, CanonicalDecodeError> {
+fn decode_text_state(
+    decoder: &mut CanonicalDecoder<'_>,
+) -> Result<TextState, CanonicalDecodeError> {
     decoder.array_exact(2)?;
     decoder.expect_str(TEXT_STATE_SCHEMA)?;
     Ok(TextState::new(TokenIdsId::from_bytes(decoder.bytes_32()?)))
 }
 
-fn decode_text_source(decoder: &mut CanonicalDecoder<'_>) -> Result<TextSource, CanonicalDecodeError> {
+fn decode_text_source(
+    decoder: &mut CanonicalDecoder<'_>,
+) -> Result<TextSource, CanonicalDecodeError> {
     decoder.array_exact(2)?;
     match decoder.str()? {
         SOURCE_INPUT_SCHEMA => Ok(SourceRef::input(TextExecutionId::from_bytes(
@@ -651,7 +855,9 @@ fn decode_text_source(decoder: &mut CanonicalDecoder<'_>) -> Result<TextSource, 
     }
 }
 
-fn decode_text_execution(decoder: &mut CanonicalDecoder<'_>) -> Result<TextExecution, CanonicalDecodeError> {
+fn decode_text_execution(
+    decoder: &mut CanonicalDecoder<'_>,
+) -> Result<TextExecution, CanonicalDecodeError> {
     decoder.array_exact(4)?;
     decoder.expect_str(TEXT_EXECUTION_SCHEMA)?;
     let from = decode_text_source(decoder)?;
@@ -660,7 +866,9 @@ fn decode_text_execution(decoder: &mut CanonicalDecoder<'_>) -> Result<TextExecu
     Ok(TextExecution::new(from, prompt_tokens, policy))
 }
 
-fn decode_text_artifact(decoder: &mut CanonicalDecoder<'_>) -> Result<TextArtifact, CanonicalDecodeError> {
+fn decode_text_artifact(
+    decoder: &mut CanonicalDecoder<'_>,
+) -> Result<TextArtifact, CanonicalDecodeError> {
     let len = decoder.array_len()?;
     match decoder.str()? {
         TEXT_ARTIFACT_IDENTITY_SCHEMA => {
@@ -724,10 +932,13 @@ mod tests {
         assert_eq!(
             hex(&tokens.canonical_bytes()),
             concat!(
-                "82",                                                 // array(2)
-                "781c", "68656c6c61732e6576616c756174652e746f6b656e5f6964732e7631", // schema tag
-                "83",                                                 // array(3) tokens
-                "01", "02", "1a000493e0",                             // 1, 2, 300000
+                "82", // array(2)
+                "781c",
+                "68656c6c61732e6576616c756174652e746f6b656e5f6964732e7631", // schema tag
+                "83",                                                       // array(3) tokens
+                "01",
+                "02",
+                "1a000493e0", // 1, 2, 300000
             )
         );
 
@@ -735,10 +946,13 @@ mod tests {
         assert_eq!(
             hex(&policy.canonical_bytes()),
             concat!(
-                "83",                                                 // array(3)
-                "781e", "68656c6c61732e6576616c756174652e746578742e706f6c6963792e7631",
-                "10",                                                 // max_new_tokens = 16
-                "82", "04", "05",                                     // sorted stop ids
+                "83", // array(3)
+                "781e",
+                "68656c6c61732e6576616c756174652e746578742e706f6c6963792e7631",
+                "10", // max_new_tokens = 16
+                "82",
+                "04",
+                "05", // sorted stop ids
             )
         );
 
@@ -746,13 +960,17 @@ mod tests {
         assert_eq!(
             hex(&identity.canonical_bytes()),
             concat!(
-                "85",                                                 // array(5)
+                "85", // array(5)
                 "7829",
                 "68656c6c61732e6576616c756174652e746578742e61727469666163742e6964656e746974792e7631",
-                "5820", "0707070707070707070707070707070707070707070707070707070707070707",
-                "65", "6d6f64656c",                                   // "model"
-                "64", "6d61696e",                                     // "main"
-                "63", "663332",                                       // "f32"
+                "5820",
+                "0707070707070707070707070707070707070707070707070707070707070707",
+                "65",
+                "6d6f64656c", // "model"
+                "64",
+                "6d61696e", // "main"
+                "63",
+                "663332", // "f32"
             )
         );
 
@@ -761,8 +979,10 @@ mod tests {
             hex(&state.canonical_bytes()),
             concat!(
                 "82",
-                "781d", "68656c6c61732e6576616c756174652e746578742e73746174652e7631",
-                "5820", "2ea3d70455fb7c175feeffc0a307b7c97fb60980926e66118b8baf8fd0cd6db2",
+                "781d",
+                "68656c6c61732e6576616c756174652e746578742e73746174652e7631",
+                "5820",
+                "2ea3d70455fb7c175feeffc0a307b7c97fb60980926e66118b8baf8fd0cd6db2",
             )
         );
 
@@ -774,28 +994,40 @@ mod tests {
         assert_eq!(
             hex(&execution.canonical_bytes()),
             concat!(
-                "84",                                                 // array(4)
-                "7821", "68656c6c61732e6576616c756174652e746578742e657865637574696f6e2e7631",
-                "82",                                                 // source array(2)
-                "7820", "68656c6c61732e6576616c756174652e736f757263652e6f75747075742e7631",
-                "5820", "f343b61a66133adec0c1c8ebee47989b00eb65a6db9b2dc63d743d9329515e1e",
-                "5820", "2ea3d70455fb7c175feeffc0a307b7c97fb60980926e66118b8baf8fd0cd6db2",
-                "5820", "3540781322ed7b80e3459cf7b40106c9a7472dd2cf2d6e8e9d5d4d25ae11aa60",
+                "84", // array(4)
+                "7821",
+                "68656c6c61732e6576616c756174652e746578742e657865637574696f6e2e7631",
+                "82", // source array(2)
+                "7820",
+                "68656c6c61732e6576616c756174652e736f757263652e6f75747075742e7631",
+                "5820",
+                "f343b61a66133adec0c1c8ebee47989b00eb65a6db9b2dc63d743d9329515e1e",
+                "5820",
+                "2ea3d70455fb7c175feeffc0a307b7c97fb60980926e66118b8baf8fd0cd6db2",
+                "5820",
+                "3540781322ed7b80e3459cf7b40106c9a7472dd2cf2d6e8e9d5d4d25ae11aa60",
             )
         );
 
-        let artifact =
-            TextArtifact::output(execution.input_id(), 3, state.output_id(), tokens.output_id());
+        let artifact = TextArtifact::output(
+            execution.input_id(),
+            3,
+            state.output_id(),
+            tokens.output_id(),
+        );
         assert_eq!(
             hex(&artifact.canonical_bytes()),
             concat!(
                 "85",
                 "7827",
                 "68656c6c61732e6576616c756174652e746578742e61727469666163742e6f75747075742e7631",
-                "5820", "6d0ea1474c6b42b534024ba508d444fc0fd7c1db10243cd7d289711523775cfd",
-                "03",                                                 // position
-                "5820", "4a7cc97833bc25d2340ce377de92c012f336858cfeb8e2859f67fd12975916b8",
-                "5820", "2ea3d70455fb7c175feeffc0a307b7c97fb60980926e66118b8baf8fd0cd6db2",
+                "5820",
+                "6d0ea1474c6b42b534024ba508d444fc0fd7c1db10243cd7d289711523775cfd",
+                "03", // position
+                "5820",
+                "4a7cc97833bc25d2340ce377de92c012f336858cfeb8e2859f67fd12975916b8",
+                "5820",
+                "2ea3d70455fb7c175feeffc0a307b7c97fb60980926e66118b8baf8fd0cd6db2",
             )
         );
 

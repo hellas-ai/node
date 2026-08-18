@@ -14,6 +14,8 @@ pub mod signature;
 pub mod stream;
 pub mod tags;
 pub mod value;
+#[cfg(feature = "work")]
+pub mod work;
 
 pub use commitment::{Assurance, Operation, RequestCommitment, SchemeId, scheme_id};
 pub use digest::{ContentId, Digest, hash_tuple};
