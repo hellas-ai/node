@@ -1488,12 +1488,12 @@ pub fn check_result(
 /// A rule enforced by construction cannot be enforced differently by the
 /// two endpoints.
 ///
-/// The capacity bound is the kernel's own
-/// [`WorkPaymentSettlement`], not a number this module derives: a
-/// certificate above `min(close_total(Freeze), close_total(Adjudicated))
-/// - omission_bond` is one no close will pay, and `EdgeState.value` is
-/// not that bound. Taking the settlement rather than a bare integer is
-/// what stops an endpoint from supplying its own arithmetic here.
+/// The capacity bound is the kernel's own [`WorkPaymentSettlement`], not
+/// a number this module derives. A certificate above the smaller of the
+/// two route totals, less the omission bond, is one no close will pay,
+/// and `EdgeState.value` is not that bound. Taking the settlement rather
+/// than a bare integer is what stops an endpoint from supplying its own
+/// arithmetic here.
 pub fn next_invoice_entry(
     channel: &PaidChannel,
     authorization: &PaidJobAuthorizationV1,
