@@ -57,6 +57,24 @@ let
     # to empty binaries.
     kernel = mk "check-kernel" "cargo test -p hellas-kernel --all-features" (cargoEnv rustToolchain);
     executor = mk "check-executor" "cargo test -p hellas-executor" (cargoEnv rustToolchain);
+    # The paid-work protocol module is behind `work`, which nothing in the
+    # default graph turns on — so without this line its records, digests,
+    # and vector suite would be neither compiled nor linted here. It is
+    # the one RPC feature that pulls the consensus kernel in, which is
+    # exactly why it is checked rather than assumed.
+    #
+    # The vector suite is named rather than running the whole package:
+    # `work` pulls `evaluate` and therefore `execute`, whose
+    # `pb::id_pins::execute_ids_are_stable` assertion is already failing
+    # on this tree — the Execute service id rotated to 0xf3384799 without
+    # its pin being moved, and no gate here compiled that feature to
+    # notice. Widening this line to the package is the right change
+    # *after* that pin is deliberately re-cut or the service is deleted;
+    # doing it now would only bury someone else's break under this one.
+    rpc-work =
+      mk "check-rpc-work"
+        "cargo test -p hellas-rpc --features work --test paid_work_vectors && cargo clippy -p hellas-rpc --features work --all-targets -- -D warnings"
+        (cargoEnv rustToolchain);
     validator =
       mk "check-validator" "cargo test -p hellas-chain --no-default-features --features validator"
         (cargoEnv rustToolchain);
