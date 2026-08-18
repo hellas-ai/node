@@ -63,17 +63,14 @@ let
     # the one RPC feature that pulls the consensus kernel in, which is
     # exactly why it is checked rather than assumed.
     #
-    # The vector suite is named rather than running the whole package:
-    # `work` pulls `evaluate` and therefore `execute`, whose
-    # `pb::id_pins::execute_ids_are_stable` assertion is already failing
-    # on this tree — the Execute service id rotated to 0xf3384799 without
-    # its pin being moved, and no gate here compiled that feature to
-    # notice. Widening this line to the package is the right change
-    # *after* that pin is deliberately re-cut or the service is deleted;
-    # doing it now would only bury someone else's break under this one.
+    # The whole package runs, not one named test file: `work` pulls
+    # `evaluate` and therefore `execute`, so this line is also what
+    # compiles `pb::id_pins` — the wire-id pins that no other gate here
+    # reaches. Naming a single `--test` target would leave a rotated
+    # service id unnoticed, which is exactly what happened once.
     rpc-work =
       mk "check-rpc-work"
-        "cargo test -p hellas-rpc --features work --test paid_work_vectors && cargo clippy -p hellas-rpc --features work --all-targets -- -D warnings"
+        "cargo test -p hellas-rpc --features work && cargo clippy -p hellas-rpc --features work --all-targets -- -D warnings"
         (cargoEnv rustToolchain);
     validator =
       mk "check-validator" "cargo test -p hellas-chain --no-default-features --features validator"

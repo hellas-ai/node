@@ -118,8 +118,8 @@ mod id_pins {
         use super::services::execute::{Execute, RunTicket};
         assert_eq!(super::execute::Assurance::ProducerSigned as i32, 0);
         assert_eq!(super::execute::Assurance::AppleAppAttest as i32, 1);
-        assert_eq!(<Execute as ServiceMarker>::SERVICE_ID, 0xb19f1af1);
-        assert_eq!(<RunTicket as MethodMarker>::METHOD_ID, 0x15fc7c7c);
+        assert_eq!(<Execute as ServiceMarker>::SERVICE_ID, 0xf339_ae99);
+        assert_eq!(<RunTicket as MethodMarker>::METHOD_ID, 0x713f_0226);
     }
 
     #[cfg(feature = "evaluate")]
