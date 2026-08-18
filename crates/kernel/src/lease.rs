@@ -20,7 +20,7 @@
 //!
 //! # Two chunks, and why absence is decided by both
 //!
-//! The record is 203 canonical bytes, so it spans two
+//! The record is 139 canonical bytes, so it spans two
 //! [`RegistryChunk`]s. "No lease" therefore means *both* derived slots
 //! are empty, and every other shape — one present chunk, a wrong chunk
 //! count, a value that does not decode, a record naming another bond —
@@ -35,10 +35,12 @@
 //! [`crate::work`]'s and [`crate::tx::work`]'s, and none of them reads
 //! this record: the lease is checked once, at payment open, because the
 //! payment edge's own id already commits to the bond it names (see the
-//! `bond_edge` field of [`crate::WorkPaymentTerms`]). Two of the fields
-//! here — the live-game pointer and the challenged bitmap — belong to the
-//! correctness game, which is not implemented in this slice. They are
-//! created empty and stay empty.
+//! `bond_edge` field of [`crate::WorkPaymentTerms`]). Nothing of the
+//! correctness game is here either — no live-game pointer and no
+//! challenged bitmap. A field no transition writes is not state held
+//! ready for later, it is 288 bits of consensus surface every node
+//! stores and no rule reads, so the game slice adds its own record
+//! shape with the transitions that mutate it.
 //!
 //! Abstract counterpart: none. Like the rest of the registry, the lease
 //! has no Quint var and no ITF trace; `models/registry.md` records which
@@ -73,9 +75,6 @@ const BOND_LEASE_VERSION: u8 = 2;
 /// look partial.
 pub const BOND_LEASE_CHUNKS: u8 = 2;
 
-/// The bitmap is 256 challenge slots, one bit each.
-const CHALLENGED_BITMAP_LENGTH: usize = 32;
-
 /// The exclusive lease one payment channel holds over one work-stake
 /// bond.
 ///
@@ -85,12 +84,22 @@ const CHALLENGED_BITMAP_LENGTH: usize = 32;
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 pub struct BondLease {
     bond_edge: EdgeId,
+    // The four fields below are written by the payment open and read
+    // back by no production path in this crate or its hosts. Exclusivity
+    // is decided by the slot being occupied and by `bond_edge`; the
+    // horizon a timeout waits for is the bond edge's own
+    // `Terms::timeout()`, not this copy of it. They are carried, not
+    // deleted, only because §2.3 of
+    // `workflows/roadmap/compute-flow-plan.md` deletes them in one step
+    // with the record itself: with them gone the lease is 35 bytes, one
+    // chunk rather than two, and the single-chunk registry that implies
+    // is the next row of the same table. No later consumer is promised
+    // them — the game slice and the snapshot verifier both read live
+    // payment terms, not this record.
     payment_edge: EdgeId,
     payment_terms_hash: TermsHash,
     private_policy_commitment: [u8; HASH_LENGTH],
     admission_horizon: u64,
-    live_game_id: [u8; HASH_LENGTH],
-    challenged_bitmap: [u8; CHALLENGED_BITMAP_LENGTH],
 }
 
 impl BondLease {
@@ -100,17 +109,14 @@ impl BondLease {
         + 2 * EdgeId::MAX_ENCODED_SIZE
         + TermsHash::MAX_ENCODED_SIZE
         + HASH_LENGTH
-        + u64::MAX_ENCODED_SIZE
-        + HASH_LENGTH
-        + CHALLENGED_BITMAP_LENGTH;
+        + u64::MAX_ENCODED_SIZE;
 
     /// Creates the lease a payment open takes out over `bond_edge`.
     ///
-    /// Both mutable fields start empty, which is the whole of their
-    /// meaning here: no game is live, and no challenge slot has been
-    /// consumed. The zero `live_game_id` is the canonical "none" — a
-    /// game id is a hash, and this record is the only place that reads
-    /// zero as absence.
+    /// Every field is fixed here and never written again: the record has
+    /// no mutable part, so the only transitions over a lease are the
+    /// open that creates it whole and the bond timeout that deletes it
+    /// whole.
     #[must_use]
     pub(crate) const fn opened(
         bond_edge: EdgeId,
@@ -125,8 +131,6 @@ impl BondLease {
             payment_terms_hash,
             private_policy_commitment,
             admission_horizon,
-            live_game_id: [0; HASH_LENGTH],
-            challenged_bitmap: [0; CHALLENGED_BITMAP_LENGTH],
         }
     }
 
@@ -163,30 +167,10 @@ impl BondLease {
         self.admission_horizon
     }
 
-    /// Returns the live game id, or `None` when no game is live.
-    ///
-    /// All-zero is the canonical "none". A game id is a hash, so the
-    /// record needs no separate presence flag that could disagree with
-    /// it.
-    #[must_use]
-    pub fn live_game_id(&self) -> Option<[u8; HASH_LENGTH]> {
-        if self.live_game_id.iter().all(|byte| *byte == 0) {
-            None
-        } else {
-            Some(self.live_game_id)
-        }
-    }
-
-    /// Returns the 256-bit monotone challenged-slot bitmap.
-    #[must_use]
-    pub const fn challenged_bitmap(&self) -> [u8; CHALLENGED_BITMAP_LENGTH] {
-        self.challenged_bitmap
-    }
-
     /// Returns this record packed into its chunks, in slot order.
     ///
     /// `None` is unreachable for a record of this fixed width — the
-    /// encoding is 203 bytes and two chunks carry 240 — and is kept a
+    /// encoding is 139 bytes and two chunks carry 240 — and is kept a
     /// rejection rather than a panic because this runs on the apply
     /// path.
     #[must_use]
@@ -350,8 +334,6 @@ impl Encode for BondLease {
         // Raw eight bytes, not the `BlockHeight` composite: §0.1 fixes
         // every height inside a registry record as a bare `u64`.
         self.admission_horizon.encode_to(writer);
-        self.live_game_id.encode_to(writer);
-        self.challenged_bitmap.encode_to(writer);
     }
 }
 
@@ -367,8 +349,6 @@ impl Decode for BondLease {
         let payment_terms_hash = decode_field(buf, &mut consumed)?;
         let private_policy_commitment = decode_field(buf, &mut consumed)?;
         let admission_horizon = decode_field(buf, &mut consumed)?;
-        let live_game_id = decode_field(buf, &mut consumed)?;
-        let challenged_bitmap = decode_field(buf, &mut consumed)?;
         Ok((
             Self {
                 bond_edge,
@@ -376,8 +356,6 @@ impl Decode for BondLease {
                 payment_terms_hash,
                 private_policy_commitment,
                 admission_horizon,
-                live_game_id,
-                challenged_bitmap,
             },
             consumed,
         ))
@@ -394,7 +372,7 @@ mod tests {
     /// declared side by side.
     #[test]
     fn the_lease_is_exactly_two_registry_chunks() {
-        assert_eq!(BondLease::ENCODED_SIZE, 203);
+        assert_eq!(BondLease::ENCODED_SIZE, 139);
         assert_eq!(
             RegistryChunk::chunk_count_for(BondLease::ENCODED_SIZE),
             Some(BOND_LEASE_CHUNKS),

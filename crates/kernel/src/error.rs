@@ -433,11 +433,6 @@ pub enum InvalidProofReason {
         /// How the stored value failed to be a lease.
         fault: BondLeaseFault,
     },
-    /// A tag-4 bond's timeout was submitted while its lease points at a
-    /// live correctness game. The game plays for this stake and settles
-    /// itself; returning the stake underneath it would decide the game
-    /// by consuming the prize.
-    BondLeaseGameLive,
     /// The provider's total exceeds the value the close distributes.
     /// Unreachable for amounts admitted under the open-time capacity
     /// rule, and a rejection rather than a wrapping subtraction because

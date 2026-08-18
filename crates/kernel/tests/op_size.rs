@@ -18,8 +18,11 @@ fn tx_size_within_envelope() {
     //
     // The cap was 5 KiB until the work-channel terms landed: a work
     // payment carries a complete bond body inside its own, which is
-    // also why the encoded `Terms` maximum moved from 335 to 555 bytes.
-    // That is one deliberate step, pinned by the canonical goldens.
+    // also why the encoded `Terms` maximum went from 335 to 555 bytes
+    // there. The cutover to one stake shape then brought that maximum
+    // back down to 360 and left this cap where it stood. Two deliberate
+    // steps, both pinned by the canonical goldens — this cap has only
+    // ever been widened, and 6 KiB is now slack rather than a fit.
     assert!(
         size_of::<Tx>() <= 6 * 1024,
         "Tx size {} exceeds 6 KiB cap",

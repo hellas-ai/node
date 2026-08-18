@@ -501,6 +501,29 @@ fn malformed_envelopes_variants_and_bounded_lengths_are_rejected() {
     );
 }
 
+/// The two proof variants the cutover removed, named one at a time.
+///
+/// Byte 2 was `Violation` and byte 5 was `WorkStakeMutual`. Both sit
+/// inside the assigned run rather than far outside it, so the `0xff`
+/// case above does not cover them: a decoder that grew an arm back for
+/// either of its old neighbours would still reject `0xff` and pass that
+/// test. Neither byte is reserved for anything. Both are simply
+/// invalid, and a later slice that wants one has to re-assign it in the
+/// open.
+#[test]
+fn the_removed_proof_variants_decode_as_nothing() {
+    let mut proof_buf = [0; Proof::MAX_ENCODED_SIZE];
+    let proof_len = Proof::timeout(terms()).write_to(&mut proof_buf);
+    for variant in [2, 5] {
+        proof_buf[2] = variant;
+        assert_eq!(
+            Proof::decode_exact(&proof_buf[..proof_len]),
+            Err(DecodeError::InvalidTag { tag: variant }),
+            "proof variant {variant}",
+        );
+    }
+}
+
 #[test]
 fn maximum_bounded_lists_reach_their_declared_codec_bounds() {
     let maker = List::all([CoinId::from_bytes([1; CoinId::LENGTH]); MAX_PARTY_INPUTS]);
@@ -586,8 +609,10 @@ const fn widest_work_payment() -> WorkPaymentTerms {
 }
 
 /// The owned maxima every stack buffer and chain payload bound is sized
-/// from. They moved exactly once, when the work profiles landed; a
-/// silent third value would resize chain transaction buffers.
+/// from. They have moved twice: up when the work profiles landed, which
+/// took `Terms` from 335 to 555 bytes, and back down when the cutover
+/// reduced the stake surface to one body, which took it to 360. A silent
+/// third move would resize chain transaction buffers.
 #[test]
 fn owned_terms_and_transaction_maxima_are_pinned() {
     assert_eq!(Terms::MAX_ENCODED_SIZE, TERMS_MAX);
@@ -945,7 +970,7 @@ fn payment_close_digests_are_pinned() {
 /// changed places moves an assertion below. The round trip alone could
 /// not: an encoder and a decoder that swapped the same two fields agree
 /// with each other perfectly and disagree with every node that did not.
-const GOLDEN_BOND_LEASE: &str = "011f021111111111111111111111111111111111111111111111111111111111111111222222222222222222222222222222222222222222222222222222222222222233333333333333333333333333333333333333333333333333333333333333334444444444444444444444444444444444444444444444444444444444444444000000000000109255555555555555555555555555555555555555555555555555555555555555556666666666666666666666666666666666666666666666666666666666666666";
+const GOLDEN_BOND_LEASE: &str = "011f0211111111111111111111111111111111111111111111111111111111111111112222222222222222222222222222222222222222222222222222222222222222333333333333333333333333333333333333333333333333333333333333333344444444444444444444444444444444444444444444444444444444444444440000000000001092";
 
 /// The lease those bytes spell.
 ///
@@ -983,8 +1008,6 @@ fn bond_lease_record_bytes_are_pinned() {
     );
     assert_eq!(lease.private_policy_commitment(), [0x44; 32]);
     assert_eq!(lease.admission_horizon(), 4_242);
-    assert_eq!(lease.live_game_id(), Some([0x55; 32]));
-    assert_eq!(lease.challenged_bitmap(), [0x66; 32]);
 
     // And the encoder puts them back exactly where they were found.
     let mut buf = [0; BondLease::ENCODED_SIZE];
@@ -993,15 +1016,15 @@ fn bond_lease_record_bytes_are_pinned() {
     assert_hex(&buf[..written], GOLDEN_BOND_LEASE);
 }
 
-/// The widths the design fixes for the lease: 203 canonical bytes over
+/// The widths the design fixes for the lease: 139 canonical bytes over
 /// two registry chunks. Both numbers are consensus — the first decides
 /// what a reassembled value must measure, the second how many slots
 /// every reader consults before it may answer "unleased".
 #[test]
 fn bond_lease_wire_width_is_pinned() {
-    assert_eq!(BondLease::ENCODED_SIZE, 203);
-    assert_eq!(BondLease::MAX_ENCODED_SIZE, 203);
-    assert_eq!(golden_lease().encoded_size(), 203);
+    assert_eq!(BondLease::ENCODED_SIZE, 139);
+    assert_eq!(BondLease::MAX_ENCODED_SIZE, 139);
+    assert_eq!(golden_lease().encoded_size(), 139);
     assert_eq!(BOND_LEASE_CHUNKS, 2);
 }
 
@@ -1028,9 +1051,6 @@ fn a_lease_decodes_only_under_its_own_tag_and_version() {
 
     assert_eq!(
         BondLease::decode_exact(&bytes[..BondLease::ENCODED_SIZE - 1]),
-        Err(DecodeError::InsufficientBytes {
-            needed: 32,
-            got: 31
-        }),
+        Err(DecodeError::InsufficientBytes { needed: 8, got: 7 }),
     );
 }

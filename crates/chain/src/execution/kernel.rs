@@ -1729,7 +1729,7 @@ mod tests {
                 else {
                     panic!("lease chunk {index} persisted");
                 };
-                assert_eq!(chunk.value_len(), 203, "the lease is its fixed width");
+                assert_eq!(chunk.value_len(), 139, "the lease is its fixed width");
             }
 
             // Before the block that settles anything: the same start on

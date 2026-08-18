@@ -357,11 +357,11 @@ fn work_payment_open_rejects_a_bond_it_does_not_match() {
 // eye — capacity 8, bond 2, and a payout pair that always sums to 10.
 
 use hellas_kernel::{
-    Batch as _, Decode, EarnedCertificate, Encode as _, InvalidMoveReason, Move, Party,
+    Batch as _, Decode, EarnedCertificate, Encode as _, InvalidMoveReason, Move, NetworkId, Party,
     PaymentCloseResponse, PaymentCloseStart, PendingCloseFault, PendingPaymentClose, PendingSlot,
     RegistryChunk, RegistryChunkId, RegistryNamespace, RegistryRecordTag, StartAuthorization,
     StartId, Store as _, freeze_digest, no_earned_digest, pending_payment_close_slot,
-    response_digest, start_digest, start_id,
+    response_digest, settlement_commitment, start_digest, start_id,
 };
 
 /// Value the payment edge locks: the client's whole funding coin, since
@@ -1118,6 +1118,161 @@ fn a_start_needs_the_client_on_the_certificate_and_the_opener_on_the_action() {
         ))),
         InvalidMoveReason::BadSignature,
     );
+}
+
+/// A second deployment, identical to this one in every respect except
+/// its name.
+const OTHER_NETWORK: NetworkId = match NetworkId::new("hellas-kernel-other") {
+    Some(network) => network,
+    None => panic!("literal is a legal network id"),
+};
+
+/// Every payload the work vocabulary signs is bound to one network.
+///
+/// Two deployments with the same genesis allocations derive the same
+/// coin ids, hence the same payment edge, hence the same terms hash —
+/// so the edge separates nothing, and the network in each preimage is
+/// the whole of the separation. `tests/network.rs` states this for a
+/// Basic open and a Mutual close only; the staked vocabulary's version
+/// of it was deleted with the staked vocabulary, and these are the
+/// digests that replaced it.
+///
+/// The inequalities alone would not settle it — a decoder can hash two
+/// networks apart and still accept either witness — so the certificate,
+/// the piece with the most to steal, is also carried through `apply`.
+#[test]
+fn every_work_payload_is_bound_to_one_network() {
+    let edge = payment_edge_id();
+    let terms = payment_terms_hash();
+    let earned = certificate(5);
+    let home = earned.digest(support::NETWORK);
+
+    assert_ne!(home, earned.digest(OTHER_NETWORK), "earned certificate");
+    assert_ne!(
+        settlement_commitment(support::NETWORK, edge, terms, 5),
+        settlement_commitment(OTHER_NETWORK, edge, terms, 5),
+        "settlement commitment",
+    );
+    assert_ne!(
+        start_digest(
+            support::NETWORK,
+            edge,
+            terms,
+            Party::Maker,
+            START_VALIDITY,
+            home
+        ),
+        start_digest(
+            OTHER_NETWORK,
+            edge,
+            terms,
+            Party::Maker,
+            START_VALIDITY,
+            home
+        ),
+        "close start",
+    );
+    let start = start_id(
+        start_digest(
+            support::NETWORK,
+            edge,
+            terms,
+            Party::Maker,
+            START_VALIDITY,
+            home,
+        ),
+        START_HEIGHT,
+    );
+    assert_ne!(
+        response_digest(support::NETWORK, edge, terms, start, Party::Taker, home),
+        response_digest(OTHER_NETWORK, edge, terms, start, Party::Taker, home),
+        "close response",
+    );
+    assert_ne!(
+        freeze_digest(support::NETWORK, edge, terms, 5, START_VALIDITY),
+        freeze_digest(OTHER_NETWORK, edge, terms, 5, START_VALIDITY),
+        "freeze",
+    );
+    assert_ne!(
+        pending_payment_close_slot(support::NETWORK, edge),
+        pending_payment_close_slot(OTHER_NETWORK, edge),
+        "contest slot",
+    );
+    assert_ne!(
+        bond_lease_slot(support::NETWORK, payment_bond_edge(), 0),
+        bond_lease_slot(OTHER_NETWORK, payment_bond_edge(), 0),
+        "lease slot",
+    );
+
+    let mut state = open_payment_state();
+    apply_move(&mut state, CONTEXT, &start_tx(Party::Maker, Some(5)));
+    let Some(record) = pending_record(&state) else {
+        panic!("a start writes its contest record");
+    };
+    assert_ne!(
+        record.contest_commitment(support::NETWORK, edge, terms),
+        record.contest_commitment(OTHER_NETWORK, edge, terms),
+        "adjudicated seal",
+    );
+}
+
+/// And the end-to-end consequence: the same certificate, signed for the
+/// other network, does not settle here.
+///
+/// One certificate is reused verbatim in both places it can be spent —
+/// a response's cumulative scalar and a cooperative freeze — because a
+/// binding that held on one path and not the other would be no binding
+/// at all.
+#[test]
+fn a_certificate_signed_for_another_network_does_not_settle_here() {
+    let mut state = open_payment_state();
+    let earned = certificate(5);
+    let foreign = (
+        earned,
+        Sig::placeholder(MAKER, earned.digest(OTHER_NETWORK)),
+    );
+
+    assert_start_rejected(
+        &mut state,
+        CONTEXT,
+        &Tx::move_action(Move::StartPaymentClose(start_body(
+            Party::Maker,
+            START_VALIDITY,
+            Some(foreign),
+            MAKER,
+        ))),
+        InvalidMoveReason::BadCertificateSignature,
+    );
+
+    let digest = freeze_digest(
+        OTHER_NETWORK,
+        payment_edge_id(),
+        payment_terms_hash(),
+        5,
+        START_VALIDITY,
+    );
+    let store = *state.store();
+    assert_eq!(
+        state.apply(
+            CONTEXT,
+            &FAKE_VERIFIER,
+            &Tx::close(
+                payment_edge_id(),
+                Proof::freeze(
+                    5,
+                    START_VALIDITY,
+                    Sig::placeholder(MAKER, digest),
+                    Sig::placeholder(TAKER, digest),
+                ),
+                payment_payouts(5, PAYMENT_VALUE - 5),
+            ),
+        ),
+        Err(ApplyError::InvalidProof {
+            input: payment_edge_id(),
+            reason: InvalidProofReason::BadSignature,
+        }),
+    );
+    assert_eq!(*state.store(), store, "a rejected close changes nothing");
 }
 
 /// The response is the certificate holder's one chance, bound to the
@@ -2061,10 +2216,6 @@ fn a_payment_open_leases_the_bond_it_names() {
     assert_eq!(lease.payment_terms_hash(), payment_terms_hash());
     assert_eq!(lease.private_policy_commitment(), [4; 32]);
     assert_eq!(lease.admission_horizon(), TIMEOUT.get());
-    // A fresh lease is empty in both of its mutable fields: no game is
-    // live and no challenge slot has been spent.
-    assert_eq!(lease.live_game_id(), None);
-    assert_eq!(lease.challenged_bitmap(), [0; 32]);
 }
 
 /// The attack, in three shapes: a payment open naming a bond that never
@@ -2377,51 +2528,6 @@ fn a_leased_work_bond_waits_for_its_horizon_and_takes_the_lease_with_it() {
     // The payment channel it insured is untouched: its own exits stay
     // open past the admission horizon.
     assert!(state.store().edge(payment_edge_id()).is_some());
-}
-
-/// A lease pointing at a live game refuses the bond's timeout outright,
-/// at any height. Nothing sets that pointer yet, so the record is
-/// written directly here — the guard exists so the step that lands game
-/// state cannot accidentally let a bond be recovered out from under the
-/// game playing for it.
-#[test]
-fn a_lease_naming_a_live_game_refuses_the_timeout() {
-    let mut state = open_payment_state();
-    let live = stored_lease(&state);
-    let mut bytes = [0_u8; BondLease::ENCODED_SIZE];
-    let written = live.write_to(&mut bytes);
-    assert_eq!(written, BondLease::ENCODED_SIZE);
-    // The live game id is the 32 bytes after the envelope, version,
-    // three ids, the policy commitment, and the horizon.
-    let offset = 3 + 32 * 4 + 8;
-    bytes[offset..offset + 32].copy_from_slice(&[0x7e; 32]);
-    for index in 0..BOND_LEASE_CHUNKS {
-        let Some(chunk) = RegistryChunk::split(
-            RegistryNamespace::BondLease,
-            RegistryRecordTag::BondLease,
-            &bytes,
-            index,
-        ) else {
-            panic!("a lease-width value splits at both indices");
-        };
-        poison_lease(&mut state, index, chunk);
-    }
-    assert_eq!(stored_lease(&state).live_game_id(), Some([0x7e; 32]));
-
-    for height in [
-        CONTEXT.block_height().get(),
-        TIMEOUT.get(),
-        TIMEOUT.get() + 1,
-    ] {
-        assert_eq!(
-            state.apply(at(height), &FAKE_VERIFIER, &bond_timeout_tx()),
-            Err(ApplyError::InvalidProof {
-                input: payment_bond_edge(),
-                reason: InvalidProofReason::BondLeaseGameLive,
-            }),
-            "height {height}",
-        );
-    }
 }
 
 /// A payment channel cannot open at or after its own admission horizon:
