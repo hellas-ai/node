@@ -6,6 +6,12 @@ module bounds {
   // temporal liveness claim; it is the amount the party can recover from the
   // current state if it exercises the enabled close path under the current
   // terms and witness assumptions.
+  //
+  // Two domains, because the kernel distributes two: the principal an edge
+  // locked at open, and the part of its close reserve the close does not
+  // spend. The state-budget refund and state-bond refund this used to add,
+  // and the slash exposure it used to subtract, went with `lifetime.qnt`
+  // and the seal apparatus — the kernel has no such buckets.
   pure def escapeHatchLowerBound(
     party: Party,
     liquid: Party -> int,
@@ -14,9 +20,6 @@ module bounds {
     liquid.get(party)
       + t.principal.get(party)
       + t.reserveSurplus.get(party)
-      + t.stateBudgetRefund.get(party)
-      + t.stateBondRefund.get(party)
-      - t.slashExposure.get(party)
 
   pure def allEscapeHatchBoundsNonNegative(
     liquid: Party -> int,
@@ -31,10 +34,4 @@ module bounds {
     AllParties.fold(0, (sum, party) =>
       sum + escapeHatchLowerBound(party, liquid, t)
     )
-
-  pure def liquidOnlyBounds(
-    liquid: Party -> int,
-    t: EconomicTerms,
-  ): bool =
-    t == EmptyTerms and totalEscapeHatchLowerBound(liquid, t) == partyTotal(liquid)
 }

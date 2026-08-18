@@ -9,8 +9,6 @@ let
   modelTestModules = [
     "l1.qnt"
     "l1_fees.qnt"
-    "lifetime.qnt"
-    "proof_lifetime.qnt"
   ];
 
   runSpecs = [
@@ -64,53 +62,6 @@ let
         "nonTimeoutProofsExpire"
       ];
     }
-    {
-      model = "lifetime.qnt";
-      maxSamples = 500;
-      maxSteps = 8;
-      invariants = [
-        "valueAccounted"
-        "noNegativeBucket"
-        "closeReserveCoversCommittedFee"
-        "closeAlwaysAvailableWhenLive"
-        "liveCloseReserveIsNotRent"
-        "expiredLiveHasCleanup"
-        "termsCoherentForLiveState"
-        "escapeHatchBoundsNonNegative"
-        "escapeHatchTotalMatchesRecoverableValue"
-        "collectorRewardsOnlySlotValue"
-        "policyBucketsConsistent"
-        "currentCloseFeeKnown"
-        "heightAtLeastGenesis"
-      ];
-    }
-    {
-      model = "proof_lifetime.qnt";
-      maxSamples = 500;
-      maxSteps = 8;
-      invariants = [
-        "valueAccounted"
-        "noNegativeBucket"
-        "lifetimeFeePrepaid"
-        "noMarginalCloseFee"
-        "liveWithinPaidLifetime"
-        "liveHasLatestProofPath"
-        "closeReserveCoversCommittedFee"
-        "latestTermsCoherent"
-        "timeoutTermsCoherent"
-        "staleTermsCoherent"
-        "staleReceiptNotAdmissible"
-        "bareSignedReceiptNotAdmissible"
-        "closedByAdmissibleProofOnly"
-        "latestProofPreservesLatestBound"
-        "timeoutCloseUsesTimeoutTerms"
-        "closeProofTimingValid"
-        "closedAtConsistent"
-        "expiryClosesByTimeout"
-        "currentCloseFeeKnown"
-        "heightAtLeastGenesis"
-      ];
-    }
   ];
 
   verifySpecs = [
@@ -160,49 +111,6 @@ let
         "fundingAuthorized"
         "expiredLiveHasTimeoutPath"
         "nonTimeoutProofsExpire"
-      ];
-    }
-    {
-      model = "lifetime.qnt";
-      invariants = [
-        "valueAccounted"
-        "noNegativeBucket"
-        "closeReserveCoversCommittedFee"
-        "closeAlwaysAvailableWhenLive"
-        "liveCloseReserveIsNotRent"
-        "expiredLiveHasCleanup"
-        "termsCoherentForLiveState"
-        "escapeHatchBoundsNonNegative"
-        "escapeHatchTotalMatchesRecoverableValue"
-        "collectorRewardsOnlySlotValue"
-        "policyBucketsConsistent"
-        "currentCloseFeeKnown"
-        "heightAtLeastGenesis"
-      ];
-    }
-    {
-      model = "proof_lifetime.qnt";
-      invariants = [
-        "valueAccounted"
-        "noNegativeBucket"
-        "lifetimeFeePrepaid"
-        "noMarginalCloseFee"
-        "liveWithinPaidLifetime"
-        "liveHasLatestProofPath"
-        "closeReserveCoversCommittedFee"
-        "latestTermsCoherent"
-        "timeoutTermsCoherent"
-        "staleTermsCoherent"
-        "staleReceiptNotAdmissible"
-        "bareSignedReceiptNotAdmissible"
-        "closedByAdmissibleProofOnly"
-        "latestProofPreservesLatestBound"
-        "timeoutCloseUsesTimeoutTerms"
-        "closeProofTimingValid"
-        "closedAtConsistent"
-        "expiryClosesByTimeout"
-        "currentCloseFeeKnown"
-        "heightAtLeastGenesis"
       ];
     }
   ];

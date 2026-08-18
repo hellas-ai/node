@@ -5,10 +5,18 @@ module l1_fees {
 
   // Unified accepted-transition model for one L1 edge. This composes the
   // object lifecycle shape from `l1.qnt` with the fee, reserve, and
-  // lifetime buckets that were previously exercised in focused models.
-  // Stake is NOT modelled here — it lives on a StakeBond edge in
-  // `l1_stake.qnt`. A stake side-bucket on a Basic edge was removed
-  // because the kernel has no such concept.
+  // prepaid-lifetime buckets, and it is now the only model of them: the
+  // focused `lifetime.qnt` and `proof_lifetime.qnt` were deleted because
+  // their subjects — budgeted/bonded lifetime policies, a self-contained
+  // latest-state proof, violation proofs, stale receipts — are things
+  // the kernel does not have and never had. Every assertion of theirs
+  // that was about the real kernel is here, and unlike theirs it is
+  // replayed against the kernel by `tests/itf.rs`.
+  //
+  // The edge modelled here is a Basic edge, with the two close kinds a
+  // Basic edge admits. Stake and work-payment edges are NOT modelled
+  // anywhere; `models/registry.md` says exactly what that leaves
+  // unproven.
   //
   // This model intentionally does not try to cover invalid-transaction network
   // spam. It models accepted L1 state transitions plus disabled invalid kernel
@@ -248,10 +256,6 @@ module l1_fees {
       takerPrincipalFor(shape),
       makerReserveSurplusFor(shape),
       takerReserveSurplusFor(shape),
-      0,
-      0,
-      0,
-      0,
     )
 
   def liveShape: FundingShape =
@@ -632,7 +636,7 @@ module l1_fees {
       })
 
   val termsCoherentForClose =
-    termsCoherent(currentTerms, edgeTotal, reserveSurplusLive, 0, 0)
+    termsCoherent(currentTerms, edgeTotal, reserveSurplusLive)
 
   val escapeHatchBoundsNonNegative =
     allEscapeHatchBoundsNonNegative(partyLiquid, currentTerms)
@@ -724,6 +728,22 @@ module l1_fees {
       .then(rejectOpen(MakerOnlyFunding))
       .expect(not(canOpen(MakerOnlyFunding)))
 
+  // The fee-raise property, and the only assertion `lifetime.qnt` and
+  // `proof_lifetime.qnt` held that this model did not already hold when
+  // they were deleted. Both spelled it as an invariant
+  // (`feeRaiseCannotStrandClose`) of the form `A or B or C` where `A or
+  // C` was another invariant, so `currentCloseFee` never did any work
+  // and the property held precisely *because* close pricing ignores the
+  // raised fee — it could not have caught a regression that honoured it.
+  //
+  // Here it is a reachability witness with the stranding shape stated
+  // outright: after the raise the current fee genuinely exceeds the
+  // whole reserve, and the close is STILL available, because it is
+  // priced at the schedule committed on the edge at open. The Rust side
+  // is not a restatement — `tests/itf.rs` replays this trace's sibling
+  // `feeRaiseThenCloseTraceTest` against the kernel under the RAISED
+  // schedule, so a kernel that priced the close from `Context::fees`
+  // fails it with `ReserveTooSmall`.
   run feeRaiseDoesNotStrandCloseTest =
     init
       .then(openBy(FullFunding))
@@ -731,6 +751,7 @@ module l1_fees {
       .expect(valueAccounted
         and partyValueAccounted
         and currentCloseFee == RaisedCloseFee
+        and currentCloseFee > reserves.get(Channel)
         and closeFees.get(Channel) == BaseCloseFee
         and canClose(Mutual)
         and reserveAtLeastCommittedFee

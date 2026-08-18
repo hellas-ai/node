@@ -1,23 +1,27 @@
 module terms {
   import accounting.* from "./accounting"
 
-  // Economic terms, separated by value domain. A terms instance can describe
-  // principal, reserve surplus, state-slot budget refund, state-slot bond
-  // refund, and slash exposure without merging those concepts into one total.
+  // Economic terms, separated by value domain. A terms instance describes
+  // the two domains a close of a real edge distributes: the principal the
+  // edge locked at open, and the part of the close reserve this close does
+  // not spend.
+  //
+  // There were three more — a state-budget refund, a state-bond refund,
+  // and a slash exposure. They were the vocabulary of `lifetime.qnt`'s
+  // budgeted/bonded policy alternatives and of the deleted seal
+  // apparatus, and the kernel has none of them: it charges one prepaid
+  // lifetime fee at open, holds one close reserve, and slashes nothing.
+  // They are deleted rather than pinned to zero, because a value domain
+  // every caller passes zero for is a domain a reader will believe the
+  // kernel has.
   type EconomicTerms = {
     principal: Party -> int,
     reserveSurplus: Party -> int,
-    stateBudgetRefund: Party -> int,
-    stateBondRefund: Party -> int,
-    slashExposure: Party -> int,
   }
 
   pure val EmptyTerms: EconomicTerms = {
     principal: zeroPartyValues,
     reserveSurplus: zeroPartyValues,
-    stateBudgetRefund: zeroPartyValues,
-    stateBondRefund: zeroPartyValues,
-    slashExposure: zeroPartyValues,
   }
 
   pure def basicTerms(
@@ -25,16 +29,9 @@ module terms {
     takerPrincipal: int,
     makerReserveSurplus: int,
     takerReserveSurplus: int,
-    makerStateBudgetRefund: int,
-    takerStateBudgetRefund: int,
-    makerStateBondRefund: int,
-    takerStateBondRefund: int,
   ): EconomicTerms = {
     principal: makerTakerValues(makerPrincipal, takerPrincipal),
     reserveSurplus: makerTakerValues(makerReserveSurplus, takerReserveSurplus),
-    stateBudgetRefund: makerTakerValues(makerStateBudgetRefund, takerStateBudgetRefund),
-    stateBondRefund: makerTakerValues(makerStateBondRefund, takerStateBondRefund),
-    slashExposure: zeroPartyValues,
   }
 
   pure def principalTotal(t: EconomicTerms): int =
@@ -43,29 +40,16 @@ module terms {
   pure def reserveSurplusTotal(t: EconomicTerms): int =
     partyTotal(t.reserveSurplus)
 
-  pure def stateBudgetRefundTotal(t: EconomicTerms): int =
-    partyTotal(t.stateBudgetRefund)
-
-  pure def stateBondRefundTotal(t: EconomicTerms): int =
-    partyTotal(t.stateBondRefund)
-
   pure def termsNonNegative(t: EconomicTerms): bool =
     partyNonNegative(t.principal)
       and partyNonNegative(t.reserveSurplus)
-      and partyNonNegative(t.stateBudgetRefund)
-      and partyNonNegative(t.stateBondRefund)
-      and partyNonNegative(t.slashExposure)
 
   pure def termsCoherent(
     t: EconomicTerms,
     principal: int,
     reserveSurplus: int,
-    stateBudgetRefund: int,
-    stateBondRefund: int,
   ): bool =
     termsNonNegative(t)
       and principalTotal(t) == principal
       and reserveSurplusTotal(t) == reserveSurplus
-      and stateBudgetRefundTotal(t) == stateBudgetRefund
-      and stateBondRefundTotal(t) == stateBondRefund
 }
