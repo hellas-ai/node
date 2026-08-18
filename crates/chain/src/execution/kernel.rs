@@ -54,8 +54,6 @@ pub enum ExecutionError {
     KernelHostContract { error: ApplyError },
     #[error("kernel transaction rejected: {error:?}")]
     KernelApply { error: ApplyError },
-    #[error("staked open rejected: the wired verifier cannot verify any dispute seal")]
-    StakedOpenUnsupported,
     #[error("staked open lifetime {blocks} blocks exceeds the consensus cap {max}")]
     EdgeLifetimeExceeded { blocks: u64, max: u64 },
 }
@@ -684,12 +682,10 @@ where
     (batches, None)
 }
 
-/// Consensus admission for staked (fraud-game) opens, checked before the
-/// kernel ever sees the transaction. A bond whose `Violation` path can
-/// never verify is just locked funds with a dead dispute game, so staked
-/// opens are refused unless the wired verifier admits them; admitted
-/// bonds must still commit a bounded lifetime, because lifetime fees are
-/// zero and a distant timeout would be operationally permanent.
+/// Consensus admission checked before the kernel ever sees the
+/// transaction: an admitted open must commit a bounded lifetime,
+/// because lifetime fees are zero and a distant timeout would be
+/// operationally permanent.
 fn check_open(context: KernelContext, tx: &KernelTx) -> Result<(), ExecutionError> {
     let KernelTx::Open { terms, .. } = tx else {
         return Ok(());
@@ -713,41 +709,11 @@ fn check_open(context: KernelContext, tx: &KernelTx) -> Result<(), ExecutionErro
             max: MAX_EDGE_LIFETIME_BLOCKS,
         });
     }
-    // The gate is a statement about *how a bond is verified*, not about
-    // the fact that it holds stake, so it is decided per profile.
-    match terms.stake_bond_base() {
-        // A legacy bond's `Violation` is decided by an external
-        // `SealVerifier`. Without that capability it is not a bond,
-        // just locked funds with a dead dispute game, so the gate lifts
-        // exactly with the cfg that supplies the verifier
-        // (`ChainVerifier::verify_seal`).
-        Some(StakeBondBaseRef::Legacy(_)) if !cfg!(feature = "preverified-seals") => {
-            return Err(ExecutionError::StakedOpenUnsupported);
-        }
-        Some(StakeBondBaseRef::Legacy(_)) => {}
-        // A tag-4 bond is natively verified end to end and never
-        // consults that verifier: `FraudArtifact::binds` refuses tag-4
-        // public inputs outright (`staked.rs`), so the preverified
-        // route could not settle one even where it is compiled in. Its
-        // dispute is the kernel's own correctness game, and until that
-        // game lands no `Violation` of either kind can fire for it —
-        // which is why gating the open on a capability it does not use
-        // bought nothing and cost everything: it left the payment
-        // channel that depends on a live bond unopenable in production
-        // while an *unbonded* payment open sailed through.
-        //
-        // What makes admitting it safe is that the stake is never
-        // trapped. Unleased, the bond times out immediately and
-        // permissionlessly to the provider; leased, it times out at the
-        // admission horizon the lifetime cap above already bounds, and
-        // takes the lease with it.
-        Some(StakeBondBaseRef::Work(_)) | None => {}
-    }
-    // There is deliberately no work-payment gate beside these. A work
-    // payment is settleable by the kernel itself — `Freeze` and
-    // `Adjudicated` are checked inline, against staged registry state,
-    // with no external seal verifier involved — and since it now
-    // requires a live tag-4 bond to lease, it can no longer be opened
+    // There is deliberately no profile gate beside the lifetime cap.
+    // Every remaining close is settleable by the kernel itself —
+    // `Mutual`, `Timeout`, `Freeze` and `Adjudicated` are checked
+    // inline, against staged registry state — and a work payment
+    // requires a live tag-4 bond to lease, so it cannot be opened
     // against stake that does not exist.
     Ok(())
 }
@@ -1305,124 +1271,13 @@ mod tests {
         });
     }
 
+    /// Consensus admission has nothing to say about a work profile:
+    /// both the tag-4 bond and the payment edge reach the kernel and
+    /// are decided there. Asserting kernel rejections here means a
+    /// gate that came back would fail as an admission error where a
+    /// kernel error is expected.
     #[test]
-    fn staked_opens_are_gated_at_consensus_execution() {
-        use hellas_kernel::{
-            Auth, BlockHeight as KernelHeight, Funding, Key as KernelKey, List,
-            MAX_EDGE_OUTPUTS as OUTPUTS, MAX_PARTY_INPUTS as INPUTS, Parties,
-            Payout as KernelPayout, ProtocolCode, Sig, StakeBondTerms, Terms as KernelTerms,
-        };
-
-        let staked_open = |timeout: u64| {
-            let terms = KernelTerms::stake_bond(StakeBondTerms {
-                protocol: ProtocolCode::new(1),
-                parties: Parties::new(
-                    KernelKey::from_bytes([2; KernelKey::LENGTH]),
-                    KernelKey::from_bytes([3; KernelKey::LENGTH]),
-                ),
-                timeout: KernelHeight::new(timeout),
-                timeout_outputs: List::take([KernelPayout::default(); OUTPUTS], 0),
-                treasury: KernelKey::from_bytes([4; KernelKey::LENGTH]),
-                award: 1,
-                stake: 1,
-                max_job_price: 1,
-                max_dispute_cost: 0,
-                challenge_margin: 1,
-            });
-            let zero = CoinId::from_bytes([0; CoinId::LENGTH]);
-            let empty = List::take([zero; INPUTS], 0);
-            let garbage = Auth::native(Sig::from_bytes([0; 64]));
-            Transaction::Kernel(KernelTx::open(
-                Funding::new(empty.clone(), empty),
-                terms,
-                garbage.clone(),
-                garbage,
-            ))
-        };
-
-        run_qmdb(|runtime| async move {
-            let database = database(runtime, "staked_gate").await;
-            let batches = database.new_batches().await;
-
-            // Production verifier (no preverified-seals feature): refused
-            // before the kernel sees it, and dropped (not retained) from
-            // proposals.
-            #[cfg(not(feature = "preverified-seals"))]
-            {
-                let (batches, error) =
-                    apply_transaction(batches, context(1), &ChainVerifier::new(), &staked_open(50))
-                        .await
-                        .err()
-                        .expect("staked open refused in production");
-                assert_eq!(error, ExecutionError::StakedOpenUnsupported);
-                assert!(!error.is_transient_for_mempool());
-                assert!(!error.is_fatal_storage());
-                let (batches, included, retained) = execute_proposal(
-                    context(1),
-                    &ChainVerifier::new(),
-                    vec![staked_open(50)],
-                    &[],
-                    MAX_TXS_PER_BLOCK,
-                    usize::MAX,
-                    batches,
-                )
-                .await
-                .expect("gated staked open is a non-fatal drop");
-                assert!(included.is_empty());
-                assert!(retained.is_empty());
-                drop(batches);
-            }
-
-            // With the gate lifted (this leg compiles the seal-capable
-            // verifier, so `ChainVerifier` admits), the lifetime cap
-            // holds...
-            #[cfg(feature = "preverified-seals")]
-            {
-                let admitting = ChainVerifier::new();
-                let over_cap = 1 + crate::domain::MAX_EDGE_LIFETIME_BLOCKS + 1;
-                let (batches, error) =
-                    apply_transaction(batches, context(1), &admitting, &staked_open(over_cap))
-                        .await
-                        .err()
-                        .expect("over-cap staked open refused");
-                assert_eq!(
-                    error,
-                    ExecutionError::EdgeLifetimeExceeded {
-                        blocks: crate::domain::MAX_EDGE_LIFETIME_BLOCKS + 1,
-                        max: crate::domain::MAX_EDGE_LIFETIME_BLOCKS,
-                    }
-                );
-
-                // ...and an in-cap staked open falls through to ordinary
-                // kernel validation (here: rejected by the kernel because the
-                // committed stake exceeds the zero funding — proof the gate
-                // itself no longer blocks it).
-                let (_batches, error) =
-                    apply_transaction(batches, context(1), &admitting, &staked_open(50))
-                        .await
-                        .err()
-                        .expect("kernel still validates admitted staked opens");
-                assert!(matches!(error, ExecutionError::KernelApply { .. }));
-            }
-        });
-    }
-
-    /// The seal gate follows how a bond is *verified*, not the fact that
-    /// it holds stake. A legacy bond's violation is decided by an
-    /// external verifier this deployment may not have, and it stays
-    /// gated on exactly that capability. A tag-4 work bond never
-    /// consults that verifier — its dispute is the kernel's own game,
-    /// and the legacy artifact refuses tag-4 inputs outright — so
-    /// gating it bought nothing and left a payment channel that
-    /// *requires* a live bond unopenable in production.
-    ///
-    /// A work payment is likewise ungated: the kernel settles it inline
-    /// and now refuses one whose bond is not live. Both halves are
-    /// asserted here as kernel rejections, so a gate that came back
-    /// would fail as an admission error where a kernel error is
-    /// expected.
-    #[test]
-    fn a_legacy_bond_is_stake_gated_and_the_native_work_profiles_are_not() {
+    fn the_native_work_profiles_reach_the_kernel_ungated() {
         use hellas_kernel::{
             Auth, BlockHeight as KernelHeight, Funding, Key as KernelKey, List,
             MAX_EDGE_OUTPUTS as OUTPUTS, MAX_PARTY_INPUTS as INPUTS, Parties,
@@ -1473,9 +1328,6 @@ mod tests {
                 garbage,
             ))
         };
-        // The same stake policy, spelled as a legacy tag-1 bond: the
-        // one difference between the two legs below is the profile.
-        let legacy_bond = work_open(KernelTerms::stake_bond(bond.base.clone()));
         let work_bond = work_open(KernelTerms::work_stake_bond(bond));
         let payment_terms = payment.clone();
         let work_payment = work_open(payment);
@@ -1484,20 +1336,7 @@ mod tests {
             let database = database(runtime, "work_profile_gate").await;
             let batches = database.new_batches().await;
 
-            // A legacy bond's dispute needs the external verifier, so
-            // admission refuses it wherever that verifier is not wired.
-            let (batches, error) =
-                apply_transaction(batches, context(1), &ChainVerifier::new(), &legacy_bond)
-                    .await
-                    .err()
-                    .expect("legacy bond open refused");
-            #[cfg(not(feature = "preverified-seals"))]
-            assert_eq!(error, ExecutionError::StakedOpenUnsupported);
-            #[cfg(feature = "preverified-seals")]
-            assert!(matches!(error, ExecutionError::KernelApply { .. }));
-            assert!(!error.is_transient_for_mempool());
-
-            // A tag-4 bond reaches the kernel in both builds. Here the
+            // A tag-4 bond reaches the kernel. Here the
             // kernel refuses it because a zero-funded open cannot lock
             // the stake it commits — which is proof the gate is no
             // longer what stops it.

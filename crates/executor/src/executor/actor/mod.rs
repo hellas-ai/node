@@ -8,7 +8,6 @@ use crate::artifact_store::ArtifactStoreConfig;
 use crate::artifacts::EvaluateArtifactStore;
 #[cfg(feature = "evaluate")]
 use crate::backend;
-use crate::chain::{ChainView, StakedProvider};
 #[cfg(feature = "evaluate")]
 use crate::evaluate::EvaluateEngine;
 use crate::fetch::{FetchCallerPolicy, FetchStateMachine, FetchTranscriptStoreBackend};
@@ -17,7 +16,6 @@ use crate::fetch_registry::FetchRouteRegistry;
 use crate::metrics::ExecutorMetrics;
 use crate::scheme::SchemeEngine;
 use crate::state::ExecutorState;
-use futures_util::StreamExt as _;
 use hellas_rpc::pb::courtesy::{GetModelStatsResponse, GetStatsResponse, ModelTokenStats};
 use hellas_rpc::policy::ExecutePolicy;
 use hellas_rpc::{Assurance, Dtype, ProducerSigningKey};
@@ -41,17 +39,6 @@ pub struct Executor {
     pub(super) fetch_max_in_flight: usize,
     pub(super) fetch_queue_capacity: usize,
     pub(super) active_fetches: usize,
-    /// The staked pairing plus its chain view, when configured. The
-    /// height stream is not here: it is moved into the maintenance
-    /// task at spawn, since a stream is consumed, not shared.
-    pub(super) staked: Option<StakedState>,
-}
-
-/// What the actor holds for a staked pairing once the height stream
-/// has been split off into the maintenance task.
-pub(super) struct StakedState {
-    pub(super) channel: hellas_chain::staked::Channel,
-    pub(super) chain: Arc<dyn ChainView>,
 }
 
 pub struct ExecutorSpawnConfig {
@@ -69,10 +56,6 @@ pub struct ExecutorSpawnConfig {
     pub fetch_store: FetchTranscriptStoreBackend,
     #[cfg(feature = "evaluate")]
     pub artifact_store: ArtifactStoreConfig,
-    /// The staked pairing plus its chain view. `Some` makes every
-    /// execution require an admissible client-signed job acceptance,
-    /// with deadlines checked against the chain's finalized height.
-    pub staked: Option<StakedProvider>,
 }
 
 struct ExecutorRuntimeConfig {
@@ -91,7 +74,6 @@ struct ExecutorRuntimeConfig {
     #[cfg(feature = "evaluate")]
     artifacts: EvaluateArtifactStore,
     fetch_store: FetchTranscriptStoreBackend,
-    staked: Option<StakedProvider>,
 }
 
 impl Executor {
@@ -121,7 +103,6 @@ impl Executor {
             #[cfg(feature = "evaluate")]
             artifacts: EvaluateArtifactStore::memory(),
             fetch_store: FetchTranscriptStoreBackend::memory(),
-            staked: None,
         })
     }
 
@@ -152,7 +133,6 @@ impl Executor {
             #[cfg(feature = "evaluate")]
             artifacts: EvaluateArtifactStore::memory(),
             fetch_store: FetchTranscriptStoreBackend::memory(),
-            staked: None,
         })
     }
 
@@ -178,7 +158,6 @@ impl Executor {
             #[cfg(feature = "evaluate")]
             artifacts,
             fetch_store: config.fetch_store,
-            staked: config.staked,
         })
     }
 
@@ -248,16 +227,6 @@ impl Executor {
         };
         #[cfg(not(feature = "evaluate"))]
         let evaluate: Option<Box<dyn SchemeEngine>> = None;
-        // The stream is consumed, not shared: split it off the pairing
-        // so the actor keeps only what it can borrow repeatedly.
-        let (staked_state, staked_heights) = match config.staked {
-            Some(StakedProvider {
-                channel,
-                chain,
-                heights,
-            }) => (Some(StakedState { channel, chain }), Some(heights)),
-            None => (None, None),
-        };
         let executor = Self {
             rx,
             tx: tx.clone(),
@@ -272,25 +241,7 @@ impl Executor {
             fetch_max_in_flight: config.fetch_max_in_flight,
             fetch_queue_capacity: config.fetch_queue_capacity,
             active_fetches: 0,
-            staked: staked_state,
         };
-        // A staked provider owes time-based work even when idle: an
-        // unredeemed frontier is erased by the client's full-capacity
-        // timeout refund, and an abandoned job would hold the
-        // serialization lock. Every such deadline is a BLOCK HEIGHT, so
-        // the loop is woken by chain progress — never a polling
-        // interval, which would be an invented constant with no defined
-        // relationship to block production.
-        if let Some(mut heights) = staked_heights {
-            let ticks = tx.clone();
-            tokio::spawn(async move {
-                while let Some(height) = heights.next().await {
-                    if ticks.send(ExecutorMessage::StakedHeight(height)).is_err() {
-                        return;
-                    }
-                }
-            });
-        }
         tokio::spawn(executor.run());
         Ok(ExecutorHandle {
             tx,
@@ -356,15 +307,6 @@ impl Executor {
                 }
                 ExecutorMessage::Execute { request, reply } => {
                     let _ = reply.send(self.handle_execute(request).await);
-                }
-                ExecutorMessage::Receipt { request, reply } => {
-                    let _ = reply.send(self.handle_receipt(&request).await);
-                }
-                ExecutorMessage::StakedHeight(height) => {
-                    self.handle_staked_height(height).await;
-                }
-                ExecutorMessage::Settle { request, reply } => {
-                    let _ = reply.send(self.handle_settle(&request).await);
                 }
                 #[cfg(feature = "evaluate")]
                 ExecutorMessage::SchemeFinished(completion) => {

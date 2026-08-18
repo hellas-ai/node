@@ -60,13 +60,6 @@ let
     validator =
       mk "check-validator" "cargo test -p hellas-chain --no-default-features --features validator"
         (cargoEnv rustToolchain);
-    # The staked fraud-game end-to-end tests (consensus-level slash and
-    # the full two-edge game) live behind `preverified-seals`. It implies
-    # `validator`, not the other way round, so the check above never
-    # reaches them.
-    staked =
-      mk "check-staked" "cargo test -p hellas-chain --no-default-features --features preverified-seals"
-        (cargoEnv rustToolchain);
     sort = mk "check-sort" "cargo-sort --workspace --check --no-format" [ pkgs.cargo-sort ];
     taplo =
       mk "check-taplo" "taplo fmt --option 'indent_string=    ' --check '*.toml' 'crates/**/Cargo.toml'"

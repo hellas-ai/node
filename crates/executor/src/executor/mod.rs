@@ -11,10 +11,7 @@ use hellas_rpc::pb::courtesy::{
     QuotePreparedTextResponse, QuotePromptRequest, QuotePromptResponse,
 };
 use hellas_rpc::pb::evaluate::EvaluateRequest as PbEvaluateRequest;
-use hellas_rpc::pb::execute::{
-    ReceiptRequest, ReceiptResponse, RunTicketRequest, SettleRequest, SettleResponse, Ticket,
-    WorkEvent,
-};
+use hellas_rpc::pb::execute::{RunTicketRequest, Ticket, WorkEvent};
 use hellas_rpc::pb::fetch::FetchRequest as PbFetchRequest;
 use hellas_rpc::provenance::ExecutionProvenance;
 use hellas_rpc::{Assurance, InputCommitment, OutputEventEnvelope, ProducerSigningKey};
@@ -98,22 +95,6 @@ pub(crate) enum ExecutorMessage {
     Execute {
         request: RunTicketRequest,
         reply: oneshot::Sender<Result<ExecuteOutcome, ExecutorError>>,
-    },
-    /// Staked flow: sign the in-flight job's acceptance and terminal
-    /// result so the client can hold a fraud artifact.
-    Receipt {
-        request: ReceiptRequest,
-        reply: oneshot::Sender<Result<ReceiptResponse, ExecutorError>>,
-    },
-    /// Staked flow: the chain reached `height`. Time-based obligations
-    /// (closing an expired channel, releasing an abandoned job) are driven
-    /// by chain progress, never by a wall clock.
-    StakedHeight(hellas_kernel::BlockHeight),
-    /// Staked flow: settle the in-flight job with the client's frontier
-    /// voucher, releasing the serialization lock.
-    Settle {
-        request: SettleRequest,
-        reply: oneshot::Sender<Result<SettleResponse, ExecutorError>>,
     },
     #[cfg(feature = "evaluate")]
     SchemeFinished(Box<dyn crate::scheme::SchemeCompletion>),

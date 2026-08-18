@@ -186,7 +186,7 @@ struct Cli {
     ///
     /// Not a genesis *document* — it is a hash you assert, not a file
     /// you load — and unrelated to `--network`, which names the chain
-    /// a signature settles on. A staked client sets both: one says
+    /// a signature settles on. A paying client sets both: one says
     /// which chain the payment channel opens on, the other says whose
     /// work it will pay for.
     #[arg(

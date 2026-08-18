@@ -39,7 +39,7 @@
 //! # Deliberately unrelated to the network
 //!
 //! This has nothing to do with which *chain* anything settles on. A
-//! staked client sets both, and they answer different questions:
+//! paying client sets both, and they answer different questions:
 //! `--network` says which chain the payment channel opens on;
 //! `--provider` says whose work it will pay for. The two are
 //! independent trust decisions about two different parties, and the

@@ -28,8 +28,6 @@ pub mod relay;
 pub mod rpc;
 #[cfg(feature = "server")]
 pub mod server;
-#[cfg(feature = "domain")]
-pub mod staked;
 #[cfg(feature = "validator")]
 pub mod validator;
 

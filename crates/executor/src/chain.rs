@@ -6,136 +6,16 @@
 //! [`hellas_chain::LightClient`] satisfies it through the blanket impl,
 //! so one executor composes over either topology: connect out to a
 //! relay/indexer/validator with a remote light client, or co-host a
-//! node in-process and hand its client here. [`FakeChainView`] drives
-//! tests with scripted heights and a recording submission sink.
+//! node in-process and hand its client here.
+//!
+//! [`kernel_signer`] is the identity bridge: the provider's on-chain
+//! party key IS its RPC producer identity, one secp256k1 scalar read
+//! through two primitive crates.
 
-use core::pin::Pin;
-use futures_core::Stream;
 use hellas_chain::domain::{ObjectId, Transaction};
-use hellas_chain::staked::{Channel, JobAcceptanceContext, JobResultContext, MakerVoucher};
 use hellas_chain::{EdgeState, LightClient, QueryError};
-use hellas_kernel::{
-    Auth, BlockHeight, EdgeId, NetworkId, PayloadHash, Secp256k1Signer, Sig, TermsHash,
-};
+use hellas_kernel::{BlockHeight, Secp256k1Signer};
 use hellas_rpc::ProducerSigningKey;
-use hellas_rpc::pb::execute::{
-    JobAcceptance, ReceiptResponse, SettleRequest, Signature as PbSignature, signature,
-};
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-
-/// A stream of finalized block heights.
-///
-/// Deliberately a plain `Stream` rather than a bespoke trait: both
-/// topologies already produce one — a remote light client's
-/// finalization subscription, and the validator's in-process
-/// `broadcast::Receiver<ConsensusActivity>` that `ActivityReporter`
-/// fans out — so a new interface would be a third abstraction over two
-/// that exist. Tests supply an ordinary channel stream.
-pub type HeightStream = Pin<Box<dyn Stream<Item = BlockHeight> + Send>>;
-
-/// Everything a staked provider needs at construction: its side of the
-/// pairing, the chain it queries, and the heights it reacts to. One
-/// value at the spawn boundary — a staked executor missing any of them
-/// is unrepresentable.
-pub struct StakedProvider {
-    /// The provider's side of the two-edge pairing.
-    pub channel: Channel,
-    /// The chain the deadline heights are read from.
-    pub chain: Arc<dyn ChainView>,
-    /// Finalized heights. Consumed by the maintenance task at spawn.
-    pub heights: HeightStream,
-}
-
-/// Encodes a kernel signature as its wire form.
-pub(crate) fn sig_to_pb(sig: Sig) -> PbSignature {
-    PbSignature {
-        kind: Some(signature::Kind::Secp256k1(sig.as_bytes().to_vec())),
-    }
-}
-
-/// Decodes a wire signature that must be a 64-byte secp256k1 witness.
-pub(crate) fn sig_from_pb(field: &'static str, pb: Option<&PbSignature>) -> Result<Sig, String> {
-    let kind = pb
-        .and_then(|sig| sig.kind.as_ref())
-        .ok_or_else(|| format!("{field} is missing"))?;
-    let signature::Kind::Secp256k1(bytes) = kind else {
-        return Err(format!("{field} must be secp256k1"));
-    };
-    Ok(Sig::from_bytes(fixed::<64>(field, bytes)?))
-}
-
-/// The provider's staked receipt: signatures over the acceptance digest
-/// and over the result context binding it to the provider's own
-/// recorded terminal transcript.
-pub(crate) fn receipt_response(
-    network: NetworkId,
-    signer: &Secp256k1Signer,
-    acceptance: PayloadHash,
-    transcript: [u8; 32],
-) -> ReceiptResponse {
-    let result = JobResultContext {
-        acceptance,
-        transcript,
-    };
-    ReceiptResponse {
-        provider_acceptance_signature: Some(sig_to_pb(signer.sign(acceptance))),
-        transcript: transcript.to_vec(),
-        provider_result_signature: Some(sig_to_pb(signer.sign(result.digest(network)))),
-    }
-}
-
-/// Decodes the maker voucher a settle request stands for.
-///
-/// A field-for-field decode: the request carries no outputs, because
-/// the canonical close shape is derived from `cumulative` and the
-/// pairing. [`Channel::settle`] re-validates everything, including the
-/// authorization over the payload it derives itself.
-pub(crate) fn voucher_from_pb(request: &SettleRequest) -> Result<MakerVoucher, String> {
-    Ok(MakerVoucher {
-        payment_edge: EdgeId::from_bytes(fixed::<32>("payment_edge", &request.payment_edge)?),
-        terms_hash: TermsHash::from_bytes(fixed::<32>("payment_terms", &request.payment_terms)?),
-        cumulative: request.cumulative,
-        client_auth: Auth::native(sig_from_pb(
-            "client_authorization",
-            request.client_authorization.as_ref(),
-        )?),
-    })
-}
-
-/// Decodes a wire [`JobAcceptance`] into the canonical context plus the
-/// client's signature over its digest.
-pub fn acceptance_from_pb(pb: &JobAcceptance) -> Result<(JobAcceptanceContext, Sig), String> {
-    let signature = sig_from_pb("client signature", pb.client_signature.as_ref())?;
-    let context = JobAcceptanceContext {
-        bond_edge: EdgeId::from_bytes(fixed::<32>("bond_edge", &pb.bond_edge)?),
-        bond_terms: TermsHash::from_bytes(fixed::<32>("bond_terms", &pb.bond_terms)?),
-        payment_edge: EdgeId::from_bytes(fixed::<32>("payment_edge", &pb.payment_edge)?),
-        sequence: pb.sequence,
-        request: fixed::<32>("request", &pb.request)?,
-        environment: fixed::<32>("environment", &pb.environment)?,
-        price: pb.price,
-        terminal_deadline: BlockHeight::new(pb.terminal_deadline),
-    };
-    Ok((context, signature))
-}
-
-/// Encodes the canonical context and the client's digest signature as a
-/// wire [`JobAcceptance`].
-#[must_use]
-pub fn acceptance_to_pb(context: &JobAcceptanceContext, client_signature: Sig) -> JobAcceptance {
-    JobAcceptance {
-        bond_edge: context.bond_edge.as_bytes().to_vec(),
-        bond_terms: context.bond_terms.as_bytes().to_vec(),
-        payment_edge: context.payment_edge.as_bytes().to_vec(),
-        sequence: context.sequence,
-        request: context.request.to_vec(),
-        environment: context.environment.to_vec(),
-        price: context.price,
-        terminal_deadline: context.terminal_deadline.get(),
-        client_signature: Some(sig_to_pb(client_signature)),
-    }
-}
 
 /// Decodes a fixed-width byte field, naming it in the failure.
 ///
@@ -199,70 +79,6 @@ impl<L: LightClient> ChainView for L {
     }
 }
 
-/// Scriptable in-memory [`ChainView`] for tests: the height is set
-/// directly, edges are registered by hand, and submissions are recorded
-/// instead of executed.
-#[derive(Debug, Clone, Default)]
-pub struct FakeChainView {
-    inner: Arc<Mutex<FakeChainState>>,
-}
-
-#[derive(Debug, Default)]
-struct FakeChainState {
-    height: Option<u64>,
-    edges: HashMap<ObjectId, EdgeState>,
-    submitted: Vec<Transaction>,
-}
-
-impl FakeChainView {
-    /// Creates a view with no finalized block, no edges, and no
-    /// recorded submissions.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Scripts the finalized height.
-    pub fn set_height(&self, height: u64) {
-        self.state().height = Some(height);
-    }
-
-    /// Registers an edge readable at the scripted state.
-    pub fn put_edge(&self, id: ObjectId, edge: EdgeState) {
-        self.state().edges.insert(id, edge);
-    }
-
-    /// Everything submitted so far, in order.
-    #[must_use]
-    pub fn submitted(&self) -> Vec<Transaction> {
-        self.state().submitted.clone()
-    }
-
-    fn state(&self) -> std::sync::MutexGuard<'_, FakeChainState> {
-        self.inner.lock().expect("fake chain state poisoned")
-    }
-}
-
-#[async_trait::async_trait]
-impl ChainView for FakeChainView {
-    async fn finalized_height(&self) -> Result<Option<BlockHeight>, QueryError> {
-        Ok(self.state().height.map(BlockHeight::new))
-    }
-
-    async fn submit(&self, tx: Transaction) -> Result<(), QueryError> {
-        self.state().submitted.push(tx);
-        Ok(())
-    }
-
-    async fn edge(&self, id: ObjectId) -> Result<Option<EdgeState>, QueryError> {
-        let state = self.state();
-        if state.height.is_none() {
-            return Ok(None);
-        }
-        Ok(state.edges.get(&id).copied())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -277,17 +93,5 @@ mod tests {
             panic!("producer keys are secp256k1");
         };
         assert_eq!(signer.party_key().as_bytes(), &compressed);
-    }
-
-    #[tokio::test]
-    async fn fake_view_round_trips_height_and_records_submissions() {
-        let view = FakeChainView::new();
-        let height = view.finalized_height().await.expect("fake never fails");
-        assert_eq!(height, None);
-        assert!(view.submitted().is_empty());
-
-        view.set_height(42);
-        let height = view.finalized_height().await.expect("fake never fails");
-        assert_eq!(height, Some(BlockHeight::new(42)));
     }
 }

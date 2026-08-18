@@ -7,11 +7,7 @@ license.workspace = true
 [features]
 default = []
 # Chain/light-client domain vocabulary: addresses, transactions,
-# WebAuthn signature policy, challenge derivation (`domain` module), and
-# the staked fraud-game protocol (`staked` module — Channel, vouchers,
-# job contexts). Staking is integral to the chain, not an opt-in: the
-# k256-backed kernel verifier builds on every target, so `domain` (and
-# thus the wasm light client) carries it unconditionally.
+# WebAuthn signature policy, and challenge derivation (`domain` module).
 domain = [
     "dep:base64ct",
     "dep:bs58",
@@ -94,13 +90,6 @@ server = [
     "tokio/time",
     "tokio-stream/sync",
 ]
-# Dev-chain seal verification: staked opens are admitted and violation
-# seals verify against a preverified fraud-artifact cache. Never enable
-# on a production chain, and never on a multi-validator network: the
-# cache is process-local trusted input, not consensus state — two
-# validators with different cache contents would fork on a violation
-# close. Single-node dev chains only.
-preverified-seals = ["validator"]
 validator = [
     "indexer",
     "server",

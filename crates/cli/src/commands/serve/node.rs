@@ -117,7 +117,6 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
         fetch_store,
         #[cfg(feature = "evaluate")]
         artifact_store: config.artifact_store,
-        staked: None,
     })
     .await
     .context("failed to spawn executor")?;

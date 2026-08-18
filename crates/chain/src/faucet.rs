@@ -1,7 +1,7 @@
 //! Dev faucet: bridges P-256 genesis funds to secp256k1 coins.
 //!
 //! Genesis allocations on a dev chain are owned by P-256 (WebAuthn)
-//! settlement keys, but the staked payment/bond flow funds its edges
+//! settlement keys, but the work payment/bond flow funds its edges
 //! with secp256k1 kernel party keys. The kernel treats a coin owner and
 //! a party key as opaque 33-byte values — no curve check — so a single
 //! `Basic` edge bridges the two: the faucet's P-256 identity funds the
