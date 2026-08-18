@@ -2274,7 +2274,7 @@ fn a_present_but_unreadable_lease_is_never_read_as_absence() {
     let cases = [
         // A whole, well-formed value of another record kind.
         (
-            RegistryRecordTag::LiveGame,
+            RegistryRecordTag::PaymentPending,
             readable,
             BondLeaseFault::Shape,
             "another record kind",

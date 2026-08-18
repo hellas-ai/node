@@ -2169,13 +2169,13 @@ mod tests {
             let chunk = crate::domain::test_registry_chunk();
             let stored = hellas_kernel::RegistryChunkId::derive(
                 crate::domain::TEST_NETWORK,
-                hellas_kernel::RegistryNamespace::GameOrWinner,
+                hellas_kernel::RegistryNamespace::BondLease,
                 [0x33; 32],
                 0,
             );
             let absent = hellas_kernel::RegistryChunkId::derive(
                 crate::domain::TEST_NETWORK,
-                hellas_kernel::RegistryNamespace::GameOrWinner,
+                hellas_kernel::RegistryNamespace::BondLease,
                 [0x33; 32],
                 1,
             );
@@ -2256,13 +2256,13 @@ mod tests {
             let chunk = crate::domain::test_registry_chunk();
             let created = hellas_kernel::RegistryChunkId::derive(
                 crate::domain::TEST_NETWORK,
-                hellas_kernel::RegistryNamespace::GameOrWinner,
+                hellas_kernel::RegistryNamespace::BondLease,
                 [0x61; 32],
                 0,
             );
             let removed = hellas_kernel::RegistryChunkId::derive(
                 crate::domain::TEST_NETWORK,
-                hellas_kernel::RegistryNamespace::GameOrWinner,
+                hellas_kernel::RegistryNamespace::BondLease,
                 [0x61; 32],
                 1,
             );

@@ -101,8 +101,6 @@ pub enum RegistryNamespace {
     PaymentClose,
     /// Keyed by bond edge.
     BondLease,
-    /// Keyed by game id.
-    GameOrWinner,
 }
 
 impl RegistryNamespace {
@@ -112,7 +110,6 @@ impl RegistryNamespace {
         match self {
             Self::PaymentClose => 0,
             Self::BondLease => 1,
-            Self::GameOrWinner => 2,
         }
     }
 
@@ -122,7 +119,6 @@ impl RegistryNamespace {
         match tag {
             0 => Some(Self::PaymentClose),
             1 => Some(Self::BondLease),
-            2 => Some(Self::GameOrWinner),
             _ => None,
         }
     }
@@ -158,10 +154,6 @@ pub enum RegistryRecordTag {
     PaymentPending,
     /// Bond lease state.
     BondLease,
-    /// Live game state.
-    LiveGame,
-    /// Recorded challenger win.
-    ChallengerWon,
 }
 
 impl RegistryRecordTag {
@@ -171,8 +163,6 @@ impl RegistryRecordTag {
         match self {
             Self::PaymentPending => 0,
             Self::BondLease => 1,
-            Self::LiveGame => 2,
-            Self::ChallengerWon => 3,
         }
     }
 
@@ -182,8 +172,6 @@ impl RegistryRecordTag {
         match tag {
             0 => Some(Self::PaymentPending),
             1 => Some(Self::BondLease),
-            2 => Some(Self::LiveGame),
-            3 => Some(Self::ChallengerWon),
             _ => None,
         }
     }
@@ -794,7 +782,7 @@ mod tests {
     fn slot_id(index: u8) -> RegistryChunkId {
         RegistryChunkId::derive(
             network(),
-            RegistryNamespace::GameOrWinner,
+            RegistryNamespace::BondLease,
             [0x5a; ID_LENGTH],
             index,
         )
@@ -802,8 +790,8 @@ mod tests {
 
     fn chunk(byte: u8) -> RegistryChunk {
         RegistryChunk::split(
-            RegistryNamespace::GameOrWinner,
-            RegistryRecordTag::LiveGame,
+            RegistryNamespace::BondLease,
+            RegistryRecordTag::BondLease,
             &[byte; 7],
             0,
         )

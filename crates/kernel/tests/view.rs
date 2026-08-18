@@ -111,8 +111,8 @@ fn terms(maker: hellas_kernel::Key, taker: hellas_kernel::Key, protocol: u8) -> 
 
 const REGISTRY_KEY: [u8; 32] = [0x5b; 32];
 const OTHER_KEY: [u8; 32] = [0x5c; 32];
-const NAMESPACE: RegistryNamespace = RegistryNamespace::GameOrWinner;
-const RECORD: RegistryRecordTag = RegistryRecordTag::LiveGame;
+const NAMESPACE: RegistryNamespace = RegistryNamespace::PaymentClose;
+const RECORD: RegistryRecordTag = RegistryRecordTag::PaymentPending;
 
 type RegistryStore = FixedStore<0, 0, 5>;
 
@@ -302,13 +302,13 @@ fn registry_value_refuses_every_corrupted_chunk_set() {
 
     // A chunk of another record kind in the middle of this record.
     let other_kind =
-        hellas_kernel::RegistryChunk::split(NAMESPACE, RegistryRecordTag::ChallengerWon, &value, 1)
+        hellas_kernel::RegistryChunk::split(NAMESPACE, RegistryRecordTag::BondLease, &value, 1)
             .expect("same value, other record kind");
     let hybrid = [chunks[0], (slot(REGISTRY_KEY, 1), other_kind), chunks[2]];
     assert_eq!(read(&view_of(&hybrid), &mut buf), None, "record tag drift");
 
     // A chunk whose own namespace is not the one its slot was derived
-    // under: the id says `GameOrWinner`, the body says `BondLease`.
+    // under: the id says `PaymentClose`, the body says `BondLease`.
     let other_namespace =
         hellas_kernel::RegistryChunk::split(RegistryNamespace::BondLease, RECORD, &value, 1)
             .expect("same value, other namespace");

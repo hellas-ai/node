@@ -3543,15 +3543,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hellas-jobs"
-version = "0.1.0"
-dependencies = [
- "futures",
- "hellas-xet",
- "trait-variant",
-]
-
-[[package]]
 name = "hellas-kernel"
 version = "0.1.0"
 dependencies = [
@@ -8484,17 +8475,6 @@ dependencies = [
  "tracing-core",
  "tracing-log",
  "tracing-serde",
-]
-
-[[package]]
-name = "trait-variant"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "70977707304198400eb4835a78f6a9f928bf41bba420deb8fdb175cd965d77a7"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
 ]
 
 [[package]]

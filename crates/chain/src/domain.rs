@@ -774,8 +774,8 @@ pub(crate) fn test_registry_chunk() -> KernelRegistryChunk {
     // easier remainder case.
     let value = [0x5a_u8; hellas_kernel::REGISTRY_CHUNK_DATA_CAPACITY + 3];
     hellas_kernel::RegistryChunk::split(
-        hellas_kernel::RegistryNamespace::GameOrWinner,
-        hellas_kernel::RegistryRecordTag::LiveGame,
+        hellas_kernel::RegistryNamespace::BondLease,
+        hellas_kernel::RegistryRecordTag::BondLease,
         &value,
         0,
     )

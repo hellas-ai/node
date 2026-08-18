@@ -8,7 +8,6 @@ members = [
     "crates/executor",
     "crates/gateway",
     "crates/genesis",
-    "crates/jobs",
     "crates/kernel",
     "crates/models",
     "crates/rpc",

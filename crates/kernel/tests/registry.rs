@@ -20,17 +20,14 @@ use support::{FixedStore, NETWORK};
 
 const CAPACITY: usize = REGISTRY_CHUNK_DATA_CAPACITY;
 
-const NAMESPACES: [RegistryNamespace; 3] = [
+const NAMESPACES: [RegistryNamespace; 2] = [
     RegistryNamespace::PaymentClose,
     RegistryNamespace::BondLease,
-    RegistryNamespace::GameOrWinner,
 ];
 
-const RECORD_TAGS: [RegistryRecordTag; 4] = [
+const RECORD_TAGS: [RegistryRecordTag; 2] = [
     RegistryRecordTag::PaymentPending,
     RegistryRecordTag::BondLease,
-    RegistryRecordTag::LiveGame,
-    RegistryRecordTag::ChallengerWon,
 ];
 
 /// A deterministic value of `len` bytes, distinct at every position so a
@@ -158,10 +155,13 @@ fn every_namespace_and_record_tag_survives_the_chunk_codec() {
         }
     }
     // The assigned wire numbers, not merely some stable permutation.
-    assert_eq!(NAMESPACES.map(RegistryNamespace::tag), [0, 1, 2]);
-    assert_eq!(RECORD_TAGS.map(RegistryRecordTag::tag), [0, 1, 2, 3]);
-    assert_eq!(RegistryNamespace::from_tag(3), None);
-    assert_eq!(RegistryRecordTag::from_tag(4), None);
+    // Tags 2 and 3 held the game and winner records; both were deleted
+    // with the unbuilt game, and both are ordinary rejections now.
+    assert_eq!(NAMESPACES.map(RegistryNamespace::tag), [0, 1]);
+    assert_eq!(RECORD_TAGS.map(RegistryRecordTag::tag), [0, 1]);
+    assert_eq!(RegistryNamespace::from_tag(2), None);
+    assert_eq!(RegistryRecordTag::from_tag(2), None);
+    assert_eq!(RegistryRecordTag::from_tag(3), None);
 }
 
 /// Encodes `chunk`, hands the bytes to `mutate`, and returns the decode
@@ -269,7 +269,6 @@ fn chunk_ids_separate_namespace_key_index_and_network() {
     // records: without it, a lease and a payment record on the same edge
     // would derive the same slot.
     assert_ne!(base, chunk_id(RegistryNamespace::PaymentClose, 0x11, 0));
-    assert_ne!(base, chunk_id(RegistryNamespace::GameOrWinner, 0x11, 0));
     assert_ne!(base, chunk_id(RegistryNamespace::BondLease, 0x12, 0));
     assert_ne!(base, chunk_id(RegistryNamespace::BondLease, 0x11, 1));
     assert_ne!(
@@ -298,7 +297,7 @@ fn chunk_id_hashes_exactly_the_specified_preimage() {
     let network = NETWORK.as_bytes();
     preimage.push(u8::try_from(network.len()).unwrap());
     preimage.extend_from_slice(network);
-    preimage.push(RegistryNamespace::GameOrWinner.tag());
+    preimage.push(RegistryNamespace::BondLease.tag());
     preimage.extend_from_slice(&[0x77; 32]);
     preimage.push(9);
 
@@ -306,7 +305,7 @@ fn chunk_id_hashes_exactly_the_specified_preimage() {
     hasher.update(&preimage);
 
     assert_eq!(
-        RegistryChunkId::derive(NETWORK, RegistryNamespace::GameOrWinner, [0x77; 32], 9).to_bytes(),
+        RegistryChunkId::derive(NETWORK, RegistryNamespace::BondLease, [0x77; 32], 9).to_bytes(),
         hasher.finalize().into_bytes(),
     );
 }
@@ -329,12 +328,7 @@ fn chunk_id_preimage_stays_inside_one_xet_chunk() {
     let filled = [b'z'; MAX_NETWORK_ID_LENGTH];
     let longest = NetworkId::new(core::str::from_utf8(&filled).expect("ascii")).expect("legal id");
     assert_eq!(longest.encoded_size(), 1 + MAX_NETWORK_ID_LENGTH);
-    let _ = RegistryChunkId::derive(
-        longest,
-        RegistryNamespace::GameOrWinner,
-        [0xff; 32],
-        u8::MAX,
-    );
+    let _ = RegistryChunkId::derive(longest, RegistryNamespace::BondLease, [0xff; 32], u8::MAX);
 }
 
 #[test]

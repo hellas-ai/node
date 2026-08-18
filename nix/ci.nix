@@ -94,9 +94,6 @@ let
       export AR_wasm32_unknown_unknown=${lib.getExe' pkgs.llvmPackages.llvm "llvm-ar"}
       cargo check -p hellas-chain --no-default-features --features wasm-client --target wasm32-unknown-unknown
     '' (cargoEnv (rustToolchain.override { targets = [ "wasm32-unknown-unknown" ]; }));
-    wasm-jobs = mk "check-wasm-jobs" "cargo check -p hellas-jobs --target wasm32-unknown-unknown" (
-      cargoEnv (rustToolchain.override { targets = [ "wasm32-unknown-unknown" ]; })
-    );
     wasm-xet = mk "check-wasm-xet" "cargo check -p hellas-xet --target wasm32-unknown-unknown" (
       cargoEnv (rustToolchain.override { targets = [ "wasm32-unknown-unknown" ]; })
     );
