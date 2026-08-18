@@ -16,6 +16,8 @@ pub mod tags;
 pub mod value;
 #[cfg(feature = "work")]
 pub mod work;
+#[cfg(feature = "work")]
+pub mod work_setup;
 
 pub use commitment::{Assurance, Operation, RequestCommitment, SchemeId, scheme_id};
 pub use digest::{ContentId, Digest, hash_tuple};
