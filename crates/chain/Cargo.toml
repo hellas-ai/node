@@ -43,7 +43,21 @@ client-core = [
     "dep:thiserror",
     "domain",
 ]
+# The finalized-block codec and accepted-transaction view, without a
+# database, a mempool, or consensus participation. This is what an
+# endpoint enables to read the block its channel was opened in.
+block-view = [
+    "client-core",
+    "domain-consensus",
+    "dep:bytes",
+    "dep:commonware-codec",
+    "dep:commonware-consensus",
+    "dep:commonware-cryptography",
+    "dep:commonware-storage",
+    "dep:commonware-utils",
+]
 indexer = [
+    "block-view",
     "client",
     "dep:bytes",
     "dep:commonware-actor",

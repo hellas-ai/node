@@ -1,5 +1,9 @@
 #[cfg(any(feature = "indexer", feature = "validator"))]
 mod app;
+#[cfg(feature = "block-view")]
+pub mod block;
+#[cfg(feature = "block-view")]
+pub mod block_view;
 #[cfg(feature = "client-core")]
 pub mod client;
 #[cfg(any(feature = "indexer", feature = "validator"))]
@@ -37,7 +41,11 @@ pub mod work_view;
 pub const CONSENSUS_NAMESPACE: &[u8] = b"hellas";
 
 #[cfg(any(feature = "indexer", feature = "validator"))]
-pub use app::{ActivityReporter, Application, ApplicationConfig, HellasBlock, Mempool};
+pub use app::{ActivityReporter, Application, ApplicationConfig, Mempool};
+#[cfg(feature = "block-view")]
+pub use block::{HellasBlock, UtxoSyncTarget};
+#[cfg(feature = "block-view")]
+pub use block_view::{BlockViewError, FinalizedBlockView};
 #[cfg(any(feature = "client-core", feature = "indexer", feature = "validator"))]
 pub use consensus::{ConsensusVerificationError, ConsensusVerifier, Finalization};
 #[cfg(any(feature = "indexer", feature = "validator"))]

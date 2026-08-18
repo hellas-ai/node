@@ -1,6 +1,4 @@
-mod block;
-
-pub use block::HellasBlock;
+pub use crate::block::HellasBlock;
 
 use crate::domain::{Activity, PublicKey, Scheme, SettlementKey, Transaction};
 #[cfg(feature = "validator")]

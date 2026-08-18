@@ -85,6 +85,15 @@ let
     validator =
       mk "check-validator" "cargo test -p hellas-chain --no-default-features --features validator"
         (cargoEnv rustToolchain);
+    # The finalized-block codec without a database or a mempool: the
+    # feature an endpoint enables to read the block its channel opened
+    # in. Every other gate reaches this code through `indexer`, which
+    # also enables the execution layer the split was made to avoid — so
+    # only this line fails if the codec grows a dependency back on it.
+    chain-block-view =
+      mk "check-chain-block-view"
+        "cargo clippy -p hellas-chain --no-default-features --features block-view --all-targets -- -D warnings"
+        (cargoEnv rustToolchain);
     sort = mk "check-sort" "cargo-sort --workspace --check --no-format" [ pkgs.cargo-sort ];
     taplo =
       mk "check-taplo" "taplo fmt --option 'indent_string=    ' --check '*.toml' 'crates/**/Cargo.toml'"

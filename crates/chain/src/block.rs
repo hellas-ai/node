@@ -1,5 +1,18 @@
+//! The canonical finalized block, and the transactions it carries.
+//!
+//! Split out of the validator application because a paid endpoint needs
+//! to read a finalized block without becoming one. The alternatives were
+//! to enable an indexer inside every client and provider process, or to
+//! write a second decoder beside this one — and a second decoder that
+//! disagrees with the first is a client that believes a transaction was
+//! accepted when it was not.
+//!
+//! Only the codec is shared. `validate` is the proposer-side check and
+//! stays behind `validator`: a reader of already-finalized blocks has a
+//! quorum's signature over exactly these bytes and does not re-derive
+//! the context they were proposed in.
+
 use crate::domain::{MAX_TXS_PER_BLOCK, PublicKey, Transaction};
-use crate::execution::store::UtxoSyncTarget;
 use bytes::{Buf, BufMut};
 use commonware_codec::{
     Encode, EncodeSize, Error as CodecError, Read, ReadExt, ReadRangeExt, Write,
@@ -10,6 +23,14 @@ use commonware_consensus::{
     types::{Epoch, Height, Round, View},
 };
 use commonware_cryptography::{Digest as _, Digestible, Hasher, Sha256, sha256::Digest};
+use commonware_storage::{mmr, qmdb::sync::Target};
+
+/// The QMDB sync target a block commits to.
+///
+/// Lives here rather than beside the database because it is part of the
+/// block's encoding: a reader that can decode a block can decode this,
+/// and a process that decodes blocks need not link a database to do it.
+pub type UtxoSyncTarget = Target<mmr::Family, Digest>;
 
 #[cfg(feature = "validator")]
 pub(crate) const SYNCHRONY_BOUND: u64 = 5_000;

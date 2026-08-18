@@ -9,10 +9,7 @@ use commonware_storage::{
     Context as StorageContext,
     journal::contiguous::fixed::Config as FixedLogConfig,
     mmr::{self, full::Config as MmrConfig},
-    qmdb::{
-        any::{FixedConfig, unordered::fixed::Db as AnyFixedDb},
-        sync::Target,
-    },
+    qmdb::any::{FixedConfig, unordered::fixed::Db as AnyFixedDb},
     translator::EightCap,
 };
 use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
@@ -26,7 +23,7 @@ pub type UtxoDb<E> = AnyFixedDb<mmr::Family, E, ObjectId, Object, Sha256, EightC
 #[cfg(feature = "validator")]
 pub type UtxoDatabase<E> = Shared<UtxoDb<E>>;
 pub type UtxoDbConfig = FixedConfig<EightCap, Sequential>;
-pub type UtxoSyncTarget = Target<mmr::Family, Digest>;
+pub use crate::block::UtxoSyncTarget;
 
 const ITEMS_PER_BLOB: NonZeroU64 = NonZeroU64::new(256).unwrap();
 const WRITE_BUFFER: NonZeroUsize = NonZeroUsize::new(8192).unwrap();
