@@ -8,10 +8,10 @@
 //! guess, and a wrong guess is a rejected transaction with funding
 //! already committed to a signature.
 //!
-//! So the formulas live here once. `apply_open`
-//! reaches them through `open_debits` and `check_work_profile_open`;
-//! an endpoint reaches the same functions through [`open_projection`].
-//! There is no second copy that agrees today.
+//! So the formulas live here once. `apply_open` reaches them through
+//! `open_debits` and `check_work_profile_open`; an endpoint reaches the
+//! same functions through [`open_projection`]. There is no second copy
+//! that agrees today.
 //!
 //! # What the projection does not answer
 //!
@@ -19,10 +19,9 @@
 //! funding ids, whether the coins exist and who owns them, whether the
 //! derived edge is already live, whether the authorizations verify,
 //! whether the named bond is live and unleased. Those checks live around
-//! this arithmetic in `apply_open` and cannot be
-//! inferred from values. A caller that projects an open has computed
-//! what the chain would compute; it has not been told the chain will
-//! accept it.
+//! this arithmetic in `apply_open` and cannot be inferred from values. A
+//! caller that projects an open has computed what the chain would
+//! compute; it has not been told the chain will accept it.
 //!
 //! One arithmetic rule is also deliberately outside the projection: the
 //! comparison of the terms' committed timeout payouts against the total
@@ -30,9 +29,8 @@
 //! [`OpenProjection::timeout_payout`] — because a caller building terms
 //! needs that number before it can write payouts that satisfy it, and a
 //! function that could only grade finished terms could not be used to
-//! finish them. The comparison itself remains
-//! `apply_open`'s, and both sides read the
-//! requirement from `timeout_payout`.
+//! finish them. The comparison itself remains `apply_open`'s, and both
+//! sides read the requirement from `timeout_payout`.
 
 use super::{Funding, is_work_bond, timeout_close_cost, units};
 use crate::{
@@ -49,9 +47,9 @@ use crate::{
 /// The funding an open would consume: one id and one value per coin,
 /// split by party exactly as [`Funding`] splits it.
 ///
-/// Carries the values beside the ids rather than beside them in a second
-/// list, because the two must describe the same coins in the same order
-/// and there is no way to check that they do. A caller reads these pairs
+/// Carries each value beside its own id rather than in a second list
+/// alongside, because the two would have to describe the same coins in
+/// the same order and nothing could check that they did. A caller reads these pairs
 /// off a finalized light-client answer and hands the whole thing to
 /// [`open_projection`]; [`Self::funding`] then returns the ids alone, so
 /// the transaction it signs cannot name coins the projection did not
@@ -184,9 +182,8 @@ impl OpenProjection {
 ///
 /// # Errors
 ///
-/// The same [`InvalidOpenReason`] `apply_open`
-/// would return for the same inputs, for every rule that reads only
-/// values and terms. See the module documentation for the rules that
+/// The same [`InvalidOpenReason`] `apply_open` would return for the same
+/// inputs, for every rule that reads only values and terms. See the module documentation for the rules that
 /// read state, signatures, or the terms' own payout list, and that this
 /// therefore does not apply.
 pub fn open_projection(
@@ -371,8 +368,8 @@ fn payout_total<const N: usize>(outputs: &List<Payout, N>) -> Option<u64> {
 /// newly added shape from defaulting into "no extra rules".
 ///
 /// The one rule of a work open that is not here is
-/// [`requires_native_auth`]: it reads the authorization witnesses, which
-/// an open being constructed does not have yet.
+/// `requires_native_auth`: it reads the authorization witnesses, which an
+/// open being constructed does not have yet.
 pub(super) fn check_work_profile_open(
     edge: &Edge,
     taker_funded: bool,
