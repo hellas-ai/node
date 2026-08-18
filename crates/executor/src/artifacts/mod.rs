@@ -7,9 +7,7 @@ use hellas_rpc::{ContentId, Digest, EvaluateRequest};
 use crate::artifact_store::{ArtifactStorage, ArtifactStoreConfig};
 use crate::state::{Invocation, ModelLocator, QuotePlan};
 
-mod schema;
-
-use schema::{
+use hellas_rpc::protocol::artifacts::{
     BoundTermId, Canonical, CanonicalDecode, InputAddressed, OutputAddressed, SourceRef,
     TextArtifact, TextArtifactId, TextExecution, TextExecutionId, TextPolicy, TextPolicyId,
     TextSource, TextState, TextStateId, TokenIds, TokenIdsId,

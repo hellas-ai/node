@@ -1,5 +1,6 @@
 //! Protocol primitives for Hellas commitments and signed streams.
 
+pub mod artifacts;
 pub mod commitment;
 pub mod digest;
 pub mod dtype;

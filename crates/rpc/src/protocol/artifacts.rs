@@ -1,6 +1,26 @@
 //! Content-addressed evaluate artifact schema.
+//!
+//! These are the canonical bodies an execution is addressed by: the
+//! prompt tokens, the generation policy, the execution that binds them to
+//! a source, and the identity or output artifact that source resolves to.
+//! Their bytes are content ids, so there is exactly one encoder and one
+//! decoder for them in the workspace.
+//!
+//! They live in the neutral RPC protocol crate rather than in the
+//! executor because both endpoints need them: the provider builds these
+//! bodies while executing, and the client must rebuild them to check a
+//! paid result rather than accepting a returned digest. A second
+//! implementation on the client side would be a second opinion about what
+//! a content id means.
+//!
+//! The decoder is strict in the way a content-addressed schema has to be:
+//! [`CanonicalDecode::from_canonical_bytes`] re-encodes what it decoded
+//! and rejects any input whose bytes it does not reproduce, so a
+//! noncanonical integer, a reordered field, or a trailing byte cannot
+//! produce a value that would hash to a different id than it arrived
+//! under.
 
-use hellas_rpc::{DagCborEncoder, Digest};
+use crate::{DagCborEncoder, Digest};
 use std::{format, marker::PhantomData, str, string::String, vec::Vec};
 
 const SOURCE_INPUT_SCHEMA: &str = "hellas.evaluate.source.input.v1";
@@ -850,6 +870,109 @@ mod tests {
 
     fn output_id<T>(byte: u8) -> OutputId<T> {
         OutputId::from_bytes([byte; 32])
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    /// Golden bytes, captured from this schema's previous home in
+    /// `hellas-executor`, decoded field by field.
+    ///
+    /// Round-tripping cannot catch a field order that moves in the
+    /// encoder and the decoder together, and every id below is the hash
+    /// of these exact bytes: an artifact that re-encoded differently
+    /// would silently re-address every stored blob. So the bytes are the
+    /// assertion, not the values they decode to.
+    #[test]
+    fn canonical_bytes_are_pinned_by_golden_vectors() {
+        let tokens = TokenIds::from([1, 2, 300_000]);
+        assert_eq!(
+            hex(&tokens.canonical_bytes()),
+            concat!(
+                "82",                                                 // array(2)
+                "781c", "68656c6c61732e6576616c756174652e746f6b656e5f6964732e7631", // schema tag
+                "83",                                                 // array(3) tokens
+                "01", "02", "1a000493e0",                             // 1, 2, 300000
+            )
+        );
+
+        let policy = TextPolicy::from_u32_stop_tokens(16, [5, 4]);
+        assert_eq!(
+            hex(&policy.canonical_bytes()),
+            concat!(
+                "83",                                                 // array(3)
+                "781e", "68656c6c61732e6576616c756174652e746578742e706f6c6963792e7631",
+                "10",                                                 // max_new_tokens = 16
+                "82", "04", "05",                                     // sorted stop ids
+            )
+        );
+
+        let identity = TextArtifact::identity(output_id::<BoundTerm>(7), "model", "main", "f32");
+        assert_eq!(
+            hex(&identity.canonical_bytes()),
+            concat!(
+                "85",                                                 // array(5)
+                "7829",
+                "68656c6c61732e6576616c756174652e746578742e61727469666163742e6964656e746974792e7631",
+                "5820", "0707070707070707070707070707070707070707070707070707070707070707",
+                "65", "6d6f64656c",                                   // "model"
+                "64", "6d61696e",                                     // "main"
+                "63", "663332",                                       // "f32"
+            )
+        );
+
+        let state = TextState::new(tokens.output_id());
+        assert_eq!(
+            hex(&state.canonical_bytes()),
+            concat!(
+                "82",
+                "781d", "68656c6c61732e6576616c756174652e746578742e73746174652e7631",
+                "5820", "2ea3d70455fb7c175feeffc0a307b7c97fb60980926e66118b8baf8fd0cd6db2",
+            )
+        );
+
+        let execution = TextExecution::new(
+            SourceRef::output(identity.output_id()),
+            tokens.output_id(),
+            policy.output_id(),
+        );
+        assert_eq!(
+            hex(&execution.canonical_bytes()),
+            concat!(
+                "84",                                                 // array(4)
+                "7821", "68656c6c61732e6576616c756174652e746578742e657865637574696f6e2e7631",
+                "82",                                                 // source array(2)
+                "7820", "68656c6c61732e6576616c756174652e736f757263652e6f75747075742e7631",
+                "5820", "f343b61a66133adec0c1c8ebee47989b00eb65a6db9b2dc63d743d9329515e1e",
+                "5820", "2ea3d70455fb7c175feeffc0a307b7c97fb60980926e66118b8baf8fd0cd6db2",
+                "5820", "3540781322ed7b80e3459cf7b40106c9a7472dd2cf2d6e8e9d5d4d25ae11aa60",
+            )
+        );
+
+        let artifact =
+            TextArtifact::output(execution.input_id(), 3, state.output_id(), tokens.output_id());
+        assert_eq!(
+            hex(&artifact.canonical_bytes()),
+            concat!(
+                "85",
+                "7827",
+                "68656c6c61732e6576616c756174652e746578742e61727469666163742e6f75747075742e7631",
+                "5820", "6d0ea1474c6b42b534024ba508d444fc0fd7c1db10243cd7d289711523775cfd",
+                "03",                                                 // position
+                "5820", "4a7cc97833bc25d2340ce377de92c012f336858cfeb8e2859f67fd12975916b8",
+                "5820", "2ea3d70455fb7c175feeffc0a307b7c97fb60980926e66118b8baf8fd0cd6db2",
+            )
+        );
+
+        assert_eq!(
+            hex(identity.output_id().as_bytes()),
+            "f343b61a66133adec0c1c8ebee47989b00eb65a6db9b2dc63d743d9329515e1e"
+        );
+        assert_eq!(
+            hex(execution.input_id().as_bytes()),
+            "6d0ea1474c6b42b534024ba508d444fc0fd7c1db10243cd7d289711523775cfd"
+        );
     }
 
     #[test]
