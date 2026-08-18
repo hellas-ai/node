@@ -2,16 +2,12 @@
 //!
 //! [`ChainVerifier`] is the one place where the chain decides which
 //! cryptography consensus execution applies kernel transactions with.
-//! Party authorizations are real secp256k1 / WebAuthn; dispute seals are
-//! hard-rejected until a real protocol seal verifier exists. Changing the
-//! seal policy happens here and nowhere else — `execute_all` and
-//! `execute_proposal` take the verifier as a parameter and never construct
-//! one.
+//! Party authorizations are real secp256k1 / WebAuthn, and that is the
+//! whole policy: no close consults an external verifier. Changing it
+//! happens here and nowhere else — `execute_all` and `execute_proposal`
+//! take the verifier as a parameter and never construct one.
 
-use hellas_kernel::{
-    Auth, Key, PayloadHash, Seal, SealPublicInputs, SealVerifier, Secp256k1Verifier, Sig,
-    SigVerifier,
-};
+use hellas_kernel::{Auth, Key, PayloadHash, Secp256k1Verifier, Sig, SigVerifier};
 
 /// The verifier every consensus execution path runs with.
 #[derive(Debug, Default)]
@@ -36,11 +32,5 @@ impl SigVerifier for ChainVerifier {
 
     fn verify_auth(&self, auth: &Auth, party_key: Key, hash: PayloadHash) -> bool {
         self.inner.verify_auth(auth, party_key, hash)
-    }
-}
-
-impl SealVerifier for ChainVerifier {
-    fn verify_seal(&self, seal: Seal, public: &SealPublicInputs<'_>) -> bool {
-        self.inner.verify_seal(seal, public)
     }
 }

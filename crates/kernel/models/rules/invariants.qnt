@@ -120,7 +120,7 @@ module invariants {
   // Every live payout coin carries the canonical (MakerPayout,
   // TakerPayout) split. Holds in every reachable state: every close
   // witness binds payouts (Mutual via signature, Timeout via
-  // `terms.timeout_outputs`, Violation via dispute seal), and `canClose`
+  // `terms.timeout_outputs`), and `canClose`
   // enforces the binding through `payoutsBound`.
   pure def payoutsHonorBindings(
     coins: Coin -> int,

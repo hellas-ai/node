@@ -1,11 +1,5 @@
-//! Work-channel terms: the shared stake base applied to a tag-4 bond,
-//! the game policy only that bond commits, and the payment edge whose
-//! exits are `Freeze` and `Adjudicated`.
-//!
-//! The bond tests here deliberately duplicate the *rules* of
-//! `channel/bond.rs` rather than its shapes. That is the point: those
-//! rules exist because an edge locks slashable stake, so a second bond
-//! profile has to be governed by them without a second copy of them.
+//! Work-channel terms: the tag-4 bond whose only exit is `Timeout`, and
+//! the payment edge whose exits are `Freeze` and `Adjudicated`.
 //!
 //! On the development filesystem this repo lives on, `cargo` has been
 //! seen to reuse a stale prebuilt binary for this target and report
@@ -15,14 +9,13 @@
 
 use super::*;
 use hellas_kernel::{
-    BOND_LEASE_CHUNKS, BondLease, BondLeaseFault, ProtocolCode, StakeBondTerms, WebAuthnAssertion,
+    BOND_LEASE_CHUNKS, BondLease, BondLeaseFault, PaymentContestCommitment, WebAuthnAssertion,
     WorkPaymentTerms, WorkStakeBondTerms, bond_lease_slot, bond_lease_slots,
 };
 
-const TREASURY: Key = Key::from_bytes([9; Key::LENGTH]);
+/// A third key, party to nothing here.
+const OUTSIDER: Key = Key::from_bytes([9; Key::LENGTH]);
 const STAKE: u64 = 10;
-const AWARD: u64 = 7;
-const CATENA: ProtocolCode = ProtocolCode::CATENA_FRAUD_V2;
 
 /// The provider's stake coin, and the provider of a *payment* channel
 /// is its taker: a bond funded from the maker's side would be the
@@ -31,36 +24,21 @@ const BOND_COIN: CoinId = coin_id(0x51);
 const BOND_SEED: Genesis = Genesis::coin(BOND_COIN, TAKER, STAKE);
 
 /// Provider = maker = `MAKER` (funds the stake), client = taker.
-fn base(award: u64, stake: u64) -> StakeBondTerms {
-    StakeBondTerms {
-        protocol: CATENA,
+fn bond() -> WorkStakeBondTerms {
+    WorkStakeBondTerms {
         parties: PARTIES,
         timeout: TIMEOUT,
         timeout_outputs: list(&[Payout::new(MAKER, STAKE)]),
-        treasury: TREASURY,
-        award,
-        stake,
         max_job_price: 4,
-        max_dispute_cost: 3,
-        challenge_margin: 1,
     }
 }
 
-const fn work_bond_of(base: StakeBondTerms) -> WorkStakeBondTerms {
-    WorkStakeBondTerms {
-        base,
-        max_challenge_bond: 5,
-        move_timeout: 20,
-        game_protocol: CATENA.get(),
-    }
-}
-
-fn work_terms_of(base: StakeBondTerms) -> Terms {
-    Terms::work_stake_bond(work_bond_of(base))
+fn work_terms_of(bond: WorkStakeBondTerms) -> Terms {
+    Terms::work_stake_bond(bond)
 }
 
 fn work_terms() -> Terms {
-    work_terms_of(base(AWARD, STAKE))
+    work_terms_of(bond())
 }
 
 fn work_funding() -> Funding {
@@ -75,36 +53,26 @@ fn work_edge() -> EdgeId {
     Tx::edge_id_of(&work_funding(), &work_terms())
 }
 
-fn slash_outputs() -> List<Payout, MAX_EDGE_OUTPUTS> {
-    payouts(
-        Payout::new(TAKER, AWARD),
-        Payout::new(TREASURY, STAKE - AWARD),
-    )
-}
-
-fn work_violation(outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> Proof {
-    Proof::violation(
-        work_terms(),
-        placeholder_seal(work_edge(), &work_terms(), outputs),
-    )
-}
-
-fn open_work_bond_state(outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> State<FixedStore<6, 1>> {
+/// The bond a payment channel leases: the same policy as
+/// [`work_terms`], with the roles mirrored so the provider — the
+/// payment's taker — is the one who stakes.
+/// A live tag-4 bond, opened into a store sized for its timeout close.
+/// The move tests use it as "a live edge that is not a payment
+/// channel".
+fn open_work_bond_state() -> State<FixedStore<6, 1>> {
+    let outputs = list(&[Payout::new(MAKER, STAKE)]);
     let open = work_open();
-    let mut state = state(store_for_close(&open, outputs), [MAKER_SEED, TAKER_SEED]);
+    let mut state = state(store_for_close(&open, &outputs), [MAKER_SEED, TAKER_SEED]);
     let _event = apply(&mut state, &open);
     state
 }
 
-/// The bond a payment channel leases: the same policy as
-/// [`work_terms`], with the roles mirrored so the provider — the
-/// payment's taker — is the one who stakes.
 fn payment_bond() -> WorkStakeBondTerms {
-    work_bond_of(StakeBondTerms {
+    WorkStakeBondTerms {
         parties: Parties::new(TAKER, MAKER),
         timeout_outputs: list(&[Payout::new(TAKER, STAKE)]),
-        ..base(AWARD, STAKE)
-    })
+        ..bond()
+    }
 }
 
 fn payment_bond_terms() -> Terms {
@@ -151,9 +119,6 @@ fn bond_timeout_tx() -> Tx {
 /// roles: the payment maker is the bond's taker.
 fn payment_of(mutate: impl FnOnce(&mut WorkPaymentTerms)) -> Terms {
     let mut payment = WorkPaymentTerms {
-        protocol: CATENA,
-        parties: PARTIES,
-        admission_horizon: TIMEOUT,
         bond_edge: payment_bond_edge(),
         bond_terms: payment_bond(),
         private_policy_commitment: [4; 32],
@@ -184,54 +149,33 @@ fn work_bond_open_locks_the_stake_under_its_own_close_kinds() {
     };
     assert_eq!(edge.value(), STAKE);
     assert!(edge.allows(CloseKind::Timeout));
-    assert!(edge.allows(CloseKind::Violation));
-    assert!(edge.allows(CloseKind::WorkStakeMutual));
     assert!(!edge.allows(CloseKind::Mutual));
     assert!(!edge.allows(CloseKind::Freeze));
+    assert!(!edge.allows(CloseKind::Adjudicated));
 }
 
-/// The tag-4 bond answers to the tag-1 slash arithmetic. A profile that
-/// reported itself as "not a stake bond" would open every one of these.
+/// The whole of a tag-4 bond's own open policy, one mutation per
+/// conjunct. Each case moves exactly one thing about an otherwise legal
+/// bond, so no rule here can be satisfied by another.
 #[test]
-fn work_bond_open_is_checked_by_the_shared_slash_arithmetic() {
+fn work_bond_open_checks_every_conjunct_of_its_policy() {
     let cases = [
+        // A bond that can cover no job insures nothing.
         (
-            work_terms_of(base(AWARD, STAKE - 1)),
-            InvalidOpenReason::StakeMismatch,
-        ),
-        (
-            work_terms_of(base(0, STAKE)),
-            InvalidOpenReason::AwardOutOfRange,
-        ),
-        (
-            work_terms_of(base(STAKE + 1, STAKE)),
-            InvalidOpenReason::AwardOutOfRange,
-        ),
-        (
-            work_terms_of(base(6, STAKE)),
-            InvalidOpenReason::AwardBelowFloor,
-        ),
-        (
-            work_terms_of(StakeBondTerms {
-                treasury: MAKER,
-                ..base(AWARD, STAKE)
-            }),
-            InvalidOpenReason::TreasuryIsParty,
-        ),
-        (
-            work_terms_of(StakeBondTerms {
+            work_terms_of(WorkStakeBondTerms {
                 max_job_price: 0,
-                max_dispute_cost: 0,
-                ..base(AWARD, STAKE)
+                ..bond()
             }),
             InvalidOpenReason::JobPriceCapZero,
         ),
+        // Sum-preserving, party-changing: the stake would time out to
+        // the client, who staked nothing.
         (
-            work_terms_of(StakeBondTerms {
-                challenge_margin: 0,
-                ..base(AWARD, STAKE)
+            work_terms_of(WorkStakeBondTerms {
+                timeout_outputs: list(&[Payout::new(TAKER, STAKE)]),
+                ..bond()
             }),
-            InvalidOpenReason::ChallengeMarginZero,
+            InvalidOpenReason::WorkStakeReturnRouting,
         ),
     ];
 
@@ -249,81 +193,38 @@ fn work_bond_open_is_checked_by_the_shared_slash_arithmetic() {
     }
 }
 
-/// The game policy the work bond adds on top of the shared base.
+/// The stake is the edge's own value, so an unfunded bond is refused as
+/// a zero-value stake rather than accepted as a bond insuring nothing.
 #[test]
-fn work_bond_open_rejects_unusable_game_policy() {
-    let usable = work_bond_of(base(AWARD, STAKE));
-    let cases = [
-        (
-            WorkStakeBondTerms {
-                max_challenge_bond: 0,
-                ..usable.clone()
-            },
-            InvalidOpenReason::WorkGamePolicyZero,
-        ),
-        (
-            WorkStakeBondTerms {
-                move_timeout: 0,
-                ..usable.clone()
-            },
-            InvalidOpenReason::WorkGamePolicyZero,
-        ),
-        (
-            WorkStakeBondTerms {
-                game_protocol: CATENA.get() + 1,
-                ..usable.clone()
-            },
-            InvalidOpenReason::WorkProtocolMismatch,
-        ),
-        (
-            WorkStakeBondTerms {
-                base: StakeBondTerms {
-                    protocol: PROTOCOL,
-                    ..base(AWARD, STAKE)
-                },
-                ..usable.clone()
-            },
-            InvalidOpenReason::WorkProtocolMismatch,
-        ),
-        // Sum-preserving, party-changing: the stake would time out to
-        // the client, who staked nothing.
-        (
-            WorkStakeBondTerms {
-                base: StakeBondTerms {
-                    timeout_outputs: list(&[Payout::new(TAKER, STAKE)]),
-                    ..base(AWARD, STAKE)
-                },
-                ..usable
-            },
-            InvalidOpenReason::WorkStakeReturnRouting,
-        ),
-    ];
+fn work_bond_open_rejects_a_zero_value_stake() {
+    let terms = work_terms_of(WorkStakeBondTerms {
+        timeout_outputs: list(&[Payout::new(MAKER, 0)]),
+        ..bond()
+    });
+    let funding = Funding::new(empty_party(), empty_party());
+    let output = Tx::edge_id_of(&funding, &terms);
+    let open = open_tx(funding, terms);
+    let mut state = funded_state_for(&work_open());
+    let store = *state.store();
 
-    for (bond, reason) in cases {
-        let terms = Terms::work_stake_bond(bond);
-        let funding = work_funding();
-        let output = Tx::edge_id_of(&funding, &terms);
-        let open = open_tx(funding, terms);
-        let mut state = funded_state_for(&work_open());
-        let store = *state.store();
-        assert_eq!(
-            state.apply(CONTEXT, &FAKE_VERIFIER, &open),
-            Err(ApplyError::InvalidOpen { output, reason }),
-        );
-        assert_eq!(*state.store(), store);
-    }
+    assert_eq!(
+        state.apply(CONTEXT, &FAKE_VERIFIER, &open),
+        Err(ApplyError::InvalidOpen {
+            output,
+            reason: InvalidOpenReason::WorkStakeValueZero,
+        }),
+    );
+    assert_eq!(*state.store(), store);
 }
 
 /// The stake is the provider's alone: an unleased bond times out
 /// permissionlessly, so a client contribution would be a gift to the
-/// provider. The committed stake is raised to the funded total here so
-/// the shared arithmetic passes and this rule is what refuses the open.
+/// provider.
 #[test]
 fn work_bond_open_rejects_client_funding() {
-    let terms = work_terms_of(StakeBondTerms {
+    let terms = work_terms_of(WorkStakeBondTerms {
         timeout_outputs: list(&[Payout::new(MAKER, STAKE + 5)]),
-        award: STAKE,
-        ..base(STAKE, STAKE + 5)
+        ..bond()
     });
     let funding = Funding::new(list(&[MAKER_COIN]), list(&[TAKER_COIN]));
     let output = Tx::edge_id_of(&funding, &terms);
@@ -370,67 +271,6 @@ fn work_opens_admit_native_authorization_only() {
     }
 }
 
-/// The violation payout is pinned from the revealed terms for every
-/// bond profile, so the seal verifier decides only whether the fraud
-/// evidence is genuine — never who gets paid.
-#[test]
-fn work_bond_violation_pays_the_committed_slash_shape_only() {
-    let outputs = slash_outputs();
-    let mut state = open_work_bond_state(&outputs);
-    let ids = Tx::close_output_ids(work_edge(), &outputs);
-    let event = apply(
-        &mut state,
-        &Tx::close(work_edge(), work_violation(&outputs), outputs.clone()),
-    );
-
-    assert_eq!(
-        event.kind(),
-        &EventKind::EdgeClosed {
-            input: work_edge(),
-            outputs: ids.clone(),
-        },
-    );
-    assert_eq!(
-        state.store().coin(nth(&ids, 0)).map(coin_view),
-        Some((TAKER, AWARD)),
-    );
-    assert_eq!(
-        state.store().coin(nth(&ids, 1)).map(coin_view),
-        Some((TREASURY, STAKE - AWARD)),
-    );
-}
-
-#[test]
-fn work_bond_violation_rejects_rerouted_payouts_without_mutation() {
-    let wrong_shapes = [
-        payouts(
-            Payout::new(MAKER, AWARD),
-            Payout::new(TREASURY, STAKE - AWARD),
-        ),
-        payouts(
-            Payout::new(TAKER, AWARD + 1),
-            Payout::new(TREASURY, STAKE - AWARD - 1),
-        ),
-        list(&[Payout::new(TAKER, STAKE)]),
-    ];
-    for outputs in wrong_shapes {
-        let mut state = open_work_bond_state(&outputs);
-        let store = *state.store();
-        assert_eq!(
-            state.apply(
-                CONTEXT,
-                &FAKE_VERIFIER,
-                &Tx::close(work_edge(), work_violation(&outputs), outputs.clone()),
-            ),
-            Err(ApplyError::InvalidProof {
-                input: work_edge(),
-                reason: InvalidProofReason::PayoutMismatch,
-            }),
-        );
-        assert_eq!(*state.store(), store);
-    }
-}
-
 /// The payment edge has no timeout close and no payout fixed at open:
 /// its horizon buys admission and rent, nothing else.
 #[test]
@@ -450,34 +290,27 @@ fn work_payment_open_commits_freeze_and_adjudicated_only() {
     assert!(edge.allows(CloseKind::Adjudicated));
     assert!(!edge.allows(CloseKind::Timeout));
     assert!(!edge.allows(CloseKind::Mutual));
-    assert!(!edge.allows(CloseKind::Violation));
     assert_eq!(terms.timeout_outputs(), None);
     assert!(Tx::timeout_close(edge_id, &terms).is_none());
 }
 
-/// A payment is only as good as the bond it names, so the embedded
-/// witness has to describe the same two parties, the same horizon, and
-/// a game that can actually run.
+/// A payment is only as good as the bond it names. Its parties and its
+/// horizon are *derived* from the embedded witness, so the cases here
+/// are the bond's own policy plus this body's own windows.
 #[test]
 fn work_payment_open_rejects_a_bond_it_does_not_match() {
     let cases = [
         (
-            payment_of(|payment| payment.protocol = PROTOCOL),
-            InvalidOpenReason::WorkProtocolMismatch,
+            payment_of(|payment| payment.bond_terms.max_job_price = 0),
+            InvalidOpenReason::JobPriceCapZero,
         ),
+        // A bond whose stake returns to a third key is not this
+        // provider's stake.
         (
-            payment_of(|payment| payment.bond_terms.max_challenge_bond = 0),
-            InvalidOpenReason::WorkGamePolicyZero,
-        ),
-        // A bond whose beneficiary is a third key would insure someone
-        // who is not this channel's client.
-        (
-            payment_of(|payment| payment.bond_terms.base.parties = Parties::new(TAKER, TREASURY)),
-            InvalidOpenReason::WorkBondPartiesMismatch,
-        ),
-        (
-            payment_of(|payment| payment.admission_horizon = BlockHeight::new(TIMEOUT.get() + 1)),
-            InvalidOpenReason::WorkAdmissionHorizonMismatch,
+            payment_of(|payment| {
+                payment.bond_terms.timeout_outputs = list(&[Payout::new(OUTSIDER, STAKE)]);
+            }),
+            InvalidOpenReason::WorkStakeReturnRouting,
         ),
         (
             payment_of(|payment| payment.omit_response_blocks = 0),
@@ -765,7 +598,7 @@ fn response_tx(start: StartId, amount: u64) -> Tx {
 }
 
 fn adjudicated_tx(record: &PendingPaymentClose, provider: u64) -> Tx {
-    let seal = record.seal(support::NETWORK, payment_edge_id(), payment_terms_hash());
+    let seal = record.contest_commitment(support::NETWORK, payment_edge_id(), payment_terms_hash());
     Tx::close(
         payment_edge_id(),
         Proof::adjudicated(seal),
@@ -1082,8 +915,7 @@ fn a_start_binds_to_the_payment_terms_of_a_payment_edge() {
         InvalidMoveReason::TermsMismatch,
     );
 
-    let outputs = slash_outputs();
-    let mut bond_state = open_work_bond_state(&outputs);
+    let mut bond_state = open_work_bond_state();
     let on_a_bond = Tx::move_action(Move::StartPaymentClose(PaymentCloseStart::new(
         work_edge(),
         work_terms(),
@@ -1426,8 +1258,7 @@ fn a_response_certificate_must_bind_this_channel() {
 /// refused for that structural reason rather than for a missing contest.
 #[test]
 fn a_response_is_refused_on_an_edge_that_is_not_a_payment_channel() {
-    let outputs = slash_outputs();
-    let mut bond_state = open_work_bond_state(&outputs);
+    let mut bond_state = open_work_bond_state();
     let on_a_bond = Tx::move_action(Move::RespondPaymentClose(PaymentCloseResponse::new(
         work_edge(),
         StartId::from_bytes([0; StartId::LENGTH]),
@@ -1551,7 +1382,7 @@ fn an_adjudicated_close_settles_only_a_finished_contest() {
         CONTEXT,
         &Tx::close(
             payment_edge_id(),
-            Proof::adjudicated(Seal::from_bytes([0; 32])),
+            Proof::adjudicated(PaymentContestCommitment::from_bytes([0; 32])),
             payment_payouts(0, PAYMENT_VALUE),
         ),
         InvalidProofReason::ClosePendingMissing,
@@ -1575,10 +1406,10 @@ fn an_adjudicated_close_settles_only_a_finished_contest() {
         at(RESPONSE_DEADLINE),
         &Tx::close(
             payment_edge_id(),
-            Proof::adjudicated(Seal::from_bytes([0xab; 32])),
+            Proof::adjudicated(PaymentContestCommitment::from_bytes([0xab; 32])),
             payment_payouts(5, PAYMENT_VALUE - 5),
         ),
-        InvalidProofReason::SealMismatch,
+        InvalidProofReason::ContestMismatch,
     );
 
     // At the deadline exactly, the window is shut and the close lands.
@@ -1599,7 +1430,7 @@ fn an_adjudicated_close_pays_only_the_derived_split() {
     let Some(record) = pending_record(&state) else {
         panic!("the start wrote a contest");
     };
-    let seal = record.seal(support::NETWORK, payment_edge_id(), payment_terms_hash());
+    let seal = record.contest_commitment(support::NETWORK, payment_edge_id(), payment_terms_hash());
 
     let wrong_shapes = [
         // Provider paid more than the contest reached, client less.
@@ -1828,7 +1659,7 @@ fn a_present_but_unreadable_contest_is_never_read_as_absence() {
             at(RESPONSE_DEADLINE),
             &Tx::close(
                 payment_edge_id(),
-                Proof::adjudicated(Seal::from_bytes([0; 32])),
+                Proof::adjudicated(PaymentContestCommitment::from_bytes([0; 32])),
                 payment_payouts(5, PAYMENT_VALUE - 5),
             ),
             InvalidProofReason::ClosePendingFault { fault },
@@ -1898,7 +1729,7 @@ fn payment_close_costs_are_the_assigned_vectors() {
     assert_eq!(
         Tx::close(
             payment_edge_id(),
-            Proof::adjudicated(Seal::from_bytes([0; 32])),
+            Proof::adjudicated(PaymentContestCommitment::from_bytes([0; 32])),
             payment_payouts(0, PAYMENT_VALUE),
         )
         .cost(),
@@ -1927,12 +1758,11 @@ fn a_work_bond_prices_its_lease_reading_timeout_under_nonzero_fees() {
     const FEE_COIN: CoinId = coin_id(0x53);
     let seed = Genesis::coin(FEE_COIN, TAKER, FUNDED);
     let outputs = list(&[Payout::new(TAKER, RETURNED)]);
-    let terms = Terms::work_stake_bond(work_bond_of(StakeBondTerms {
+    let terms = Terms::work_stake_bond(WorkStakeBondTerms {
         parties: Parties::new(TAKER, MAKER),
         timeout_outputs: outputs.clone(),
-        stake: STAKED,
-        ..base(AWARD, STAKED)
-    }));
+        ..bond()
+    });
     let funding = Funding::new(list(&[FEE_COIN]), empty_party());
     let edge = Tx::edge_id_of(&funding, &terms);
     let open = open_tx_with(funding, terms.clone(), TAKER, MAKER);
@@ -1977,8 +1807,8 @@ fn a_work_bond_prices_its_lease_reading_timeout_under_nonzero_fees() {
 /// payment open reaches for its funding coin, the edge it creates, the
 /// bond it verifies, and both chunks of the lease it writes, and a
 /// tag-4 timeout reads both lease chunks before it can know which
-/// height rule governs it. The legacy vectors are pinned beside them
-/// because the split must not reprice an already-deployed shape.
+/// height rule governs it. The generic Basic vectors are pinned beside
+/// them because the work profiles must not reprice them.
 #[test]
 fn work_open_and_bond_timeout_costs_are_the_assigned_vectors() {
     assert_eq!(
@@ -1988,17 +1818,17 @@ fn work_open_and_bond_timeout_costs_are_the_assigned_vectors() {
     assert_eq!(payment_bond_open().cost(), Cost::new(1, 2, 2));
     assert_eq!(bond_timeout_tx().cost(), Cost::new(1, 4, 1));
 
-    // Legacy, unchanged: one funding coin and one edge at open, one
+    // Generic, unchanged: one funding coin and one edge at open, one
     // edge and one payout at timeout, and no charged proof units on the
     // open's two signatures.
-    let legacy = Terms::stake_bond(base(AWARD, STAKE));
+    let generic = basic_terms();
     let funding = Funding::new(list(&[MAKER_COIN]), empty_party());
-    let edge = Tx::edge_id_of(&funding, &legacy);
-    assert_eq!(open_tx(funding, legacy.clone()).cost(), Cost::new(1, 2, 0));
+    let edge = Tx::edge_id_of(&funding, &generic);
+    assert_eq!(open_tx(funding, generic.clone()).cost(), Cost::new(1, 2, 0));
     assert_eq!(
         Tx::close(
             edge,
-            Proof::timeout(legacy),
+            Proof::timeout(generic),
             list(&[Payout::new(MAKER, STAKE)]),
         )
         .cost(),
@@ -2157,11 +1987,11 @@ fn second_payment_edge() -> EdgeId {
 }
 
 /// A live tag-4 bond the payment did *not* embed: same parties, same
-/// stake, one different game-policy field, so its terms hash is not the
-/// one the payment commits to.
+/// stake, one different price cap, so its terms hash is not the one the
+/// payment commits to.
 fn other_bond_terms() -> Terms {
     Terms::work_stake_bond(WorkStakeBondTerms {
-        max_challenge_bond: 6,
+        max_job_price: 6,
         ..payment_bond()
     })
 }
@@ -2498,35 +2328,6 @@ fn an_unleased_work_bond_times_out_at_once() {
         state.store().coin(bond_timeout_out()).map(coin_view),
         Some((TAKER, STAKE)),
         "the stake returns to the provider that posted it",
-    );
-}
-
-/// A legacy bond has no lease and no early exit: the immediate route is
-/// the tag-4 profile's, not the timeout kind's.
-#[test]
-fn a_legacy_bond_keeps_its_height_rule() {
-    let outputs = list(&[Payout::new(MAKER, STAKE)]);
-    let terms = Terms::stake_bond(base(AWARD, STAKE));
-    let funding = Funding::new(list(&[MAKER_COIN]), empty_party());
-    let edge = Tx::edge_id_of(&funding, &terms);
-    let open = open_tx(funding, terms.clone());
-    let store = FixedStore::empty(
-        [MAKER_COIN, nth(&Tx::close_output_ids(edge, &outputs), 0)],
-        [edge],
-    );
-    let mut state = state(store, [MAKER_SEED]);
-    let _event = apply(&mut state, &open);
-
-    assert_eq!(
-        state.apply(
-            CONTEXT,
-            &FAKE_VERIFIER,
-            &Tx::close(edge, Proof::timeout(terms), outputs),
-        ),
-        Err(ApplyError::InvalidProof {
-            input: edge,
-            reason: InvalidProofReason::TimeoutNotReached,
-        }),
     );
 }
 

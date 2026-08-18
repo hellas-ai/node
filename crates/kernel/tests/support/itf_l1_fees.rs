@@ -79,7 +79,6 @@ impl FundingShapeTag {
 pub(crate) enum ProofTag {
     Mutual,
     Timeout,
-    Violation,
 }
 
 impl ProofTag {
@@ -87,7 +86,6 @@ impl ProofTag {
         match self {
             Self::Mutual => l1_fees::ProofKey::Mutual,
             Self::Timeout => l1_fees::ProofKey::Timeout,
-            Self::Violation => l1_fees::ProofKey::Violation,
         }
     }
 }
@@ -98,7 +96,6 @@ pub(crate) enum CloseOutcomeTag {
     NoClose,
     ClosedMutual,
     ClosedTimeout,
-    ClosedViolation,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Deserialize)]

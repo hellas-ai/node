@@ -219,34 +219,12 @@ pub enum InvalidOpenReason {
     /// `SigVerifier`. Both maker and taker must sign the canonical open
     /// hash for the produced edge.
     BadSignature,
-    /// Stake-bond terms commit a stake that does not equal the net value
-    /// the open actually locks.
-    StakeMismatch,
-    /// Stake-bond terms commit an award of zero or above the stake.
-    AwardOutOfRange,
-    /// Stake-bond terms commit an award below `max_job_price +
-    /// max_dispute_cost`, so a slash could not make the client whole.
-    AwardBelowFloor,
-    /// `max_job_price + max_dispute_cost` overflowed while checking the
-    /// award floor.
-    AwardFloorOverflow,
-    /// Stake-bond terms name a party key as the treasury, which would
-    /// collapse the slash penalty from the stake to the award.
-    TreasuryIsParty,
-    /// Stake-bond terms commit a zero `max_job_price`: the bond covers
-    /// no job and the strict dispute incentive degenerates.
+    /// A work-stake-bond open locks no value. The edge's value is the
+    /// stake, so a zero-value object is not a stake bond.
+    WorkStakeValueZero,
+    /// Work-stake-bond terms commit a zero `max_job_price`: the bond
+    /// covers no job (a price is at least 1), so it insures nothing.
     JobPriceCapZero,
-    /// Stake-bond terms commit a zero `challenge_margin`: no block is
-    /// left between a job's terminal deadline and the bond timeout for a
-    /// challenge to land, so the bond could never cover a job.
-    ChallengeMarginZero,
-    /// Work terms name a protocol other than the kernel-owned
-    /// correctness game, whose rules are the only ones the kernel
-    /// enforces for these shapes.
-    WorkProtocolMismatch,
-    /// Work-stake-bond terms commit a zero `max_challenge_bond` or
-    /// `move_timeout`: no game could be funded, or none could advance.
-    WorkGamePolicyZero,
     /// Work-stake-bond timeout payouts are empty or pay a key other
     /// than the provider. An unleased bond times out permissionlessly,
     /// so any other routing would let the stake return to the wrong
@@ -261,13 +239,6 @@ pub enum InvalidOpenReason {
     /// transferred to the provider by a permissionless unleased
     /// timeout.
     WorkStakeTakerFunded,
-    /// Work-payment terms and the bond they embed do not name the same
-    /// two parties in mirrored roles.
-    WorkBondPartiesMismatch,
-    /// Work-payment terms commit an admission horizon other than the
-    /// embedded bond's own horizon, so admitted jobs could outlive the
-    /// bond that insures them.
-    WorkAdmissionHorizonMismatch,
     /// Work-payment terms commit a zero or over-long response window.
     WorkResponseWindowOutOfRange,
     /// Work-payment terms commit a zero or over-long start validity
@@ -418,20 +389,17 @@ pub enum InvalidCloseReason {
 
 /// Specific reason an [`ApplyError::InvalidProof`] was raised.
 ///
-/// `BadSignature` and `BadSeal` come from the wired
-/// [`crate::SigVerifier`] / [`crate::SealVerifier`]; `TermsMismatch`,
-/// `ProofExpired`, `TimeoutNotReached`, and `PayoutMismatch` come from the
-/// kernel's inline lifetime and Timeout/Violation structural checks.
+/// `BadSignature` comes from the wired [`crate::SigVerifier`];
+/// every other variant comes from one of the kernel's own inline
+/// structural checks.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 pub enum InvalidProofReason {
     /// The proof's terms commitment does not match the edge's `TermsHash`.
     TermsMismatch,
     /// A signature on the close payload was rejected.
     BadSignature,
-    /// A dispute seal was rejected.
-    BadSeal,
-    /// A pre-expiry close proof (`Mutual` or `Violation`) was submitted at or
-    /// after the committed timeout height.
+    /// A pre-expiry close proof (`Mutual`) was submitted at or after
+    /// the committed timeout height.
     ProofExpired,
     /// A `Proof::Timeout` was submitted before the committed timeout height.
     TimeoutNotReached,
@@ -449,9 +417,9 @@ pub enum InvalidProofReason {
     /// An adjudicated close was submitted while the response window is
     /// still open and no response has landed.
     ResponseWindowOpen,
-    /// An adjudicated close carries a seal that is not the one this
-    /// contest's record derives.
-    SealMismatch,
+    /// An adjudicated close carries a contest commitment that is not
+    /// the one this contest's record derives.
+    ContestMismatch,
     /// A freeze's inclusion height is outside its signed validity
     /// window, or that window is wider than consensus allows.
     FreezeOutsideValidityWindow,

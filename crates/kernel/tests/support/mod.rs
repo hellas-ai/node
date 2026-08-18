@@ -7,17 +7,15 @@
 
 pub(crate) mod itf;
 pub(crate) mod itf_l1_fees;
-pub(crate) mod itf_l1_stake;
 pub(crate) mod l1;
 pub(crate) mod l1_fees;
-pub(crate) mod l1_stake;
 pub(crate) mod map_store;
 
 use hellas_kernel::{
     Auth, Batch, BlockHeight, CloseKind, Coin, CoinId, Edge, EdgeId, Funding, Genesis, InsertError,
     KernelResult, Key, List, MAX_EDGE_OUTPUTS, NetworkId, Parties, PayloadHash, Payout, Proof,
-    RegistryChunk, RegistryChunkId, RegistryNamespace, Seal, SealPublicInputs, SealVerifier, Sig,
-    SigVerifier, Snapshot, State, Store, Terms, TermsHash, Tx, View,
+    RegistryChunk, RegistryChunkId, RegistryNamespace, Sig, SigVerifier, Snapshot, State, Store,
+    Terms, TermsHash, Tx, View,
 };
 
 /// The network every fixture in this crate's tests is bound to.
@@ -31,10 +29,9 @@ pub(crate) const NETWORK: NetworkId = match NetworkId::new("hellas-kernel-test")
 };
 
 /// Forgeable verifier used by every test in this crate. Accepts the
-/// deterministic shapes produced by [`Sig::placeholder`] /
-/// [`Seal::placeholder`] in place of real cryptography. Production
-/// callers must wire verifiers backed by real crypto or a preverified-
-/// cache lookup.
+/// deterministic shapes produced by [`Sig::placeholder`] in place of
+/// real cryptography. Production callers must wire verifiers backed by
+/// real crypto or a preverified-cache lookup.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 pub(crate) struct FakeVerifier;
 
@@ -46,22 +43,9 @@ impl SigVerifier for FakeVerifier {
     }
 }
 
-impl SealVerifier for FakeVerifier {
-    fn verify_seal(&self, seal: Seal, public: &SealPublicInputs<'_>) -> bool {
-        let hash = Tx::payload_hash(
-            public.network,
-            public.edge_id,
-            CloseKind::Violation,
-            public.terms_hash(),
-            public.payouts,
-        );
-        seal == Seal::placeholder(public.protocol(), CloseKind::Violation, hash)
-    }
-}
-
-/// Production-shaped verifier stub: rejects every signature and seal.
-/// Tests that exercise "what happens without an accepting verifier" use
-/// this to stand in for the unconfigured production case.
+/// Production-shaped verifier stub: rejects every signature. Tests that
+/// exercise "what happens without an accepting verifier" use this to
+/// stand in for the unconfigured production case.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 pub(crate) struct RejectVerifier;
 
@@ -69,12 +53,6 @@ pub(crate) const REJECT_VERIFIER: RejectVerifier = RejectVerifier;
 
 impl SigVerifier for RejectVerifier {
     fn verify_sig(&self, _sig: Sig, _party_key: Key, _hash: hellas_kernel::PayloadHash) -> bool {
-        false
-    }
-}
-
-impl SealVerifier for RejectVerifier {
-    fn verify_seal(&self, _seal: Seal, _public: &SealPublicInputs<'_>) -> bool {
         false
     }
 }
@@ -425,15 +403,4 @@ pub(crate) fn mutual_hash(
     outputs: &List<Payout, MAX_EDGE_OUTPUTS>,
 ) -> PayloadHash {
     Tx::payload_hash(NETWORK, input, CloseKind::Mutual, terms, outputs)
-}
-
-/// Placeholder seal bound to the canonical violation close payload, as
-/// `FAKE_VERIFIER` expects.
-pub(crate) fn placeholder_seal(
-    input: EdgeId,
-    terms: &Terms,
-    outputs: &List<Payout, MAX_EDGE_OUTPUTS>,
-) -> Seal {
-    let hash = Tx::payload_hash(NETWORK, input, CloseKind::Violation, terms.hash(), outputs);
-    Seal::placeholder(terms.protocol(), CloseKind::Violation, hash)
 }

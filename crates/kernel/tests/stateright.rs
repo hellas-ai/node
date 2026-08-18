@@ -49,7 +49,6 @@ impl Model for ChannelModel {
         if view.edge(l1::open_case_id(OpenKey::Full)).is_some() {
             actions.push(Action::Close(ProofKey::Mutual));
             actions.push(Action::Close(ProofKey::Timeout));
-            actions.push(Action::Close(ProofKey::Violation));
             actions.push(Action::Close(ProofKey::EarlyTimeout));
             actions.push(Action::InvalidClose);
             actions.push(Action::InvalidProof);

@@ -41,10 +41,19 @@ reads it and — at the horizon — deletes it. No `.qnt` action opens a
 payment edge, so nothing abstract says a bond backs at most one channel,
 and nothing abstract distinguishes an unleased bond from a leased one.
 
-The remaining registry records — the challenged bitmap, the live-game
-pointer, the winner record — arrive with the later transitions that
-create them. Those transitions are where the rest of the properties
-worth checking live: one live game per lease and bitmap monotonicity.
+**The tag-4 bond itself is unmodelled.** `l1_stake.qnt` modelled the
+legacy tag-1 bond and was deleted with it. The tag-4 bond used to
+inherit its checked properties through a shared body; it no longer
+shares one, so stake conservation, provider-only funding, the immediate
+unleased timeout, the horizon leased timeout, and lease deletion are
+Rust-side properties only. A tag-4 lease/timeout model with ITF replay
+is owed before a paid release.
+
+There are no other registry records. The challenge bitmap, the
+live-game pointer and the winner record were deleted with the rest of
+the unbuilt game surface: a record kind nothing writes is not coverage
+owed, it is a promise. The game slice adds its records, its
+transitions, and their model together.
 
 ## What that costs, precisely
 
@@ -136,5 +145,5 @@ real fixtures: registry state in `types.qnt`, the record-mutating
 actions in `l1.qnt`, and ITF traces carrying the record fields, with
 every field asserted against the kernel in `tests/itf.rs`. A trace field
 that is deserialized and never compared is worse than an unmodelled
-one — see the `l1_stake` `bond_terms` comment in `tests/itf.rs` for the
-one time that already happened here.
+one; it has already happened here once, on a bond-terms field the
+replay read and never asserted.

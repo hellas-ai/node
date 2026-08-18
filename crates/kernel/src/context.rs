@@ -23,7 +23,7 @@
 //!   needs wall-clock time, not block-relative time.
 //! - **Validator set.** The kernel never checks "is this signer in the
 //!   active set?" — that knowledge lives in whichever
-//!   [`crate::SigVerifier`] / [`crate::SealVerifier`] implementations
+//!   [`crate::SigVerifier`] implementations
 //!   the chain wires in. A future dispute mode that wants validator-
 //!   quorum-signed seals expresses that policy inside the verifier
 //!   impls; [`Context`] stays oblivious.

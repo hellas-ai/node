@@ -798,8 +798,8 @@ pub(crate) fn test_edge() -> KernelEdge {
     bytes.extend_from_slice(&[2; KernelKey::LENGTH]);
     bytes.extend_from_slice(&[3; KernelKey::LENGTH]);
     bytes.extend_from_slice(&[4; 32]);
-    // CloseKindSet: the basic-terms set (mutual, timeout, violation).
-    bytes.push(0b111);
+    // CloseKindSet: the basic-terms set (mutual, timeout).
+    bytes.push(0b011);
     assert_eq!(bytes.len(), KernelEdge::MAX_ENCODED_SIZE);
     KernelEdge::decode_exact(&bytes).expect("test edge must use the kernel canonical layout")
 }
@@ -1508,34 +1508,20 @@ mod tests {
     fn payment_close_start_tx() -> KernelTx {
         use hellas_kernel::{
             EarnedCertificate, Move, Party, PaymentCloseStart, Payout as KernelPayout, Sig,
-            StakeBondTerms, Terms as KernelTerms, WorkPaymentTerms, WorkStakeBondTerms,
+            Terms as KernelTerms, WorkPaymentTerms, WorkStakeBondTerms,
         };
 
         let maker = hellas_kernel::Key::from_bytes([0x31; 33]);
         let taker = hellas_kernel::Key::from_bytes([0x32; 33]);
         let bond = WorkStakeBondTerms {
-            base: StakeBondTerms {
-                protocol: hellas_kernel::ProtocolCode::CATENA_FRAUD_V2,
-                parties: hellas_kernel::Parties::new(taker, maker),
-                timeout: hellas_kernel::BlockHeight::new(900),
-                timeout_outputs: hellas_kernel::List::all(
-                    [KernelPayout::new(taker, 3); hellas_kernel::MAX_EDGE_OUTPUTS],
-                ),
-                treasury: hellas_kernel::Key::from_bytes([0x33; 33]),
-                award: 12,
-                stake: 12,
-                max_job_price: 4,
-                max_dispute_cost: 3,
-                challenge_margin: 5,
-            },
-            max_challenge_bond: 3,
-            move_timeout: 20,
-            game_protocol: hellas_kernel::ProtocolCode::CATENA_FRAUD_V2.get(),
+            parties: hellas_kernel::Parties::new(taker, maker),
+            timeout: hellas_kernel::BlockHeight::new(900),
+            timeout_outputs: hellas_kernel::List::all(
+                [KernelPayout::new(taker, 3); hellas_kernel::MAX_EDGE_OUTPUTS],
+            ),
+            max_job_price: 4,
         };
         let terms = KernelTerms::work_payment(WorkPaymentTerms {
-            protocol: hellas_kernel::ProtocolCode::CATENA_FRAUD_V2,
-            parties: hellas_kernel::Parties::new(maker, taker),
-            admission_horizon: bond.base.timeout,
             bond_edge: hellas_kernel::EdgeId::from_bytes([0x44; 32]),
             bond_terms: bond,
             private_policy_commitment: [0x55; 32],
@@ -1618,7 +1604,7 @@ mod tests {
     #[test]
     fn the_payment_close_chain_wrapper_is_three_bytes() {
         for (kernel_tx, kernel_len, chain_len) in [
-            (payment_close_start_tx(), 814, 817),
+            (payment_close_start_tx(), 619, 622),
             (payment_close_response_tx(), 274, 277),
         ] {
             assert_eq!(kernel_tx.encoded_size(), kernel_len);

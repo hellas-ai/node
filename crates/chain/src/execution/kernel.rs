@@ -12,7 +12,7 @@ use commonware_storage::Context as StorageContext;
 use hellas_kernel::{
     ApplyError, CloseKind, Coin as KernelCoin, CoinId, Context as KernelContext, EdgeId, Event,
     EventKind, InvalidProofReason, Move as KernelMove, Proof as KernelProof, RegistryChunkId,
-    RegistryDiff, StakeBondBaseRef, State, TermsProfile, Tx as KernelTx, bond_lease_slots,
+    RegistryDiff, State, TermsProfile, Tx as KernelTx, bond_lease_slots,
     pending_payment_close_slot,
 };
 use thiserror::Error;
@@ -508,7 +508,7 @@ where
             // declares a slot it may find empty — the absence is the
             // answer, so it has to be read rather than assumed.
             if let KernelProof::Timeout { terms } = proof
-                && matches!(terms.stake_bond_base(), Some(StakeBondBaseRef::Work(_)))
+                && matches!(terms.profile(), TermsProfile::WorkStakeBond(_))
             {
                 for slot in bond_lease_slots(context.network(), *input) {
                     load_registry_chunk_slot(batches, &mut working, slot).await?;
@@ -1281,8 +1281,8 @@ mod tests {
         use hellas_kernel::{
             Auth, BlockHeight as KernelHeight, Funding, Key as KernelKey, List,
             MAX_EDGE_OUTPUTS as OUTPUTS, MAX_PARTY_INPUTS as INPUTS, Parties,
-            Payout as KernelPayout, ProtocolCode, Sig, StakeBondTerms, Terms as KernelTerms,
-            WorkPaymentTerms, WorkStakeBondTerms,
+            Payout as KernelPayout, Sig, Terms as KernelTerms, WorkPaymentTerms,
+            WorkStakeBondTerms,
         };
 
         let provider = KernelKey::from_bytes([2; KernelKey::LENGTH]);
@@ -1290,26 +1290,12 @@ mod tests {
         let mut stake_outputs = [KernelPayout::default(); OUTPUTS];
         stake_outputs[0] = KernelPayout::new(provider, 1);
         let bond = WorkStakeBondTerms {
-            base: StakeBondTerms {
-                protocol: ProtocolCode::CATENA_FRAUD_V2,
-                parties: Parties::new(provider, client),
-                timeout: KernelHeight::new(50),
-                timeout_outputs: List::take(stake_outputs, 1),
-                treasury: KernelKey::from_bytes([4; KernelKey::LENGTH]),
-                award: 1,
-                stake: 1,
-                max_job_price: 1,
-                max_dispute_cost: 0,
-                challenge_margin: 1,
-            },
-            max_challenge_bond: 1,
-            move_timeout: 1,
-            game_protocol: ProtocolCode::CATENA_FRAUD_V2.get(),
+            parties: Parties::new(provider, client),
+            timeout: KernelHeight::new(50),
+            timeout_outputs: List::take(stake_outputs, 1),
+            max_job_price: 1,
         };
         let payment = KernelTerms::work_payment(WorkPaymentTerms {
-            protocol: ProtocolCode::CATENA_FRAUD_V2,
-            parties: Parties::new(client, provider),
-            admission_horizon: bond.base.timeout,
             bond_edge: EdgeId::from_bytes([6; EdgeId::LENGTH]),
             bond_terms: bond.clone(),
             private_policy_commitment: [7; 32],
@@ -1395,10 +1381,9 @@ mod tests {
     #[test]
     fn a_payment_open_naming_an_absent_bond_is_retained_not_settled() {
         use hellas_kernel::{
-            Auth, BlockHeight as KernelHeight, Funding, Key as KernelKey, List, MAX_EDGE_OUTPUTS,
-            MAX_PARTY_INPUTS as INPUTS, Parties, Payout as KernelPayout, ProtocolCode,
-            Secp256k1Signer, StakeBondTerms, Terms as KernelTerms, WorkPaymentTerms,
-            WorkStakeBondTerms,
+            Auth, BlockHeight as KernelHeight, Funding, List, MAX_EDGE_OUTPUTS,
+            MAX_PARTY_INPUTS as INPUTS, Parties, Payout as KernelPayout, Secp256k1Signer,
+            Terms as KernelTerms, WorkPaymentTerms, WorkStakeBondTerms,
         };
 
         const FUNDING: u64 = 100;
@@ -1414,24 +1399,10 @@ mod tests {
         let network = crate::domain::TEST_NETWORK;
 
         let bond = WorkStakeBondTerms {
-            base: StakeBondTerms {
-                protocol: ProtocolCode::CATENA_FRAUD_V2,
-                parties: Parties::new(provider_key, client_key),
-                timeout: KernelHeight::new(500),
-                timeout_outputs: List::take(
-                    [KernelPayout::new(provider_key, 12); MAX_EDGE_OUTPUTS],
-                    1,
-                ),
-                treasury: KernelKey::from_bytes([0x43; KernelKey::LENGTH]),
-                award: 12,
-                stake: 12,
-                max_job_price: 4,
-                max_dispute_cost: 3,
-                challenge_margin: 5,
-            },
-            max_challenge_bond: 3,
-            move_timeout: 20,
-            game_protocol: ProtocolCode::CATENA_FRAUD_V2.get(),
+            parties: Parties::new(provider_key, client_key),
+            timeout: KernelHeight::new(500),
+            timeout_outputs: List::take([KernelPayout::new(provider_key, 12); MAX_EDGE_OUTPUTS], 1),
+            max_job_price: 4,
         };
         // The bond edge id of a bond nobody posted.
         let bond_funding = Funding::new(
@@ -1442,9 +1413,6 @@ mod tests {
             KernelTx::edge_id_of(&bond_funding, &KernelTerms::work_stake_bond(bond.clone()));
 
         let terms = KernelTerms::work_payment(WorkPaymentTerms {
-            protocol: ProtocolCode::CATENA_FRAUD_V2,
-            parties: Parties::new(client_key, provider_key),
-            admission_horizon: bond.base.timeout,
             bond_edge,
             bond_terms: bond,
             private_policy_commitment: [0x45; 32],
@@ -1553,10 +1521,9 @@ mod tests {
     fn a_work_payment_channel_settles_end_to_end_through_consensus() {
         use hellas_kernel::{
             Auth, BlockHeight as KernelHeight, Decode as _, EarnedCertificate, Funding,
-            InvalidMoveReason, Key as KernelKey, List, MAX_EDGE_OUTPUTS,
-            MAX_PARTY_INPUTS as INPUTS, Move, Parties, Party, PaymentCloseResponse,
-            PaymentCloseStart, Payout as KernelPayout, PendingPaymentClose, Proof, ProtocolCode,
-            Secp256k1Signer, StakeBondTerms, Terms as KernelTerms, WorkPaymentTerms,
+            InvalidMoveReason, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS as INPUTS, Move, Parties,
+            Party, PaymentCloseResponse, PaymentCloseStart, Payout as KernelPayout,
+            PendingPaymentClose, Proof, Secp256k1Signer, Terms as KernelTerms, WorkPaymentTerms,
             WorkStakeBondTerms, bond_lease_slots, pending_payment_close_slot,
         };
 
@@ -1584,24 +1551,13 @@ mod tests {
         let network = crate::domain::TEST_NETWORK;
 
         let bond = WorkStakeBondTerms {
-            base: StakeBondTerms {
-                protocol: ProtocolCode::CATENA_FRAUD_V2,
-                parties: Parties::new(provider_key, client_key),
-                timeout: KernelHeight::new(HORIZON),
-                timeout_outputs: List::take(
-                    [KernelPayout::new(provider_key, STAKE); MAX_EDGE_OUTPUTS],
-                    1,
-                ),
-                treasury: KernelKey::from_bytes([0x23; KernelKey::LENGTH]),
-                award: STAKE,
-                stake: STAKE,
-                max_job_price: 4,
-                max_dispute_cost: 3,
-                challenge_margin: 5,
-            },
-            max_challenge_bond: 3,
-            move_timeout: 20,
-            game_protocol: ProtocolCode::CATENA_FRAUD_V2.get(),
+            parties: Parties::new(provider_key, client_key),
+            timeout: KernelHeight::new(HORIZON),
+            timeout_outputs: List::take(
+                [KernelPayout::new(provider_key, STAKE); MAX_EDGE_OUTPUTS],
+                1,
+            ),
+            max_job_price: 4,
         };
         // The bond the channel leases: the provider's whole allocation,
         // staked under mirrored roles.
@@ -1621,9 +1577,6 @@ mod tests {
         );
 
         let terms = KernelTerms::work_payment(WorkPaymentTerms {
-            protocol: ProtocolCode::CATENA_FRAUD_V2,
-            parties: Parties::new(client_key, provider_key),
-            admission_horizon: bond.base.timeout,
             bond_edge,
             bond_terms: bond,
             private_policy_commitment: [0x25; 32],
@@ -1807,13 +1760,13 @@ mod tests {
             assert!(!opened.responded(), "no answer has landed yet");
             // The contest as it stands before any answer, and the seal
             // that names exactly that state.
-            let stale_seal = opened.seal(network, edge, terms.hash());
+            let stale_commitment = opened.contest_commitment(network, edge, terms.hash());
             let mut understated_split = [KernelPayout::default(); MAX_EDGE_OUTPUTS];
             understated_split[0] = KernelPayout::new(provider_key, UNDERSTATED);
             understated_split[1] = KernelPayout::new(client_key, FUNDING - UNDERSTATED);
             let early_close = Transaction::Kernel(KernelTx::close(
                 edge,
-                Proof::adjudicated(stale_seal),
+                Proof::adjudicated(stale_commitment),
                 List::take(understated_split, 2),
             ));
             // The close a submitter racing the response would carry: the
@@ -1821,7 +1774,7 @@ mod tests {
             // against.
             let stale_close = Transaction::Kernel(KernelTx::close(
                 edge,
-                Proof::adjudicated(stale_seal),
+                Proof::adjudicated(stale_commitment),
                 split.clone(),
             ));
 
@@ -1946,7 +1899,7 @@ mod tests {
                 ExecutionError::KernelApply {
                     error: ApplyError::InvalidProof {
                         input: edge,
-                        reason: InvalidProofReason::SealMismatch,
+                        reason: InvalidProofReason::ContestMismatch,
                     },
                 },
             );
@@ -1954,7 +1907,7 @@ mod tests {
 
             let close = KernelTx::close(
                 edge,
-                Proof::adjudicated(record.seal(network, edge, terms.hash())),
+                Proof::adjudicated(record.contest_commitment(network, edge, terms.hash())),
                 split,
             );
             apply_and_finalize(

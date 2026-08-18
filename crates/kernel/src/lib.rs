@@ -20,7 +20,7 @@
 //! payment open takes an exclusive [`BondLease`] over that bond in the
 //! same atomic change that creates the edge. Exclusivity is the point: a
 //! bond names no channel, so without the lease one stake could back
-//! several channels at once, each priced as if it could slash the whole
+//! several channels at once, each priced as if it could cover the whole
 //! of it. A second payment open naming a leased bond finds the slots
 //! occupied and is refused.
 //!
@@ -42,8 +42,8 @@
 //!   forfeits the omission bond its terms funded.
 //!
 //! There is deliberately **no [`Proof::Timeout`]** on a payment edge; see
-//! [`CloseKindSet`] and the `admission_horizon` field of
-//! [`WorkPaymentTerms`]. The horizon that shape commits is an admission
+//! [`CloseKindSet`] and [`WorkPaymentTerms::admission_horizon`]. The
+//! horizon that shape derives from its bond is an admission
 //! and rent deadline, not a refund deadline: a fixed refund payable after
 //! the provider has already earned against the channel would pay the
 //! wrong party. An abandoned payment edge is therefore settled by
@@ -59,19 +59,18 @@
 //!
 //! ## What this slice does not implement
 //!
-//! **Payment close only.** The correctness dispute game is not here. No
-//! transition opens a game, no transition writes the challenge bitmap or
-//! the live-game pointer that [`BondLease`] already reserves fields for,
-//! there is no native winner settlement, and there is no Catena execution
-//! verifier. Do not read the landed payment close as evidence that fraud
-//! proofs work end to end — nothing in this crate proves a job was
-//! computed wrongly, and nothing slashes a work bond for it yet.
-//!
-//! [`CloseKind::WorkStakeMutual`] is the visible edge of that gap: it is
-//! a member of the work-stake-bond set and it has a consensus tag, but no
-//! [`Proof`] variant produces it, deliberately — the tag is a wire number
-//! and assigning it late would renumber the close-kind bits. Its own
-//! documentation says so at the site.
+//! **Payment close only.** The correctness dispute game is not here.
+//! No transition opens a game, no transition slashes a bond, and there
+//! is no Catena execution verifier. Nothing is *reserved* for one
+//! either: there is no dormant game policy in the tag-4 body, no
+//! challenge bitmap or live-game pointer in [`BondLease`], no
+//! unreachable close kind, and no external seal verifier. A tag-4
+//! bond's only exit is its `Timeout` — immediate while unleased, at the
+//! horizon while leased. Do not read the landed payment close as
+//! evidence that fraud proofs work end to end: nothing in this crate
+//! proves a job was computed wrongly, and the stake is leased capital
+//! that returns on time rather than working insurance. The game slice
+//! adds its own transitions, its own state, and its own tags, together.
 //!
 //! # Abstract model
 //!
@@ -86,13 +85,12 @@
 //! | Apply driver         | [`State`]                       | `models/l1.qnt`                      |
 //! | Tx vocabulary + step | [`Tx`]                          | `models/l1.qnt` (`step` action)      |
 //! | Proof witnesses      | [`Proof`]                       | `models/verifier.qnt`                |
-//! | Verification policy  | [`SigVerifier`]/[`SealVerifier`]| `models/verifier.qnt`                |
+//! | Verification policy  | [`SigVerifier`]                 | `models/verifier.qnt`                |
 //! | Live objects         | [`Coin`] / [`Edge`] / ids       | `models/types.qnt`                   |
 //! | Block context        | [`Context`]                     | `models/l1.qnt` (`height` var)       |
 //! | Established rules    | [`Diff`], [`View`]              | `models/rules/invariants.qnt`        |
 //! | Assumed dependencies | [`Store`], verifier traits      | `models/deps/assumptions.qnt`        |
 //! | Fees / reserve        | [`Fees`], [`Cost`]             | `models/l1_fees.qnt`                 |
-//! | Stake bond edge       | [`StakeBondTerms`]             | `models/l1_stake.qnt`                |
 //!
 //! The table is authoritative for the coin and edge state above and for
 //! nothing else. Registry state — [`RegistryChunk`], [`RegistryDiff`],
@@ -104,12 +102,12 @@
 //! read "the kernel is model-checked" as covering registry state.
 //!
 //! The work-channel terms shapes — [`WorkPaymentTerms`] and
-//! [`WorkStakeBondTerms`] — have no abstract counterpart either.
-//! `models/l1_stake.qnt` models the legacy tag-1 bond, and the work bond
-//! inherits its checked properties only through the shared
-//! [`StakeBondTerms`] base that [`Terms::stake_bond_base`] exposes;
-//! nothing in the model covers the game policy, the payment edge, or
-//! their close-kind sets.
+//! [`WorkStakeBondTerms`] — have **no** abstract counterpart, and no
+//! longer inherit one. The tag-1 bond model that used to stand in for
+//! the tag-4 bond through a shared base was deleted with its subject,
+//! so stake conservation, provider-only funding, the immediate and
+//! horizon timeouts, and lease deletion are Rust-side properties only
+//! until a tag-4 model lands. `models/registry.md` lists them.
 //!
 //! The correspondence claim above is likewise **retracted for the
 //! payment-close actions and for the bond lease**. [`Tx::Move`],
@@ -124,14 +122,16 @@
 //!
 //! # Verifier boundary
 //!
-//! The transition core delegates cryptography to caller-wired traits:
-//! [`SigVerifier`] decides cooperative-close signatures and open
-//! authorizations, [`SealVerifier`] decides dispute seals. [`Proof::Timeout`]
-//! needs neither — its admissibility is purely structural and the kernel
-//! checks it inline. Test verifiers accept the deterministic placeholders
-//! built by `Sig::placeholder` and `Seal::placeholder` (available only
-//! under the `placeholders` feature — production builds cannot construct
-//! forgeable witnesses); production verifiers wire real cryptography.
+//! The transition core delegates cryptography to one caller-wired
+//! trait: [`SigVerifier`] decides open authorizations, cooperative-close
+//! signatures, and the payment `Freeze`. [`Proof::Timeout`] and
+//! `Proof::Adjudicated` need none — their admissibility is structural
+//! and the kernel checks it inline against committed terms and staged
+//! registry state. There is no seal trait and no external verifier
+//! seam. Test verifiers accept the deterministic placeholders built by
+//! `Sig::placeholder` (available only under the `placeholders` feature —
+//! production builds cannot construct forgeable witnesses); production
+//! verifiers wire real cryptography.
 //! Optional feature-gated helpers provide
 //! concrete native/`WebAuthn` verification without changing the apply path.
 //! [`Auth`] is only a witness format: it proves consent from the same
@@ -210,14 +210,12 @@ pub use registry::{
 pub use secp256k1::{Secp256k1Signer, Secp256k1SignerError, Secp256k1Verifier};
 pub use state::State;
 pub use store::{Batch, Store};
-pub use terms::{
-    StakeBondBaseRef, StakeBondTerms, Terms, TermsProfile, WorkPaymentTerms, WorkStakeBondTerms,
-};
+pub use terms::{Terms, TermsProfile, WorkPaymentTerms, WorkStakeBondTerms};
 pub use tx::{
-    Auth, CloseKind, CloseKindSet, Funding, Move, Payout, Proof, Seal, Tx, WebAuthnAssertion,
-    WebAuthnData,
+    Auth, CloseKind, CloseKindSet, Funding, Move, PaymentContestCommitment, Payout, Proof, Tx,
+    WebAuthnAssertion, WebAuthnData,
 };
-pub use verifier::{SealPublicInputs, SealVerifier, SigVerifier};
+pub use verifier::SigVerifier;
 pub use view::{Snapshot, View};
 #[cfg(feature = "test-support")]
 pub use webauthn::test_support;

@@ -14,8 +14,6 @@ mod support;
 
 #[path = "channel/batch.rs"]
 mod batch;
-#[path = "channel/bond.rs"]
-mod bond;
 #[path = "channel/close.rs"]
 mod close;
 #[path = "channel/op.rs"]
@@ -31,14 +29,14 @@ use support::l1::{
 };
 use support::{
     FAKE_VERIFIER, FixedStore, REJECT_VERIFIER, coin_id, coin_view, edge_view, list,
-    open_tx as open_tx_with, placeholder_mutual, placeholder_seal, state,
+    open_tx as open_tx_with, placeholder_mutual, state,
 };
 
 use hellas_kernel::{
     ApplyError, Auth, Block, BlockHash, BlockHeight, CloseKind, CoinId, Context, Cost, EdgeId,
     Event, EventKind, Fees, Funding, Genesis, InsertError, InvalidCloseReason, InvalidOpenReason,
     InvalidProofReason, Key, List, MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Parties,
-    PayloadHash, Payout, Proof, Seal, Sig, State, Terms, TermsHash, Tx, View,
+    PayloadHash, Payout, Proof, Sig, State, Terms, TermsHash, Tx, View,
 };
 
 const FEE_CONTEXT: Context = Context::with_fees(
@@ -110,21 +108,6 @@ fn mutual_proof(input: EdgeId, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> Proo
 
 fn mutual_hash(input: EdgeId, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> PayloadHash {
     support::mutual_hash(input, terms(), outputs)
-}
-
-fn violation_proof(input: EdgeId, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> Proof {
-    Proof::violation(
-        basic_terms(),
-        placeholder_seal(input, &basic_terms(), outputs),
-    )
-}
-
-/// Seal bound to the canonical payload of the *other* terms; rejected as
-/// `TermsMismatch` (proof terms) or `BadSeal` (payload binding) depending
-/// on which side the test corrupts.
-fn other_seal(kind: CloseKind, input: EdgeId, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> Seal {
-    let hash = Tx::payload_hash(support::NETWORK, input, kind, other_terms(), outputs);
-    Seal::placeholder(l1::OTHER_PROTOCOL, kind, hash)
 }
 
 fn edge() -> EdgeId {

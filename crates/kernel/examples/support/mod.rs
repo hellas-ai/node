@@ -6,8 +6,8 @@ use std::collections::BTreeMap;
 use hellas_kernel::{
     Batch, Block, BlockHash, BlockHeight, Coin, CoinId, Context, Cost, Edge, EdgeId, EventKind,
     Fees, Genesis, InsertError, KernelResult, Key, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS,
-    NetworkId, PayloadHash, Payout, RegistryChunk, RegistryChunkId, SealVerifier, Sig, SigVerifier,
-    State, Store, Tx,
+    NetworkId, PayloadHash, Payout, RegistryChunk, RegistryChunkId, Sig, SigVerifier, State, Store,
+    Tx,
 };
 
 /// The network these examples settle on. Every authorization they build
@@ -144,7 +144,7 @@ pub(crate) fn apply_one<V>(
     operation: Tx,
 ) -> EventKind
 where
-    V: SigVerifier + SealVerifier + ?Sized,
+    V: SigVerifier + ?Sized,
 {
     let block = Block::new(context, List::all([operation]));
     let diff = state

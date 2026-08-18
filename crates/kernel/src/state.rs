@@ -16,7 +16,7 @@ use crate::{
     object::Genesis,
     store::{Batch, Store},
     tx::Tx,
-    verifier::{SealVerifier, SigVerifier},
+    verifier::SigVerifier,
     view::Snapshot,
 };
 
@@ -100,7 +100,7 @@ impl<S: Store> State<S> {
     ///
     /// Returns [`crate::ApplyError`] if the operation is not valid for the
     /// current store contents or if the backing store rejects an insertion.
-    pub fn apply<V: SigVerifier + SealVerifier + ?Sized>(
+    pub fn apply<V: SigVerifier + ?Sized>(
         &mut self,
         context: Context,
         verifier: &V,
@@ -121,7 +121,7 @@ impl<S: Store> State<S> {
     /// # Errors
     ///
     /// Returns [`BatchError`] with the failed operation index and source error.
-    pub fn apply_all<V: SigVerifier + SealVerifier + ?Sized, const N: usize>(
+    pub fn apply_all<V: SigVerifier + ?Sized, const N: usize>(
         &mut self,
         context: Context,
         verifier: &V,
@@ -150,7 +150,7 @@ impl<S: Store> State<S> {
     /// # Errors
     ///
     /// Returns [`BatchError`] with the failed operation index and source error.
-    pub fn apply_block<V: SigVerifier + SealVerifier + ?Sized, const N: usize>(
+    pub fn apply_block<V: SigVerifier + ?Sized, const N: usize>(
         &mut self,
         verifier: &V,
         block: &Block<N>,
@@ -191,7 +191,7 @@ impl<S: Store> State<S> {
         mut on_outcome: F,
     ) -> KernelResult<(), BatchError>
     where
-        V: SigVerifier + SealVerifier + ?Sized,
+        V: SigVerifier + ?Sized,
         I: IntoIterator<Item = B>,
         B: Borrow<Tx>,
         F: FnMut(usize, &ApplyOutcome),
@@ -208,7 +208,7 @@ impl<S: Store> State<S> {
         Ok(())
     }
 
-    fn fold_one<B: Batch, V: SigVerifier + SealVerifier + ?Sized>(
+    fn fold_one<B: Batch, V: SigVerifier + ?Sized>(
         batch: &mut B,
         context: Context,
         verifier: &V,

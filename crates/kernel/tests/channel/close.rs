@@ -416,45 +416,6 @@ fn close_rejects_wrong_timeout_terms_without_mutation() {
 }
 
 #[test]
-fn close_accepts_violation_witness() {
-    let mut state = open_state();
-    let outputs = payouts(Payout::new(MAKER, 7), Payout::new(TAKER, 8));
-    let event = apply(
-        &mut state,
-        &Tx::close(edge(), violation_proof(edge(), &outputs), outputs),
-    );
-
-    assert_eq!(
-        event.kind(),
-        &EventKind::EdgeClosed {
-            input: edge(),
-            outputs: output_ids2(maker_out(), taker_out()),
-        },
-    );
-    assert_eq!(state.store().edge(edge()), None);
-}
-
-#[test]
-fn close_rejects_violation_after_deadline_without_mutation() {
-    let mut state = open_state();
-    let store = *state.store();
-    let outputs = payouts(Payout::new(MAKER, 7), Payout::new(TAKER, 8));
-
-    assert_eq!(
-        state.apply(
-            TIMEOUT_CONTEXT,
-            &FAKE_VERIFIER,
-            &Tx::close(edge(), violation_proof(edge(), &outputs), outputs),
-        ),
-        Err(ApplyError::InvalidProof {
-            input: edge(),
-            reason: InvalidProofReason::ProofExpired,
-        }),
-    );
-    assert_eq!(*state.store(), store);
-}
-
-#[test]
 fn placeholder_witnesses_do_not_verify_under_reject_verifier() {
     let mut state = open_state();
     let store = *state.store();
@@ -469,54 +430,6 @@ fn placeholder_witnesses_do_not_verify_under_reject_verifier() {
         Err(ApplyError::InvalidProof {
             input: edge(),
             reason: InvalidProofReason::BadSignature,
-        }),
-    );
-    assert_eq!(*state.store(), store);
-}
-
-#[test]
-fn close_rejects_bad_dispute_seal_without_mutation() {
-    let mut state = open_state();
-    let store = *state.store();
-    let outputs = payouts(Payout::new(MAKER, 7), Payout::new(TAKER, 8));
-    // Seal bound to a non-canonical payload (different terms hash); the
-    // verifier rejects with `BadSeal` rather than `TermsMismatch` because
-    // the proof's own terms commitment is correct.
-    let bad_hash = Tx::payload_hash(
-        crate::support::NETWORK,
-        edge(),
-        CloseKind::Violation,
-        other_terms(),
-        &outputs,
-    );
-    let bad_seal = Seal::placeholder(PROTOCOL, CloseKind::Violation, bad_hash);
-    let proof = Proof::violation(basic_terms(), bad_seal);
-
-    assert_eq!(
-        state.apply(CONTEXT, &FAKE_VERIFIER, &Tx::close(edge(), proof, outputs),),
-        Err(ApplyError::InvalidProof {
-            input: edge(),
-            reason: InvalidProofReason::BadSeal,
-        }),
-    );
-    assert_eq!(*state.store(), store);
-}
-
-#[test]
-fn close_rejects_wrong_dispute_terms_without_mutation() {
-    let mut state = open_state();
-    let store = *state.store();
-    let outputs = payouts(Payout::new(MAKER, 7), Payout::new(TAKER, 8));
-    let proof = Proof::violation(
-        other_terms_value(),
-        other_seal(CloseKind::Violation, edge(), &outputs),
-    );
-
-    assert_eq!(
-        state.apply(CONTEXT, &FAKE_VERIFIER, &Tx::close(edge(), proof, outputs),),
-        Err(ApplyError::InvalidProof {
-            input: edge(),
-            reason: InvalidProofReason::TermsMismatch,
         }),
     );
     assert_eq!(*state.store(), store);

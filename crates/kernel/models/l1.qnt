@@ -229,20 +229,16 @@ module l1 {
     // Canonical-split closes under each proof kind.
     closeEdge(Edge1, Mutual, MakerPayout, TakerPayout),
     closeEdge(Edge1, Timeout, MakerPayout, TakerPayout),
-    closeEdge(Edge1, Violation, MakerPayout, TakerPayout),
     closeEdge(Edge2, Mutual, MakerPayout, TakerPayout),
     closeEdge(Edge2, Timeout, MakerPayout, TakerPayout),
-    closeEdge(Edge2, Violation, MakerPayout, TakerPayout),
     // Non-canonical splits. Each is rejected by `canClose` via
     // `payoutsBound`; Apalache symbolically confirms these remain
     // unreachable, making the rejection surface explicit in the spec
     // rather than implicit in `payoutsBound`.
     closeEdge(Edge1, Mutual, EdgeValue, 0),
     closeEdge(Edge1, Timeout, EdgeValue, 0),
-    closeEdge(Edge1, Violation, EdgeValue, 0),
     closeEdge(Edge2, Mutual, EdgeValue, 0),
     closeEdge(Edge2, Timeout, EdgeValue, 0),
-    closeEdge(Edge2, Violation, EdgeValue, 0),
     tick,
     idle,
   }
@@ -296,15 +292,6 @@ module l1 {
       .then(closeEdge(Edge2, Timeout, MakerPayout, TakerPayout))
       .expect(valueConserved and atMostOneLiveEdge and noNegativeValue and deadSlotsAreZero)
 
-  // Violation closes on both edges.
-  run violationTraceTest =
-    init
-      .then(openEdge(Edge1, Maker, Taker))
-      .then(closeEdge(Edge1, Violation, MakerPayout, TakerPayout))
-      .then(openEdge(Edge2, Maker, Taker))
-      .then(closeEdge(Edge2, Violation, MakerPayout, TakerPayout))
-      .expect(valueConserved and atMostOneLiveEdge and noNegativeValue and deadSlotsAreZero)
-
   // Negative trace: an open without a tick cannot Timeout.
   run earlyTimeoutRejectedTest =
     init
@@ -348,9 +335,7 @@ module l1 {
     init
       .then(openEdge(Edge1, Maker, Taker))
       .then(rejectClose(Edge1, Mutual, EdgeValue, 0))
-      .then(rejectClose(Edge1, Violation, EdgeValue, 0))
-      .expect(not(canClose(Edge1, Mutual, EdgeValue, 0))
-        and not(canClose(Edge1, Violation, EdgeValue, 0)))
+      .expect(not(canClose(Edge1, Mutual, EdgeValue, 0)))
 
   // Negative trace: timeout close rejects the same non-canonical split even
   // after the height guard is satisfied.
@@ -388,26 +373,13 @@ module l1 {
 
   // Negative trace: pre-expiry proof paths are not accepted once timeout is
   // available.
-  run expiredMutualAndViolationRejectedTest =
+  run expiredMutualRejectedTest =
     init
       .then(openEdge(Edge1, Maker, Taker))
       .then(tick)
       .then(rejectClose(Edge1, Mutual, MakerPayout, TakerPayout))
-      .then(rejectClose(Edge1, Violation, MakerPayout, TakerPayout))
       .expect(height >= TimeoutHeight
-        and not(canClose(Edge1, Mutual, MakerPayout, TakerPayout))
-        and not(canClose(Edge1, Violation, MakerPayout, TakerPayout)))
-
-  // Mixed proof kinds across edges: violation close on the first,
-  // mutual on the second. Catches kernel paths that assume the
-  // same proof kind across an entire trace.
-  run mixedProofsTraceTest =
-    init
-      .then(openEdge(Edge1, Maker, Taker))
-      .then(closeEdge(Edge1, Violation, MakerPayout, TakerPayout))
-      .then(openEdge(Edge2, Maker, Taker))
-      .then(closeEdge(Edge2, Mutual, MakerPayout, TakerPayout))
-      .expect(valueConserved and atMostOneLiveEdge and noNegativeValue and deadSlotsAreZero)
+        and not(canClose(Edge1, Mutual, MakerPayout, TakerPayout)))
 
   // Height accumulates across multiple ticks; idle stutter does not
   // disturb live state. Once the single model timeout is reached, new opens

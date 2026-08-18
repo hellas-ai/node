@@ -37,7 +37,8 @@ pub(crate) mod tag {
     pub(crate) const EDGE: u8 = 5;
     pub(crate) const FUNDING: u8 = 6;
     pub(crate) const PAYOUT: u8 = 7;
-    pub(crate) const SEAL: u8 = 8;
+    // 8 was the standalone dispute seal. Deleted with the external
+    // violation close; the byte is an ordinary rejection.
     pub(crate) const WEBAUTHN_ASSERTION: u8 = 9;
     pub(crate) const AUTH: u8 = 10;
     pub(crate) const TERMS: u8 = 11;
@@ -527,12 +528,10 @@ mod tests {
     use super::Encode;
     use crate::consts::{
         CLOSE, COIN_GENESIS, COIN_PAYOUT, EDGE_OPEN, ID_LENGTH, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS,
-        OPEN, REGISTRY_CHUNK_ID, SEAL_PLACEHOLDER, SIG_PLACEHOLDER, TERMS_BASIC, TERMS_STAKE_BOND,
-        TERMS_WORK_PAYMENT, TERMS_WORK_STAKE_BOND,
+        OPEN, REGISTRY_CHUNK_ID, SIG_PLACEHOLDER, TERMS_BASIC, TERMS_WORK_PAYMENT,
+        TERMS_WORK_STAKE_BOND,
     };
-    use crate::{
-        CoinId, EdgeId, Key, List, NetworkId, PayloadHash, Payout, ProtocolCode, Terms, TermsHash,
-    };
+    use crate::{CoinId, EdgeId, Key, List, NetworkId, PayloadHash, Payout, Terms, TermsHash};
 
     #[test]
     fn every_commitment_preimage_fits_one_xet_chunk() {
@@ -550,7 +549,6 @@ mod tests {
             // halt in a kernel that cannot unwind. Every domain is
             // measured against the *widest* body, not its own.
             TERMS_BASIC.len() + Terms::MAX_ENCODED_SIZE,
-            TERMS_STAKE_BOND.len() + Terms::MAX_ENCODED_SIZE,
             TERMS_WORK_PAYMENT.len() + Terms::MAX_ENCODED_SIZE,
             TERMS_WORK_STAKE_BOND.len() + Terms::MAX_ENCODED_SIZE,
             OPEN.len() + EdgeId::MAX_ENCODED_SIZE,
@@ -562,10 +560,6 @@ mod tests {
             SIG_PLACEHOLDER.len()
                 + u8::MAX_ENCODED_SIZE
                 + Key::MAX_ENCODED_SIZE
-                + PayloadHash::MAX_ENCODED_SIZE,
-            SEAL_PLACEHOLDER.len()
-                + ProtocolCode::MAX_ENCODED_SIZE
-                + u8::MAX_ENCODED_SIZE
                 + PayloadHash::MAX_ENCODED_SIZE,
             REGISTRY_CHUNK_ID.len()
                 + NetworkId::MAX_ENCODED_SIZE

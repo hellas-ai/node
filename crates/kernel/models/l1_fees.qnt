@@ -30,7 +30,6 @@ module l1_fees {
   type Proof =
     | Mutual
     | Timeout
-    | Violation
 
   type FundingShape =
     | FullFunding
@@ -50,7 +49,6 @@ module l1_fees {
     | NoClose
     | ClosedMutual
     | ClosedTimeout
-    | ClosedViolation
 
   type Input =
     | NoInput
@@ -256,10 +254,6 @@ module l1_fees {
       0,
     )
 
-  pure def violationEnabled(shape: FundingShape): bool =
-    shape != EmptyFunding
-      and openPartiesFor(shape).maker != openPartiesFor(shape).taker
-
   def liveShape: FundingShape =
     edgeShape.get(Channel)
 
@@ -307,7 +301,6 @@ module l1_fees {
     match p {
       | Mutual => height < TimeoutHeight
       | Timeout => height >= TimeoutHeight
-      | Violation => height < TimeoutHeight
     }
 
   def canOpen(shape: FundingShape): bool =
@@ -333,7 +326,6 @@ module l1_fees {
       and proofOk(p)
       and not(liveCoins.contains(MakerOut))
       and not(liveCoins.contains(TakerOut))
-      and (p != Violation or violationEnabled(liveShape))
 
   action init = all {
     coins' = AllCoins.mapBy(id =>
@@ -449,26 +441,6 @@ module l1_fees {
     lastEvent' = EdgeClosedEvent,
   }
 
-  action closeViolation = all {
-    canClose(Violation),
-    coins' = coins
-      .set(MakerOut, makerPayoutFor(liveShape))
-      .set(TakerOut, takerPayoutFor(liveShape)),
-    edges' = edges.set(Channel, 0),
-    reserves' = reserves.set(Channel, 0),
-    closeFees' = closeFees.set(Channel, 0),
-    edgeShape' = edgeShape,
-    edgeParties' = edgeParties,
-    liveCoins' = liveCoins.union(Set(MakerOut, TakerOut)),
-    liveEdges' = liveEdges.exclude(Set(Channel)),
-    paid' = paid + committedCloseFeeFor(liveShape),
-    height' = height,
-    currentCloseFee' = currentCloseFee,
-    closeOutcome' = ClosedViolation,
-    lastInput' = CloseInput(Violation),
-    lastEvent' = EdgeClosedEvent,
-  }
-
   action raiseFee = all {
     liveEdges.contains(Channel),
     currentCloseFee == BaseCloseFee,
@@ -575,7 +547,6 @@ module l1_fees {
     openBy(SelfFunding),
     closeMutual,
     closeTimeout,
-    closeViolation,
     raiseFee,
     tick,
   }
@@ -686,11 +657,7 @@ module l1_fees {
     not(liveEdges.contains(Channel)) or height < TimeoutHeight or canClose(Timeout)
 
   val nonTimeoutProofsExpire =
-    height < TimeoutHeight
-      or all {
-        not(canClose(Mutual)),
-        not(canClose(Violation)),
-      }
+    height < TimeoutHeight or not(canClose(Mutual))
 
 
 
@@ -792,25 +759,22 @@ module l1_fees {
         and closeOutcome == ClosedTimeout
         and nonTimeoutProofsExpire)
 
-  run expiredMutualAndViolationRejectedTest =
+  run expiredMutualRejectedTest =
     init
       .then(openBy(FullFunding))
       .then(tick)
       .then(rejectClose(Mutual))
-      .then(rejectClose(Violation))
       .expect(height >= TimeoutHeight
         and canClose(Timeout)
-        and not(canClose(Mutual))
-        and not(canClose(Violation)))
+        and not(canClose(Mutual)))
 
-  // A Violation close of a Basic edge pays principal and charges the
-  // committed close fee like any other close kind. Stake lives on a
-  // StakeBond edge (models/l1_stake.qnt), never as a side bucket here.
-  run violationClosePaysPrincipalTraceTest =
+  // A cooperative close of a Basic edge pays principal and charges the
+  // committed close fee.
+  run mutualClosePaysPrincipalTraceTest =
     init
       .then(openBy(FullFunding))
-      .then(closeViolation)
+      .then(closeMutual)
       .expect(valueAccounted
         and partyValueAccounted
-        and closeOutcome == ClosedViolation)
+        and closeOutcome == ClosedMutual)
 }

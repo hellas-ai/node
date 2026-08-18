@@ -6,13 +6,13 @@
 
 use super::{
     CANARY_REGISTRY_SLOTS, FixedStore, canary_registry_slots, coin_id, list, open_tx,
-    placeholder_mutual, placeholder_seal, state,
+    placeholder_mutual, state,
 };
 
 use hellas_kernel::{
-    BlockHash, BlockHeight, CloseKind, CoinId, Context, Edge, EdgeId, Funding, Genesis, Key, List,
-    MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, Parties, Payout, Proof, ProtocolCode, Seal, State, Terms,
-    Tx, View,
+    BlockHash, BlockHeight, CoinId, Context, Edge, EdgeId, Funding, Genesis, Key, List,
+    MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, Parties, Payout, Proof, ProtocolCode, State, Terms, Tx,
+    View,
 };
 
 pub(crate) const CONTEXT: Context = Context::new(
@@ -72,10 +72,8 @@ pub(crate) enum OpenKey {
 pub(crate) enum ProofKey {
     Mutual,
     Timeout,
-    Violation,
     EarlyTimeout,
     WrongTerms,
-    BadSeal,
 }
 
 pub(crate) fn initial_state() -> TraceState {
@@ -234,16 +232,9 @@ fn proof_for(edge: EdgeKey, proof: ProofKey, outputs: &List<Payout, MAX_EDGE_OUT
     match proof {
         ProofKey::Mutual => placeholder_mutual(edge_id(edge), terms.hash(), outputs, MAKER, TAKER),
         ProofKey::Timeout | ProofKey::EarlyTimeout => Proof::timeout(terms),
-        ProofKey::Violation => {
-            let seal = placeholder_seal(edge_id(edge), &terms, outputs);
-            Proof::violation(terms, seal)
-        }
         // Submitting a Timeout proof whose terms don't match the edge's terms
         // commitment triggers `TermsMismatch` in the verifier.
         ProofKey::WrongTerms => Proof::timeout(other_terms()),
-        // Bind the seal to a payload that does not match the canonical close
-        // payload, so the verifier rejects it with `BadSeal`.
-        ProofKey::BadSeal => Proof::violation(terms, bad_seal(edge, outputs)),
     }
 }
 
@@ -264,18 +255,4 @@ fn open_terms(key: OpenKey) -> Terms {
         OpenKey::Empty => (0, 0),
     };
     Terms::basic(PROTOCOL, PARTIES, TIMEOUT, payouts_with(maker, taker))
-}
-
-/// Seal bound to a non-canonical close payload (uses `other_terms()` for the
-/// terms-hash binding), so the verifier rejects with `BadSeal` rather than
-/// `TermsMismatch`.
-fn bad_seal(edge: EdgeKey, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> Seal {
-    let bad_hash = Tx::payload_hash(
-        super::NETWORK,
-        edge_id(edge),
-        CloseKind::Violation,
-        other_terms().hash(),
-        outputs,
-    );
-    Seal::placeholder(terms().protocol(), CloseKind::Violation, bad_hash)
 }

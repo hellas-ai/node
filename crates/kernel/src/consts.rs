@@ -35,12 +35,6 @@ pub(crate) const P256_COORDINATE_LENGTH: usize = 32;
 /// each, no DER framing.
 pub(crate) const SIG_LENGTH: usize = 64;
 
-/// Length of a compact dispute seal. v1 commits to a 32-byte seal; if
-/// the dispute mode produces a larger artifact (e.g. a ZK proof), the
-/// seal is a commitment to that artifact and the verifier resolves it
-/// out of band.
-pub(crate) const SEAL_LENGTH: usize = 32;
-
 /// Maximum bytes of `authenticatorData || clientDataJSON` carried by one
 /// `WebAuthn` authorization assertion.
 ///
@@ -208,20 +202,15 @@ pub(crate) const CLOSE: &[u8] = b"hellas.edge.close.v1";
 /// parties, timeout height, timeout payouts.
 pub(crate) const TERMS_BASIC: &[u8] = b"hellas.terms.basic.v1";
 
-/// Prefix for the stake-bond terms commitment. Inputs: protocol code,
-/// parties, timeout height, timeout payouts, treasury key, award, stake,
-/// max job price, max dispute cost.
-pub(crate) const TERMS_STAKE_BOND: &[u8] = b"hellas.terms.stake_bond.v1";
-
 /// Prefix for the work-payment terms commitment. Inputs: the complete
 /// canonical tag-2 terms body.
-pub(crate) const TERMS_WORK_PAYMENT: &[u8] = b"hellas.terms.work-payment.v2";
+pub(crate) const TERMS_WORK_PAYMENT: &[u8] = b"hellas.terms.work-payment.v3";
 
 /// Prefix for the work-stake-bond terms commitment. Inputs: the
 /// complete canonical tag-4 terms bytes, envelope and variant included,
 /// so an embedded bond witness and a standalone bond commit to the same
 /// hash.
-pub(crate) const TERMS_WORK_STAKE_BOND: &[u8] = b"hellas.terms.work-stake-bond.v2";
+pub(crate) const TERMS_WORK_STAKE_BOND: &[u8] = b"hellas.terms.work-stake-bond.v3";
 
 /// Prefix for the earned-certificate digest the client signs. Inputs:
 /// network id, payment edge, payment terms hash, and the complete
@@ -258,9 +247,9 @@ pub(crate) const WORK_START_PAYMENT_CLOSE_ID: &[u8] = b"hellas.work.start-paymen
 /// role, earned digest.
 pub(crate) const WORK_RESPOND_PAYMENT_CLOSE: &[u8] = b"hellas.work.respond-payment-close.v2";
 
-/// Prefix for the adjudicated-close seal. Inputs: network id, payment
-/// edge, payment terms hash, and the complete pending record the contest
-/// ended in.
+/// Prefix for the adjudicated-close contest commitment. Inputs: network
+/// id, payment edge, payment terms hash, and the complete pending record
+/// the contest ended in.
 pub(crate) const WORK_ADJUDICATED_PAYMENT_CLOSE: &[u8] =
     b"hellas.work.adjudicated-payment-close.v2";
 
@@ -279,11 +268,6 @@ pub(crate) const WORK_FREEZE_CLOSE: &[u8] = b"hellas.work.freeze-close.v2";
 /// because the design fixes this derivation, and changing it later would
 /// move every stored chunk.
 pub(crate) const REGISTRY_CHUNK_ID: &[u8] = b"hellas.registry.chunk-id.v2";
-
-/// Prefix for the deterministic seal placeholder used by tests and
-/// modelling. Inputs: protocol code, close kind tag, close hash.
-#[cfg(any(test, feature = "placeholders"))]
-pub(crate) const SEAL_PLACEHOLDER: &[u8] = b"hellas.seal.placeholder.v1";
 
 /// Prefix for the deterministic signature placeholder used by tests and
 /// modelling. Inputs: half index (0 or 1), key, close hash.

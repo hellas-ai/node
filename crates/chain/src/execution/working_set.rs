@@ -183,8 +183,7 @@ mod tests {
     use super::*;
     use hellas_kernel::{
         Auth, CloseKind, Funding, Genesis, Key, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Parties,
-        PayloadHash, Payout, ProtocolCode, SealPublicInputs, SealVerifier, Sig, SigVerifier, State,
-        Terms, Tx,
+        PayloadHash, Payout, ProtocolCode, Sig, SigVerifier, State, Terms, Tx,
     };
 
     const MAKER: Key = Key::from_bytes([0xaa; Key::LENGTH]);
@@ -194,11 +193,6 @@ mod tests {
     impl SigVerifier for FakeVerifier {
         fn verify_sig(&self, sig: Sig, key: Key, hash: PayloadHash) -> bool {
             sig == Sig::placeholder(key, hash)
-        }
-    }
-    impl SealVerifier for FakeVerifier {
-        fn verify_seal(&self, _seal: hellas_kernel::Seal, _public: &SealPublicInputs<'_>) -> bool {
-            false
         }
     }
 

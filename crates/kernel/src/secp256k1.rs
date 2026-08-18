@@ -19,14 +19,10 @@
 //!
 //! # Scope
 //!
-//! Real ECDSA covers [`SigVerifier`] cleanly: cooperative-close
-//! signatures used by [`crate::Proof::Mutual`]. The seal half —
-//! [`crate::Proof::Violation`] — is protocol-specific (TEE attestation,
-//! ZK proof commitment, fraud-game seal) with no universal admissibility
-//! policy, so [`Secp256k1Verifier`] also implements [`SealVerifier`] as
-//! a hard-reject: every seal is rejected, every violation close fails.
-//! Deployments that support violation closes wrap or replace the seal
-//! impl with one that knows their protocol's seal shape.
+//! Real ECDSA covers [`SigVerifier`] cleanly: the open authorizations
+//! and the cooperative-close signatures used by [`crate::Proof::Mutual`]
+//! and the work-payment `Freeze`. Nothing else needs a verifier: every
+//! remaining close is decided structurally by the kernel.
 
 use core::fmt;
 
@@ -35,8 +31,8 @@ use k256::ecdsa::signature::hazmat::{PrehashSigner, PrehashVerifier};
 use k256::ecdsa::{Signature, SigningKey, VerifyingKey};
 
 use crate::primitive::{Key, PayloadHash, Sig};
-use crate::tx::{Auth, Seal};
-use crate::verifier::{SealPublicInputs, SealVerifier, SigVerifier};
+use crate::tx::Auth;
+use crate::verifier::SigVerifier;
 
 /// Failure while constructing an in-memory native signer.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
@@ -161,15 +157,5 @@ impl SigVerifier for Secp256k1Verifier {
             #[cfg(not(feature = "webauthn"))]
             Auth::WebAuthn(_) => false,
         }
-    }
-}
-
-impl SealVerifier for Secp256k1Verifier {
-    /// Rejects every seal. Dispute seals are protocol-specific (TEE
-    /// attestation, ZK proof commitment, fraud-game seal); this verifier
-    /// owns no such policy. Deployments that admit violation closes wrap
-    /// or replace this impl with one that knows their protocol's seal.
-    fn verify_seal(&self, _seal: Seal, _public: &SealPublicInputs<'_>) -> bool {
-        false
     }
 }

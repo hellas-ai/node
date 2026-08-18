@@ -1,9 +1,9 @@
 use super::{CANARY_REGISTRY_SLOTS, FixedStore, canary_registry_slots, coin_id, state};
 
 use hellas_kernel::{
-    BlockHash, BlockHeight, CloseKind, CoinId, Context, EdgeId, Fees, Funding, Genesis, Key, List,
-    MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Parties, Payout, Proof, ProtocolCode, Seal, State, Terms,
-    Tx, View,
+    BlockHash, BlockHeight, CoinId, Context, EdgeId, Fees, Funding, Genesis, Key, List,
+    MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Parties, Payout, Proof, ProtocolCode, State, Terms, Tx,
+    View,
 };
 
 pub(crate) const TIMEOUT: BlockHeight = BlockHeight::new(2);
@@ -36,7 +36,6 @@ pub(crate) enum FundingShape {
 pub(crate) enum ProofKey {
     Mutual,
     Timeout,
-    Violation,
 }
 
 pub(crate) fn initial_state() -> TraceState {
@@ -127,19 +126,6 @@ pub(crate) fn close(shape: FundingShape, proof: ProofKey) -> Tx {
             )
         }
         ProofKey::Timeout => Proof::timeout(terms(shape)),
-        ProofKey::Violation => {
-            let hash = Tx::payload_hash(
-                super::NETWORK,
-                input,
-                CloseKind::Violation,
-                terms(shape).hash(),
-                &outputs,
-            );
-            Proof::violation(
-                terms(shape),
-                Seal::placeholder(PROTOCOL, CloseKind::Violation, hash),
-            )
-        }
     };
     Tx::close(input, proof, outputs)
 }

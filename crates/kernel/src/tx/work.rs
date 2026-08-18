@@ -33,7 +33,7 @@ use crate::{
     registry::{RegistryDiff, RegistryMutation},
     store::Batch,
     terms::{Terms, TermsProfile, WorkPaymentTerms},
-    tx::{CloseKind, Payout, Seal},
+    tx::{CloseKind, PaymentContestCommitment, Payout},
     verifier::SigVerifier,
     work::{
         EarnedCertificate, PaymentCloseResponse, PaymentCloseStart, PendingPaymentClose,
@@ -300,7 +300,7 @@ pub(super) struct CloseSubject<'a> {
 /// and the window has closed on any further evidence.
 pub(super) fn check_adjudicated<B: Batch>(
     close: CloseSubject<'_>,
-    seal: Seal,
+    contest_commitment: PaymentContestCommitment,
     context: Context,
     batch: &B,
 ) -> Result<Option<RegistryMutation>, InvalidProofReason> {
@@ -328,11 +328,11 @@ pub(super) fn check_adjudicated<B: Batch>(
         .ok_or(InvalidProofReason::PayoutOverCapacity)?;
     check_split(edge.parties(), total, provider, outputs)?;
 
-    // Recomputed and byte-compared rather than verified: the seal names
+    // Recomputed and byte-compared rather than verified: it names
     // the contest state this transaction expects to settle, so a close
     // racing a response pays out the state it was built for or nothing.
-    if seal != record.seal(context.network(), input, edge.terms()) {
-        return Err(InvalidProofReason::SealMismatch);
+    if contest_commitment != record.contest_commitment(context.network(), input, edge.terms()) {
+        return Err(InvalidProofReason::ContestMismatch);
     }
 
     Ok(Some(RegistryMutation::delete(pending_payment_close_slot(
@@ -480,7 +480,7 @@ pub(super) fn open_bond_lease<B: Batch>(
         output,
         terms.hash(),
         payment.private_policy_commitment,
-        payment.admission_horizon.get(),
+        payment.admission_horizon().get(),
     );
     // `None` is unreachable for this fixed-width record; it is a
     // rejection rather than a panic because this runs on the apply path.

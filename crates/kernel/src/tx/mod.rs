@@ -18,7 +18,7 @@ pub use self::{
     auth::{Auth, WebAuthnAssertion, WebAuthnData},
     funding::Funding,
     payout::Payout,
-    proof::{CloseKind, CloseKindSet, Proof, Seal},
+    proof::{CloseKind, CloseKindSet, PaymentContestCommitment, Proof},
 };
 
 use crate::{
@@ -33,13 +33,11 @@ use crate::{
     list::List,
     network::NetworkId,
     object::{Coin, Edge},
-    primitive::{CoinId, EdgeId, Key, PayloadHash, ProtocolCode, TermsHash},
+    primitive::{CoinId, EdgeId, Key, PayloadHash, TermsHash},
     registry::{RegistryDiff, RegistryMutation},
     store::Batch,
-    terms::{
-        StakeBondBaseRef, StakeBondTerms, Terms, TermsProfile, WorkPaymentTerms, WorkStakeBondTerms,
-    },
-    verifier::{SealPublicInputs, SealVerifier, SigVerifier},
+    terms::{Terms, TermsProfile, WorkPaymentTerms, WorkStakeBondTerms},
+    verifier::SigVerifier,
     work::{PaymentCloseResponse, PaymentCloseStart, work_payment_close_cost},
 };
 
@@ -320,7 +318,7 @@ impl Tx {
     ) -> KernelResult<Change>
     where
         B: Batch,
-        V: SigVerifier + SealVerifier + ?Sized,
+        V: SigVerifier + ?Sized,
     {
         match self {
             Self::Open {
@@ -455,9 +453,7 @@ fn open_cost(funding: &Funding, terms: &Terms) -> Cost {
     match terms.profile() {
         TermsProfile::WorkPayment(_) => Cost::new(1, inputs.saturating_add(4), 2),
         TermsProfile::WorkStakeBond(_) => Cost::new(1, inputs.saturating_add(1), 2),
-        TermsProfile::Basic | TermsProfile::StakeBond(_) => {
-            Cost::new(1, inputs.saturating_add(1), 0)
-        }
+        TermsProfile::Basic => Cost::new(1, inputs.saturating_add(1), 0),
     }
 }
 
@@ -471,12 +467,11 @@ fn open_cost(funding: &Funding, terms: &Terms) -> Cost {
 fn open_reserve_cost(terms: &Terms) -> Cost {
     match terms.profile() {
         TermsProfile::WorkPayment(_) => crate::work::work_payment_reserve_cost(),
-        // A tag-4 bond's dearest close is not its dearest *kind*: its
-        // timeout reads both lease chunks on top of the maximum payout
-        // fanout, which is two slots more than any of its signature
-        // closes touch. The reserve takes the maximum of both axes —
-        // the timeout's slots and the cooperative kinds' proofs — so no
-        // exit its own set admits can strand the edge.
+        // A tag-4 bond's only exit is its timeout, which reads both
+        // lease chunks on top of the maximum payout fanout. The proof
+        // axis is still charged at the dearest kind so a bond that
+        // later admits a two-signature exit cannot be stranded by a
+        // reserve fixed here.
         TermsProfile::WorkStakeBond(_) => Cost::new(
             1,
             units(MAX_EDGE_OUTPUTS).saturating_add(WORK_BOND_TIMEOUT_EXTRA_SLOTS),
@@ -484,9 +479,7 @@ fn open_reserve_cost(terms: &Terms) -> Cost {
         ),
         // The close kind with the most proof units, at the maximum
         // payout fanout.
-        TermsProfile::Basic | TermsProfile::StakeBond(_) => {
-            kind_close_cost(MAX_EDGE_OUTPUTS, CloseKind::Mutual)
-        }
+        TermsProfile::Basic => kind_close_cost(MAX_EDGE_OUTPUTS, CloseKind::Mutual),
     }
 }
 
@@ -510,17 +503,16 @@ fn close_cost(outputs: usize, proof: &Proof) -> Cost {
         // timeout reveals the terms that name one. Every other kind is
         // priced by its kind alone.
         Proof::Timeout { terms } => timeout_close_cost(outputs, is_work_bond(terms)),
-        Proof::Mutual { .. }
-        | Proof::Violation { .. }
-        | Proof::Freeze { .. }
-        | Proof::Adjudicated { .. } => kind_close_cost(outputs, proof.kind()),
+        Proof::Mutual { .. } | Proof::Freeze { .. } | Proof::Adjudicated { .. } => {
+            kind_close_cost(outputs, proof.kind())
+        }
     }
 }
 
-/// True when `terms` are a tag-4 work bond, whose closes read lease
-/// state the legacy bond has none of.
+/// True when `terms` are a tag-4 work bond, whose timeout reads lease
+/// state no other shape has.
 const fn is_work_bond(terms: &Terms) -> bool {
-    matches!(terms.stake_bond_base(), Some(StakeBondBaseRef::Work(_)))
+    matches!(terms.profile(), TermsProfile::WorkStakeBond(_))
 }
 
 /// A timeout's slots: its payouts, the edge it consumes, and — for a
@@ -542,10 +534,7 @@ fn timeout_close_cost(outputs: usize, work_bond: bool) -> Cost {
 fn kind_close_cost(outputs: usize, kind: CloseKind) -> Cost {
     match kind {
         CloseKind::Freeze | CloseKind::Adjudicated => work_payment_close_cost(kind),
-        CloseKind::Mutual
-        | CloseKind::Timeout
-        | CloseKind::Violation
-        | CloseKind::WorkStakeMutual => {
+        CloseKind::Mutual | CloseKind::Timeout => {
             Cost::new(1, units(outputs).saturating_add(1), kind.proofs())
         }
     }
@@ -600,7 +589,6 @@ where
     )
     .map_err(|reason| invalid_open(output, reason))?;
     check_open_terms(output, &edge, terms)?;
-    check_stake_bond_open(output, &edge, terms)?;
     check_work_profile_open(output, &edge, funding, terms, maker_auth, taker_auth)?;
     // Before the verifier, like every other structural check: a payment
     // naming a bond that is absent, wrong, or already leased must not
@@ -622,86 +610,29 @@ where
     Ok(Change::open(&coins, (output, edge)).with_registry(&registry))
 }
 
-/// Stake-bond opens additionally commit the slash arithmetic.
-///
-/// Every bond profile is checked here, through the shared base: the
-/// rules below exist because the edge locks slashable stake, and that is
-/// true of a bond whatever else its profile adds. Profile-specific rules
-/// branch afterwards, never instead.
-fn check_stake_bond_open(output: EdgeId, edge: &Edge, terms: &Terms) -> KernelResult<()> {
-    let Some(bond) = terms.stake_bond_base() else {
-        return Ok(());
-    };
-    check_stake_policy(output, edge, bond.base())?;
-    match bond {
-        // The legacy bond is its base and nothing more.
-        StakeBondBaseRef::Legacy(_) => Ok(()),
-        StakeBondBaseRef::Work(work) => check_work_bond_policy(output, work),
-    }
-}
-
-/// The stake must be the value this open actually locks, and the award
-/// must be positive, within the stake, and at least `max_job_price +
-/// max_dispute_cost` — otherwise a later slash could not reimburse the
-/// client for the worst job this bond admits.
-fn check_stake_policy(output: EdgeId, edge: &Edge, bond: &StakeBondTerms) -> KernelResult<()> {
-    if bond.stake != edge.value() {
-        return Err(invalid_open(output, InvalidOpenReason::StakeMismatch));
-    }
-    if bond.award == 0 || bond.award > bond.stake {
-        return Err(invalid_open(output, InvalidOpenReason::AwardOutOfRange));
-    }
-    // A party-controlled treasury would collapse the slash penalty from
-    // S to A: the provider would recover S − A through its own key.
-    if bond.treasury == bond.parties.maker() || bond.treasury == bond.parties.taker() {
-        return Err(invalid_open(output, InvalidOpenReason::TreasuryIsParty));
-    }
-    // A zero job-price cap covers no job (p_j ≥ 1) and would let the
-    // award floor degenerate to A = max_dispute_cost, breaking the
-    // strict dispute incentive A > C_disp.
-    if bond.max_job_price == 0 {
-        return Err(invalid_open(output, InvalidOpenReason::JobPriceCapZero));
-    }
-    // A zero challenge margin leaves no block between an honest job's
-    // terminal deadline and the bond timeout for a challenge to land,
-    // so no job could ever be covered (`covered_by` is unsatisfiable).
-    if bond.challenge_margin == 0 {
-        return Err(invalid_open(output, InvalidOpenReason::ChallengeMarginZero));
-    }
-    let floor = bond
-        .max_job_price
-        .checked_add(bond.max_dispute_cost)
-        .ok_or_else(|| invalid_open(output, InvalidOpenReason::AwardFloorOverflow))?;
-    if bond.award < floor {
-        return Err(invalid_open(output, InvalidOpenReason::AwardBelowFloor));
-    }
-    Ok(())
-}
-
-/// Game policy a work bond commits on top of the shared stake rules.
+/// Policy a work bond commits at open.
 ///
 /// Also checked on the bond witness a work-payment body embeds: that
 /// witness is the bond's own terms, so it answers to the bond's rules
-/// wherever it appears.
+/// wherever it appears. The embedded case has no edge, so the
+/// value rule is checked only where there is one.
 fn check_work_bond_policy(output: EdgeId, bond: &WorkStakeBondTerms) -> KernelResult<()> {
-    if bond.base.protocol != ProtocolCode::CATENA_FRAUD_V2
-        || bond.game_protocol != ProtocolCode::CATENA_FRAUD_V2.get()
-    {
-        return Err(invalid_open(
-            output,
-            InvalidOpenReason::WorkProtocolMismatch,
-        ));
-    }
-    // A bond that can fund no challenge, or a game whose moves have no
-    // deadline, insures nothing: the client could never open a game, or
-    // never finish one.
-    if bond.max_challenge_bond == 0 || bond.move_timeout == 0 {
-        return Err(invalid_open(output, InvalidOpenReason::WorkGamePolicyZero));
+    // A bond whose price cap covers no job (p_j >= 1) insures nothing.
+    if bond.max_job_price == 0 {
+        return Err(invalid_open(output, InvalidOpenReason::JobPriceCapZero));
     }
     // Unleased, this bond times out permissionlessly, so its committed
     // payout is the only thing deciding who receives the stake back.
     // The generic open path pins the payout *sum* alone.
-    if !paid_solely_to(&bond.base.timeout_outputs, bond.base.parties.maker()) {
+    //
+    // `paid_solely_to` also rejects an empty list, and that half is not
+    // independently reachable: `check_open_terms` runs first and pins
+    // the payout sum to the edge's close value, and `WorkStakeValueZero`
+    // below refuses a zero-value bond, so an empty list is refused as a
+    // value mismatch or as a zero stake before it is ever refused as
+    // routing. It stays because "pays nobody everything" and "pays the
+    // wrong party" are one rule about who receives the stake.
+    if !paid_solely_to(&bond.timeout_outputs, bond.parties.maker()) {
         return Err(invalid_open(
             output,
             InvalidOpenReason::WorkStakeReturnRouting,
@@ -723,9 +654,16 @@ fn check_work_profile_open(
     taker_auth: &Auth,
 ) -> KernelResult<()> {
     match terms.profile() {
-        TermsProfile::Basic | TermsProfile::StakeBond(_) => Ok(()),
-        TermsProfile::WorkStakeBond(_) => {
+        TermsProfile::Basic => Ok(()),
+        TermsProfile::WorkStakeBond(bond) => {
             check_native_open_auth(output, maker_auth, taker_auth)?;
+            check_work_bond_policy(output, bond)?;
+            // The stake is the edge's own locked value, and a zero-value
+            // object is not a stake bond. There is no second `stake`
+            // scalar to compare it against, so this is the whole rule.
+            if edge.value() == 0 {
+                return Err(invalid_open(output, InvalidOpenReason::WorkStakeValueZero));
+            }
             // The stake is the provider's alone. Any client
             // contribution would be handed to the provider by the
             // permissionless timeout an unleased bond admits.
@@ -762,34 +700,11 @@ const fn check_native_open_auth(output: EdgeId, maker: &Auth, taker: &Auth) -> K
 /// bond's complete terms, and those terms must describe the same two
 /// parties in mirrored roles over the same horizon.
 fn check_work_payment_terms(output: EdgeId, payment: &WorkPaymentTerms) -> KernelResult<()> {
-    if payment.protocol != ProtocolCode::CATENA_FRAUD_V2 {
-        return Err(invalid_open(
-            output,
-            InvalidOpenReason::WorkProtocolMismatch,
-        ));
-    }
+    // The mirrored roles and the shared horizon are derivations, not
+    // checks: `parties()` reverses the bond's and `admission_horizon()`
+    // is the bond's timeout, so there is no second spelling to disagree
+    // with. What remains is the bond's own policy and this body's.
     check_work_bond_policy(output, &payment.bond_terms)?;
-    let bond_parties = payment.bond_terms.base.parties;
-    // Opposite roles on the two edges: the client funds the payment and
-    // is the bond's beneficiary; the provider stakes the bond and earns
-    // the payment.
-    if bond_parties.maker() != payment.parties.taker()
-        || bond_parties.taker() != payment.parties.maker()
-    {
-        return Err(invalid_open(
-            output,
-            InvalidOpenReason::WorkBondPartiesMismatch,
-        ));
-    }
-    // Jobs are admitted below this horizon and disputed under the
-    // bond's. One horizon, or a job could be admitted with no live bond
-    // left to insure it.
-    if payment.admission_horizon != payment.bond_terms.base.timeout {
-        return Err(invalid_open(
-            output,
-            InvalidOpenReason::WorkAdmissionHorizonMismatch,
-        ));
-    }
     // The floor is derived, not chosen: below it the provider has no
     // measured opportunity to observe the start, sign an answer, and get
     // it included, so the omission theorem the channel is priced on does
@@ -918,7 +833,7 @@ fn apply_close<B, V>(
 ) -> KernelResult<Change>
 where
     B: Batch,
-    V: SigVerifier + SealVerifier + ?Sized,
+    V: SigVerifier + ?Sized,
 {
     check_close_outputs(input, outputs, batch)?;
 
@@ -932,9 +847,8 @@ where
     // Cheap structural checks first: output freshness and value conservation.
     // Close has no marginal monetary fee: the reserve was committed when the
     // edge opened, while `Tx::cost()` still counts close resources for block
-    // admission. Verifier comes last because real `SealVerifier` impls may
-    // resolve and check expensive ZK artifacts, and we don't want to pay for
-    // that on closes that fail trivial checks.
+    // admission. Signature verification comes last so a close that fails a
+    // trivial check never pays for it.
     let total = edge
         .closes(&coins, close_cost(outputs.len(), proof))
         .map_err(|reason| invalid_close(input, reason))?;
@@ -990,7 +904,7 @@ fn check_proof<B, V>(
 ) -> Result<StagedCloseRegistry, InvalidProofReason>
 where
     B: Batch,
-    V: SigVerifier + SealVerifier + ?Sized,
+    V: SigVerifier + ?Sized,
 {
     let work::CloseSubject {
         input,
@@ -1073,27 +987,6 @@ where
                 crate::lease::delete_mutations(context.network(), input).map(Some)
             }))
         }
-        Proof::Violation { terms, seal } => {
-            let terms_hash = terms.hash();
-            if terms_hash != edge.terms() {
-                return Err(InvalidProofReason::TermsMismatch);
-            }
-            if context.block_height() >= edge.timeout() {
-                return Err(InvalidProofReason::ProofExpired);
-            }
-            check_violation_payouts(terms, outputs)?;
-            let public = SealPublicInputs {
-                network: context.network(),
-                edge_id: input,
-                terms,
-                payouts: outputs,
-            };
-            if verifier.verify_seal(*seal, &public) {
-                Ok(NO_STAGED_REGISTRY)
-            } else {
-                Err(InvalidProofReason::BadSeal)
-            }
-        }
         // Neither work-payment exit expires at the admission horizon. That
         // horizon buys admission and rent, not a refund, and a channel
         // that stopped being settleable once it stopped admitting jobs
@@ -1117,8 +1010,8 @@ where
             batch,
         )
         .map(one_staged),
-        Proof::Adjudicated { seal } => {
-            work::check_adjudicated(close, *seal, context, batch).map(one_staged)
+        Proof::Adjudicated { contest_commitment } => {
+            work::check_adjudicated(close, *contest_commitment, context, batch).map(one_staged)
         }
     }
 }
@@ -1129,47 +1022,6 @@ const NO_STAGED_REGISTRY: StagedCloseRegistry = [None, None];
 /// Widens the one mutation a work-payment exit stages, or none.
 const fn one_staged(mutation: Option<RegistryMutation>) -> StagedCloseRegistry {
     [mutation, None]
-}
-
-/// A stake-bond violation pays out exactly `[(client, award + surplus),
-/// (treasury, stake − award)]`, where client = the bond's taker. The
-/// routing is enforced here, structurally, from the terms revealed by
-/// the proof — the seal verifier only decides whether the fraud
-/// artifact is genuine, and can never redirect the payout. Output 0's
-/// value follows from conservation (`Edge::closes` pins the total to
-/// `stake + surplus`), so checking output 1's exact value pins both.
-///
-/// Read through the shared base, so every bond profile is routed by the
-/// same rule. A profile that reached this check as "not a bond" would
-/// hand the seal verifier the power to choose the payout.
-///
-/// A shape with no bond — `Basic` terms — returns early, and that is
-/// not a hole: it has no protocol-specific payout structure to pin, and
-/// its payouts still enter [`SealPublicInputs`], so the seal has to
-/// verify over the exact split it is spent with. Arbitrary payouts there
-/// cost a forged seal, and against a forged seal a structural rule is
-/// not what was protecting the edge. What the routing above adds for a
-/// bond is defence in depth over that same binding, which is the reason
-/// [`StakeBondTerms`] states the slash split as its own invariant.
-fn check_violation_payouts(terms: &Terms, outputs: &Payouts) -> Result<(), InvalidProofReason> {
-    let Some(bond) = terms.stake_bond_base().map(StakeBondBaseRef::base) else {
-        return Ok(());
-    };
-    let [client, treasury] = outputs.as_slice() else {
-        return Err(InvalidProofReason::PayoutMismatch);
-    };
-    // Open-time checks guarantee award ≤ stake; a violated subtraction
-    // here means the terms did not pass this kernel's open path.
-    let Some(remainder) = bond.stake.checked_sub(bond.award) else {
-        return Err(InvalidProofReason::PayoutMismatch);
-    };
-    if client.owner() != bond.parties.taker()
-        || treasury.owner() != bond.treasury
-        || treasury.value() != remainder
-    {
-        return Err(InvalidProofReason::PayoutMismatch);
-    }
-    Ok(())
 }
 
 fn open_inputs(funding: &Funding) -> List<CoinId, MAX_EDGE_INPUTS> {
@@ -1266,11 +1118,6 @@ mod tests {
                 false,
             ),
             (
-                CloseKindSet::STAKE_BOND,
-                kind_close_cost(MAX_EDGE_OUTPUTS, CloseKind::Mutual),
-                false,
-            ),
-            (
                 CloseKindSet::WORK_STAKE_BOND,
                 open_reserve_cost(&work_bond_terms()),
                 true,
@@ -1302,12 +1149,11 @@ mod tests {
         }
     }
 
-    /// The legacy reserve is unchanged by the profile split: every shape
-    /// that was priced by the generic maximum still is. The two work
-    /// profiles each reserve their own — the payment its fixed
-    /// four-slot exits, the bond its lease-reading timeout.
+    /// Basic keeps the generic maximum. The two work profiles each
+    /// reserve their own — the payment its fixed four-slot exits, the
+    /// bond its lease-reading timeout.
     #[test]
-    fn legacy_profiles_keep_the_generic_reserve() {
+    fn each_profile_reserves_its_own_worst_close() {
         let generic = kind_close_cost(MAX_EDGE_OUTPUTS, CloseKind::Mutual);
         assert_eq!(generic, Cost::new(1, 5, 2));
         assert_eq!(open_reserve_cost(&work_bond_terms()), Cost::new(1, 7, 2));
@@ -1319,24 +1165,13 @@ mod tests {
     /// the profile's, not this bond's.
     fn work_bond_terms() -> Terms {
         Terms::work_stake_bond(WorkStakeBondTerms {
-            base: StakeBondTerms {
-                protocol: ProtocolCode::CATENA_FRAUD_V2,
-                parties: crate::object::Parties::new(
-                    Key::from_bytes([1; Key::LENGTH]),
-                    Key::from_bytes([2; Key::LENGTH]),
-                ),
-                timeout: crate::context::BlockHeight::new(10),
-                timeout_outputs: List::take([Payout::default(); MAX_EDGE_OUTPUTS], 0),
-                treasury: Key::from_bytes([3; Key::LENGTH]),
-                award: 1,
-                stake: 1,
-                max_job_price: 1,
-                max_dispute_cost: 0,
-                challenge_margin: 1,
-            },
-            max_challenge_bond: 1,
-            move_timeout: 1,
-            game_protocol: ProtocolCode::CATENA_FRAUD_V2.get(),
+            parties: crate::object::Parties::new(
+                Key::from_bytes([1; Key::LENGTH]),
+                Key::from_bytes([2; Key::LENGTH]),
+            ),
+            timeout: crate::context::BlockHeight::new(10),
+            timeout_outputs: List::take([Payout::default(); MAX_EDGE_OUTPUTS], 0),
+            max_job_price: 1,
         })
     }
 }

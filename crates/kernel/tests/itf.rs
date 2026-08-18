@@ -38,12 +38,12 @@ use support::{
         CoinTag, EdgeTag, Event, Input, State, context_for_height, edge_key, op_for, party_key,
         rejected_op_for,
     },
-    itf_l1_fees as fee_itf, itf_l1_stake as stake_itf,
+    itf_l1_fees as fee_itf,
     l1::{
         MAKER, MAKER_ID, TAKER, TAKER_ID, TraceState, TraceView, edge_id, edge_value,
         initial_state, maker_out, taker_out,
     },
-    l1_fees as fee_model, l1_stake as stake_model,
+    l1_fees as fee_model,
 };
 
 use hellas_kernel::{ApplyOutcome, EventKind, Fees, View};
@@ -460,7 +460,6 @@ fn check_fee_close_outcome(
         fee_itf::CloseOutcomeTag::NoClose => None,
         fee_itf::CloseOutcomeTag::ClosedMutual => Some(fee_model::ProofKey::Mutual),
         fee_itf::CloseOutcomeTag::ClosedTimeout => Some(fee_model::ProofKey::Timeout),
-        fee_itf::CloseOutcomeTag::ClosedViolation => Some(fee_model::ProofKey::Violation),
     };
     if applied != want {
         return Err(format!(
@@ -746,248 +745,17 @@ fn expected_nonnegative(name: &str, value: Option<i64>) -> Result<u64, String> {
 // -- Test entry: discover and replay every committed fixture ----------------
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-// -- l1_stake runner --------------------------------------------------------
-
-struct L1StakeRunner;
-
-/// Maps an abstract coin tag to the concrete payout id the kernel
-/// derives for it. Violation pays (client, treasury) at indices 0/1;
-/// timeout pays the provider at index 0.
-fn stake_coin_id(tag: stake_itf::CoinTag) -> hellas_kernel::CoinId {
-    use hellas_kernel::Payout;
-    let edge = stake_model::edge_id(stake_model::Variant::Valid);
-    match tag {
-        stake_itf::CoinTag::ProviderCoin => stake_model::PROVIDER_COIN,
-        stake_itf::CoinTag::ClientAward => Payout::new(stake_model::CLIENT, 0).id(edge, 0),
-        stake_itf::CoinTag::TreasuryRemainder => Payout::new(stake_model::TREASURY, 0).id(edge, 1),
-        stake_itf::CoinTag::ProviderReturn => Payout::new(stake_model::PROVIDER, 0).id(edge, 0),
-    }
-}
-
-fn stake_close_tx(payouts: stake_itf::ClosePayouts) -> hellas_kernel::Tx {
-    let first = u64::try_from(payouts.first).unwrap_or(0);
-    let second = u64::try_from(payouts.second).unwrap_or(0);
-    match payouts.proof.to_model() {
-        stake_model::ProofKey::Violation => stake_model::close_violation(first, second),
-        stake_model::ProofKey::Timeout => stake_model::close_timeout(first),
-        // A genuinely dual-signed mutual close: the committed
-        // close-kind set must refuse it regardless.
-        stake_model::ProofKey::Mutual => stake_model::close_mutual(first, second),
-    }
-}
-
-impl ItfRunner for L1StakeRunner {
-    type ActualState = stake_model::TraceState;
-    type ExpectedState = stake_itf::State;
-    type Result = Option<EventKind>;
-    type Error = String;
-
-    fn init(&mut self, _expected: &Self::ExpectedState) -> Result<Self::ActualState, Self::Error> {
-        Ok(stake_model::initial_state())
-    }
-
-    fn step(
-        &mut self,
-        actual: &mut Self::ActualState,
-        expected: &Self::ExpectedState,
-    ) -> Result<Self::Result, Self::Error> {
-        let context = stake_model::context(expected.height);
-        match expected.last_input {
-            stake_itf::Input::NoInput | stake_itf::Input::TickInput => Ok(None),
-            stake_itf::Input::OpenInput(variant) => {
-                let op = stake_model::open(variant.to_model());
-                let outcome = actual
-                    .apply(context, &FAKE_VERIFIER, &op)
-                    .map_err(|err| format!("kernel rejected l1_stake open {variant:?}: {err:?}"))?;
-                Ok(event_kind(&outcome))
-            }
-            stake_itf::Input::CloseInput(payouts) => {
-                let op = stake_close_tx(payouts);
-                let outcome = actual.apply(context, &FAKE_VERIFIER, &op).map_err(|err| {
-                    format!("kernel rejected l1_stake close {payouts:?}: {err:?}")
-                })?;
-                Ok(event_kind(&outcome))
-            }
-            // The model refused these; the kernel must too, leaving the
-            // store untouched.
-            //
-            // Reason-blind by construction: the fixture format records
-            // no rejection reason, so ANY `ApplyError` satisfies this.
-            // A regression that rejected every bond open for one wrong
-            // reason would keep all seven malformed-open fixtures green.
-            // The exact `InvalidOpenReason` per malformed variant is
-            // pinned by `tests/channel/bond.rs` instead; this replay
-            // pins only that acceptance/rejection agrees with the model
-            // and that a refusal is atomic.
-            stake_itf::Input::RejectedOpenInput(variant) => {
-                let before = *actual.store();
-                let op = stake_model::open(variant.to_model());
-                if actual.apply(context, &FAKE_VERIFIER, &op).is_ok() {
-                    return Err(format!(
-                        "kernel accepted l1_stake open {variant:?} that the model refused"
-                    ));
-                }
-                if *actual.store() != before {
-                    return Err(format!(
-                        "rejected l1_stake open {variant:?} mutated the store"
-                    ));
-                }
-                Ok(None)
-            }
-            stake_itf::Input::RejectedCloseInput(payouts) => {
-                let before = *actual.store();
-                let op = stake_close_tx(payouts);
-                if actual.apply(context, &FAKE_VERIFIER, &op).is_ok() {
-                    return Err(format!(
-                        "kernel accepted l1_stake close {payouts:?} that the model refused"
-                    ));
-                }
-                if *actual.store() != before {
-                    return Err(format!(
-                        "rejected l1_stake close {payouts:?} mutated the store"
-                    ));
-                }
-                Ok(None)
-            }
-        }
-    }
-
-    fn result_invariant(
-        &self,
-        actual: &Self::Result,
-        expected: &Self::ExpectedState,
-    ) -> Result<bool, Self::Error> {
-        let edge = stake_model::edge_id(stake_model::Variant::Valid);
-        match (actual, expected.last_event) {
-            (None, stake_itf::Event::NoEvent) => Ok(true),
-            (Some(EventKind::EdgeOpened { output, .. }), stake_itf::Event::EdgeOpenedEvent) => {
-                if *output == edge {
-                    Ok(true)
-                } else {
-                    Err(format!(
-                        "expected l1_stake EdgeOpened {edge:?}, got {output:?}"
-                    ))
-                }
-            }
-            (Some(EventKind::EdgeClosed { input, .. }), stake_itf::Event::EdgeClosedEvent) => {
-                if *input == edge {
-                    Ok(true)
-                } else {
-                    Err(format!(
-                        "expected l1_stake EdgeClosed {edge:?}, got {input:?}"
-                    ))
-                }
-            }
-            (actual, expected_event) => Err(format!(
-                "actual l1_stake event {actual:?} does not match expected {expected_event:?}",
-            )),
-        }
-    }
-
-    fn state_invariant(
-        &self,
-        actual: &Self::ActualState,
-        expected: &Self::ExpectedState,
-    ) -> Result<bool, Self::Error> {
-        let view: stake_model::TraceView = actual.view();
-        let edge = stake_model::edge_id(stake_model::Variant::Valid);
-
-        // bondLive / bondValue against the live kernel edge.
-        match (view.edge(edge), expected.bond_live) {
-            (Some(live), true) => {
-                let want = u64::try_from(expected.bond_value).unwrap_or(0);
-                if live.value() != want {
-                    return Err(format!(
-                        "l1_stake bond value: kernel {}, model {want}",
-                        live.value(),
-                    ));
-                }
-            }
-            (None, false) => {}
-            (live, model_live) => {
-                return Err(format!(
-                    "l1_stake bond liveness: kernel {:?}, model {model_live}",
-                    live.is_some(),
-                ));
-            }
-        }
-
-        // Every modelled coin, live or dead, matches the kernel.
-        for tag in [
-            stake_itf::CoinTag::ProviderCoin,
-            stake_itf::CoinTag::ClientAward,
-            stake_itf::CoinTag::TreasuryRemainder,
-            stake_itf::CoinTag::ProviderReturn,
-        ] {
-            let want = expected.coins.get(&tag).copied().unwrap_or(0);
-            let want = u64::try_from(want).unwrap_or(0);
-            let live = expected.live_coins.contains(&tag);
-            match view.coin(stake_coin_id(tag)) {
-                Some(coin) if live => {
-                    if coin.value() != want {
-                        return Err(format!(
-                            "l1_stake coin {tag:?}: kernel {}, model {want}",
-                            coin.value(),
-                        ));
-                    }
-                }
-                None if !live => {}
-                other => {
-                    return Err(format!(
-                        "l1_stake coin {tag:?} liveness: kernel {:?}, model {live}",
-                        other.is_some(),
-                    ));
-                }
-            }
-        }
-
-        // A closed bond must be gone from the kernel too.
-        let closed = matches!(
-            expected.close_outcome,
-            stake_itf::CloseOutcomeTag::ClosedViolation | stake_itf::CloseOutcomeTag::ClosedTimeout
-        );
-        if closed && view.edge(edge).is_some() {
-            return Err("l1_stake closed bond is still live in the kernel".to_string());
-        }
-        // The committed terms correspondence. This must compare against
-        // the KERNEL's terms hash: an earlier version asserted only
-        // `expected.bond_terms != Valid`, which restated the Quint
-        // invariant `liveBondIsWellFormed` against itself and could
-        // never fail — the exact false correspondence this suite exists
-        // to prevent.
-        if expected.bond_live {
-            let want = stake_model::terms_for(expected.bond_terms.to_model()).hash();
-            let live = view
-                .edge(edge)
-                .ok_or_else(|| "l1_stake model says bond live, kernel has none".to_string())?;
-            if live.terms() != want {
-                return Err(format!(
-                    "l1_stake kernel terms {:?} do not match committed {:?}",
-                    live.terms(),
-                    expected.bond_terms,
-                ));
-            }
-        }
-        check_no_registry_state(&view)?;
-
-        Ok(true)
-    }
-}
-
 enum FixtureKind {
     L1,
     L1Fees,
-    L1Stake,
 }
 
 impl FixtureKind {
     fn from_name(name: &str) -> Option<Self> {
-        // Longest prefix first: `l1_stake_` and `l1_fees_` both start
-        // with `l1_`, so the bare-L1 arm must come last.
+        // Longest prefix first: `l1_fees_` also starts with `l1_`, so
+        // the bare-L1 arm must come last.
         if name.starts_with("l1_fees_") {
             Some(Self::L1Fees)
-        } else if name.starts_with("l1_stake_") {
-            Some(Self::L1Stake)
         } else if name.starts_with("l1_") {
             Some(Self::L1)
         } else {
@@ -1041,13 +809,6 @@ fn replays_all_itf_fixtures() {
                     .unwrap_or_else(|err| panic!("invalid ITF fixture {name}: {err}"));
                 trace
                     .run_on(L1FeesRunner::default())
-                    .unwrap_or_else(|err| panic!("fixture {name} replay failed: {err:?}"));
-            }
-            FixtureKind::L1Stake => {
-                let trace: itf::Trace<stake_itf::State> = itf::trace_from_str(&json)
-                    .unwrap_or_else(|err| panic!("invalid ITF fixture {name}: {err}"));
-                trace
-                    .run_on(L1StakeRunner)
                     .unwrap_or_else(|err| panic!("fixture {name} replay failed: {err:?}"));
             }
         }

@@ -21,28 +21,18 @@ fn operations_report_deterministic_cost() {
     );
     assert_eq!(proof().kind(), CloseKind::Timeout);
     assert_eq!(Proof::timeout(basic_terms()).cost(), Cost::new(0, 0, 1));
-    assert_eq!(
-        violation_proof(edge(), &close_outputs).cost(),
-        Cost::new(0, 0, 1),
-    );
-    assert_eq!(
-        violation_proof(edge(), &close_outputs).kind(),
-        CloseKind::Violation,
-    );
 }
 
 #[test]
 fn open_reserves_worst_case_close_cost() {
     let outputs = payouts4();
-    // `Mutual` charges 2 proof units (two signatures); `Violation`/`Timeout`
-    // charge 1. The reserved worst case is Mutual at MAX_EDGE_OUTPUTS payouts.
+    // `Mutual` charges 2 proof units (two signatures); `Timeout` charges
+    // 1. The reserved worst case is Mutual at MAX_EDGE_OUTPUTS payouts.
     let mutual = Tx::close(edge(), mutual_proof(edge(), &outputs), outputs.clone());
-    let violation = Tx::close(edge(), violation_proof(edge(), &outputs), outputs);
-    let expected_mutual = Cost::new(1, 5, 2);
-    let expected_violation = Cost::new(1, 5, 1);
+    let timeout = Tx::close(edge(), proof(), outputs);
 
-    assert_eq!(mutual.cost(), expected_mutual);
-    assert_eq!(violation.cost(), expected_violation);
+    assert_eq!(mutual.cost(), Cost::new(1, 5, 2));
+    assert_eq!(timeout.cost(), Cost::new(1, 5, 1));
 }
 
 #[test]

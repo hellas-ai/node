@@ -9,7 +9,6 @@ let
   modelTestModules = [
     "l1.qnt"
     "l1_fees.qnt"
-    "l1_stake.qnt"
     "lifetime.qnt"
     "proof_lifetime.qnt"
   ];
@@ -63,23 +62,6 @@ let
         "fundingAuthorized"
         "expiredLiveHasTimeoutPath"
         "nonTimeoutProofsExpire"
-      ];
-    }
-    {
-      model = "l1_stake.qnt";
-      maxSamples = 1000;
-      maxSteps = 8;
-      invariants = [
-        "valueConserved"
-        "noNegativeValue"
-        "liveCoinsAreKnown"
-        "deadSlotsAreZero"
-        "liveBondIsWellFormed"
-        "liveBondHoldsCommittedStake"
-        "slashRoutingPinned"
-        "timeoutReturnsStakeOnly"
-        "timeoutOnlyAfterCommittedHeight"
-        "heightAtLeastGenesis"
       ];
     }
     {
@@ -181,20 +163,6 @@ let
       ];
     }
     {
-      model = "l1_stake.qnt";
-      maxSteps = 5;
-      invariants = [
-        "valueConserved"
-        "noNegativeValue"
-        "deadSlotsAreZero"
-        "liveBondIsWellFormed"
-        "liveBondHoldsCommittedStake"
-        "slashRoutingPinned"
-        "timeoutReturnsStakeOnly"
-        "timeoutOnlyAfterCommittedHeight"
-      ];
-    }
-    {
       model = "lifetime.qnt";
       invariants = [
         "valueAccounted"
@@ -263,7 +231,6 @@ let
     mkdir -p models/traces
     quint test models/l1.qnt --out-itf 'models/traces/l1_{test}.itf.json' --verbosity=0
     quint test models/l1_fees.qnt --out-itf 'models/traces/l1_fees_{test}.itf.json' --verbosity=0
-    quint test models/l1_stake.qnt --out-itf 'models/traces/l1_stake_{test}.itf.json' --verbosity=0
   '';
 
   modelRuntimePackages = with pkgs; [
@@ -362,7 +329,7 @@ let
 
   kernelFixtureFreshness = mkModelApp {
     name = "hellas-kernel-fixture-freshness";
-    command = freshnessCommand "kernel" [ "l1" "l1_fees" "l1_stake" ];
+    command = freshnessCommand "kernel" [ "l1" "l1_fees" ];
   };
 
   modelFixtures = mkModelApp {

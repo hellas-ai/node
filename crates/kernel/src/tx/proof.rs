@@ -1,9 +1,10 @@
 //! Close witnesses.
 //!
 //! A [`Proof`] is the kernel-visible *shape* of why an edge should
-//! close. Each variant maps to exactly one validation kind: `Mutual` →
-//! [`crate::SigVerifier`] (one [`Auth`] witness per party), `Timeout` →
-//! kernel inline structural check, `Violation` → [`crate::SealVerifier`].
+//! close. Each variant maps to exactly one validation kind: `Mutual` and
+//! `Freeze` → [`crate::SigVerifier`], `Timeout` and `Adjudicated` →
+//! kernel inline structural checks against committed terms and staged
+//! registry state. No close consults an external verifier.
 //!
 //! Abstract counterpart: `models/types.qnt::Proof` (witness ADT) and
 //! `models/verifier.qnt` (`proofOk`, `payoutsBound`). The Quint module
@@ -11,25 +12,24 @@
 //! defers the same checks by routing each variant to the matching
 //! verifier impl (or to its own inline check for Timeout).
 
-#[cfg(any(test, feature = "placeholders"))]
-use crate::primitive::{PayloadHash, ProtocolCode};
 use crate::{
     canonical::{
         Decode, DecodeError, ENVELOPE_SIZE, Encode, Writer, decode_envelope, decode_field,
         encode_envelope, tag,
     },
-    consts::SEAL_LENGTH,
+    consts::HASH_LENGTH,
     context::Cost,
     primitive::Sig,
     terms::Terms,
     tx::Auth,
 };
-#[cfg(any(test, feature = "placeholders"))]
-use hellas_xet::SingleChunkHasher;
 
+// Tag numbers are fixed consensus assignments, not positions. 2 and 5
+// were the external-violation and work-stake-mutual closes; both are
+// deleted, and both bytes are ordinary rejections with no promise
+// attached.
 const MUTUAL_TAG: u8 = 0;
 const TIMEOUT_TAG: u8 = 1;
-const VIOLATION_TAG: u8 = 2;
 const FREEZE_TAG: u8 = 3;
 const ADJUDICATED_TAG: u8 = 4;
 
@@ -46,9 +46,6 @@ pub enum CloseKind {
     /// Timeout close under the committed terms.
     Timeout,
 
-    /// Correctness violation resolved by a protocol-specific seal.
-    Violation,
-
     /// Cooperative close of a work-payment channel at a jointly signed
     /// settlement amount.
     Freeze,
@@ -56,55 +53,29 @@ pub enum CloseKind {
     /// Unilateral close of a work-payment channel decided by the staged
     /// close contest rather than by a fresh bilateral signature.
     Adjudicated,
-
-    /// Cooperative release of a work-stake bond. Kept distinct from
-    /// [`Self::Mutual`] so a bond can admit a negotiated release
-    /// without admitting the cooperative close its slashing rule
-    /// forbids.
-    ///
-    /// **No [`Proof`] variant produces this kind yet, deliberately.**
-    /// The design's build order lands `WorkStakeMutual` with the leased
-    /// bond lifecycle (§10.7 step 6), after the payment slice; the
-    /// consensus tag and the set membership are assigned here because
-    /// they are wire numbers, and assigning them late would renumber
-    /// the close-kind bits. Until that step the member is unreachable:
-    /// a close names its kind through the proof it carries, and no
-    /// proof carries this one. Nothing depends on it being absent —
-    /// a tag-4 bond's exits meanwhile are its immediate unleased
-    /// `Timeout` and its horizon `Timeout`, both of which are live.
-    WorkStakeMutual,
 }
 
 impl CloseKind {
     /// Every close kind. [`CloseKindSet`] members and the resource
     /// bounds that must hold for *every* close path enumerate this, so
     /// a kind that is absent here is a kind nothing checks.
-    pub const ALL: [Self; 6] = [
-        Self::Mutual,
-        Self::Timeout,
-        Self::Violation,
-        Self::Freeze,
-        Self::Adjudicated,
-        Self::WorkStakeMutual,
-    ];
+    pub const ALL: [Self; 4] = [Self::Mutual, Self::Timeout, Self::Freeze, Self::Adjudicated];
 
     /// Returns the canonical one-byte close witness tag.
     #[must_use]
     pub const fn tag(self) -> u8 {
         match self {
-            Self::Mutual => 0,
-            Self::Timeout => 1,
-            Self::Violation => 2,
-            Self::Freeze => 3,
-            Self::Adjudicated => 4,
-            Self::WorkStakeMutual => 5,
+            Self::Mutual => MUTUAL_TAG,
+            Self::Timeout => TIMEOUT_TAG,
+            Self::Freeze => FREEZE_TAG,
+            Self::Adjudicated => ADJUDICATED_TAG,
         }
     }
 
     pub(crate) const fn proofs(self) -> u64 {
         match self {
-            Self::Timeout | Self::Violation | Self::Adjudicated => 1,
-            Self::Mutual | Self::Freeze | Self::WorkStakeMutual => 2,
+            Self::Timeout | Self::Adjudicated => 1,
+            Self::Mutual | Self::Freeze => 2,
         }
     }
 
@@ -125,21 +96,15 @@ impl CloseKind {
 pub struct CloseKindSet(u8);
 
 impl CloseKindSet {
-    /// Basic terms: cooperative, timeout, or violation close.
+    /// Basic terms: cooperative or timeout close.
     pub(crate) const BASIC: Self = Self::empty()
         .with(CloseKind::Mutual)
-        .with(CloseKind::Timeout)
-        .with(CloseKind::Violation);
+        .with(CloseKind::Timeout);
 
-    /// Legacy stake bond: no cooperative exit, so the provider cannot
-    /// co-sign its way out from under a pending fraud proof.
-    pub(crate) const STAKE_BOND: Self = Self::empty()
-        .with(CloseKind::Timeout)
-        .with(CloseKind::Violation);
-
-    /// Work-stake bond: the legacy bond set plus its own cooperative
-    /// release, which is gated on there being no live dispute.
-    pub(crate) const WORK_STAKE_BOND: Self = Self::STAKE_BOND.with(CloseKind::WorkStakeMutual);
+    /// Work-stake bond: `Timeout` alone. There is no cooperative exit,
+    /// so the provider cannot co-sign its way out from under a lease,
+    /// and no terminal bond proof exists to admit anything else.
+    pub(crate) const WORK_STAKE_BOND: Self = Self::empty().with(CloseKind::Timeout);
 
     /// Work payment: cooperative `Freeze` or contested `Adjudicated`.
     /// Deliberately no `Timeout` — see the decoder below.
@@ -150,19 +115,8 @@ impl CloseKindSet {
     /// The exact sets an edge may carry, one per terms shape.
     ///
     /// One per shape and no more, so this table is exactly what
-    /// [`crate::Terms::allowed_closes`] can return. The correctness
-    /// game's set — empty, because a game edge is settled by its own
-    /// terminal move rather than by a `Proof` — is deliberately *not*
-    /// here: terms tag 3 is reserved and no `TermsBody` yields it, so
-    /// admitting the pattern would be a permission only corrupt state
-    /// could use. It goes back in with the game slice (§10.7), as one
-    /// entry here and one arm in the destructuring below.
-    const PERMITTED: [Self; 4] = [
-        Self::BASIC,
-        Self::STAKE_BOND,
-        Self::WORK_STAKE_BOND,
-        Self::WORK_PAYMENT,
-    ];
+    /// [`crate::Terms::allowed_closes`] can return.
+    const PERMITTED: [Self; 3] = [Self::BASIC, Self::WORK_STAKE_BOND, Self::WORK_PAYMENT];
 }
 
 /// A response reveals no terms, so [`crate::tx::work::apply_response`]
@@ -172,14 +126,13 @@ impl CloseKindSet {
 /// close would otherwise make responses legal on an edge that is not a
 /// payment channel, silently and with no test to notice.
 ///
-/// The destructuring is the load-bearing part: a fifth permitted set
+/// The destructuring is the load-bearing part: a fourth permitted set
 /// stops compiling here, which is the point at which someone has to
 /// decide what it means rather than discover it later.
 const _: () = {
-    let [basic, stake_bond, work_stake_bond, work_payment] = CloseKindSet::PERMITTED;
+    let [basic, work_stake_bond, work_payment] = CloseKindSet::PERMITTED;
     assert!(
         !basic.contains(CloseKind::Adjudicated)
-            && !stake_bond.contains(CloseKind::Adjudicated)
             && !work_stake_bond.contains(CloseKind::Adjudicated),
         "only a work-payment edge may commit an adjudicated close",
     );
@@ -241,72 +194,57 @@ impl Decode for CloseKindSet {
     }
 }
 
-/// Compact mode-specific proof result for a violation outcome.
+/// Commitment to the staged close contest an adjudicated close settles.
 ///
-/// Opaque to the kernel. The seal's bytes encode whatever artifact the
-/// protocol-specific dispute game produces — a TEE attestation, a ZK
-/// proof commitment, a fraud-game commitment — and the wired
-/// [`crate::SealVerifier`] alone decides whether it is admissible.
+/// Not a verifier input and not a capability: the kernel recomputes
+/// these bytes from the edge and the live pending record and compares
+/// them. It is carried so the transaction names exactly the contest
+/// state it expects to settle, and a submitter racing a response
+/// cannot pay out the wrong one.
+///
+/// Encoded as its raw bytes. There is no standalone envelope, because
+/// the value never appears outside the one proof body that carries it.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
-pub struct Seal([u8; Self::LENGTH]);
+pub struct PaymentContestCommitment([u8; Self::LENGTH]);
 
-impl Seal {
-    /// Encoded length of a compact dispute seal.
-    pub const LENGTH: usize = SEAL_LENGTH;
+impl PaymentContestCommitment {
+    /// Encoded length of a contest commitment.
+    pub const LENGTH: usize = HASH_LENGTH;
 
-    /// Creates a dispute seal from its fixed-width payload bytes.
+    /// Creates a contest commitment from its bytes.
     #[must_use]
     pub const fn from_bytes(bytes: [u8; Self::LENGTH]) -> Self {
         Self(bytes)
     }
 
-    /// Returns the fixed-width payload bytes, without the codec envelope.
+    /// Returns the commitment bytes.
     #[must_use]
     pub const fn to_bytes(self) -> [u8; Self::LENGTH] {
         self.0
     }
 
-    /// Borrows the fixed-width payload bytes, without the codec envelope.
+    /// Borrows the commitment bytes.
     #[must_use]
     pub const fn as_bytes(&self) -> &[u8; Self::LENGTH] {
         &self.0
     }
-
-    /// Creates a deterministic dispute seal placeholder for modelling.
-    ///
-    /// This is forgeable and not a cryptographic proof. Whether the kernel
-    /// accepts this shape is decided by the [`crate::SealVerifier`] passed
-    /// at apply time. Gated behind the `placeholders` feature so production
-    /// builds cannot construct one.
-    #[cfg(any(test, feature = "placeholders"))]
-    #[must_use]
-    pub fn placeholder(protocol: ProtocolCode, kind: CloseKind, hash: PayloadHash) -> Self {
-        let mut hasher = SingleChunkHasher::new();
-        hasher.update(crate::consts::SEAL_PLACEHOLDER);
-        protocol.encode_to(&mut hasher);
-        kind.tag().encode_to(&mut hasher);
-        hash.encode_to(&mut hasher);
-        Self(hasher.finalize().into_bytes())
-    }
 }
 
-impl Encode for Seal {
-    const MAX_ENCODED_SIZE: usize =
-        ENVELOPE_SIZE + <[u8; Self::LENGTH] as Encode>::MAX_ENCODED_SIZE;
+impl Encode for PaymentContestCommitment {
+    const MAX_ENCODED_SIZE: usize = <[u8; Self::LENGTH] as Encode>::MAX_ENCODED_SIZE;
 
     fn encoded_size(&self) -> usize {
         Self::MAX_ENCODED_SIZE
     }
 
     fn encode_to<W: Writer + ?Sized>(&self, writer: &mut W) {
-        encode_envelope(writer, tag::SEAL);
         self.0.encode_to(writer);
     }
 }
 
-impl Decode for Seal {
+impl Decode for PaymentContestCommitment {
     fn decode(buf: &[u8]) -> Result<(Self, usize), DecodeError> {
-        let mut consumed = decode_envelope(buf, tag::SEAL)?;
+        let mut consumed = 0;
         let bytes = decode_field(buf, &mut consumed)?;
         Ok((Self::from_bytes(bytes), consumed))
     }
@@ -314,9 +252,9 @@ impl Decode for Seal {
 
 /// Bounded close witness.
 ///
-/// Each variant maps to one validator: `Mutual` is checked by
-/// [`crate::SigVerifier`], `Timeout` is checked structurally inside the
-/// kernel, `Violation` is checked by [`crate::SealVerifier`].
+/// Each variant maps to one check: `Mutual` and `Freeze` are checked by
+/// [`crate::SigVerifier`]; `Timeout` and `Adjudicated` are checked
+/// structurally inside the kernel.
 #[allow(
     clippy::large_enum_variant,
     reason = "Mutual auth is stored inline so the no-alloc kernel can verify WebAuthn bytes directly"
@@ -338,14 +276,6 @@ pub enum Proof {
     Timeout {
         /// Concrete terms revealed to check the timeout.
         terms: Terms,
-    },
-
-    /// Correctness violation witness resolved by a mode-specific seal.
-    Violation {
-        /// Concrete terms revealed to select the mode verifier.
-        terms: Terms,
-        /// Compact mode-specific verifier result.
-        seal: Seal,
     },
 
     /// Cooperative close of a work-payment channel at a jointly signed
@@ -372,15 +302,12 @@ pub enum Proof {
     /// Unilateral close of a work-payment channel at the amount its
     /// staged close contest ended on.
     ///
-    /// The seal is not verified by a [`crate::SealVerifier`]: the kernel
-    /// recomputes it from the edge and the live pending record and
-    /// compares bytes. It carries no information the chain does not
-    /// already hold — it is there so the transaction names exactly the
-    /// contest state it expects to settle, and a submitter racing a
-    /// response cannot pay out the wrong one.
+    /// The commitment is not verified by any external verifier: the
+    /// kernel recomputes it from the edge and the live pending record
+    /// and compares bytes.
     Adjudicated {
         /// Commitment to the contest state this close settles.
-        seal: Seal,
+        contest_commitment: PaymentContestCommitment,
     },
 }
 
@@ -395,12 +322,6 @@ impl Proof {
     #[must_use]
     pub const fn timeout(terms: Terms) -> Self {
         Self::Timeout { terms }
-    }
-
-    /// Creates a correctness-violation close witness.
-    #[must_use]
-    pub const fn violation(terms: Terms, seal: Seal) -> Self {
-        Self::Violation { terms, seal }
     }
 
     /// Creates a cooperative work-payment freeze witness.
@@ -418,8 +339,8 @@ impl Proof {
 
     /// Creates an adjudicated work-payment close witness.
     #[must_use]
-    pub const fn adjudicated(seal: Seal) -> Self {
-        Self::Adjudicated { seal }
+    pub const fn adjudicated(contest_commitment: PaymentContestCommitment) -> Self {
+        Self::Adjudicated { contest_commitment }
     }
 
     /// Returns the close witness kind.
@@ -428,7 +349,6 @@ impl Proof {
         match self {
             Self::Mutual { .. } => CloseKind::Mutual,
             Self::Timeout { .. } => CloseKind::Timeout,
-            Self::Violation { .. } => CloseKind::Violation,
             Self::Freeze { .. } => CloseKind::Freeze,
             Self::Adjudicated { .. } => CloseKind::Adjudicated,
         }
@@ -444,15 +364,14 @@ impl Proof {
 /// Body bytes of the widest [`Proof`] variant.
 const MAX_PROOF_BODY: usize = {
     let mut max = 2 * Auth::MAX_ENCODED_SIZE;
-    let violation = Terms::MAX_ENCODED_SIZE + Seal::MAX_ENCODED_SIZE;
-    if violation > max {
-        max = violation;
+    if Terms::MAX_ENCODED_SIZE > max {
+        max = Terms::MAX_ENCODED_SIZE;
     }
     if FREEZE_BODY_SIZE > max {
         max = FREEZE_BODY_SIZE;
     }
-    if Seal::MAX_ENCODED_SIZE > max {
-        max = Seal::MAX_ENCODED_SIZE;
+    if PaymentContestCommitment::MAX_ENCODED_SIZE > max {
+        max = PaymentContestCommitment::MAX_ENCODED_SIZE;
     }
     max
 };
@@ -468,9 +387,8 @@ impl Encode for Proof {
             + match self {
                 Self::Mutual { maker, taker } => maker.encoded_size() + taker.encoded_size(),
                 Self::Timeout { terms } => terms.encoded_size(),
-                Self::Violation { terms, seal } => terms.encoded_size() + seal.encoded_size(),
                 Self::Freeze { .. } => FREEZE_BODY_SIZE,
-                Self::Adjudicated { seal } => seal.encoded_size(),
+                Self::Adjudicated { contest_commitment } => contest_commitment.encoded_size(),
             }
     }
 
@@ -486,11 +404,6 @@ impl Encode for Proof {
                 TIMEOUT_TAG.encode_to(writer);
                 terms.encode_to(writer);
             }
-            Self::Violation { terms, seal } => {
-                VIOLATION_TAG.encode_to(writer);
-                terms.encode_to(writer);
-                seal.encode_to(writer);
-            }
             Self::Freeze {
                 earned,
                 valid_from_height,
@@ -505,9 +418,9 @@ impl Encode for Proof {
                 maker.encode_to(writer);
                 taker.encode_to(writer);
             }
-            Self::Adjudicated { seal } => {
+            Self::Adjudicated { contest_commitment } => {
                 ADJUDICATED_TAG.encode_to(writer);
-                seal.encode_to(writer);
+                contest_commitment.encode_to(writer);
             }
         }
     }
@@ -527,11 +440,6 @@ impl Decode for Proof {
                 let terms = decode_field(buf, &mut consumed)?;
                 Ok((Self::timeout(terms), consumed))
             }
-            VIOLATION_TAG => {
-                let terms = decode_field(buf, &mut consumed)?;
-                let seal = decode_field(buf, &mut consumed)?;
-                Ok((Self::violation(terms, seal), consumed))
-            }
             FREEZE_TAG => {
                 let earned = decode_field(buf, &mut consumed)?;
                 let valid_from_height = decode_field(buf, &mut consumed)?;
@@ -549,8 +457,8 @@ impl Decode for Proof {
                 ))
             }
             ADJUDICATED_TAG => {
-                let seal = decode_field(buf, &mut consumed)?;
-                Ok((Self::adjudicated(seal), consumed))
+                let contest_commitment = decode_field(buf, &mut consumed)?;
+                Ok((Self::adjudicated(contest_commitment), consumed))
             }
             tag => Err(DecodeError::InvalidTag { tag }),
         }
@@ -564,26 +472,30 @@ mod tests {
 
     /// Consensus assignments. A close kind's tag is its `Proof` variant
     /// number and its set bit position; all three move together or the
-    /// wire breaks.
+    /// wire breaks. Tags are not positions: 2 and 5 were deleted with
+    /// their subjects and are not reassigned.
     #[test]
     fn close_kind_tags_are_the_assigned_numbers() {
-        for (position, kind) in CloseKind::ALL.into_iter().enumerate() {
-            assert_eq!(usize::from(kind.tag()), position);
-        }
-        assert_eq!(CloseKind::ALL.len(), 6);
+        assert_eq!(
+            CloseKind::ALL.map(CloseKind::tag),
+            [MUTUAL_TAG, TIMEOUT_TAG, FREEZE_TAG, ADJUDICATED_TAG],
+        );
+        assert_eq!(CloseKind::ALL.map(CloseKind::tag), [0, 1, 3, 4]);
     }
 
     #[test]
     fn permitted_sets_are_the_assigned_bit_patterns() {
-        assert_eq!(CloseKindSet::BASIC.0, 0b000_111);
-        assert_eq!(CloseKindSet::STAKE_BOND.0, 0b000_110);
-        assert_eq!(CloseKindSet::WORK_STAKE_BOND.0, 0b100_110);
+        assert_eq!(CloseKindSet::BASIC.0, 0b000_011);
+        assert_eq!(CloseKindSet::WORK_STAKE_BOND.0, 0b000_010);
         assert_eq!(CloseKindSet::WORK_PAYMENT.0, 0b011_000);
-        // The empty pattern belongs to the correctness game, which is
-        // not built: no terms body yields it, so the decoder refuses it
-        // like any other unassigned byte. This asserts that absence, so
-        // restoring the member is a deliberate edit here too.
+        // The empty pattern belongs to no shape, so the decoder refuses
+        // it like any other unassigned byte.
         assert!(CloseKindSet::decode(&[0b000_000]).is_err());
+        // Bits 2 and 5 carried the deleted external-violation and
+        // work-stake-mutual closes. Setting either on an otherwise
+        // permitted set rejects: they are invalid, not reserved.
+        assert!(CloseKindSet::decode(&[0b000_111]).is_err());
+        assert!(CloseKindSet::decode(&[0b100_010]).is_err());
     }
 
     /// The whitelist is exact: every other byte, including supersets of
@@ -610,11 +522,7 @@ mod tests {
     /// `Adjudicated` exit needs no counterparty either.
     #[test]
     fn every_permitted_set_keeps_an_exit_that_needs_no_counterparty() {
-        for set in [
-            CloseKindSet::BASIC,
-            CloseKindSet::STAKE_BOND,
-            CloseKindSet::WORK_STAKE_BOND,
-        ] {
+        for set in [CloseKindSet::BASIC, CloseKindSet::WORK_STAKE_BOND] {
             assert!(set.contains(CloseKind::Timeout));
         }
         assert!(!CloseKindSet::WORK_PAYMENT.contains(CloseKind::Timeout));

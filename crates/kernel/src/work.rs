@@ -64,7 +64,7 @@ use crate::{
     registry::{RegistryChunk, RegistryChunkId, RegistryNamespace, RegistryRecordTag},
     store::Batch,
     terms::Terms,
-    tx::{CloseKind, Seal},
+    tx::{CloseKind, PaymentContestCommitment},
 };
 
 /// Version byte every work-payment v2 body carries. Decode rejects any
@@ -1011,17 +1011,18 @@ impl PendingPaymentClose {
         }
     }
 
-    /// Returns the seal an adjudicated close of this contest carries.
+    /// Returns the commitment an adjudicated close of this contest
+    /// carries.
     #[must_use]
-    pub fn seal(
+    pub fn contest_commitment(
         &self,
         network: NetworkId,
         payment_edge: EdgeId,
         payment_terms_hash: TermsHash,
-    ) -> Seal {
+    ) -> PaymentContestCommitment {
         let mut hasher = SingleChunkHasher::new();
         adjudicated_preimage(&mut hasher, network, payment_edge, payment_terms_hash, self);
-        Seal::from_bytes(hasher.finalize().into_bytes())
+        PaymentContestCommitment::from_bytes(hasher.finalize().into_bytes())
     }
 
     /// Returns this record packed into its single registry chunk.
@@ -1107,19 +1108,19 @@ pub(crate) fn read_pending_close<B: Batch>(
         })
 }
 
-/// The seal preimage, field for field as §4.6 of the concurrency design
+/// The contest-commitment preimage, field for field as §4.6 of the concurrency design
 /// fixes it.
 ///
 /// Two fields of the record are deliberately not here: `opener_role` and
-/// `responded`. The seal names the state a close settles, and what a
+/// `responded`. The commitment names the state a close settles, and what a
 /// close does with that state is `final_cumulative + penalty` — every
 /// term of which is committed above. Two records differing only in who
 /// opened the contest, or only in whether the window was answered rather
-/// than merely spent, pay out the same two coins, so a seal that
+/// than merely spent, pay out the same two coins, so a commitment that
 /// separated them would name a difference the close cannot act on.
 ///
 /// Nor is the omission a way past the guards those two fields drive. The
-/// seal is not a capability: the kernel recomputes it from the one
+/// commitment is not a capability: the kernel recomputes it from the one
 /// record stored for this edge and compares bytes, and the response
 /// window is then decided from that same stored record. A close built
 /// for an unresponded contest cannot borrow a responded one's window,
@@ -1552,12 +1553,12 @@ mod tests {
         }
     }
 
-    /// Every field the seal preimage carries moves the seal.
+    /// Every field the preimage carries moves the commitment.
     ///
-    /// The seal is what a close names to say which contest state it is
+    /// The commitment is what a close names to say which contest state it is
     /// settling, so a carried field that did not move it would be a
     /// field a racing submitter could change without invalidating the
-    /// seal. Each variant below moves exactly one field, which is what
+    /// commitment. Each variant below moves exactly one field, which is what
     /// stops a neighbouring field's change from standing in for it.
     ///
     /// Not every field of the record is a field of the preimage:
@@ -1565,11 +1566,14 @@ mod tests {
     /// [`adjudicated_preimage`] says why. This test is about what the
     /// preimage carries, not about what the record holds.
     #[test]
-    fn every_field_in_the_seal_preimage_moves_the_seal() {
+    fn every_field_in_the_contest_preimage_moves_the_commitment() {
         let network = widest_network();
         let base = sample_record();
-        let seal_of =
-            |record: &PendingPaymentClose| record.seal(network, edge(), terms_hash()).to_bytes();
+        let commitment_of = |record: &PendingPaymentClose| {
+            record
+                .contest_commitment(network, edge(), terms_hash())
+                .to_bytes()
+        };
 
         let mut other_start = base;
         other_start.start_id = StartId::from_bytes([0x99; StartId::LENGTH]);
@@ -1585,22 +1589,22 @@ mod tests {
         other_bond.penalty_amount = base.penalty_amount + 1;
 
         assert_all_distinct(&[
-            ("base", seal_of(&base)),
-            ("start_id", seal_of(&other_start)),
-            ("response_deadline", seal_of(&other_deadline)),
-            ("start_cumulative", seal_of(&other_claim)),
-            ("final_cumulative", seal_of(&other_final)),
-            ("penalty_due", seal_of(&other_due)),
-            ("penalty_amount", seal_of(&other_bond)),
+            ("base", commitment_of(&base)),
+            ("start_id", commitment_of(&other_start)),
+            ("response_deadline", commitment_of(&other_deadline)),
+            ("start_cumulative", commitment_of(&other_claim)),
+            ("final_cumulative", commitment_of(&other_final)),
+            ("penalty_due", commitment_of(&other_due)),
+            ("penalty_amount", commitment_of(&other_bond)),
         ]);
 
-        // The edge and terms the seal is derived against are the close's,
+        // The edge and terms the commitment is derived against are the close's,
         // not the record's, and both are committed too.
         assert_all_distinct(&[
-            ("base", seal_of(&base)),
+            ("base", commitment_of(&base)),
             (
                 "payment_edge",
-                base.seal(
+                base.contest_commitment(
                     network,
                     EdgeId::from_bytes([0x88; EdgeId::LENGTH]),
                     terms_hash(),
@@ -1609,7 +1613,7 @@ mod tests {
             ),
             (
                 "payment_terms_hash",
-                base.seal(
+                base.contest_commitment(
                     network,
                     edge(),
                     TermsHash::from_bytes([0x88; TermsHash::LENGTH]),
@@ -1844,12 +1848,12 @@ mod tests {
             no_earned_digest(edge(), terms_hash()),
             no_earned_digest(as_edge, swapped),
         );
-        // The seal's three amounts: deadline, start, and final.
+        // The commitment's three amounts: deadline, start, and final.
         let record = sample_record();
         let advanced = record.responded_at(9);
         assert_ne!(
-            record.seal(network, edge(), terms_hash()),
-            advanced.seal(network, edge(), terms_hash()),
+            record.contest_commitment(network, edge(), terms_hash()),
+            advanced.contest_commitment(network, edge(), terms_hash()),
         );
     }
 
@@ -1886,7 +1890,7 @@ mod tests {
 
     /// The two boolean fields have exactly two spellings each. A third
     /// byte would give one stored state two encodings, and therefore two
-    /// adjudicated seals.
+    /// adjudicated commitments.
     #[test]
     fn record_flags_decode_only_as_zero_or_one() {
         // Offsets of `responded` and `penalty_due` inside the body.
