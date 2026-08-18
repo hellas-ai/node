@@ -142,7 +142,7 @@ pub const MAX_ALLOCATION_ENTRIES: usize = 256;
 /// Why a paid-work record was refused.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum PaidWorkError {
-    /// The envelope's first byte was not [`FORMAT_VERSION`].
+    /// The envelope's first byte was not the format version `1`.
     #[error("private-work format version {actual} is not {FORMAT_VERSION}")]
     UnknownFormatVersion {
         /// Version byte carried.
