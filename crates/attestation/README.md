@@ -123,9 +123,9 @@ with.
 
 Why nothing on-chain is needed, case by case:
 
-- **Payment for work (Evaluate/Fetch):** the bilateral, sequence-numbered
-  frontier both parties sign. A dispute is an ordinary economic close (signed
-  frontier + timeout). True of every channel; no Apple input.
+- **Payment for work (Evaluate/Fetch):** the cumulative amount the client
+  signs. A dispute is an ordinary economic close (`Freeze`, or the staged
+  close contest). True of every channel; no Apple input.
 - **"Prove you're attested to get paid":** the requester already demanded that
   proof *before opening*. A provider that couldn't prove it never got a
   channel. Nothing is left to adjudicate on-chain.
@@ -133,10 +133,10 @@ Why nothing on-chain is needed, case by case:
   provable on-chain under any design. Prevented by verify-before-send, not by
   consensus.
 
-So there is **no attested `ProtocolCode`, no `SealVerifier` for Apple, no
+So there is **no attested `ProtocolCode`, no seal verifier for Apple, no
 preverified cache, no on-chain certificate parsing, and no ZK proof of the
-Apple chain.** The kernel settles ordinary bilateral channels between ordinary
-keys.
+Apple chain.** The kernel has no external verifier seam at all, and settles
+ordinary bilateral channels between ordinary keys.
 
 ### The one wiring requirement
 
