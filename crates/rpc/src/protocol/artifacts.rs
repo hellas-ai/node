@@ -20,6 +20,7 @@
 //! produce a value that would hash to a different id than it arrived
 //! under.
 
+use crate::protocol::value::{CanonicalDecodeError, CanonicalDecoder};
 use crate::{DagCborEncoder, Digest};
 use std::{format, marker::PhantomData, str, string::String, vec::Vec};
 
@@ -43,7 +44,7 @@ pub trait Canonical {
 }
 
 pub trait CanonicalDecode: Canonical + Sized {
-    fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, DecodeError>;
+    fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, CanonicalDecodeError>;
 }
 
 pub trait InputAddressed: Canonical {
@@ -344,7 +345,7 @@ impl Canonical for TokenIds {
 impl OutputAddressed for TokenIds {}
 
 impl CanonicalDecode for TokenIds {
-    fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, DecodeError> {
+    fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, CanonicalDecodeError> {
         parse_canonical(bytes, decode_token_ids)
     }
 }
@@ -397,7 +398,7 @@ impl Canonical for TextPolicy {
 impl OutputAddressed for TextPolicy {}
 
 impl CanonicalDecode for TextPolicy {
-    fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, DecodeError> {
+    fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, CanonicalDecodeError> {
         parse_canonical(bytes, decode_text_policy)
     }
 }
@@ -428,7 +429,7 @@ impl Canonical for TextState {
 impl OutputAddressed for TextState {}
 
 impl CanonicalDecode for TextState {
-    fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, DecodeError> {
+    fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, CanonicalDecodeError> {
         parse_canonical(bytes, decode_text_state)
     }
 }
@@ -479,7 +480,7 @@ impl InputAddressed for TextExecution {
 }
 
 impl CanonicalDecode for TextExecution {
-    fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, DecodeError> {
+    fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, CanonicalDecodeError> {
         parse_canonical(bytes, decode_text_execution)
     }
 }
@@ -588,46 +589,25 @@ impl Canonical for TextArtifact {
 impl OutputAddressed for TextArtifact {}
 
 impl CanonicalDecode for TextArtifact {
-    fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, DecodeError> {
+    fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, CanonicalDecodeError> {
         parse_canonical(bytes, decode_text_artifact)
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DecodeError {
-    message: String,
-}
-
-impl DecodeError {
-    fn new(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-        }
-    }
-}
-
-impl core::fmt::Display for DecodeError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        self.message.fmt(f)
-    }
-}
-
-impl core::error::Error for DecodeError {}
-
 fn parse_canonical<T: Canonical>(
     bytes: &[u8],
-    decode: fn(&mut DagCborDecoder<'_>) -> Result<T, DecodeError>,
-) -> Result<T, DecodeError> {
-    let mut decoder = DagCborDecoder::new(bytes);
+    decode: fn(&mut CanonicalDecoder<'_>) -> Result<T, CanonicalDecodeError>,
+) -> Result<T, CanonicalDecodeError> {
+    let mut decoder = CanonicalDecoder::new(bytes);
     let value = decode(&mut decoder)?;
     decoder.finish()?;
     if value.canonical_bytes() != bytes {
-        return Err(DecodeError::new("value is not in canonical artifact form"));
+        return Err(CanonicalDecodeError::new("value is not in canonical artifact form"));
     }
     Ok(value)
 }
 
-fn decode_token_ids(decoder: &mut DagCborDecoder<'_>) -> Result<TokenIds, DecodeError> {
+fn decode_token_ids(decoder: &mut CanonicalDecoder<'_>) -> Result<TokenIds, CanonicalDecodeError> {
     decoder.array_exact(2)?;
     decoder.expect_str(TOKEN_IDS_SCHEMA)?;
     let len = decoder.array_len()?;
@@ -638,7 +618,7 @@ fn decode_token_ids(decoder: &mut DagCborDecoder<'_>) -> Result<TokenIds, Decode
     Ok(TokenIds::new(tokens))
 }
 
-fn decode_text_policy(decoder: &mut DagCborDecoder<'_>) -> Result<TextPolicy, DecodeError> {
+fn decode_text_policy(decoder: &mut CanonicalDecoder<'_>) -> Result<TextPolicy, CanonicalDecodeError> {
     decoder.array_exact(3)?;
     decoder.expect_str(TEXT_POLICY_SCHEMA)?;
     let max_new_tokens = decoder.u32()?;
@@ -650,13 +630,13 @@ fn decode_text_policy(decoder: &mut DagCborDecoder<'_>) -> Result<TextPolicy, De
     Ok(TextPolicy::new(max_new_tokens, stop_token_ids))
 }
 
-fn decode_text_state(decoder: &mut DagCborDecoder<'_>) -> Result<TextState, DecodeError> {
+fn decode_text_state(decoder: &mut CanonicalDecoder<'_>) -> Result<TextState, CanonicalDecodeError> {
     decoder.array_exact(2)?;
     decoder.expect_str(TEXT_STATE_SCHEMA)?;
     Ok(TextState::new(TokenIdsId::from_bytes(decoder.bytes_32()?)))
 }
 
-fn decode_text_source(decoder: &mut DagCborDecoder<'_>) -> Result<TextSource, DecodeError> {
+fn decode_text_source(decoder: &mut CanonicalDecoder<'_>) -> Result<TextSource, CanonicalDecodeError> {
     decoder.array_exact(2)?;
     match decoder.str()? {
         SOURCE_INPUT_SCHEMA => Ok(SourceRef::input(TextExecutionId::from_bytes(
@@ -665,13 +645,13 @@ fn decode_text_source(decoder: &mut DagCborDecoder<'_>) -> Result<TextSource, De
         SOURCE_OUTPUT_SCHEMA => Ok(SourceRef::output(TextArtifactId::from_bytes(
             decoder.bytes_32()?,
         ))),
-        other => Err(DecodeError::new(format!(
+        other => Err(CanonicalDecodeError::new(format!(
             "unexpected text source schema tag {other:?}"
         ))),
     }
 }
 
-fn decode_text_execution(decoder: &mut DagCborDecoder<'_>) -> Result<TextExecution, DecodeError> {
+fn decode_text_execution(decoder: &mut CanonicalDecoder<'_>) -> Result<TextExecution, CanonicalDecodeError> {
     decoder.array_exact(4)?;
     decoder.expect_str(TEXT_EXECUTION_SCHEMA)?;
     let from = decode_text_source(decoder)?;
@@ -680,12 +660,12 @@ fn decode_text_execution(decoder: &mut DagCborDecoder<'_>) -> Result<TextExecuti
     Ok(TextExecution::new(from, prompt_tokens, policy))
 }
 
-fn decode_text_artifact(decoder: &mut DagCborDecoder<'_>) -> Result<TextArtifact, DecodeError> {
+fn decode_text_artifact(decoder: &mut CanonicalDecoder<'_>) -> Result<TextArtifact, CanonicalDecodeError> {
     let len = decoder.array_len()?;
     match decoder.str()? {
         TEXT_ARTIFACT_IDENTITY_SCHEMA => {
             if len != 5 {
-                return Err(DecodeError::new(format!(
+                return Err(CanonicalDecodeError::new(format!(
                     "{TEXT_ARTIFACT_IDENTITY_SCHEMA} expected array length 5, got {len}"
                 )));
             }
@@ -698,7 +678,7 @@ fn decode_text_artifact(decoder: &mut DagCborDecoder<'_>) -> Result<TextArtifact
         }
         TEXT_ARTIFACT_OUTPUT_SCHEMA => {
             if len != 5 {
-                return Err(DecodeError::new(format!(
+                return Err(CanonicalDecodeError::new(format!(
                     "{TEXT_ARTIFACT_OUTPUT_SCHEMA} expected array length 5, got {len}"
                 )));
             }
@@ -709,155 +689,9 @@ fn decode_text_artifact(decoder: &mut DagCborDecoder<'_>) -> Result<TextArtifact
                 TokenIdsId::from_bytes(decoder.bytes_32()?),
             ))
         }
-        other => Err(DecodeError::new(format!(
+        other => Err(CanonicalDecodeError::new(format!(
             "unexpected text artifact schema tag {other:?}"
         ))),
-    }
-}
-
-struct DagCborDecoder<'a> {
-    bytes: &'a [u8],
-    offset: usize,
-}
-
-impl<'a> DagCborDecoder<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, offset: 0 }
-    }
-
-    fn finish(&self) -> Result<(), DecodeError> {
-        if self.offset == self.bytes.len() {
-            Ok(())
-        } else {
-            Err(DecodeError::new(format!(
-                "trailing bytes after canonical object: {}",
-                self.bytes.len() - self.offset
-            )))
-        }
-    }
-
-    fn array_exact(&mut self, expected: u64) -> Result<(), DecodeError> {
-        let actual = self.read_len(4)?;
-        if actual == expected {
-            Ok(())
-        } else {
-            Err(DecodeError::new(format!(
-                "expected array length {expected}, got {actual}"
-            )))
-        }
-    }
-
-    fn array_len(&mut self) -> Result<usize, DecodeError> {
-        usize::try_from(self.read_len(4)?)
-            .map_err(|_| DecodeError::new("array length exceeds usize range"))
-    }
-
-    fn bytes_32(&mut self) -> Result<[u8; 32], DecodeError> {
-        let bytes = self.bytes()?;
-        bytes
-            .try_into()
-            .map_err(|_| DecodeError::new(format!("expected 32 bytes, got {}", bytes.len())))
-    }
-
-    fn bytes(&mut self) -> Result<&'a [u8], DecodeError> {
-        let len = usize::try_from(self.read_len(2)?)
-            .map_err(|_| DecodeError::new("byte string length exceeds usize range"))?;
-        self.read_exact(len)
-    }
-
-    fn expect_str(&mut self, expected: &str) -> Result<(), DecodeError> {
-        let actual = self.str()?;
-        if actual == expected {
-            Ok(())
-        } else {
-            Err(DecodeError::new(format!(
-                "expected schema tag {expected:?}, got {actual:?}"
-            )))
-        }
-    }
-
-    fn str(&mut self) -> Result<&'a str, DecodeError> {
-        let len = usize::try_from(self.read_len(3)?)
-            .map_err(|_| DecodeError::new("text string length exceeds usize range"))?;
-        let bytes = self.read_exact(len)?;
-        str::from_utf8(bytes).map_err(|err| DecodeError::new(format!("invalid utf-8: {err}")))
-    }
-
-    fn u32(&mut self) -> Result<u32, DecodeError> {
-        u32::try_from(self.u64()?).map_err(|_| DecodeError::new("integer exceeds u32 range"))
-    }
-
-    fn u64(&mut self) -> Result<u64, DecodeError> {
-        self.read_len(0)
-    }
-
-    fn read_len(&mut self, expected_major: u8) -> Result<u64, DecodeError> {
-        let first = self.read_u8()?;
-        let major = first >> 5;
-        if major != expected_major {
-            return Err(DecodeError::new(format!(
-                "expected CBOR major type {expected_major}, got {major}"
-            )));
-        }
-        let additional = first & 0x1f;
-        match additional {
-            0..=23 => Ok(additional as u64),
-            24 => {
-                let value = self.read_u8()? as u64;
-                if value < 24 {
-                    return Err(DecodeError::new("non-canonical one-byte integer"));
-                }
-                Ok(value)
-            }
-            25 => {
-                let value = u16::from_be_bytes(self.read_array()?);
-                if value <= 0xff {
-                    return Err(DecodeError::new("non-canonical two-byte integer"));
-                }
-                Ok(value as u64)
-            }
-            26 => {
-                let value = u32::from_be_bytes(self.read_array()?);
-                if value <= 0xffff {
-                    return Err(DecodeError::new("non-canonical four-byte integer"));
-                }
-                Ok(value as u64)
-            }
-            27 => {
-                let value = u64::from_be_bytes(self.read_array()?);
-                if value <= 0xffff_ffff {
-                    return Err(DecodeError::new("non-canonical eight-byte integer"));
-                }
-                Ok(value)
-            }
-            _ => Err(DecodeError::new(
-                "unsupported indefinite or reserved CBOR length",
-            )),
-        }
-    }
-
-    fn read_array<const N: usize>(&mut self) -> Result<[u8; N], DecodeError> {
-        let bytes = self.read_exact(N)?;
-        let mut array = [0u8; N];
-        array.copy_from_slice(bytes);
-        Ok(array)
-    }
-
-    fn read_exact(&mut self, len: usize) -> Result<&'a [u8], DecodeError> {
-        let end = self
-            .offset
-            .checked_add(len)
-            .ok_or_else(|| DecodeError::new("decoder offset overflow"))?;
-        if end > self.bytes.len() {
-            return Err(DecodeError::new("unexpected end of CBOR input"));
-        }
-        let bytes = &self.bytes[self.offset..end];
-        self.offset = end;
-        Ok(bytes)
-    }
-
-    fn read_u8(&mut self) -> Result<u8, DecodeError> {
-        Ok(self.read_exact(1)?[0])
     }
 }
 
