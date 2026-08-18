@@ -79,10 +79,12 @@ impl FinalizedBlockView {
     /// Decodes one finalized block and checks it is the block its
     /// snapshot names.
     ///
-    /// Decoding is exact: a canonical prefix followed by trailing bytes
-    /// is refused rather than read, because the payload digest covers
-    /// every byte and a reader that stopped early would disagree with
-    /// the hash it is about to check.
+    /// Trailing bytes are refused by the payload check rather than by
+    /// the decoder: the digest is taken over every byte handed in, so a
+    /// canonical prefix followed by anything at all hashes to something
+    /// the certificate does not name. The re-encoding check below closes
+    /// the other direction, where bytes decode and encode back
+    /// differently.
     ///
     /// This does not verify the finalization certificate. That is
     /// `ConsensusVerifier`'s, and the light client applies it while

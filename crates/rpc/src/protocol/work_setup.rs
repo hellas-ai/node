@@ -10,11 +10,16 @@
 //! configuration, and none of it is evidence.
 //!
 //! [`WorkChannelDescriptor::check_ready`] is what turns it into
-//! evidence, by comparing it against one coherent finalized read. What
-//! it establishes is exactly the §6 admission rule: the two edges are
-//! live at the same finalized block, they hash to the configured terms,
-//! the bond is leased to this channel, no contest is open, and the
-//! channel's own capacity covers what its policy admits.
+//! evidence, by comparing it against one finalized read the caller
+//! supplies. What it establishes is that at that read: both edges are
+//! live, both hash to the configured terms, both name the parties those
+//! terms fix, the bond is leased to *this* payment edge, no contest is
+//! open, the funded edge still clears the omission inequality, and the
+//! height is inside the admission horizon.
+//!
+//! That the read is coherent — one block, one state root, one database
+//! snapshot — is the caller's, not this module's. See
+//! [`ObservedChannel`].
 //!
 //! # Why the terms are hashed locally
 //!
@@ -106,7 +111,7 @@ pub enum WorkSetupError {
     /// An omission-economics gate failed.
     #[error("omission economics: {0}")]
     Omission(#[from] OmissionError),
-    /// The channel's admission horizon has passed, or is about to.
+    /// The finalized height is at or past the admission horizon.
     #[error("finalized height {height} is at or past the admission horizon {horizon}")]
     HorizonPassed {
         /// Finalized height that was read.
@@ -473,12 +478,19 @@ impl WorkChannelDescriptor {
     }
 }
 
-/// One coherent finalized read of a channel's four objects.
+/// One finalized read of a channel's four objects.
 ///
 /// A struct rather than five arguments because two of the five are
 /// `Option<&Edge>` and would otherwise be silently swappable. Every
 /// field is named at the call site that builds it, so a bond passed as a
 /// payment edge is a visible mistake rather than a subtle one.
+///
+/// Nothing here proves the five fields came from one block, and nothing
+/// downstream can: whoever fills this in owes the coherence.
+/// `hellas_chain::WorkChannelSnapshot` is what supplies it in this
+/// milestone, by reading every object under one database snapshot at one
+/// finalized block; five separate point queries would satisfy the type
+/// and not the requirement.
 #[derive(Clone, Copy, Debug)]
 pub struct ObservedChannel<'a> {
     /// Finalized height every field below was read at.
