@@ -1537,12 +1537,10 @@ impl StartAuthorization {
 mod tests {
     use super::*;
     use crate::{
-        consts::MAX_EDGE_INPUTS,
         context::{BlockHeight, Fees},
-        list::List,
         network::MAX_NETWORK_ID_LENGTH,
-        object::{Coin, Parties},
-        primitive::{CoinId, Key},
+        object::Parties,
+        primitive::Key,
         tx::CloseKindSet,
     };
 
@@ -2080,14 +2078,9 @@ mod tests {
         );
         // 110 funded, no open or lifetime fee, 10 reserved: principal
         // 100 with a 10-unit reserve, priced at one per slot and proof.
-        let mut coins = [(CoinId::ZERO, Coin::ZERO); MAX_EDGE_INPUTS];
-        coins[0] = (
-            CoinId::from_bytes([7; CoinId::LENGTH]),
-            Coin::issue(parties.maker(), 110),
-        );
         let fees = Fees::new(0, 1, 1, 0);
         let Ok(edge) = Edge::open(
-            &List::take(coins, 1),
+            110,
             parties,
             terms_hash(),
             (0, 0, 10, fees),

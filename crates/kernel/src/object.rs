@@ -169,8 +169,15 @@ impl Edge {
         }
     }
 
-    pub(super) fn open<const N: usize>(
-        coins: &List<(CoinId, Coin), N>,
+    /// Builds the edge an open leaves behind: the funding total less the
+    /// three debits it is charged.
+    ///
+    /// Takes the total rather than the coins because the endpoint-facing
+    /// projection prices an open it has not submitted, and holds funding
+    /// values without holding [`Coin`]s. Summing is the caller's; what
+    /// the sum buys is here.
+    pub(super) fn open(
+        total: u64,
         parties: Parties,
         terms: TermsHash,
         debits: (u64, u64, u64, Fees),
@@ -178,7 +185,6 @@ impl Edge {
         allowed: CloseKindSet,
     ) -> Result<Self, InvalidOpenReason> {
         let (open_fee, lifetime_fee, reserve, close_fees) = debits;
-        let total = Self::total(coins).ok_or(InvalidOpenReason::FundingOverflow)?;
         let value = total
             .checked_sub(open_fee)
             .and_then(|after_open_fee| after_open_fee.checked_sub(lifetime_fee))
@@ -312,6 +318,18 @@ impl EdgeValues {
             reserve,
             close_fees,
         }
+    }
+
+    /// Returns the principal locked by the edge.
+    #[must_use]
+    pub const fn value(self) -> u64 {
+        self.value
+    }
+
+    /// Returns the close reserve locked when the edge opened.
+    #[must_use]
+    pub const fn reserve(self) -> u64 {
+        self.reserve
     }
 
     /// Returns what a close of this cost distributes: the principal plus

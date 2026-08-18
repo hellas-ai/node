@@ -409,7 +409,7 @@ mod tests {
         coin_slots[1] = (second, Coin::issue(taker, 60));
         let coins = List::take(coin_slots, 2);
         let edge = Edge::open(
-            &coins,
+            100,
             Parties::new(maker, taker),
             TermsHash::from_bytes([0x44; TermsHash::LENGTH]),
             (0, 0, 0, Fees::ZERO),

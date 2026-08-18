@@ -240,8 +240,8 @@ pub use state::State;
 pub use store::{Batch, Store};
 pub use terms::{Terms, TermsProfile, WorkPaymentTerms, WorkStakeBondTerms};
 pub use tx::{
-    Auth, CloseKind, CloseKindSet, Funding, Move, PaymentContestCommitment, Payout, Proof, Tx,
-    WebAuthnAssertion, WebAuthnData,
+    Auth, CloseKind, CloseKindSet, Funding, Move, OpenFunding, OpenProjection,
+    PaymentContestCommitment, Payout, Proof, Tx, WebAuthnAssertion, WebAuthnData, open_projection,
 };
 pub use verifier::SigVerifier;
 pub use view::{Snapshot, View};
