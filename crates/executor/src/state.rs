@@ -312,9 +312,20 @@ fn parse_evaluate_start(start: Option<PbEvaluateStart>) -> Result<Option<Digest>
     }
 }
 
+/// Decodes a fixed-width byte field, naming it in the failure.
+///
+/// The crate's one copy of this: `state` and `evaluate` wrap it in
+/// their own error type rather than restating the conversion.
+#[cfg(feature = "evaluate")]
+pub(crate) fn fixed<const N: usize>(field: &str, bytes: &[u8]) -> Result<[u8; N], String> {
+    bytes
+        .try_into()
+        .map_err(|_| format!("{field} must be {N} bytes, got {}", bytes.len()))
+}
+
 #[cfg(feature = "evaluate")]
 fn bytes32(bytes: &[u8], field: &str) -> Result<[u8; 32], ExecutorError> {
-    crate::chain::fixed(field, bytes).map_err(ExecutorError::InvalidQuoteRequest)
+    fixed(field, bytes).map_err(ExecutorError::InvalidQuoteRequest)
 }
 
 fn hex32(bytes: &[u8; 32]) -> String {

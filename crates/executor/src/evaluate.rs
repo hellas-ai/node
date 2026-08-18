@@ -761,7 +761,7 @@ fn parse_runner_public_key(key: Option<PbPublicKey>) -> Result<PublicKey, Execut
 }
 
 fn digest_from_slice(bytes: &[u8], field: &str) -> Result<Digest, ExecutorError> {
-    crate::chain::fixed::<32>(field, bytes)
+    crate::state::fixed::<32>(field, bytes)
         .map(Digest::from_bytes)
         .map_err(ExecutorError::InvalidQuoteRequest)
 }

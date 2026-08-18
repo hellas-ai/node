@@ -17,16 +17,6 @@ use hellas_chain::{EdgeState, LightClient, QueryError};
 use hellas_kernel::{BlockHeight, Secp256k1Signer};
 use hellas_rpc::ProducerSigningKey;
 
-/// Decodes a fixed-width byte field, naming it in the failure.
-///
-/// The crate's one copy of this: `state` and `evaluate` wrap it in
-/// their own error type rather than restating the conversion.
-pub(crate) fn fixed<const N: usize>(field: &str, bytes: &[u8]) -> Result<[u8; N], String> {
-    bytes
-        .try_into()
-        .map_err(|_| format!("{field} must be {N} bytes, got {}", bytes.len()))
-}
-
 /// Kernel signer sharing the producer identity's secp256k1 scalar: the
 /// provider's on-chain party key IS its RPC identity.
 ///
