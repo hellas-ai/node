@@ -961,10 +961,10 @@ fn loss_outlives_the_channel_it_was_lost_on() {
         panic!("the directory reads");
     };
     for entry in entries.filter_map(Result::ok) {
-        if entry.path().to_string_lossy().contains("channel-") {
-            if let Err(error) = std::fs::remove_file(entry.path()) {
-                panic!("the channel journal is removable: {error}");
-            }
+        if entry.path().to_string_lossy().contains("channel-")
+            && let Err(error) = std::fs::remove_file(entry.path())
+        {
+            panic!("the channel journal is removable: {error}");
         }
     }
 
@@ -1766,7 +1766,7 @@ fn the_retained_dispatch_input_is_the_one_the_authorization_commits_to() {
         commit_all(&mut store, &[job.proposed(), job.accepted()]);
     }
 
-    let mut recovered = open(dir.path(), Role::Provider);
+    let recovered = open(dir.path(), Role::Provider);
     let Some(open_job) = recovered.state().job() else {
         panic!("the accepted job survives");
     };
