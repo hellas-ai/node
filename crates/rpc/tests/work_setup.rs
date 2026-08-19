@@ -751,8 +751,11 @@ fn signing_needs_a_caught_up_cursor_and_deadlines_the_margins_fit() {
             height,
         }),
     );
+    // A cursor ahead of the snapshot is allowed, and the margins move
+    // with it: the same job is signable one block later only against
+    // deadlines one block later.
     assert_eq!(
-        ready.check_signable(height + 1, terminal, payment_deadline),
+        ready.check_signable(height + 1, terminal + 1, payment_deadline + 1),
         Ok(()),
     );
 
@@ -786,5 +789,80 @@ fn signing_needs_a_caught_up_cursor_and_deadlines_the_margins_fit() {
         Err(WorkSetupError::Record(PaidWorkError::Overflow {
             field: "oracle grace interval",
         })),
+    );
+}
+
+/// Every bound is measured from the moment the signature is asked for,
+/// not from the stale moment readiness was decided at.
+///
+/// Anchored at the readiness height, the whole interval `[H + margins,
+/// C + margins)` passes — and that interval is exactly the deadlines
+/// already missed by the time the chain has reached `C`. An honest
+/// provider signs them, cannot deliver, and goes unpaid.
+#[test]
+fn signing_measures_the_margins_from_the_cursor_not_the_readiness_height() {
+    let descriptor = descriptor();
+    let bond = bond_object();
+    let payment = payment_object();
+    let height = 100;
+    let Ok(ready) = descriptor.check_ready(&ObservedChannel {
+        height,
+        ..observed(&bond, &payment)
+    }) else {
+        panic!("the fixture channel is ready");
+    };
+
+    let policy = execution_policy();
+    let margins = policy.dispatch_margin_blocks + policy.delivery_margin_blocks;
+    let grace = policy.oracle_grace_blocks;
+
+    // The deadline that is exactly reachable from the readiness height,
+    // offered one block after that height. It is already lost.
+    let cursor = height + 1;
+    assert_eq!(
+        ready.check_signable(cursor, height + margins, height + margins + grace),
+        Err(WorkSetupError::TerminalUnreachable {
+            height: cursor,
+            dispatch: policy.dispatch_margin_blocks,
+            delivery: policy.delivery_margin_blocks,
+            terminal: height + margins,
+        }),
+    );
+
+    // Not one block of that interval — all of it. Fifty blocks on, every
+    // deadline the readiness height would have admitted is refused, and
+    // the first one the cursor can actually reach is admitted.
+    let far = height + 50;
+    for terminal in (height + margins)..(far + margins) {
+        assert!(
+            ready
+                .check_signable(far, terminal, terminal + grace)
+                .is_err(),
+            "terminal {terminal} is not reachable from height {far}",
+        );
+    }
+    assert_eq!(
+        ready.check_signable(far, far + margins, far + margins + grace),
+        Ok(()),
+    );
+
+    // And the horizon. The readiness height is inside it forever, so
+    // only the cursor can carry a channel past it — an endpoint that
+    // never re-read its snapshot would otherwise sign new work for as
+    // long as it stayed running.
+    assert_eq!(
+        ready.check_signable(HORIZON, HORIZON + margins, HORIZON + margins + grace),
+        Err(WorkSetupError::HorizonPassed {
+            height: HORIZON,
+            horizon: HORIZON,
+        }),
+    );
+    assert_eq!(
+        ready.check_signable(
+            HORIZON - 1,
+            HORIZON - 1 + margins,
+            HORIZON - 1 + margins + grace,
+        ),
+        Ok(()),
     );
 }

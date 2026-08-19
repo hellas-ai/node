@@ -114,7 +114,9 @@ pub enum WorkSetupError {
     /// The finalized height is at or past the admission horizon.
     #[error("finalized height {height} is at or past the admission horizon {horizon}")]
     HorizonPassed {
-        /// Finalized height that was read.
+        /// Finalized height the refusal is anchored at: the height the
+        /// snapshot was read at, or the height a signature is being
+        /// asked for at.
         height: u64,
         /// Height at and after which no work is admitted.
         horizon: u64,
@@ -509,9 +511,21 @@ pub struct ObservedChannel<'a> {
 /// and inside its horizon at one finalized height.
 ///
 /// It can only be built by [`WorkChannelDescriptor::check_ready`], so
-/// holding one is holding that decision. It is not a permission to sign:
-/// it names the height it was decided at, and
-/// [`Self::check_signable`] is what re-decides at signing time.
+/// holding one is holding that decision — and holding it *only at*
+/// [`Self::finalized_height`]. Liveness, the lease, and the absence of a
+/// contest are facts about that one block, and nothing on this type
+/// refreshes them: a close opened one block later is invisible to every
+/// method here, because the objects it would have to re-read are not
+/// carried.
+///
+/// So the obligation is the holder's, in the same way [`ObservedChannel`]
+/// owes coherence: run [`WorkChannelDescriptor::check_ready`] again
+/// against a fresh snapshot before each signature, and sign against the
+/// `ReadyChannel` that read produced. [`Self::check_signable`] is the
+/// per-signature *arithmetic* — the horizon and the deadline margins,
+/// against the height the endpoint has actually reached. It is not a
+/// substitute for the refresh, and it does not claim to be one: no
+/// arithmetic over a stale read can see a contest that opened after it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReadyChannel {
     channel: PaidChannel,
@@ -542,11 +556,20 @@ impl ReadyChannel {
     ///
     /// Readiness was decided at a height; this is decided at a
     /// signature, which is a different moment and a different question.
-    /// `cursor_height` is how far the endpoint has actually processed
-    /// finalized blocks: an endpoint that has read a snapshot it has not
-    /// caught up to has seen a state it cannot yet act on, because the
-    /// blocks between are where a contest it must not sign over would
-    /// appear.
+    /// `cursor_height` is that moment: how far the endpoint has actually
+    /// processed finalized blocks. An endpoint that has read a snapshot
+    /// it has not caught up to has seen a state it cannot yet act on,
+    /// because the blocks between are where a contest it must not sign
+    /// over would appear.
+    ///
+    /// Every bound below is therefore anchored at `cursor_height` and
+    /// not at [`Self::finalized_height`]. The readiness height is the
+    /// past; the chain has moved since, and a horizon or a deadline
+    /// measured from the past is measured from a moment the signature
+    /// will not be made at. Anchored at the readiness height, the whole
+    /// interval `[finalized_height + margins, cursor_height + margins)`
+    /// passes — and that interval is exactly the deadlines already
+    /// missed by the time the signature is made.
     ///
     /// The two margins are the policy's measured ones, so this refuses a
     /// deadline that is legal, ordered, and unreachable — which is the
@@ -579,16 +602,15 @@ impl ReadyChannel {
                 height: self.finalized_height,
             });
         }
-        if self.finalized_height >= self.admission_horizon {
+        if cursor_height >= self.admission_horizon {
             return Err(WorkSetupError::HorizonPassed {
-                height: self.finalized_height,
+                height: cursor_height,
                 horizon: self.admission_horizon,
             });
         }
 
         let policy = &self.execution_policy;
-        let reachable = self
-            .finalized_height
+        let reachable = cursor_height
             .checked_add(policy.dispatch_margin_blocks)
             .and_then(|sum| sum.checked_add(policy.delivery_margin_blocks))
             .ok_or(PaidWorkError::Overflow {
@@ -596,7 +618,7 @@ impl ReadyChannel {
             })?;
         if reachable > terminal_deadline {
             return Err(WorkSetupError::TerminalUnreachable {
-                height: self.finalized_height,
+                height: cursor_height,
                 dispatch: policy.dispatch_margin_blocks,
                 delivery: policy.delivery_margin_blocks,
                 terminal: terminal_deadline,
