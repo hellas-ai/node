@@ -75,7 +75,7 @@ pub use channel::{
     ChannelRecord, ChannelState, ChannelStateError, ChannelStore, CounterpartyLoss, JobEnd,
     JobPhase, JobState, LossTotals, PaidCertificate,
 };
-pub use journal::{Journal, JournalError, JournalId, JournalKind, Role};
+pub use journal::{JournalError, Role};
 pub use setup::{
     ObservedSetup, SetupAbort, SetupDecision, SetupEnd, SetupFault, SetupOrigin, SetupRecord,
     SetupState, SetupStateError, SetupStore,

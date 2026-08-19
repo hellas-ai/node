@@ -1709,8 +1709,7 @@ impl ChannelStore {
 /// both terms bodies. A journal opened for a channel whose terms,
 /// edges, or network differ by one byte is a journal with another key,
 /// and the header check refuses it.
-#[must_use]
-pub fn channel_key(channel: &PaidChannel) -> Digest {
+fn channel_key(channel: &PaidChannel) -> Digest {
     let mut hasher = XetFileHasher::new();
     hasher.update(CHANNEL_KEY);
     hasher.update(channel.id().as_bytes());
@@ -1718,8 +1717,7 @@ pub fn channel_key(channel: &PaidChannel) -> Digest {
 }
 
 /// Returns the key a counterparty-loss journal is named and bound by.
-#[must_use]
-pub fn loss_key(network: NetworkId, client: Key) -> Digest {
+fn loss_key(network: NetworkId, client: Key) -> Digest {
     let mut hasher = XetFileHasher::new();
     hasher.update(LOSS_KEY);
     hasher.update(network.as_str().as_bytes());

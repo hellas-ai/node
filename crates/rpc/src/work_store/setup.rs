@@ -33,7 +33,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use hellas_kernel::{CoinId, Edge, EdgeId, LeaseSlots, NetworkId, SigVerifier, Terms, Tx};
+use hellas_kernel::{CoinId, Edge, EdgeId, LeaseSlots, NetworkId, SigVerifier, Tx};
 use hellas_xet::XetFileHasher;
 
 use crate::protocol::Digest;
@@ -383,12 +383,6 @@ impl SetupState {
     #[must_use]
     pub fn revision(&self) -> Option<u8> {
         self.bundle.as_ref().map(WorkChannelSetupBundleV1::revision)
-    }
-
-    /// Returns the retained revision itself.
-    #[must_use]
-    pub const fn bundle(&self) -> Option<&WorkChannelSetupBundleV1> {
-        self.bundle.as_ref()
     }
 
     /// Returns the exact bytes of the retained revision.
@@ -879,17 +873,4 @@ fn hex(bytes: &[u8]) -> String {
         out.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
     out
-}
-
-/// Returns the terms one retained Open commits to.
-///
-/// Exposed because an endpoint recovering a channel needs the payment
-/// body it is about to submit, and re-deriving it from configuration
-/// would be a second opinion about what was signed.
-#[must_use]
-pub fn open_terms(tx: &Tx) -> Option<&Terms> {
-    match tx {
-        Tx::Open { terms, .. } => Some(terms),
-        _ => None,
-    }
 }
