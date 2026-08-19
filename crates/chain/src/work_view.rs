@@ -36,7 +36,6 @@
 //! own [`parse_bond_lease`] and [`parse_pending_close`] are called, so
 //! an endpoint and a close cannot disagree about what a slot holds.
 
-use crate::domain::Digest;
 use crate::light_client::{LatestBlock, QueryError};
 use hellas_kernel::{
     BOND_LEASE_CHUNKS, Edge, EdgeId, LeaseSlots, PendingSlot, RegistryChunk, parse_bond_lease,
@@ -115,18 +114,6 @@ impl WorkChannelSnapshot {
         &self.block
     }
 
-    /// Returns the finalized height every object here was read at.
-    #[must_use]
-    pub const fn height(&self) -> u64 {
-        self.block.height
-    }
-
-    /// Returns the state root every object here was read under.
-    #[must_use]
-    pub const fn state_root(&self) -> Digest {
-        self.block.state_root
-    }
-
     /// Returns the bond edge, or its absence.
     #[must_use]
     pub const fn bond(&self) -> Option<&Edge> {
@@ -196,6 +183,7 @@ pub trait FinalizedWorkView: Clone + Send + Sync + 'static {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::Digest;
     use hellas_kernel::{
         BondLease, NetworkId, RegistryNamespace, RegistryRecordTag, bond_lease_slots,
         pending_payment_close_slot,

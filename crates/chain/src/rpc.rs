@@ -152,12 +152,10 @@ async fn work_channel_snapshot_at(
     network: NetworkId,
     query: WorkChannelQuery,
 ) -> Result<Option<WorkChannelSnapshot>, QueryError> {
-    if owner_index.cursor().height == 0 {
-        return Ok(None);
-    }
-
     let reader = databases.read().await;
     let state_root = reader.root();
+    // Read after the reader is held: a cursor sampled before it says
+    // nothing about the state the objects will come out of.
     let cursor = owner_index.cursor();
     if cursor.height == 0 {
         return Ok(None);
@@ -614,12 +612,12 @@ mod tests {
 
             assert_eq!(snapshot.query(), query);
             assert_eq!(
-                snapshot.height(),
+                snapshot.block().height,
                 commonware_consensus::Heightable::height(&open_block).get()
             );
-            assert_eq!(snapshot.state_root(), open_root);
+            assert_eq!(snapshot.block().state_root, open_root);
             assert_eq!(snapshot.block().payload, open_block.digest());
-            assert_eq!(snapshot.state_root(), database.read().await.root());
+            assert_eq!(snapshot.block().state_root, database.read().await.root());
 
             let bond_state = snapshot.bond().expect("the bond edge is live");
             assert_eq!(bond_state.value(), STAKE);
@@ -660,7 +658,7 @@ mod tests {
 
             // One lease slot's bytes truncated. A chunk that does not
             // decode is not an empty slot either.
-            let mut corrupt = encoded;
+            let mut corrupt = encoded.clone();
             if let Some(slot) = corrupt.lease_slots.first_mut()
                 && let Some(chunk) = slot.chunk.as_mut()
             {
@@ -668,6 +666,17 @@ mod tests {
             }
             assert!(matches!(
                 crate::client::work_channel_snapshot_from_proto(query, corrupt, None),
+                Err(QueryError::Remote(_)),
+            ));
+
+            // The pending-close slot message dropped. An empty slot is a
+            // permission — it is what says no contest is open and new
+            // work may be admitted — so an omitted field must not be
+            // read as one.
+            let mut silent = encoded;
+            silent.pending_slot = None;
+            assert!(matches!(
+                crate::client::work_channel_snapshot_from_proto(query, silent, None),
                 Err(QueryError::Remote(_)),
             ));
 

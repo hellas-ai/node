@@ -399,6 +399,13 @@ impl FinalizedWorkView for RemoteLightClient {
 /// reply carrying one lease slot is not a lease half-read, it is a peer
 /// answering a question this build did not ask, and treating its missing
 /// slot as empty would read a live lease as absent.
+///
+/// The pending-close slot is required for the same reason, and it is the
+/// half that matters more: an empty slot is a *permission* — it is what
+/// says no contest is open and new work may be admitted. A reply that
+/// omitted the field entirely would read as that permission. The server
+/// always sends the message, present or empty, so a missing one is a
+/// peer this build does not agree with.
 pub(crate) fn work_channel_snapshot_from_proto(
     query: WorkChannelQuery,
     response: GetWorkChannelSnapshotResponse,
@@ -420,10 +427,12 @@ pub(crate) fn work_channel_snapshot_from_proto(
     for (slot, wire) in lease_slots.iter_mut().zip(response.lease_slots) {
         *slot = registry_chunk_from_wire(wire.chunk, "lease slot")?;
     }
-    let pending_slot = registry_chunk_from_wire(
-        response.pending_slot.and_then(|slot| slot.chunk),
-        "pending-close slot",
-    )?;
+    let Some(pending) = response.pending_slot else {
+        return Err(QueryError::Remote(
+            "work channel snapshot carried no pending-close slot".to_string(),
+        ));
+    };
+    let pending_slot = registry_chunk_from_wire(pending.chunk, "pending-close slot")?;
 
     Ok(Some(WorkChannelSnapshot::new(
         query,
