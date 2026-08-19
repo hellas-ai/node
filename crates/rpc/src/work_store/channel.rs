@@ -1682,6 +1682,12 @@ impl ChannelStore {
         if next.apply(&record, verifier)? == Applied::Changed {
             if let Some((work_id, compute, delivery)) = loss {
                 self.loss.record(work_id, compute, delivery)?;
+                // Installed on the live state as well as on the one
+                // about to replace it: if the append below fails, the
+                // loss is already durable, and a state that had not
+                // counted it would admit work this client's credit no
+                // longer covers.
+                self.state.loss = self.loss.totals();
                 next.loss = self.loss.totals();
             }
             self.journal.append(&record.encode())?;
