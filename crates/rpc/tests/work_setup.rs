@@ -330,6 +330,13 @@ fn omission_economics_hold_exactly_at_their_three_boundaries() {
         check_omission_economics(M + 1, 10, 1, 1),
         Err(OmissionError::ProbabilityOutOfRange { q: M + 1 }),
     );
+    // Zero at zero capacity, where the third inequality is `0 > 0` and
+    // refuses on its own. The `q = 0` arm is not what makes this safe;
+    // it is what makes the refusal name the thing to change.
+    assert_eq!(
+        check_omission_economics(0, 10, 1, 0),
+        Err(OmissionError::ProbabilityOutOfRange { q: 0 }),
+    );
     // q = 1 and q = M are both inside the range; whether they pass is
     // the third inequality's business, not the first's.
     assert_eq!(check_omission_economics(M, 10, 1, u64::MAX), Ok(()));

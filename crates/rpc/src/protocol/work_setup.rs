@@ -363,11 +363,16 @@ impl WorkChannelDescriptor {
 
     /// Decides whether this configured channel is the channel on chain.
     ///
-    /// Every check is against one coherent read, and every one of them
-    /// can refuse: a live payment edge whose bond is gone is not a
-    /// channel, a live pair under other terms is not this channel, and a
-    /// live pair with an open contest is a channel that admits no new
+    /// Every check is against the one read it is handed, and every one
+    /// of them can refuse: a live payment edge whose bond is gone is not
+    /// a channel, a live pair under other terms is not this channel, and
+    /// a live pair with an open contest is a channel that admits no new
     /// work even though both edges are perfectly healthy.
+    ///
+    /// Whether that read is *coherent* is not established here and
+    /// cannot be: five fields assembled from five point queries satisfy
+    /// [`ObservedChannel`] exactly as well as one database snapshot
+    /// does, and the difference is the caller's to owe.
     ///
     /// # Errors
     ///
@@ -643,29 +648,41 @@ impl ReadyChannel {
     }
 }
 
-/// Checks that omitting a response to a payment-close contest costs the
-/// provider more than it saves.
+/// Checks that understating a payment close costs the client more than
+/// it stands to keep.
 ///
-/// The implemented close contest gives a provider one way to steal: stay
-/// offline, let the client's understated start settle, and keep the
-/// difference. What stops it is the omission bond, and what makes the
-/// bond sufficient is an inequality over three measured quantities.
-/// With `M` = [`OMISSION_PROBABILITY_SCALE`]:
+/// The thief the implemented contest admits is the *client*, and the
+/// theft is an understatement: the client opens a close naming less than
+/// it has already signed for, and if this provider's watcher is offline
+/// for `omit_response_blocks` that understated start settles and the
+/// client keeps the difference. The provider's omission is the
+/// opportunity; it is not the profit, and a provider that stays offline
+/// only loses. The kernel's rule is `WorkPaymentTerms::omission_bond` —
+/// "amount the client forfeits to the provider when a close reveals the
+/// client understated" — charged on a `Party::Maker` opener, and the
+/// payment edge's maker is the client.
+///
+/// What deters it is that bond, and what makes the bond sufficient is an
+/// inequality over three measured quantities. With `M` =
+/// [`OMISSION_PROBABILITY_SCALE`]:
 ///
 /// - `1 <= q <= M`, where `q/M` is the measured probability that this
 ///   provider's watcher answers a contest in time;
-/// - `omission_bond > omission_response_cost_cap`, so answering is
-///   cheaper than forfeiting;
-/// - `q * omission_bond > (M - q) * payment_capacity`, so the expected
-///   forfeit exceeds the expected theft.
+/// - `omission_bond > omission_response_cost_cap`, so answering pays the
+///   provider more than answering costs it, and the response the whole
+///   deterrence rests on is one the provider actually wants to make;
+/// - `q * omission_bond > (M - q) * payment_capacity`, so the client's
+///   expected forfeit exceeds its expected theft.
 ///
 /// The products are `u128` because both factors are `u64` and their
-/// product is not. A `q` of zero is refused rather than treated as a
-/// provider that never answers: a provider that never answers has no
-/// business opening a channel, and `q = 0` makes the third inequality
-/// `0 > (M)(capacity)`, which is false for every positive capacity
-/// anyway — but only *because* capacity is positive, and that is a fact
-/// about the funding rather than about `q`.
+/// product is not. The `q > M` half of the range check is load-bearing:
+/// `M - q` below would underflow without it. The `q == 0` half is not —
+/// `q = 0` makes the third inequality `0 > M * capacity`, which is false
+/// for *every* capacity, zero included, because the comparison is
+/// strict. It is kept for the answer it gives rather than the refusal:
+/// `ProbabilityOutOfRange` names the configuration mistake, where
+/// `OmissionNotLossMaking { responded: 0, .. }` would report an
+/// arithmetic result that says nothing about what to change.
 ///
 /// These are bilateral policy gates, not kernel facts. The kernel checks
 /// that the bond is funded and that a proved understatement forfeits it.
