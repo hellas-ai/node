@@ -3608,6 +3608,7 @@ dependencies = [
  "serde_json",
  "smol_str 0.3.6",
  "syn",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "web-time",

@@ -1,0 +1,1738 @@
+//! One channel's durable state: its nonces, its one job, its credit,
+//! and the certificates that pay for it.
+//!
+//! # Why this exists
+//!
+//! `CreditLedger` is what says a job is paid for at most once, and it is
+//! a value in memory. A process that lost it and started again would
+//! credit the same job at a fresh sequence and a fresh cumulative, and
+//! nothing in the records themselves could tell the difference. This
+//! module is where that value lives across a restart, and it is what
+//! makes "billed once" a property of the endpoint rather than of the
+//! process.
+//!
+//! # The order every rule here is about
+//!
+//! For each of the five signed artifacts — the client's authorization,
+//! the provider's co-signature, the provider's result, the provider's
+//! invoice, and the client's allocation and certificate — the rule is
+//! the same: the record is fsynced first, and only then does the
+//! signature leave the process. [`ChannelStore::commit`] returns after
+//! `fsync`; a crash before it returns loses a signature nobody has, and
+//! a crash after it returns is recovered by re-sending retained bytes,
+//! never by signing again.
+//!
+//! Two ledger movements have the same shape. Compute credit is reserved
+//! before the provider co-signs, not when it dispatches, because a
+//! signature it cannot afford to honour is already the loss. Delivery
+//! credit is reserved before the plaintext leaves, because afterwards
+//! there is nothing left to decide.
+//!
+//! # What a record is
+//!
+//! Six of the eleven records carry a signed artifact — the
+//! authorization, the co-signature, the result, the invoice entry, the
+//! certificate with its allocation, and the unsolicited certificate —
+//! and for each of those [`ChannelStore`] verifies the signature
+//! against the party the channel names, over that record's own digest,
+//! on commit *and* on replay. A journal that would not have been
+//! accepted a record at a time is not accepted whole.
+//!
+//! The other five — the cursor, the nonce reservation, the running
+//! marker, the plaintext release, and the job ending — are this
+//! endpoint's own statements about itself. Nothing signs them, and
+//! nothing here pretends to check them against anything but the state
+//! they move.
+//!
+//! None of it defends the file against someone who can write it; see
+//! [`super::journal`].
+//!
+//! # What one job means here
+//!
+//! The profile admits one job at a time: at most one half-signed,
+//! accepted, running, ready, or delivered-unpaid job exists in durable
+//! state. That is why the job-scoped records carry no job identifier —
+//! there is exactly one job they could be about — and why an allocation
+//! covers exactly the open job's single invoice entry. A concurrent
+//! profile needs a job identifier in every record and a list in every
+//! allocation; it is not this one.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
+
+use hellas_kernel::{
+    Decode as _, EarnedCertificate, Encode as _, Key, NetworkId, PayloadHash, Sig, SigVerifier,
+    WorkPaymentSettlement,
+};
+use hellas_xet::XetFileHasher;
+
+use crate::protocol::Digest;
+use crate::protocol::artifacts::PreparedPaidInputV1;
+use crate::protocol::work::{
+    CertificateAllocationV1, CreditLedger, InvoiceEntryV1, InvoicedJob, PaidChannel,
+    PaidJobAuthorizationV1, PaidJobResultV1, PaidWorkError, PrivateRecord as _, allocation_digest,
+    invoice_digest, next_invoice_entry, prepared_input_digest, result_digest, work_id,
+};
+use crate::work_store::journal::{Journal, JournalId, JournalKind, MAX_RECORD_BYTES, Role};
+use crate::work_store::{Applied, WorkStoreError, cursor::Cursor, put_u64};
+
+/// Domain of a channel journal's key.
+const CHANNEL_KEY: &[u8] = b"hellas.work.channel-journal-key.v1";
+/// Domain of a counterparty-loss journal's key.
+const LOSS_KEY: &[u8] = b"hellas.work.counterparty-loss-key.v1";
+
+/// Why a channel record is not one this state may hold.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ChannelStateError {
+    /// A private-record rule refused the record's own contents.
+    #[error(transparent)]
+    Record(#[from] PaidWorkError),
+    /// A carried signature is not the named party's over this record's
+    /// digest.
+    #[error("the {slot} signature is not {party}'s over this record")]
+    BadSignature {
+        /// Which signature failed.
+        slot: &'static str,
+        /// Party whose key it was checked against.
+        party: &'static str,
+    },
+    /// A step was recorded from a state that cannot take it.
+    #[error("{step} cannot be recorded while the job is {phase}")]
+    WrongPhase {
+        /// Step that was attempted.
+        step: &'static str,
+        /// Phase the job is in, or `none`.
+        phase: &'static str,
+    },
+    /// A step belongs to the other role.
+    #[error("{step} is a {expected} step, and this journal is not one")]
+    WrongRole {
+        /// Step that was attempted.
+        step: &'static str,
+        /// Role that may take it.
+        expected: &'static str,
+    },
+    /// A record named another channel, another job, or another entry
+    /// than the one this state holds.
+    #[error("the record's {field} is not this channel's")]
+    WrongChannel {
+        /// Which field disagreed.
+        field: &'static str,
+    },
+    /// The proposal nonce was not the reserved one, or was reused.
+    #[error("proposal nonce {actual} is not the expected {expected}")]
+    Nonce {
+        /// Nonce the transition requires.
+        expected: u64,
+        /// Nonce the record carried.
+        actual: u64,
+    },
+    /// A credit limit would have been exceeded.
+    #[error("{ledger} credit: {used} lost plus {reserved} reserved plus {price} exceeds {limit}")]
+    OverCredit {
+        /// Which limit.
+        ledger: &'static str,
+        /// Unrecovered loss against this counterparty.
+        used: u64,
+        /// Reserved against the job in flight.
+        reserved: u64,
+        /// Price this job would add.
+        price: u64,
+        /// Limit the channel policy fixes.
+        limit: u64,
+    },
+    /// A certificate is executable evidence the credited prefix cannot
+    /// account for, so the channel admits no new work.
+    #[error("an unallocated certificate at {executable} exceeds the credited {credited}")]
+    UnallocatedGap {
+        /// Largest valid certificate held.
+        executable: u64,
+        /// Cumulative the invoice prefix accounts for.
+        credited: u64,
+    },
+    /// A result arrived for an invocation this process did not make and
+    /// cannot know the outcome of.
+    #[error("the job's invocation is indeterminate after a restart; a result now would be a guess")]
+    Indeterminate,
+    /// The finalized cursor moved backwards or stood still.
+    #[error("cursor height {actual} does not advance past {held}")]
+    CursorNotAdvancing {
+        /// Height already recorded.
+        held: u64,
+        /// Height the record carried.
+        actual: u64,
+    },
+    /// The same step was recorded twice with different contents.
+    #[error("{what} was already recorded with different contents")]
+    Conflict {
+        /// What repeated.
+        what: &'static str,
+    },
+    /// A record's bytes were not canonical.
+    #[error("channel record is not canonical")]
+    Malformed,
+}
+
+/// How far one job has got.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JobPhase {
+    /// The client's signature exists; the provider's does not.
+    HalfSigned,
+    /// Both signatures exist. Nothing has been invoked.
+    Accepted,
+    /// The backend may have been invoked. Provider-only.
+    Running,
+    /// A signed terminal result exists.
+    Ready,
+    /// The plaintext has left the provider. Provider-only.
+    Delivered,
+    /// A signed invoice entry exists for it.
+    Invoiced,
+}
+
+impl JobPhase {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::HalfSigned => "half-signed",
+            Self::Accepted => "accepted",
+            Self::Running => "running",
+            Self::Ready => "ready",
+            Self::Delivered => "delivered",
+            Self::Invoiced => "invoiced",
+        }
+    }
+
+    /// Whether reaching this phase means compute was actually spent.
+    const fn compute_spent(self) -> bool {
+        matches!(
+            self,
+            Self::Running | Self::Ready | Self::Delivered | Self::Invoiced
+        )
+    }
+
+    /// Whether reaching this phase means plaintext left the provider.
+    const fn delivered(self) -> bool {
+        matches!(self, Self::Delivered | Self::Invoiced)
+    }
+}
+
+/// Why one job stopped without being paid.
+///
+/// Journaled as evidence. It does not move the ledgers: what a job cost
+/// is decided by how far it got, not by what it was called.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum JobEnd {
+    /// A deadline passed with the job unfinished or unpaid.
+    #[error("expired")]
+    Expired,
+    /// Execution or validation failed.
+    #[error("failed")]
+    Failed,
+    /// The process crashed between invocation and terminal
+    /// persistence. Recording this is an operator's decision, never an
+    /// automatic one.
+    #[error("indeterminate")]
+    Indeterminate,
+}
+
+mod end_code {
+    pub(super) const EXPIRED: u8 = 0;
+    pub(super) const FAILED: u8 = 1;
+    pub(super) const INDETERMINATE: u8 = 2;
+}
+
+/// One durable step of a channel's life.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ChannelRecord {
+    /// Finalized blocks have been processed through this block.
+    CursorAdvanced {
+        /// Height processed through.
+        height: u64,
+        /// That block's payload digest.
+        payload: [u8; 32],
+    },
+    /// The client has consumed one proposal nonce. Written before the
+    /// authorization that carries it is built.
+    NonceReserved {
+        /// Nonce consumed.
+        nonce: u64,
+    },
+    /// The client's signed authorization, and the inputs it commits to.
+    ///
+    /// The prepared bundle rides here because the quote it came from is
+    /// transient: a provider that accepted a job and then restarted must
+    /// still be able to execute exactly the job it accepted, and an
+    /// authorization carries only the digest of those inputs.
+    JobProposed {
+        /// The body both parties sign.
+        authorization: PaidJobAuthorizationV1,
+        /// The client's signature over its `work_id`.
+        client_signature: Sig,
+        /// The canonical prepared-input bundle the authorization's
+        /// `prepared_input_digest` commits to.
+        prepared_input: Vec<u8>,
+    },
+    /// The provider's co-signature over the same `work_id`.
+    JobAccepted {
+        /// The provider's signature.
+        provider_signature: Sig,
+    },
+    /// The provider is about to invoke the backend.
+    JobRunning,
+    /// The provider's signed terminal result.
+    JobResult {
+        /// The result body.
+        result: PaidJobResultV1,
+        /// The provider's signature over its digest.
+        provider_signature: Sig,
+    },
+    /// The provider is about to release the plaintext.
+    PlaintextReleased,
+    /// The provider's signed invoice entry for the delivered result.
+    InvoiceIssued {
+        /// The entry.
+        entry: InvoiceEntryV1,
+        /// The provider's signature over its digest.
+        provider_signature: Sig,
+    },
+    /// The client's certificate and the allocation that says what it
+    /// paid for.
+    CertificatePaid {
+        /// The scalar consensus will settle.
+        certificate: EarnedCertificate,
+        /// The private evidence of what it bought.
+        allocation: CertificateAllocationV1,
+        /// The client's signature over the allocation's digest.
+        allocation_signature: Sig,
+        /// The client's signature over the kernel's earned digest.
+        certificate_signature: Sig,
+    },
+    /// A valid client certificate larger than anything allocated.
+    ///
+    /// Executable evidence and nothing else: it marks no invoice paid
+    /// and releases no service.
+    CertificateGift {
+        /// The certificate.
+        certificate: EarnedCertificate,
+        /// The client's signature over the kernel's earned digest.
+        certificate_signature: Sig,
+    },
+    /// The open job stopped without payment.
+    JobEnded {
+        /// Why.
+        reason: JobEnd,
+    },
+}
+
+mod tag {
+    pub(super) const CURSOR: u8 = 0;
+    pub(super) const NONCE: u8 = 1;
+    pub(super) const PROPOSED: u8 = 2;
+    pub(super) const ACCEPTED: u8 = 3;
+    pub(super) const RUNNING: u8 = 4;
+    pub(super) const RESULT: u8 = 5;
+    pub(super) const PLAINTEXT: u8 = 6;
+    pub(super) const INVOICE: u8 = 7;
+    pub(super) const PAID: u8 = 8;
+    pub(super) const GIFT: u8 = 9;
+    pub(super) const ENDED: u8 = 10;
+}
+
+impl ChannelRecord {
+    /// Returns this record's canonical bytes.
+    ///
+    /// Each nested body is its own canonical encoding — the private
+    /// record's, or the kernel's — so the journal holds exactly the
+    /// bytes whose digests the signatures beside them cover.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        match self {
+            Self::CursorAdvanced { height, payload } => {
+                out.push(tag::CURSOR);
+                put_u64(&mut out, *height);
+                out.extend_from_slice(payload);
+            }
+            Self::NonceReserved { nonce } => {
+                out.push(tag::NONCE);
+                put_u64(&mut out, *nonce);
+            }
+            Self::JobProposed {
+                authorization,
+                client_signature,
+                prepared_input,
+            } => {
+                out.push(tag::PROPOSED);
+                out.extend_from_slice(&authorization.encode());
+                out.extend_from_slice(client_signature.as_bytes());
+                // Last field, and the whole of the rest: the journal
+                // frame already carries this record's length, and a
+                // second length here could disagree with it.
+                out.extend_from_slice(prepared_input);
+            }
+            Self::JobAccepted { provider_signature } => {
+                out.push(tag::ACCEPTED);
+                out.extend_from_slice(provider_signature.as_bytes());
+            }
+            Self::JobRunning => out.push(tag::RUNNING),
+            Self::JobResult {
+                result,
+                provider_signature,
+            } => {
+                out.push(tag::RESULT);
+                out.extend_from_slice(&result.encode());
+                out.extend_from_slice(provider_signature.as_bytes());
+            }
+            Self::PlaintextReleased => out.push(tag::PLAINTEXT),
+            Self::InvoiceIssued {
+                entry,
+                provider_signature,
+            } => {
+                out.push(tag::INVOICE);
+                out.extend_from_slice(&entry.encode());
+                out.extend_from_slice(provider_signature.as_bytes());
+            }
+            Self::CertificatePaid {
+                certificate,
+                allocation,
+                allocation_signature,
+                certificate_signature,
+            } => {
+                out.push(tag::PAID);
+                out.extend_from_slice(&encode_certificate(certificate));
+                out.extend_from_slice(&allocation.encode());
+                out.extend_from_slice(allocation_signature.as_bytes());
+                out.extend_from_slice(certificate_signature.as_bytes());
+            }
+            Self::CertificateGift {
+                certificate,
+                certificate_signature,
+            } => {
+                out.push(tag::GIFT);
+                out.extend_from_slice(&encode_certificate(certificate));
+                out.extend_from_slice(certificate_signature.as_bytes());
+            }
+            Self::JobEnded { reason } => {
+                out.push(tag::ENDED);
+                out.push(match reason {
+                    JobEnd::Expired => end_code::EXPIRED,
+                    JobEnd::Failed => end_code::FAILED,
+                    JobEnd::Indeterminate => end_code::INDETERMINATE,
+                });
+            }
+        }
+        out
+    }
+
+    /// Reads one record from exactly its canonical bytes.
+    ///
+    /// # Errors
+    ///
+    /// [`ChannelStateError::Malformed`] for an unknown tag, a nested
+    /// body that does not decode, a truncated record, or a trailing
+    /// byte.
+    pub fn decode(bytes: &[u8]) -> Result<Self, ChannelStateError> {
+        let mut cursor = Cursor::new(bytes);
+        let record = match cursor.byte().ok_or(ChannelStateError::Malformed)? {
+            tag::CURSOR => Self::CursorAdvanced {
+                height: cursor.u64().ok_or(ChannelStateError::Malformed)?,
+                payload: cursor.array::<32>().ok_or(ChannelStateError::Malformed)?,
+            },
+            tag::NONCE => Self::NonceReserved {
+                nonce: cursor.u64().ok_or(ChannelStateError::Malformed)?,
+            },
+            tag::PROPOSED => Self::JobProposed {
+                authorization: private_record(&mut cursor)?,
+                client_signature: signature(&mut cursor)?,
+                prepared_input: cursor.rest().to_vec(),
+            },
+            tag::ACCEPTED => Self::JobAccepted {
+                provider_signature: signature(&mut cursor)?,
+            },
+            tag::RUNNING => Self::JobRunning,
+            tag::RESULT => Self::JobResult {
+                result: private_record(&mut cursor)?,
+                provider_signature: signature(&mut cursor)?,
+            },
+            tag::PLAINTEXT => Self::PlaintextReleased,
+            tag::INVOICE => Self::InvoiceIssued {
+                entry: private_record(&mut cursor)?,
+                provider_signature: signature(&mut cursor)?,
+            },
+            tag::PAID => Self::CertificatePaid {
+                certificate: certificate(&mut cursor)?,
+                allocation: private_record(&mut cursor)?,
+                allocation_signature: signature(&mut cursor)?,
+                certificate_signature: signature(&mut cursor)?,
+            },
+            tag::GIFT => Self::CertificateGift {
+                certificate: certificate(&mut cursor)?,
+                certificate_signature: signature(&mut cursor)?,
+            },
+            tag::ENDED => Self::JobEnded {
+                reason: match cursor.byte().ok_or(ChannelStateError::Malformed)? {
+                    end_code::EXPIRED => JobEnd::Expired,
+                    end_code::FAILED => JobEnd::Failed,
+                    end_code::INDETERMINATE => JobEnd::Indeterminate,
+                    _ => return Err(ChannelStateError::Malformed),
+                },
+            },
+            _ => return Err(ChannelStateError::Malformed),
+        };
+        if cursor.is_empty() {
+            Ok(record)
+        } else {
+            Err(ChannelStateError::Malformed)
+        }
+    }
+}
+
+fn private_record<R: crate::protocol::work::PrivateRecord>(
+    cursor: &mut Cursor<'_>,
+) -> Result<R, ChannelStateError> {
+    let bytes = cursor
+        .take(R::ENCODED_SIZE)
+        .ok_or(ChannelStateError::Malformed)?;
+    Ok(R::decode(bytes)?)
+}
+
+fn signature(cursor: &mut Cursor<'_>) -> Result<Sig, ChannelStateError> {
+    let bytes = cursor
+        .array::<{ Sig::LENGTH }>()
+        .ok_or(ChannelStateError::Malformed)?;
+    Ok(Sig::from_bytes(bytes))
+}
+
+fn certificate(cursor: &mut Cursor<'_>) -> Result<EarnedCertificate, ChannelStateError> {
+    let bytes = cursor
+        .take(EarnedCertificate::ENCODED_SIZE)
+        .ok_or(ChannelStateError::Malformed)?;
+    let (certificate, consumed) =
+        EarnedCertificate::decode(bytes).map_err(|_| ChannelStateError::Malformed)?;
+    if consumed == bytes.len() {
+        Ok(certificate)
+    } else {
+        Err(ChannelStateError::Malformed)
+    }
+}
+
+fn encode_certificate(certificate: &EarnedCertificate) -> Vec<u8> {
+    let mut buf = vec![0_u8; certificate.encoded_size()];
+    let written = certificate.write_to(&mut buf);
+    buf.truncate(written);
+    buf
+}
+
+/// The one job a channel may have in flight.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JobState {
+    authorization: PaidJobAuthorizationV1,
+    work_id: Digest,
+    prepared_input: Vec<u8>,
+    client_signature: Sig,
+    provider_signature: Option<Sig>,
+    phase: JobPhase,
+    result: Option<(PaidJobResultV1, Sig)>,
+    entry: Option<(InvoiceEntryV1, Sig)>,
+}
+
+impl JobState {
+    /// Returns the authorization both parties sign.
+    #[must_use]
+    pub const fn authorization(&self) -> &PaidJobAuthorizationV1 {
+        &self.authorization
+    }
+
+    /// Returns the job's `work_id`.
+    #[must_use]
+    pub const fn work_id(&self) -> Digest {
+        self.work_id
+    }
+
+    /// Returns the prepared-input bundle this job executes from.
+    ///
+    /// Retained because the quote that carried it is transient. What
+    /// makes it the right bundle is not that it was stored, but that it
+    /// hashes to the digest inside the authorization both parties
+    /// signed — which is checked before it is stored, and again on
+    /// replay.
+    #[must_use]
+    pub fn prepared_input(&self) -> &[u8] {
+        &self.prepared_input
+    }
+
+    /// Returns how far the job has got.
+    #[must_use]
+    pub const fn phase(&self) -> JobPhase {
+        self.phase
+    }
+
+    /// Returns the client's signature over the `work_id`.
+    #[must_use]
+    pub const fn client_signature(&self) -> Sig {
+        self.client_signature
+    }
+
+    /// Returns the provider's co-signature, once it exists.
+    #[must_use]
+    pub const fn provider_signature(&self) -> Option<Sig> {
+        self.provider_signature
+    }
+
+    /// Returns the signed result, once it exists.
+    #[must_use]
+    pub const fn result(&self) -> Option<&(PaidJobResultV1, Sig)> {
+        self.result.as_ref()
+    }
+
+    /// Returns the signed invoice entry, once it exists.
+    #[must_use]
+    pub const fn entry(&self) -> Option<&(InvoiceEntryV1, Sig)> {
+        self.entry.as_ref()
+    }
+}
+
+/// One credited payment, exactly as it was recorded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PaidCertificate {
+    /// The scalar consensus will settle.
+    pub certificate: EarnedCertificate,
+    /// The private evidence of what it bought.
+    pub allocation: CertificateAllocationV1,
+    /// The client's signature over the allocation's digest.
+    pub allocation_signature: Sig,
+    /// The client's signature over the kernel's earned digest.
+    pub certificate_signature: Sig,
+}
+
+/// Unrecovered value one counterparty owes, in the two currencies v4
+/// bounds it in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LossTotals {
+    /// Compute spent on jobs that were never paid for.
+    pub compute: u64,
+    /// Plaintext value delivered on jobs that were never paid for.
+    pub delivery: u64,
+}
+
+/// What one endpoint durably knows about one channel.
+#[derive(Clone, Debug)]
+pub struct ChannelState {
+    channel: PaidChannel,
+    settlement: WorkPaymentSettlement,
+    role: Role,
+    loss: LossTotals,
+    ledger: CreditLedger,
+    next_proposal_nonce: u64,
+    reserved_nonce: Option<u64>,
+    used_nonces: BTreeSet<u64>,
+    job: Option<JobState>,
+    last_payment: Option<PaidCertificate>,
+    executable: Option<(EarnedCertificate, Sig)>,
+    compute_outstanding: u64,
+    delivery_outstanding: u64,
+    cursor: Option<(u64, [u8; 32])>,
+    indeterminate: bool,
+}
+
+impl ChannelState {
+    fn new(
+        channel: PaidChannel,
+        settlement: WorkPaymentSettlement,
+        role: Role,
+        loss: LossTotals,
+    ) -> Self {
+        Self {
+            channel,
+            settlement,
+            role,
+            loss,
+            ledger: CreditLedger::new(),
+            // The serialized client-proposer profile starts at one, and
+            // zero is a nonce no authorization may carry.
+            next_proposal_nonce: 1,
+            reserved_nonce: None,
+            used_nonces: BTreeSet::new(),
+            job: None,
+            last_payment: None,
+            executable: None,
+            compute_outstanding: 0,
+            delivery_outstanding: 0,
+            cursor: None,
+            indeterminate: false,
+        }
+    }
+
+    /// Returns the channel every record here is bound to.
+    #[must_use]
+    pub const fn channel(&self) -> &PaidChannel {
+        &self.channel
+    }
+
+    /// Returns what this endpoint has credited.
+    #[must_use]
+    pub const fn ledger(&self) -> &CreditLedger {
+        &self.ledger
+    }
+
+    /// Returns the next proposal nonce this client may consume.
+    #[must_use]
+    pub const fn next_proposal_nonce(&self) -> u64 {
+        self.next_proposal_nonce
+    }
+
+    /// Returns the job in flight, if there is one.
+    #[must_use]
+    pub const fn job(&self) -> Option<&JobState> {
+        self.job.as_ref()
+    }
+
+    /// Returns the last certificate this channel credited, with the
+    /// allocation and the two signatures it was credited against.
+    ///
+    /// What a recovered endpoint re-sends. The job it paid for is
+    /// closed, so these bytes are the only remaining copy of what was
+    /// agreed, and offering them again is idempotent rather than a
+    /// second payment.
+    #[must_use]
+    pub const fn last_payment(&self) -> Option<&PaidCertificate> {
+        self.last_payment.as_ref()
+    }
+
+    /// Returns whether the job in flight was left running by a process
+    /// that did not come back.
+    ///
+    /// True means exactly one thing: the backend may or may not have
+    /// been invoked, and nothing local can say which. No automatic step
+    /// resolves it, and a [`ChannelRecord::JobResult`] is refused while
+    /// it holds.
+    #[must_use]
+    pub const fn is_indeterminate(&self) -> bool {
+        self.indeterminate
+    }
+
+    /// Returns the largest valid certificate held, and its signature.
+    ///
+    /// The most this channel has been shown it earned. A certificate
+    /// the client signed is one it cannot repudiate, so a close that
+    /// named less than this would be a close below what was already
+    /// earned. Nothing here builds a close, and nothing here enforces
+    /// that; this is the value such a builder must start from.
+    #[must_use]
+    pub const fn executable_certificate(&self) -> Option<&(EarnedCertificate, Sig)> {
+        self.executable.as_ref()
+    }
+
+    /// Returns the largest cumulative any held certificate names.
+    #[must_use]
+    pub fn max_executable_certificate(&self) -> u64 {
+        self.executable
+            .as_ref()
+            .map_or(0, |(certificate, _)| certificate.earned_cumulative())
+    }
+
+    /// Returns the compute reserved against the job in flight.
+    #[must_use]
+    pub const fn compute_outstanding(&self) -> u64 {
+        self.compute_outstanding
+    }
+
+    /// Returns the plaintext value delivered and not yet paid for.
+    #[must_use]
+    pub const fn delivery_outstanding(&self) -> u64 {
+        self.delivery_outstanding
+    }
+
+    /// Returns this counterparty's unrecovered loss, as the shared
+    /// identity-keyed ledger holds it.
+    #[must_use]
+    pub const fn loss(&self) -> LossTotals {
+        self.loss
+    }
+
+    /// Returns the finalized block this endpoint has processed through.
+    #[must_use]
+    pub const fn cursor(&self) -> Option<(u64, [u8; 32])> {
+        self.cursor
+    }
+
+    /// Returns the unallocated monetary gap, if there is one.
+    ///
+    /// A gap is a certificate this endpoint holds that the credited
+    /// invoice prefix does not account for. While one is open the
+    /// channel admits no new work: the amount was either earned by
+    /// something this ledger cannot name, or it is the one allocation
+    /// that failed to be recorded — and only retrying that exact
+    /// allocation resolves it.
+    #[must_use]
+    pub fn unallocated_gap(&self) -> Option<u64> {
+        let executable = self.max_executable_certificate();
+        let credited = self.ledger.credited_invoice_high_water();
+        executable.checked_sub(credited).filter(|gap| *gap > 0)
+    }
+
+    const fn client_key(&self) -> Key {
+        self.channel.client_key()
+    }
+
+    const fn provider_key(&self) -> Key {
+        self.channel.provider_key()
+    }
+
+    const fn network(&self) -> NetworkId {
+        self.channel.network()
+    }
+
+    fn require_role(&self, step: &'static str, role: Role) -> Result<(), ChannelStateError> {
+        if self.role == role {
+            Ok(())
+        } else {
+            Err(ChannelStateError::WrongRole {
+                step,
+                expected: match role {
+                    Role::Client => "client",
+                    Role::Provider => "provider",
+                },
+            })
+        }
+    }
+
+    fn open_job(&self, step: &'static str) -> Result<JobState, ChannelStateError> {
+        self.job.clone().ok_or(ChannelStateError::WrongPhase {
+            step,
+            phase: "none",
+        })
+    }
+
+    /// Applies one record, or says why it may not be applied.
+    ///
+    /// Every rule this endpoint has is here, and replay runs it too, so
+    /// a journal that could not have been written a record at a time is
+    /// not read back whole.
+    fn apply<V: SigVerifier>(
+        &mut self,
+        record: &ChannelRecord,
+        verifier: &V,
+    ) -> Result<Applied, ChannelStateError> {
+        match record {
+            ChannelRecord::CursorAdvanced { height, payload } => {
+                self.apply_cursor(*height, payload)
+            }
+            ChannelRecord::NonceReserved { nonce } => self.apply_nonce(*nonce),
+            ChannelRecord::JobProposed {
+                authorization,
+                client_signature,
+                prepared_input,
+            } => self.apply_proposed(authorization, *client_signature, prepared_input, verifier),
+            ChannelRecord::JobAccepted { provider_signature } => {
+                self.apply_accepted(*provider_signature, verifier)
+            }
+            ChannelRecord::JobRunning => self.apply_running(),
+            ChannelRecord::JobResult {
+                result,
+                provider_signature,
+            } => self.apply_result(result, *provider_signature, verifier),
+            ChannelRecord::PlaintextReleased => self.apply_plaintext(),
+            ChannelRecord::InvoiceIssued {
+                entry,
+                provider_signature,
+            } => self.apply_invoice(entry, *provider_signature, verifier),
+            ChannelRecord::CertificatePaid {
+                certificate,
+                allocation,
+                allocation_signature,
+                certificate_signature,
+            } => self.apply_paid(
+                certificate,
+                allocation,
+                *allocation_signature,
+                *certificate_signature,
+                verifier,
+            ),
+            ChannelRecord::CertificateGift {
+                certificate,
+                certificate_signature,
+            } => self.apply_gift(certificate, *certificate_signature, verifier),
+            ChannelRecord::JobEnded { reason } => self.apply_ended(*reason),
+        }
+    }
+
+    fn apply_cursor(
+        &mut self,
+        height: u64,
+        payload: &[u8; 32],
+    ) -> Result<Applied, ChannelStateError> {
+        if self.cursor == Some((height, *payload)) {
+            return Ok(Applied::Redundant);
+        }
+        if let Some((held, _)) = self.cursor
+            && height <= held
+        {
+            return Err(ChannelStateError::CursorNotAdvancing {
+                held,
+                actual: height,
+            });
+        }
+        self.cursor = Some((height, *payload));
+        Ok(Applied::Changed)
+    }
+
+    /// Consumes one proposal nonce, exactly once.
+    ///
+    /// A reservation that has not yet been spent on a proposal may be
+    /// re-recorded: that is the retry after a crash between the write
+    /// and the authorization it was for. Once a proposal has carried
+    /// it, the nonce is burnt — ending that job releases its credit and
+    /// its capacity, and never its nonce.
+    fn apply_nonce(&mut self, nonce: u64) -> Result<Applied, ChannelStateError> {
+        self.require_role("reserving a proposal nonce", Role::Client)?;
+        if self.reserved_nonce == Some(nonce) {
+            return Ok(Applied::Redundant);
+        }
+        if nonce != self.next_proposal_nonce {
+            return Err(ChannelStateError::Nonce {
+                expected: self.next_proposal_nonce,
+                actual: nonce,
+            });
+        }
+        if let Some(job) = &self.job {
+            return Err(ChannelStateError::WrongPhase {
+                step: "reserving a proposal nonce",
+                phase: job.phase.name(),
+            });
+        }
+        let next = nonce.checked_add(1).ok_or(PaidWorkError::Overflow {
+            field: "proposal nonce",
+        })?;
+        self.used_nonces.insert(nonce);
+        self.reserved_nonce = Some(nonce);
+        self.next_proposal_nonce = next;
+        Ok(Applied::Changed)
+    }
+
+    fn apply_proposed<V: SigVerifier>(
+        &mut self,
+        authorization: &PaidJobAuthorizationV1,
+        client_signature: Sig,
+        prepared_input: &[u8],
+        verifier: &V,
+    ) -> Result<Applied, ChannelStateError> {
+        let work_id = work_id(&self.channel, authorization);
+        if let Some(job) = &self.job {
+            if job.authorization == *authorization
+                && job.client_signature == client_signature
+                && job.prepared_input == prepared_input
+            {
+                return Ok(Applied::Redundant);
+            }
+            return Err(ChannelStateError::WrongPhase {
+                step: "proposing a job",
+                phase: job.phase.name(),
+            });
+        }
+
+        // The channel this endpoint is, against the channel the
+        // authorization names. The rest of the authorization's rules —
+        // the policy digest, the deadlines, the price against the
+        // finalized height — are `check_authorization`'s, and a second
+        // spelling of them here would be a second chance to spell them
+        // differently.
+        let terms = self.channel.payment_terms();
+        for (field, holds) in [
+            (
+                "channel_id",
+                authorization.channel_id.as_bytes() == self.channel.id().as_bytes(),
+            ),
+            (
+                "payment_edge",
+                authorization.payment_edge == self.channel.payment_edge(),
+            ),
+            (
+                "payment_terms_hash",
+                authorization.payment_terms_hash == self.channel.payment_terms_hash(),
+            ),
+            ("bond_edge", authorization.bond_edge == terms.bond_edge),
+            (
+                "bond_terms_hash",
+                authorization.bond_terms_hash == terms.bond_terms_hash(),
+            ),
+        ] {
+            if !holds {
+                return Err(ChannelStateError::WrongChannel { field });
+            }
+        }
+
+        // The inputs this job will be executed from, against the digest
+        // the authorization both parties sign commits to. A bundle that
+        // does not hash to it is a job neither party agreed to run.
+        let bundle = PreparedPaidInputV1::decode(prepared_input, MAX_RECORD_BYTES)
+            .map_err(PaidWorkError::from)?;
+        if prepared_input_digest(&self.channel, &bundle)?.as_bytes()
+            != authorization.prepared_input_digest.as_bytes()
+        {
+            return Err(ChannelStateError::Record(PaidWorkError::Mismatch {
+                field: "prepared_input_digest",
+            }));
+        }
+
+        if !verifier.verify_sig(client_signature, self.client_key(), payload_of(work_id)) {
+            return Err(ChannelStateError::BadSignature {
+                slot: "authorization",
+                party: "the client",
+            });
+        }
+
+        // A gap is money this endpoint holds and cannot say what for.
+        // Until it is reconciled the channel does no new work, which is
+        // the whole of what stops it being applied silently to a later
+        // job.
+        if self.unallocated_gap().is_some() {
+            return Err(ChannelStateError::UnallocatedGap {
+                executable: self.max_executable_certificate(),
+                credited: self.ledger.credited_invoice_high_water(),
+            });
+        }
+
+        let nonce = authorization.proposal_nonce;
+        match self.role {
+            Role::Client => {
+                // The client must have consumed exactly this nonce, and
+                // not yet spent it on a proposal.
+                if self.reserved_nonce != Some(nonce) {
+                    return Err(ChannelStateError::Nonce {
+                        expected: self.reserved_nonce.unwrap_or(self.next_proposal_nonce),
+                        actual: nonce,
+                    });
+                }
+                self.reserved_nonce = None;
+            }
+            Role::Provider => {
+                // The provider burns each nonce it has seen before it
+                // co-signs. A repeat with different bytes is a
+                // conflict; an exact repeat was answered above.
+                if self.used_nonces.contains(&nonce) {
+                    return Err(ChannelStateError::Conflict {
+                        what: "this proposal nonce",
+                    });
+                }
+                let next = nonce.checked_add(1).ok_or(PaidWorkError::Overflow {
+                    field: "proposal nonce",
+                })?;
+                self.used_nonces.insert(nonce);
+                self.next_proposal_nonce = self.next_proposal_nonce.max(next);
+                self.reserve_compute(authorization.price)?;
+            }
+        }
+
+        self.job = Some(JobState {
+            authorization: *authorization,
+            work_id,
+            prepared_input: prepared_input.to_vec(),
+            client_signature,
+            provider_signature: None,
+            phase: JobPhase::HalfSigned,
+            result: None,
+            entry: None,
+        });
+        Ok(Applied::Changed)
+    }
+
+    fn apply_accepted<V: SigVerifier>(
+        &mut self,
+        provider_signature: Sig,
+        verifier: &V,
+    ) -> Result<Applied, ChannelStateError> {
+        let mut job = self.open_job("co-signing a job")?;
+        if job.provider_signature == Some(provider_signature) {
+            return Ok(Applied::Redundant);
+        }
+        if job.phase != JobPhase::HalfSigned {
+            return Err(ChannelStateError::WrongPhase {
+                step: "co-signing a job",
+                phase: job.phase.name(),
+            });
+        }
+        if !verifier.verify_sig(
+            provider_signature,
+            self.provider_key(),
+            payload_of(job.work_id),
+        ) {
+            return Err(ChannelStateError::BadSignature {
+                slot: "authorization",
+                party: "the provider",
+            });
+        }
+        job.provider_signature = Some(provider_signature);
+        job.phase = JobPhase::Accepted;
+        self.job = Some(job);
+        Ok(Applied::Changed)
+    }
+
+    fn apply_running(&mut self) -> Result<Applied, ChannelStateError> {
+        self.require_role("a running marker", Role::Provider)?;
+        let mut job = self.open_job("a running marker")?;
+        match job.phase {
+            JobPhase::Running => return Ok(Applied::Redundant),
+            JobPhase::Accepted => {}
+            phase => {
+                return Err(ChannelStateError::WrongPhase {
+                    step: "a running marker",
+                    phase: phase.name(),
+                });
+            }
+        }
+        job.phase = JobPhase::Running;
+        self.job = Some(job);
+        Ok(Applied::Changed)
+    }
+
+    fn apply_result<V: SigVerifier>(
+        &mut self,
+        result: &PaidJobResultV1,
+        provider_signature: Sig,
+        verifier: &V,
+    ) -> Result<Applied, ChannelStateError> {
+        let mut job = self.open_job("recording a result")?;
+        if let Some((held, signature)) = &job.result {
+            if held == result && *signature == provider_signature {
+                return Ok(Applied::Redundant);
+            }
+            return Err(ChannelStateError::Conflict {
+                what: "this job's result",
+            });
+        }
+        // A running marker proves only that the backend may have been
+        // invoked. If this process did not make that invocation, no
+        // result it could produce now is evidence about it.
+        if self.indeterminate {
+            return Err(ChannelStateError::Indeterminate);
+        }
+        // The provider may only record a result for an invocation it
+        // marked; the client never sees that marker, and records the
+        // result it was sent against the job it accepted.
+        let expected = match self.role {
+            Role::Provider => JobPhase::Running,
+            Role::Client => JobPhase::Accepted,
+        };
+        if job.phase != expected {
+            return Err(ChannelStateError::WrongPhase {
+                step: "recording a result",
+                phase: job.phase.name(),
+            });
+        }
+        if result.work_id.as_bytes() != job.work_id.as_bytes() {
+            return Err(ChannelStateError::WrongChannel {
+                field: "result work_id",
+            });
+        }
+        if !verifier.verify_sig(
+            provider_signature,
+            self.provider_key(),
+            payload_of(result_digest(&self.channel, result)),
+        ) {
+            return Err(ChannelStateError::BadSignature {
+                slot: "result",
+                party: "the provider",
+            });
+        }
+        job.result = Some((*result, provider_signature));
+        job.phase = JobPhase::Ready;
+        self.job = Some(job);
+        Ok(Applied::Changed)
+    }
+
+    fn apply_plaintext(&mut self) -> Result<Applied, ChannelStateError> {
+        self.require_role("releasing plaintext", Role::Provider)?;
+        let mut job = self.open_job("releasing plaintext")?;
+        if job.phase.delivered() {
+            return Ok(Applied::Redundant);
+        }
+        if job.phase != JobPhase::Ready {
+            return Err(ChannelStateError::WrongPhase {
+                step: "releasing plaintext",
+                phase: job.phase.name(),
+            });
+        }
+        self.reserve_delivery(job.authorization.price)?;
+        job.phase = JobPhase::Delivered;
+        self.job = Some(job);
+        Ok(Applied::Changed)
+    }
+
+    fn apply_invoice<V: SigVerifier>(
+        &mut self,
+        entry: &InvoiceEntryV1,
+        provider_signature: Sig,
+        verifier: &V,
+    ) -> Result<Applied, ChannelStateError> {
+        let mut job = self.open_job("issuing an invoice")?;
+        if let Some((held, signature)) = &job.entry {
+            if held == entry && *signature == provider_signature {
+                return Ok(Applied::Redundant);
+            }
+            return Err(ChannelStateError::Conflict {
+                what: "this job's invoice entry",
+            });
+        }
+        // A provider invoices what it has delivered. A client has no
+        // delivery marker of its own; what it has is the result it
+        // verified.
+        let expected = match self.role {
+            Role::Provider => JobPhase::Delivered,
+            Role::Client => JobPhase::Ready,
+        };
+        if job.phase != expected {
+            return Err(ChannelStateError::WrongPhase {
+                step: "issuing an invoice",
+                phase: job.phase.name(),
+            });
+        }
+        let Some((result, _)) = &job.result else {
+            return Err(ChannelStateError::WrongPhase {
+                step: "issuing an invoice",
+                phase: job.phase.name(),
+            });
+        };
+        // The one legal entry for this job at this ledger position,
+        // built by the same constructor both endpoints use. Anything
+        // else is refused before it is signed or stored, including an
+        // entry whose cumulative would exceed what this edge settles.
+        let expected_entry = next_invoice_entry(
+            &self.channel,
+            &job.authorization,
+            result,
+            self.ledger.next_invoice_seq(),
+            self.ledger.credited_invoice_high_water(),
+            self.settlement,
+        )?;
+        if *entry != expected_entry {
+            return Err(ChannelStateError::WrongChannel {
+                field: "invoice entry",
+            });
+        }
+        if !verifier.verify_sig(
+            provider_signature,
+            self.provider_key(),
+            payload_of(invoice_digest(&self.channel, entry)),
+        ) {
+            return Err(ChannelStateError::BadSignature {
+                slot: "invoice",
+                party: "the provider",
+            });
+        }
+        job.entry = Some((*entry, provider_signature));
+        job.phase = JobPhase::Invoiced;
+        self.job = Some(job);
+        Ok(Applied::Changed)
+    }
+
+    fn apply_paid<V: SigVerifier>(
+        &mut self,
+        certificate: &EarnedCertificate,
+        allocation: &CertificateAllocationV1,
+        allocation_signature: Sig,
+        certificate_signature: Sig,
+        verifier: &V,
+    ) -> Result<Applied, ChannelStateError> {
+        let payment = PaidCertificate {
+            certificate: *certificate,
+            allocation: *allocation,
+            allocation_signature,
+            certificate_signature,
+        };
+        // The retained payment, offered again. This is the crash
+        // between writing the certificate and sending it: the job it
+        // paid for is closed, and re-sending the retained bytes must
+        // not look like a second payment.
+        if self.last_payment.as_ref() == Some(&payment) {
+            return Ok(Applied::Redundant);
+        }
+        let job = self.open_job("crediting an allocation")?;
+        let (Some((result, _)), Some((entry, _))) = (job.result, job.entry) else {
+            return Err(ChannelStateError::WrongPhase {
+                step: "crediting an allocation",
+                phase: job.phase.name(),
+            });
+        };
+        for (slot, signature, hash) in [
+            (
+                "allocation",
+                allocation_signature,
+                payload_of(allocation_digest(&self.channel, allocation)),
+            ),
+            (
+                "certificate",
+                certificate_signature,
+                certificate.digest(self.network()),
+            ),
+        ] {
+            if !verifier.verify_sig(signature, self.client_key(), hash) {
+                return Err(ChannelStateError::BadSignature {
+                    slot,
+                    party: "the client",
+                });
+            }
+        }
+
+        // The one rule that says a job is paid for at most once. It runs
+        // here, on commit and on replay both, over the job this journal
+        // itself recorded — not over a list the record could have named
+        // for itself.
+        let jobs = [InvoicedJob {
+            authorization: job.authorization,
+            result,
+            entry,
+        }];
+        self.ledger
+            .credit_allocation(&self.channel, allocation, &jobs, certificate)?;
+
+        let price = job.authorization.price;
+        self.compute_outstanding = self.compute_outstanding.saturating_sub(price);
+        if job.phase.delivered() {
+            self.delivery_outstanding = self.delivery_outstanding.saturating_sub(price);
+        }
+        self.retain_executable(certificate, certificate_signature);
+        self.last_payment = Some(payment);
+        self.job = None;
+        self.indeterminate = false;
+        Ok(Applied::Changed)
+    }
+
+    fn apply_gift<V: SigVerifier>(
+        &mut self,
+        certificate: &EarnedCertificate,
+        certificate_signature: Sig,
+        verifier: &V,
+    ) -> Result<Applied, ChannelStateError> {
+        if certificate.payment_edge() != self.channel.payment_edge() {
+            return Err(ChannelStateError::WrongChannel {
+                field: "certificate payment_edge",
+            });
+        }
+        if certificate.payment_terms_hash() != self.channel.payment_terms_hash() {
+            return Err(ChannelStateError::WrongChannel {
+                field: "certificate payment_terms_hash",
+            });
+        }
+        if certificate.earned_cumulative() > self.settlement.capacity() {
+            return Err(ChannelStateError::Record(PaidWorkError::OverCapacity {
+                cumulative: certificate.earned_cumulative(),
+                capacity: self.settlement.capacity(),
+            }));
+        }
+        if !verifier.verify_sig(
+            certificate_signature,
+            self.client_key(),
+            certificate.digest(self.network()),
+        ) {
+            return Err(ChannelStateError::BadSignature {
+                slot: "certificate",
+                party: "the client",
+            });
+        }
+        // Only a larger certificate is news. A smaller or equal one adds
+        // nothing a close could use, and moves nothing here.
+        if certificate.earned_cumulative() <= self.max_executable_certificate() {
+            return Ok(Applied::Redundant);
+        }
+        self.retain_executable(certificate, certificate_signature);
+        Ok(Applied::Changed)
+    }
+
+    /// Ends the open job, releasing its reservations.
+    ///
+    /// The reason is journaled and does not appear here: what a job
+    /// cost is decided by how far it got. A job that never ran releases
+    /// its compute reservation whole; one that ran and was never paid
+    /// for turns that reservation into loss, and one whose plaintext
+    /// left turns its delivery reservation into loss as well. The loss
+    /// itself is the counterparty ledger's, written before this.
+    fn apply_ended(&mut self, reason: JobEnd) -> Result<Applied, ChannelStateError> {
+        let _ = reason;
+        let job = self.open_job("ending a job")?;
+        let price = job.authorization.price;
+        self.compute_outstanding = self.compute_outstanding.saturating_sub(price);
+        if job.phase.delivered() {
+            self.delivery_outstanding = self.delivery_outstanding.saturating_sub(price);
+        }
+        self.job = None;
+        self.indeterminate = false;
+        Ok(Applied::Changed)
+    }
+
+    /// Returns what ending the open job costs this counterparty
+    /// permanently, if anything.
+    fn loss_of(&self) -> Option<(Digest, u64, u64)> {
+        let job = self.job.as_ref()?;
+        if self.role != Role::Provider {
+            return None;
+        }
+        let price = job.authorization.price;
+        let compute = if job.phase.compute_spent() { price } else { 0 };
+        let delivery = if job.phase.delivered() { price } else { 0 };
+        if compute == 0 && delivery == 0 {
+            return None;
+        }
+        Some((job.work_id, compute, delivery))
+    }
+
+    fn retain_executable(&mut self, certificate: &EarnedCertificate, signature: Sig) {
+        if certificate.earned_cumulative() > self.max_executable_certificate() {
+            self.executable = Some((*certificate, signature));
+        }
+    }
+
+    fn reserve_compute(&mut self, price: u64) -> Result<(), ChannelStateError> {
+        let limit = self.channel.channel_policy().compute_credit_limit;
+        let reserved = self.compute_outstanding;
+        let used = self.loss.compute;
+        let total = used
+            .checked_add(reserved)
+            .and_then(|sum| sum.checked_add(price))
+            .ok_or(PaidWorkError::Overflow {
+                field: "compute credit",
+            })?;
+        if total > limit {
+            return Err(ChannelStateError::OverCredit {
+                ledger: "compute",
+                used,
+                reserved,
+                price,
+                limit,
+            });
+        }
+        self.compute_outstanding = total.saturating_sub(used);
+        Ok(())
+    }
+
+    fn reserve_delivery(&mut self, price: u64) -> Result<(), ChannelStateError> {
+        let limit = self.channel.channel_policy().delivery_credit_limit;
+        let reserved = self.delivery_outstanding;
+        let used = self.loss.delivery;
+        let total = used
+            .checked_add(reserved)
+            .and_then(|sum| sum.checked_add(price))
+            .ok_or(PaidWorkError::Overflow {
+                field: "delivery credit",
+            })?;
+        if total > limit {
+            return Err(ChannelStateError::OverCredit {
+                ledger: "delivery",
+                used,
+                reserved,
+                price,
+                limit,
+            });
+        }
+        self.delivery_outstanding = total.saturating_sub(used);
+        Ok(())
+    }
+}
+
+fn payload_of(digest: Digest) -> PayloadHash {
+    PayloadHash::from_bytes(digest.into_bytes())
+}
+
+/// One counterparty's unrecovered loss, keyed by identity rather than by
+/// channel.
+///
+/// Separate from the channel journal on purpose, and this is the whole
+/// reason it is a second file: a fresh payment edge for the same client
+/// inherits it. Closing a channel, rotating it, or deleting its journal
+/// does not give a defaulting client its credit back.
+#[derive(Debug)]
+pub struct CounterpartyLoss {
+    journal: Journal,
+    entries: BTreeMap<[u8; 32], (u64, u64)>,
+    totals: LossTotals,
+}
+
+impl CounterpartyLoss {
+    /// Opens the loss ledger for one client key on one network.
+    ///
+    /// # Errors
+    ///
+    /// [`WorkStoreError::Journal`] when the file is held, corrupt, or
+    /// another journal, and [`WorkStoreError::Channel`] when a replayed
+    /// record contradicts an earlier one.
+    pub fn open(
+        root: &Path,
+        network: NetworkId,
+        client: Key,
+        role: Role,
+    ) -> Result<Self, WorkStoreError> {
+        let key = loss_key(network, client).into_bytes();
+        let (journal, replay) = Journal::open(
+            root.join(format!("counterparty-{}.journal", hex(&key))),
+            JournalId {
+                kind: JournalKind::CounterpartyLoss,
+                role,
+                key,
+            },
+        )?;
+        let mut ledger = Self {
+            journal,
+            entries: BTreeMap::new(),
+            totals: LossTotals::default(),
+        };
+        for bytes in &replay.records {
+            let (work_id, compute, delivery) = decode_loss(bytes)?;
+            ledger.apply(work_id, compute, delivery)?;
+        }
+        Ok(ledger)
+    }
+
+    /// Returns what this counterparty owes and has not paid.
+    #[must_use]
+    pub const fn totals(&self) -> LossTotals {
+        self.totals
+    }
+
+    /// Records one job's unrecovered loss, and returns once it is on
+    /// the disk.
+    ///
+    /// Idempotent by `work_id`: the same job's loss recorded twice is
+    /// counted once, which is what lets the channel journal re-commit
+    /// an interrupted job ending without paying for it twice.
+    ///
+    /// # Errors
+    ///
+    /// [`WorkStoreError::Channel`] when the same job is recorded with
+    /// different amounts, and [`WorkStoreError::Journal`] when the
+    /// append or its sync fails.
+    pub fn record(
+        &mut self,
+        work_id: Digest,
+        compute: u64,
+        delivery: u64,
+    ) -> Result<(), WorkStoreError> {
+        let key = work_id.into_bytes();
+        match self.entries.get(&key) {
+            Some(held) if *held == (compute, delivery) => return Ok(()),
+            Some(_) => {
+                return Err(ChannelStateError::Conflict {
+                    what: "this job's loss",
+                }
+                .into());
+            }
+            None => {}
+        }
+        self.journal
+            .append(&encode_loss(work_id, compute, delivery))?;
+        self.apply(key, compute, delivery)?;
+        Ok(())
+    }
+
+    fn apply(
+        &mut self,
+        work_id: [u8; 32],
+        compute: u64,
+        delivery: u64,
+    ) -> Result<(), ChannelStateError> {
+        match self.entries.get(&work_id) {
+            Some(held) if *held == (compute, delivery) => return Ok(()),
+            Some(_) => {
+                return Err(ChannelStateError::Conflict {
+                    what: "this job's loss",
+                });
+            }
+            None => {}
+        }
+        self.totals.compute =
+            self.totals
+                .compute
+                .checked_add(compute)
+                .ok_or(PaidWorkError::Overflow {
+                    field: "compute loss",
+                })?;
+        self.totals.delivery =
+            self.totals
+                .delivery
+                .checked_add(delivery)
+                .ok_or(PaidWorkError::Overflow {
+                    field: "delivery loss",
+                })?;
+        self.entries.insert(work_id, (compute, delivery));
+        Ok(())
+    }
+}
+
+fn encode_loss(work_id: Digest, compute: u64, delivery: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(48);
+    out.extend_from_slice(work_id.as_bytes());
+    put_u64(&mut out, compute);
+    put_u64(&mut out, delivery);
+    out
+}
+
+fn decode_loss(bytes: &[u8]) -> Result<([u8; 32], u64, u64), ChannelStateError> {
+    let mut cursor = Cursor::new(bytes);
+    let work_id = cursor.array::<32>().ok_or(ChannelStateError::Malformed)?;
+    let compute = cursor.u64().ok_or(ChannelStateError::Malformed)?;
+    let delivery = cursor.u64().ok_or(ChannelStateError::Malformed)?;
+    if cursor.is_empty() {
+        Ok((work_id, compute, delivery))
+    } else {
+        Err(ChannelStateError::Malformed)
+    }
+}
+
+/// The durable channel journal: the state above, the file it is
+/// replayed from, and the counterparty ledger its credit rules read.
+#[derive(Debug)]
+pub struct ChannelStore {
+    journal: Journal,
+    loss: CounterpartyLoss,
+    state: ChannelState,
+}
+
+impl ChannelStore {
+    /// Opens one channel's journal, replaying and re-checking every
+    /// record it holds.
+    ///
+    /// `settlement` is what the funded payment edge can settle, taken
+    /// from the finalized read that established the channel is live. It
+    /// is a channel constant: a payment edge's value is fixed when it is
+    /// opened, and every invoice this store admits is bounded by it.
+    ///
+    /// A job left in its running phase by the process that did not come
+    /// back makes the state indeterminate. Opening does not resolve it,
+    /// does not invoke anything, and refuses a result for it.
+    ///
+    /// # Errors
+    ///
+    /// [`WorkStoreError::Journal`] when a file is held, corrupt, or
+    /// another journal, and [`WorkStoreError::Channel`] when a replayed
+    /// record does not obey the transition rules.
+    pub fn open<V: SigVerifier>(
+        root: &Path,
+        channel: PaidChannel,
+        settlement: WorkPaymentSettlement,
+        role: Role,
+        verifier: &V,
+    ) -> Result<Self, WorkStoreError> {
+        let loss = CounterpartyLoss::open(root, channel.network(), channel.client_key(), role)?;
+        let key = channel_key(&channel).into_bytes();
+        let (journal, replay) = Journal::open(
+            root.join(format!("channel-{}.journal", hex(&key))),
+            JournalId {
+                kind: JournalKind::Channel,
+                role,
+                key,
+            },
+        )?;
+        let mut state = ChannelState::new(channel, settlement, role, loss.totals());
+        for bytes in &replay.records {
+            let record = ChannelRecord::decode(bytes)?;
+            state.apply(&record, verifier)?;
+        }
+        state.indeterminate = state
+            .job
+            .as_ref()
+            .is_some_and(|job| job.phase == JobPhase::Running);
+        Ok(Self {
+            journal,
+            loss,
+            state,
+        })
+    }
+
+    /// Returns what this endpoint durably knows.
+    #[must_use]
+    pub const fn state(&self) -> &ChannelState {
+        &self.state
+    }
+
+    /// Returns this counterparty's unrecovered loss.
+    #[must_use]
+    pub const fn loss(&self) -> LossTotals {
+        self.loss.totals()
+    }
+
+    /// Journals one step, and returns only once it is on the disk.
+    ///
+    /// The rule this exists to enforce: call it *before* the bytes it
+    /// records leave the process, and before the side effect it
+    /// authorises happens. A record the state already holds is not
+    /// written twice, so retrying after a crash between the write and
+    /// the release costs nothing and changes nothing.
+    ///
+    /// Ending a job writes two files. The counterparty's loss goes
+    /// first, so a crash between them leaves the loss counted and the
+    /// job still open — which over-counts what the client owes until
+    /// the ending is re-committed, and never under-counts it.
+    ///
+    /// # Errors
+    ///
+    /// [`WorkStoreError::Channel`] when the step is not one this state
+    /// may take — checked before anything is written — and
+    /// [`WorkStoreError::Journal`] when an append or its sync fails.
+    pub fn commit<V: SigVerifier>(
+        &mut self,
+        record: ChannelRecord,
+        verifier: &V,
+    ) -> Result<&ChannelState, WorkStoreError> {
+        // Applied to a copy first: a record the rules refuse must leave
+        // neither the file nor the state touched.
+        let mut next = self.state.clone();
+        let loss = match record {
+            ChannelRecord::JobEnded { .. } => next.loss_of(),
+            _ => None,
+        };
+        if next.apply(&record, verifier)? == Applied::Changed {
+            if let Some((work_id, compute, delivery)) = loss {
+                self.loss.record(work_id, compute, delivery)?;
+                next.loss = self.loss.totals();
+            }
+            self.journal.append(&record.encode())?;
+            self.state = next;
+        }
+        Ok(&self.state)
+    }
+
+    /// Returns how many records the channel journal holds.
+    #[must_use]
+    pub const fn len(&self) -> u64 {
+        self.journal.len()
+    }
+
+    /// Returns whether the channel journal holds no records.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.journal.is_empty()
+    }
+}
+
+/// Returns the key a channel journal is named and bound by.
+///
+/// The channel id, which already binds the network, both edges, and
+/// both terms bodies. A journal opened for a channel whose terms,
+/// edges, or network differ by one byte is a journal with another key,
+/// and the header check refuses it.
+#[must_use]
+pub fn channel_key(channel: &PaidChannel) -> Digest {
+    let mut hasher = XetFileHasher::new();
+    hasher.update(CHANNEL_KEY);
+    hasher.update(channel.id().as_bytes());
+    hasher.finalize()
+}
+
+/// Returns the key a counterparty-loss journal is named and bound by.
+#[must_use]
+pub fn loss_key(network: NetworkId, client: Key) -> Digest {
+    let mut hasher = XetFileHasher::new();
+    hasher.update(LOSS_KEY);
+    hasher.update(network.as_str().as_bytes());
+    hasher.update(&client.to_bytes());
+    hasher.finalize()
+}
+
+fn hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(char::from(HEX[usize::from(byte >> 4)]));
+        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    out
+}

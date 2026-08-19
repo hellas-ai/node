@@ -80,4 +80,5 @@ syn = { version = "2", features = ["full"] }
 # secp256k1 signer, not a placeholder that proves nothing about the keys
 # a channel actually settles with.
 hellas-kernel = { workspace = true, features = ["secp256k1"] }
+tempfile = "3"
 tokio.workspace = true

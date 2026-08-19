@@ -22,6 +22,10 @@ pub mod serve;
 pub mod spec;
 #[cfg(feature = "execute")]
 pub mod stream;
+/// Durable endpoint state for paid work: the setup journal, the channel
+/// journal, and the counterparty loss ledger.
+#[cfg(feature = "work")]
+pub mod work_store;
 pub use spec::ModelSpec;
 
 /// Execution authorization policy module.
