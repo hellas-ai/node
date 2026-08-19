@@ -176,6 +176,21 @@ struct PaymentLeg {
     client_auth: Auth,
 }
 
+impl SetupStage {
+    /// Returns the revision number this stage is.
+    ///
+    /// The one place the three numbers are written. The stage is what
+    /// the number means, so a caller that has moved the stage out of a
+    /// bundle can still name it.
+    const fn revision(&self) -> u8 {
+        match self {
+            Self::BondProposed => 1,
+            Self::PaymentProposed(_) => 2,
+            Self::Complete(..) => 3,
+        }
+    }
+}
+
 impl WorkChannelSetupBundleV1 {
     /// Starts the handshake: the provider's staked funding, the bond
     /// terms, and the provider's signature over that open.
@@ -248,27 +263,23 @@ impl WorkChannelSetupBundleV1 {
         mut self,
         provider_payment_auth: Auth,
     ) -> Result<Self, SetupBundleError> {
-        let SetupStage::PaymentProposed(payment) = self.stage else {
-            return Err(SetupBundleError::WrongStage {
-                actual: match self.stage {
-                    SetupStage::BondProposed => 1,
-                    SetupStage::PaymentProposed(_) => 2,
-                    SetupStage::Complete(..) => 3,
-                },
-            });
+        self.stage = match self.stage {
+            SetupStage::PaymentProposed(payment) => {
+                SetupStage::Complete(payment, Box::new(provider_payment_auth))
+            }
+            stage => {
+                return Err(SetupBundleError::WrongStage {
+                    actual: stage.revision(),
+                });
+            }
         };
-        self.stage = SetupStage::Complete(payment, Box::new(provider_payment_auth));
         Ok(self)
     }
 
     /// Returns which of the three revisions this is.
     #[must_use]
     pub const fn revision(&self) -> u8 {
-        match self.stage {
-            SetupStage::BondProposed => 1,
-            SetupStage::PaymentProposed(_) => 2,
-            SetupStage::Complete(..) => 3,
-        }
+        self.stage.revision()
     }
 
     const fn payment(&self) -> Option<&PaymentLeg> {
@@ -325,12 +336,20 @@ impl WorkChannelSetupBundleV1 {
     /// open.
     #[must_use]
     pub fn payment_open_hash(&self) -> Option<PayloadHash> {
-        let payment = self.payment()?;
-        Some(Tx::open_hash(
+        Some(self.leg_open_hash(self.payment()?))
+    }
+
+    /// Returns the hash that authorizes `leg`'s payment open.
+    ///
+    /// Takes the leg rather than reading it back off `self`, so a caller
+    /// that already holds one is not handed an `Option` whose `None` its
+    /// own binding has already ruled out.
+    fn leg_open_hash(&self, leg: &PaymentLeg) -> PayloadHash {
+        Tx::open_hash(
             self.network,
-            &payment.funding,
-            &Terms::work_payment(payment.terms.clone()),
-        ))
+            &leg.funding,
+            &Terms::work_payment(leg.terms.clone()),
+        )
     }
 
     /// Returns the executable bond open, once both parties have signed
@@ -411,9 +430,7 @@ impl WorkChannelSetupBundleV1 {
             });
         }
 
-        let Some(payment_hash) = self.payment_open_hash() else {
-            return Ok(());
-        };
+        let payment_hash = self.leg_open_hash(payment);
         if !verifier.verify_auth(&payment.client_auth, client, payment_hash) {
             return Err(SetupBundleError::BadAuthorization {
                 slot: "payment open",
@@ -456,13 +473,15 @@ impl WorkChannelSetupBundleV1 {
                 actual: self.revision(),
             });
         }
+        // Both encodings are `version || revision || body`. The version
+        // byte is written by `encode` and is the same constant on both
+        // sides, and the revision byte is the one that legally differs
+        // and has just been checked — so the body is what is left to
+        // compare.
+        const HEAD: usize = 2;
         let held = previous.encode();
         let arrived = self.encode();
-        // Both encodings are `version || revision || prefix`, and the
-        // revision byte is the one byte that legally differs.
-        let (held_head, held_body) = held.split_at(2.min(held.len()));
-        let (arrived_head, arrived_body) = arrived.split_at(2.min(arrived.len()));
-        if held_head.first() != arrived_head.first() || !arrived_body.starts_with(held_body) {
+        if !arrived[HEAD..].starts_with(&held[HEAD..]) {
             return Err(SetupBundleError::Rewritten);
         }
         Ok(())
