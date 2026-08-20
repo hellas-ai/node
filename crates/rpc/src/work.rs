@@ -49,14 +49,21 @@
 //! same `work_id`, so it lives beside the acceptance that authorised it.
 //!
 //! The property it exists for: **for one `work_id`, at most one call in
-//! the lifetime of the journal ever invokes the backend.** Three durable
-//! facts make that hold together, and none of them alone does. The
-//! provider burns each proposal nonce it sees, so one `work_id` opens at
-//! most one job, ever — ending a job does not give its nonce back. The
-//! journal takes a running marker only from the accepted phase, so one
-//! job crosses into running at most once. And a marker found on the
-//! disk by a process that did not write it makes the state
-//! indeterminate, which no automatic step resolves.
+//! the lifetime of one journal ever invokes the backend.** Two durable
+//! facts carry it, and neither alone does. The provider burns each
+//! proposal nonce it sees, so one `work_id` opens at most one job, ever
+//! — ending a job does not give its nonce back. And the journal takes a
+//! running marker only from the accepted phase, so one job crosses into
+//! running at most once; every later call reads that phase and answers
+//! from it instead of invoking. Deleting the journal file forfeits both,
+//! which is why the claim is scoped to one journal's life and not to one
+//! `work_id`'s.
+//!
+//! A third durable fact is about the crash rather than the count. A
+//! marker found on the disk by a process that did not write it makes the
+//! state indeterminate, and that does not stop a second invocation — the
+//! phase already does — it stops the *resolution*: a recovered process
+//! may not sign a result for an invocation it cannot know it made.
 //!
 //! # What this phase does not carry
 //!
@@ -518,19 +525,22 @@ impl ProviderEndpoint {
     /// [`RunAdmission::Invoke`] is returned only when the job was
     /// accepted and not yet running, and only after the running marker
     /// is on the disk — so a crash between the marker and the answer
-    /// costs the invocation, never a second one. Every other state
-    /// answers with what it already is: a job this process is running,
-    /// a job whose result is already signed, or a job whose marker was
-    /// found by a process that did not write it.
+    /// costs the invocation, never a second one. Every other phase past
+    /// acceptance answers with what it already is: a job this process is
+    /// running, a job whose result is already signed, or a job whose
+    /// marker was found by a process that did not write it. A job that
+    /// was never co-signed is refused rather than answered.
     ///
     /// `ready` is a *fresh* readiness decision, and the freshness is the
     /// caller's to owe in exactly the sense [`ReadyChannel`] already
     /// documents: nothing on that type re-reads the chain, so a
     /// contest opened after it was built is invisible here. What is
     /// checked is that it is this endpoint's own channel, at this
-    /// endpoint's own policy, and that the margins the policy measured
-    /// still fit before the terminal deadline at the height this
-    /// endpoint has processed blocks through.
+    /// endpoint's own policy, that the channel still admits work at all,
+    /// and that the margins the policy measured still fit before the
+    /// terminal deadline — all at the height this endpoint has processed
+    /// finalized blocks through, not at the height the readiness was
+    /// decided at.
     ///
     /// The request it hands back is rebuilt from the bundle the journal
     /// holds, never from a quote. That bundle is the one the
@@ -735,12 +745,17 @@ pub enum RunAdmission {
 
 /// What one run of an accepted job produced.
 ///
-/// [`Self::Completed`] is returned by exactly one call per `work_id`,
+/// [`Self::Completed`] is returned by at most one call per `work_id`,
 /// ever: it is the answer of the call that invoked the backend, and it
-/// is the only one that carries the transcript. A later call finds
-/// [`Self::Ready`] instead, which carries the signed result and not the
-/// bytes it summarises — this phase retains no spool, so the transcript
-/// exists once, in the hand of the caller that caused it.
+/// is the only one that carries the transcript. It is *at most* rather
+/// than exactly one because that call can still fault — a backend that
+/// refuses, or a journal that will not take the result, leaves a job
+/// whose `Completed` never comes.
+///
+/// A later call finds [`Self::Ready`] instead, which carries the signed
+/// result and not the bytes it summarises. This phase retains no spool,
+/// so the transcript exists once, in the hand of the caller that caused
+/// it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RunOutcome {
     /// This call invoked the backend and recorded its terminal.

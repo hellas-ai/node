@@ -15,10 +15,16 @@
 //!
 //! # Invoked once
 //!
-//! Not by anything in this file. This calls the engine every time it is
-//! called, and that is the honest shape for it: the caller has already
-//! journaled a running marker for this `work_id`, and it is that marker
-//! — not any restraint here — which means no second call will come.
+//! Not by anything in this file. This starts the engine every time it is
+//! called, and that is the honest shape for it: what makes a second call
+//! not come is the running marker the gate journaled, and nothing here
+//! can see one.
+//!
+//! Which is also to say what this is not: a paid gate on the executor's
+//! own front door. An owner of the [`ExecutorHandle`] can call it
+//! directly and get an execution for nothing — the same reach
+//! `materialize_model` has, and for the same reason, since the handle is
+//! held in-process and no RPC routes to either.
 //!
 //! One thing this file must not do, and deliberately does not: consult
 //! the engine's completed-execution map. That map is keyed by request
@@ -274,13 +280,17 @@ mod tests {
         }
     }
 
-    /// Retention is the user's artifact policy and not the protocol's
-    /// evidence policy.
+    /// Retention is a field of the request, not a gate on this seam.
     ///
-    /// A `retain=false` request is the one whose transcript the artifact
-    /// store will not keep, and it is drained here exactly as a retained
-    /// one is: what the paid endpoint journals is the signed result, and
-    /// this seam never consults the store that retention governs.
+    /// A `retain=false` request is drained here exactly as a retained one
+    /// is, and the transcript that comes back is complete — which is
+    /// what the paid endpoint needs, because the evidence it journals is
+    /// the signed result and not a stored artifact. Nothing here reads
+    /// the artifact store, so nothing here can suppress the answer.
+    ///
+    /// It says nothing about what the artifact store does with an
+    /// ephemeral request; that is `EvaluateArtifactStores`' and has its
+    /// own tests.
     #[tokio::test]
     async fn an_unretained_request_still_yields_its_transcript() {
         let mut unretained = request();

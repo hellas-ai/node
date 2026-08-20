@@ -98,10 +98,12 @@ pub trait SchemeEngine: Send + Sync {
     /// accepted, from the bundle on its disk, and a quote lookup could
     /// only fail there.
     ///
-    /// It is not an unpaid execution route. Nothing outside this crate
-    /// can reach it, and the one caller that can — the paid work backend
-    /// — has already been told by a durable running marker that this
-    /// invocation is owed.
+    /// It admits nothing financial, and does not pretend to. Its one
+    /// caller is `ExecutorHandle::run_paid_evaluate`, which is reachable
+    /// by an owner of the handle and by no RPC — the same reach
+    /// `materialize_model` has. What makes an invocation through it a
+    /// paid one is the running marker the paid endpoint journaled
+    /// before calling, and that marker is not visible from here.
     async fn start_request(
         &mut self,
         request: hellas_rpc::EvaluateRequest,
