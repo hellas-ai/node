@@ -2557,3 +2557,108 @@ fn the_retained_dispatch_input_is_the_one_the_authorization_commits_to() {
         "unexpected error: {error}"
     );
 }
+
+/// Inputs swapped on the disk fault the journal rather than becoming a
+/// job to execute.
+///
+/// The other half of the property above, and the one that matters to a
+/// dispatch: an accepted job is executed from bytes nobody re-verifies
+/// at dispatch time, so what makes them the right bytes is that opening
+/// the file re-runs the same digest check that admitted them. A store
+/// that only checked on commit would hand a restarted provider a job
+/// its client never signed, and ask for no new signature to do it.
+#[test]
+fn inputs_swapped_on_the_disk_are_not_a_job_to_execute() {
+    let channel = channel();
+    let job = job_at(&channel, 1, 1, 0);
+
+    // Two journals written the same way, behind the store's back
+    // because no store would take the second: the same authorization,
+    // the same real client signature, and the same real co-signature
+    // over the same work id. Only the bundle differs.
+    for (bundle_nonce, readable) in [(1_u64, true), (2, false)] {
+        let dir = temp();
+        {
+            // One store, opened and dropped, so the journal exists with
+            // the name and header its key fixes.
+            drop(open(dir.path(), Role::Provider));
+        }
+        let path = channel_journal(dir.path());
+        if let Err(error) = std::fs::remove_file(&path) {
+            panic!("the empty journal is removable: {error}");
+        }
+        {
+            let id = JournalId {
+                kind: JournalKind::Channel,
+                role: Role::Provider,
+                key: channel_key_bytes(&path),
+            };
+            let (mut journal, _) = match Journal::open(&path, id) {
+                Ok(opened) => opened,
+                Err(error) => panic!("the journal opens: {error}"),
+            };
+            for record in [
+                ChannelRecord::JobProposed {
+                    authorization: job.authorization,
+                    client_signature: client().sign(payload(job.work_id)),
+                    prepared_input: bundle_bytes(bundle_nonce),
+                },
+                ChannelRecord::JobAccepted {
+                    provider_signature: provider().sign(payload(job.work_id)),
+                },
+            ] {
+                if let Err(error) = journal.append(&record.encode()) {
+                    panic!("the record appends: {error}");
+                }
+            }
+        }
+
+        let opened = ChannelStore::open(
+            dir.path(),
+            channel.clone(),
+            settlement(),
+            Role::Provider,
+            &Secp256k1Verifier::new(),
+        );
+        if readable {
+            match opened {
+                Ok(store) => assert!(store.state().job().is_some(), "the job replays"),
+                Err(error) => panic!("the journal this route wrote reopens: {error}"),
+            }
+            continue;
+        }
+        let Err(error) = opened else {
+            panic!("those are not the inputs the authorization names");
+        };
+        assert!(
+            matches!(error, WorkStoreError::Channel(ChannelStateError::Record(_))),
+            "unexpected error: {error}"
+        );
+    }
+}
+
+/// The 32-byte key a channel journal's own file name carries.
+///
+/// Read from the name rather than derived a second time: a second
+/// derivation could be wrong in the same way twice.
+fn channel_key_bytes(path: &std::path::Path) -> [u8; 32] {
+    let name = path.to_string_lossy().into_owned();
+    let Some(hex) = name
+        .rsplit_once("channel-")
+        .and_then(|(_, rest)| rest.strip_suffix(".journal"))
+    else {
+        panic!("the channel journal is named channel-<key>.journal");
+    };
+    let mut key = [0_u8; 32];
+    assert_eq!(hex.len(), 2 * key.len(), "the name carries a 32-byte key");
+    for (byte, pair) in key.iter_mut().zip(hex.as_bytes().chunks_exact(2)) {
+        let Ok(text) = std::str::from_utf8(pair) else {
+            panic!("hex is ascii");
+        };
+        match u8::from_str_radix(text, 16) {
+            Ok(value) => *byte = value,
+            Err(error) => panic!("the name is hex: {error}"),
+        }
+    }
+    key
+}
