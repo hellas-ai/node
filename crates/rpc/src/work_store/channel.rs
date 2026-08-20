@@ -1692,9 +1692,11 @@ impl ChannelStore {
     /// each historical reservation is re-checked against what this
     /// journal shows was lost before it, and the counterparty's whole
     /// total — every channel it has had — is what the state carries
-    /// afterwards. A journal this endpoint wrote a record at a time
-    /// therefore opens; one whose own records show a reservation the
-    /// limit did not allow does not.
+    /// afterwards. A journal this endpoint wrote a record at a time is
+    /// therefore never refused by a credit rule — each reservation is
+    /// re-checked against a total no larger than the one it was taken
+    /// under — while a journal whose own records show a reservation the
+    /// limit did not allow still is.
     ///
     /// # Errors
     ///
