@@ -719,15 +719,19 @@ fn an_interrupted_invocation_stays_indeterminate() {
     assert_eq!(recovered.loss().delivery, 0, "nothing was delivered");
 }
 
-/// A job the provider's own side failed costs this client nothing, and
-/// leaves its credit whole.
+/// A job the provider's own side failed costs this client nothing, at a
+/// phase where the client's own silence would have cost it a price.
 ///
-/// The rule this is about is `loss_of`'s first question — whose fault —
-/// and the attack it refuses is a provider that accepts a client's work
+/// `loss_of`'s first question — whose fault — isolated from its second.
+/// Every job here reaches the same phase, `Ready`: the result is signed,
+/// so the *phase* half of the rule is satisfied and only the reason is
+/// varied. The last one is the control, and it is charged.
+///
+/// The attack this refuses is a provider that accepts a client's work
 /// and fails it, over and over, until that client's identity-wide credit
-/// is spent and no honest provider will take it either. The second job
-/// below is the whole point: it is admitted, at the same price, on a
-/// channel whose limit is two prices.
+/// is spent and no honest provider will take it either. Two prices is
+/// this channel's whole limit, and after four faults the fifth job is
+/// admitted.
 #[test]
 fn a_provider_fault_is_not_the_clients_debt() {
     let dir = temp();
@@ -735,12 +739,20 @@ fn a_provider_fault_is_not_the_clients_debt() {
     let verifier = Secp256k1Verifier::new();
     let mut store = open_on(dir.path(), channel.clone(), Role::Provider);
 
-    // Two runs that got as far as compute can get without a result.
-    for (nonce, reason) in [(1, JobEnd::Failed), (2, JobEnd::Indeterminate)] {
+    // Four jobs whose results were signed, and whose endings were the
+    // provider's own side going wrong.
+    for nonce in 1..=4 {
+        let reason = if nonce % 2 == 0 {
+            JobEnd::Failed
+        } else {
+            JobEnd::Indeterminate
+        };
         let job = job_at(&channel, nonce, 1, 0);
-        commit_all(
-            &mut store,
-            &[job.proposed(), job.accepted(), ChannelRecord::JobRunning],
+        commit_all(&mut store, &provider_sequence(&channel, &job)[..4]);
+        assert_eq!(
+            store.state().job().map(JobState::phase),
+            Some(JobPhase::Ready),
+            "the result is signed before this ending",
         );
         if let Err(error) = store.commit(ChannelRecord::JobEnded { reason }, &verifier) {
             panic!("the ending commits: {error}");
@@ -749,25 +761,9 @@ fn a_provider_fault_is_not_the_clients_debt() {
         assert_eq!(store.state().compute_outstanding(), 0);
     }
 
-    // Twenty prices of provider faults later, this client may still
-    // order the two jobs its limit allows.
-    for nonce in 3..=4 {
-        let job = job_at(&channel, nonce, 1, 0);
-        if let Err(error) = store.commit(job.proposed(), &verifier) {
-            panic!("an honest client's credit is untouched: {error}");
-        }
-        if let Err(error) = store.commit(
-            ChannelRecord::JobEnded {
-                reason: JobEnd::Failed,
-            },
-            &verifier,
-        ) {
-            panic!("the ending commits: {error}");
-        }
-    }
-
-    // And the control: the same phase, ended as the client's own
-    // silence, is the client's debt.
+    // The control: the same phase, ended as the client's own silence, is
+    // the client's debt — and it is the whole of what this channel then
+    // has left.
     let expired = job_at(&channel, 5, 1, 0);
     commit_all(&mut store, &provider_sequence(&channel, &expired)[..4]);
     if let Err(error) = store.commit(
