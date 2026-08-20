@@ -24,10 +24,10 @@ use hellas_rpc::protocol::work::{
     result_digest, work_id,
 };
 use hellas_rpc::protocol::{ContentId, Digest, EventCommitment};
-use hellas_rpc::work_store::journal::JournalError;
+use hellas_rpc::work_store::journal::{Journal, JournalError, JournalId, JournalKind};
 use hellas_rpc::work_store::{
-    ChannelRecord, ChannelStateError, ChannelStore, CounterpartyLoss, JobEnd, JobPhase, Role,
-    WorkStoreError,
+    ChannelRecord, ChannelStateError, ChannelStore, CounterpartyLoss, JobEnd, JobPhase, JobState,
+    Role, WorkStoreError,
 };
 use hellas_rpc::{
     Assurance, Evaluate, EvaluateProgramManifest, EvaluateRequest, ProgramManifest, PublicKey,
@@ -988,6 +988,340 @@ fn loss_outlives_the_channel_it_was_lost_on() {
         panic!("unexpected error: {error}");
     };
     assert_eq!((used, limit), (2 * PRICE, COMPUTE_LIMIT));
+}
+
+// ── A journal is read back as the journal it was written as ───────────
+
+/// A journal accepted a record at a time is accepted whole.
+///
+/// Every prefix of one legal provider journal is reopened over the files
+/// the first process left behind, and what the second process holds is
+/// compared with what the first one held when it wrote that prefix's
+/// last record. Both sequences drive one recorded loss to exactly its
+/// limit — compute on the first channel, delivery on the second, since
+/// they are two readings of one seed and a fix for either is a fix for
+/// both. That is where a replay which re-checked each historical
+/// reservation against the *final* loss total would refuse the file it
+/// had itself written, record by legal record.
+#[test]
+fn a_journal_accepted_a_record_at_a_time_reopens_whole() {
+    let channel = channel_with(EdgeId::from_bytes([0xe5; 32]), limits(2 * PRICE, 2 * PRICE));
+    let verifier = Secp256k1Verifier::new();
+    let first = job_at(&channel, 1, 1, 0);
+    let second = job_at(&channel, 2, 1, 0);
+    let sequence = vec![
+        first.proposed(),
+        first.accepted(),
+        ChannelRecord::JobRunning,
+        first.result_record(&channel),
+        ChannelRecord::PlaintextReleased,
+        // Delivered and never paid for: 10 of the 20 compute and 10 of
+        // the 20 delivery this client is allowed.
+        ChannelRecord::JobEnded {
+            reason: JobEnd::Expired,
+        },
+        // 10 lost plus 10 more is 20, which is the compute limit and not
+        // over it. This is the record the whole test is about.
+        second.proposed(),
+        second.accepted(),
+        ChannelRecord::JobRunning,
+        // And now the recorded compute loss *is* the limit.
+        ChannelRecord::JobEnded {
+            reason: JobEnd::Failed,
+        },
+    ];
+    every_prefix_reopens_as_it_was(&channel, &sequence);
+
+    // The same, with the room in the other currency: two delivered and
+    // unpaid jobs put the recorded *delivery* loss exactly on its limit,
+    // and the second release is the record checked at the boundary.
+    let delivering = channel_with(
+        EdgeId::from_bytes([0xea; 32]),
+        limits(20 * PRICE, 2 * PRICE),
+    );
+    let third = job_at(&delivering, 1, 1, 0);
+    let fourth = job_at(&delivering, 2, 1, 0);
+    let mut delivered = Vec::new();
+    for job in [&third, &fourth] {
+        delivered.extend(provider_sequence(&delivering, job)[..5].to_vec());
+        delivered.push(ChannelRecord::JobEnded {
+            reason: JobEnd::Expired,
+        });
+    }
+    every_prefix_reopens_as_it_was(&delivering, &delivered);
+
+    // What the whole journal leaves is a channel with no credit left,
+    // which is a refusal the endpoint makes when the next job arrives —
+    // not one the file makes when it is opened.
+    let dir = temp();
+    {
+        let mut store = open_on(dir.path(), channel.clone(), Role::Provider);
+        commit_all(&mut store, &sequence);
+    }
+    let mut recovered = open_on(dir.path(), channel.clone(), Role::Provider);
+    assert_eq!(recovered.loss().compute, 2 * PRICE, "the limit, exactly");
+    let next = job_at(&channel, 3, 1, 0);
+    let error = recovered
+        .commit(next.proposed(), &verifier)
+        .expect_err("this client has spent its compute credit");
+    let WorkStoreError::Channel(ChannelStateError::OverCredit {
+        ledger,
+        used,
+        reserved,
+        price,
+        limit,
+    }) = error
+    else {
+        panic!("unexpected error: {error}");
+    };
+    assert_eq!(
+        (ledger, used, reserved, price, limit),
+        ("compute", 2 * PRICE, 0, PRICE, 2 * PRICE)
+    );
+}
+
+/// Reopens every prefix of one journal, and holds what the second
+/// process reads against what the first one held when it wrote that
+/// prefix's last record.
+fn every_prefix_reopens_as_it_was(channel: &PaidChannel, sequence: &[ChannelRecord]) {
+    let verifier = Secp256k1Verifier::new();
+    for length in 1..=sequence.len() {
+        let dir = temp();
+        let (live, live_loss) = {
+            let mut store = open_on(dir.path(), channel.clone(), Role::Provider);
+            commit_all(&mut store, &sequence[..length]);
+            (store.state().clone(), store.loss())
+        };
+
+        let recovered = match ChannelStore::open(
+            dir.path(),
+            channel.clone(),
+            settlement(),
+            Role::Provider,
+            &verifier,
+        ) {
+            Ok(store) => store,
+            Err(error) => panic!("the first {length} records reopen: {error}"),
+        };
+        assert_eq!(recovered.loss(), live_loss, "loss after {length} records");
+
+        // The running marker is the one field a reopen may move: the
+        // process that wrote it made the invocation, and the process
+        // that reads it did not. `JobRunning` moves a phase and nothing
+        // else, and the prefix one record shorter is compared whole.
+        let running = live.job().map(JobState::phase) == Some(JobPhase::Running);
+        assert_eq!(
+            recovered.state().is_indeterminate(),
+            running,
+            "the marker after {length} records"
+        );
+        if running {
+            assert_eq!(
+                recovered.state().job().map(JobState::phase),
+                Some(JobPhase::Running)
+            );
+            assert_eq!(
+                recovered.state().compute_outstanding(),
+                live.compute_outstanding()
+            );
+            assert_eq!(
+                recovered.state().delivery_outstanding(),
+                live.delivery_outstanding()
+            );
+        } else {
+            assert_eq!(*recovered.state(), live, "state after {length} records");
+        }
+    }
+}
+
+/// The same property when the loss is not this channel's own.
+///
+/// A client that has defaulted elsewhere for more than this channel's
+/// entire limit still has one legal journal here, and it still reads
+/// back as itself. What that loss costs it is the next job, not the
+/// history of this one.
+#[test]
+fn a_journal_reopens_when_the_clients_loss_has_passed_this_channels_limit() {
+    let dir = temp();
+    let verifier = Secp256k1Verifier::new();
+    let narrow = channel_with(EdgeId::from_bytes([0xe6; 32]), limits(2 * PRICE, 2 * PRICE));
+    let roomy = channel_with(
+        EdgeId::from_bytes([0xe7; 32]),
+        limits(20 * PRICE, 20 * PRICE),
+    );
+
+    // One whole job on the narrow channel, done and paid for while this
+    // client owed nothing.
+    let paid = job_at(&narrow, 1, 1, 0);
+    let live = {
+        let mut store = open_on(dir.path(), narrow.clone(), Role::Provider);
+        commit_all(&mut store, &provider_sequence(&narrow, &paid));
+        store.state().clone()
+    };
+
+    // The same client then runs three jobs on the other channel and pays
+    // for none. 30 lost is more than the narrow channel's whole 20 of
+    // compute credit — and the loss ledger is the client's, not the
+    // channel's, so the narrow channel's replay sees all of it.
+    {
+        let mut store = open_on(dir.path(), roomy.clone(), Role::Provider);
+        for nonce in 1..=3 {
+            let job = job_at(&roomy, nonce, 1, 0);
+            commit_all(
+                &mut store,
+                &[job.proposed(), job.accepted(), ChannelRecord::JobRunning],
+            );
+            if let Err(error) = store.commit(
+                ChannelRecord::JobEnded {
+                    reason: JobEnd::Failed,
+                },
+                &verifier,
+            ) {
+                panic!("the ending commits: {error}");
+            }
+        }
+        assert_eq!(store.loss().compute, 3 * PRICE);
+    }
+
+    let mut recovered = match ChannelStore::open(
+        dir.path(),
+        narrow.clone(),
+        settlement(),
+        Role::Provider,
+        &verifier,
+    ) {
+        Ok(store) => store,
+        Err(error) => panic!("the narrow channel's journal reopens: {error}"),
+    };
+
+    // The loss is the one thing that must have moved: it is what this
+    // client owes now, across every channel it has had.
+    assert_eq!(recovered.loss().compute, 3 * PRICE);
+    assert_eq!(recovered.state().loss().compute, 3 * PRICE);
+    let state = recovered.state();
+    assert_eq!(state.job(), live.job(), "the job it ended with");
+    assert_eq!(state.ledger(), live.ledger(), "what it had credited");
+    assert_eq!(
+        state.max_executable_certificate(),
+        live.max_executable_certificate()
+    );
+    assert_eq!(state.last_payment(), live.last_payment());
+    assert_eq!(state.compute_outstanding(), live.compute_outstanding());
+    assert_eq!(state.delivery_outstanding(), live.delivery_outstanding());
+    assert_eq!(state.next_proposal_nonce(), live.next_proposal_nonce());
+    assert_eq!(state.unallocated_gap(), live.unallocated_gap());
+    assert_eq!(state.cursor(), live.cursor());
+    assert!(!state.is_indeterminate());
+
+    // And the credit rule the replay stopped applying to history still
+    // applies to the next job.
+    let next = job_at(&narrow, 2, 2, PRICE);
+    let error = recovered
+        .commit(next.proposed(), &verifier)
+        .expect_err("this client's credit was spent on another channel");
+    let WorkStoreError::Channel(ChannelStateError::OverCredit { used, limit, .. }) = error else {
+        panic!("unexpected error: {error}");
+    };
+    assert_eq!((used, limit), (3 * PRICE, 2 * PRICE));
+}
+
+/// A reservation the journal's own records forbid is refused on replay.
+///
+/// The other half of the property above, and what stops the loss replay
+/// from being a fold nobody can see: a file that says on its face that
+/// 20 was lost and then 10 more was reserved against a limit of 20 is
+/// not a file any endpoint here wrote a record at a time, and it is not
+/// read back whole. The judgement is made from this journal's own
+/// records — never from a total that only existed later.
+#[test]
+fn replay_refuses_a_reservation_this_journals_own_losses_forbid() {
+    let dir = temp();
+    let channel = channel_with(EdgeId::from_bytes([0xe8; 32]), limits(2 * PRICE, 2 * PRICE));
+    let verifier = Secp256k1Verifier::new();
+    {
+        let mut store = open_on(dir.path(), channel.clone(), Role::Provider);
+        for nonce in 1..=2 {
+            let job = job_at(&channel, nonce, 1, 0);
+            commit_all(
+                &mut store,
+                &[job.proposed(), job.accepted(), ChannelRecord::JobRunning],
+            );
+            if let Err(error) = store.commit(
+                ChannelRecord::JobEnded {
+                    reason: JobEnd::Failed,
+                },
+                &verifier,
+            ) {
+                panic!("the ending commits: {error}");
+            }
+        }
+        assert_eq!(store.loss().compute, 2 * PRICE, "the limit, exactly");
+    }
+
+    // A third proposal, correct in every other way — the client's real
+    // signature, this channel's fields, a nonce nothing has spent —
+    // written behind the store's back, because no store would take it.
+    let third = job_at(&channel, 3, 1, 0);
+    {
+        let (mut journal, replay) = match Journal::open(
+            channel_journal(dir.path()),
+            channel_journal_id(dir.path(), Role::Provider),
+        ) {
+            Ok(opened) => opened,
+            Err(error) => panic!("the journal opens: {error}"),
+        };
+        assert_eq!(replay.records.len(), 8, "two jobs of four records");
+        if let Err(error) = journal.append(&third.proposed().encode()) {
+            panic!("the record appends: {error}");
+        }
+    }
+
+    let error = ChannelStore::open(dir.path(), channel, settlement(), Role::Provider, &verifier)
+        .expect_err("that reservation was never one this channel could make");
+    let WorkStoreError::Channel(ChannelStateError::OverCredit {
+        ledger,
+        used,
+        reserved,
+        price,
+        limit,
+    }) = error
+    else {
+        panic!("unexpected error: {error}");
+    };
+    assert_eq!(
+        (ledger, used, reserved, price, limit),
+        ("compute", 2 * PRICE, 0, PRICE, 2 * PRICE)
+    );
+}
+
+/// The journal id of the channel file the store wrote, taken from the
+/// name it is stored under rather than from a second copy of the key
+/// derivation, which could be wrong in the same way twice.
+fn channel_journal_id(root: &std::path::Path, role: Role) -> JournalId {
+    let path = channel_journal(root);
+    let name = path.to_string_lossy().into_owned();
+    let Some(hex) = name
+        .rsplit_once("channel-")
+        .and_then(|(_, rest)| rest.strip_suffix(".journal"))
+    else {
+        panic!("the channel journal is named channel-<key>.journal");
+    };
+    let mut key = [0_u8; 32];
+    assert_eq!(hex.len(), 2 * key.len(), "the name carries a 32-byte key");
+    for (byte, pair) in key.iter_mut().zip(hex.as_bytes().chunks_exact(2)) {
+        let Ok(text) = std::str::from_utf8(pair) else {
+            panic!("hex is ascii");
+        };
+        match u8::from_str_radix(text, 16) {
+            Ok(value) => *byte = value,
+            Err(error) => panic!("the name is hex: {error}"),
+        }
+    }
+    JournalId {
+        kind: JournalKind::Channel,
+        role,
+        key,
+    }
 }
 
 // ── The unallocated gap ───────────────────────────────────────────────

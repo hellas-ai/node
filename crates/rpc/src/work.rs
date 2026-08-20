@@ -244,11 +244,12 @@ impl From<WorkStoreError> for Refusal {
 ///
 /// `OverCredit` is reachable but not from a test here. This profile
 /// admits one job at a time, so the gate can only bite after earlier
-/// jobs have been run and lost — and a channel whose recorded loss has
-/// reached its limit cannot currently be reopened at all, because replay
-/// re-checks each historical reservation against the *final* loss total
-/// rather than the total at the time. That is a durable-state defect,
-/// not a wire one, and it is recorded rather than worked around here.
+/// jobs have been run and lost, which takes a journal rather than a
+/// request. What it is on the wire — a decline, not a fault — is
+/// decided here; that it bites at all is
+/// `compute_credit_bounds_what_may_be_co_signed`'s, and that a channel
+/// which has reached its limit still *opens* is
+/// `a_journal_accepted_a_record_at_a_time_reopens_whole`'s.
 ///
 /// The rest belong to steps this phase does not carry — a result, an
 /// invoice, a cursor — and are mapped so the match is total, not because

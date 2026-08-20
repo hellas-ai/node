@@ -28,6 +28,22 @@
 //! credit is reserved before the plaintext leaves, because afterwards
 //! there is nothing left to decide.
 //!
+//! # Credit is a decision with a time
+//!
+//! Both reservations read what this counterparty has already lost, and
+//! that number only grows. A replay therefore reads the journal the way
+//! it was written: [`ChannelStore::open`] starts owed nothing and adds
+//! each ending's loss as it reaches the record that ends it, so every
+//! historical reservation is re-checked against what was lost *before*
+//! it. Judging an old reservation by a later total is how a file that
+//! was legal at every step becomes a file that cannot be opened.
+//!
+//! What that re-check can see is what this journal itself records. The
+//! loss ledger is keyed by counterparty, not by channel, so the totals
+//! it holds when the file is opened may include channels this journal
+//! has never heard of; those are installed once, at the end, because
+//! they bound the *next* job rather than the ones already recorded.
+//!
 //! # What a record is
 //!
 //! Six of the eleven records carry a signed artifact — the
@@ -622,8 +638,34 @@ pub struct LossTotals {
     pub delivery: u64,
 }
 
+impl LossTotals {
+    /// Returns these totals with one more job's loss counted.
+    ///
+    /// # Errors
+    ///
+    /// [`PaidWorkError::Overflow`] if either currency would wrap. The
+    /// totals move in one step, so a sum that cannot be taken leaves
+    /// neither currency moved.
+    fn plus(self, compute: u64, delivery: u64) -> Result<Self, PaidWorkError> {
+        Ok(Self {
+            compute: self
+                .compute
+                .checked_add(compute)
+                .ok_or(PaidWorkError::Overflow {
+                    field: "compute loss",
+                })?,
+            delivery: self
+                .delivery
+                .checked_add(delivery)
+                .ok_or(PaidWorkError::Overflow {
+                    field: "delivery loss",
+                })?,
+        })
+    }
+}
+
 /// What one endpoint durably knows about one channel.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChannelState {
     channel: PaidChannel,
     settlement: WorkPaymentSettlement,
@@ -832,7 +874,10 @@ impl ChannelState {
     ///
     /// Every rule this endpoint has is here, and replay runs it too, so
     /// a journal that could not have been written a record at a time is
-    /// not read back whole.
+    /// not read back whole. The two credit rules read [`Self::loss`],
+    /// which is a moving number rather than a fact about the record —
+    /// so a replay must move it as it goes, and [`ChannelStore::open`]
+    /// is where that is done.
     fn apply<V: SigVerifier>(
         &mut self,
         record: &ChannelRecord,
@@ -1558,20 +1603,7 @@ impl CounterpartyLoss {
             }
             None => {}
         }
-        self.totals.compute =
-            self.totals
-                .compute
-                .checked_add(compute)
-                .ok_or(PaidWorkError::Overflow {
-                    field: "compute loss",
-                })?;
-        self.totals.delivery =
-            self.totals
-                .delivery
-                .checked_add(delivery)
-                .ok_or(PaidWorkError::Overflow {
-                    field: "delivery loss",
-                })?;
+        self.totals = self.totals.plus(compute, delivery)?;
         self.entries.insert(work_id, (compute, delivery));
         Ok(())
     }
@@ -1619,6 +1651,14 @@ impl ChannelStore {
     /// back makes the state indeterminate. Opening does not resolve it,
     /// does not invoke anything, and refuses a result for it.
     ///
+    /// Loss is replayed with the records rather than in front of them:
+    /// each historical reservation is re-checked against what this
+    /// journal shows was lost before it, and the counterparty's whole
+    /// total — every channel it has had — is what the state carries
+    /// afterwards. A journal this endpoint wrote a record at a time
+    /// therefore opens; one whose own records show a reservation the
+    /// limit did not allow does not.
+    ///
     /// # Errors
     ///
     /// [`WorkStoreError::Journal`] when a file is held, corrupt, or
@@ -1641,11 +1681,38 @@ impl ChannelStore {
                 key,
             },
         )?;
-        let mut state = ChannelState::new(channel, settlement, role, loss.totals());
+        // Replay starts owed nothing and learns what it is owed as it
+        // reads, because that is the order the file was written in. A
+        // credit rule reads [`ChannelState::loss`], and a rule re-run
+        // over a total that only existed later is a rule asking a
+        // different question than the one that was answered.
+        let mut state = ChannelState::new(channel, settlement, role, LossTotals::default());
+        let mut counted = BTreeSet::new();
         for bytes in &replay.records {
             let record = ChannelRecord::decode(bytes)?;
+            // Read before the record is applied: applying it is what
+            // closes the job whose loss this is. Counted by `work_id`,
+            // exactly as the ledger being reconstructed counts it, so
+            // what one job cost is added once however it is recorded.
+            let ending = match record {
+                ChannelRecord::JobEnded { .. } => state.loss_of(),
+                _ => None,
+            };
             state.apply(&record, verifier)?;
+            if let Some((work_id, compute, delivery)) = ending
+                && counted.insert(work_id.into_bytes())
+            {
+                state.loss = state
+                    .loss
+                    .plus(compute, delivery)
+                    .map_err(ChannelStateError::from)?;
+            }
         }
+        // What the *next* job is checked against is the whole of what
+        // this client owes now — including the channels this journal
+        // knows nothing about, which is the reason the loss ledger is
+        // keyed by identity and not by channel.
+        state.loss = loss.totals();
         state.indeterminate = state
             .job
             .as_ref()
