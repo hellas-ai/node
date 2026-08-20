@@ -74,13 +74,14 @@ use hellas_kernel::{
 };
 use hellas_xet::{MIN_CHUNK_SIZE, SingleChunkHasher, XetFileHasher};
 
-use crate::evaluate::EvaluateTerminal;
+use crate::evaluate::{EvaluateTerminal, verify_output_events};
 use crate::protocol::artifacts::{
     Canonical, InputAddressed, OutputAddressed, PreparedPaidInputV1, SourceRef, TextArtifact,
 };
 use crate::protocol::value::CanonicalDecodeError;
 use crate::{
-    Assurance, ContentId, Digest, Evaluate, EventCommitment, PublicKey, RequestCommitment,
+    Assurance, ContentId, Digest, Evaluate, EventCommitment, InputCommitment, OutputEventEnvelope,
+    PublicKey, RequestCommitment,
 };
 
 // ── Domains ───────────────────────────────────────────────────────────
@@ -267,6 +268,14 @@ pub enum PaidWorkError {
         /// Which identifier repeated.
         field: &'static str,
     },
+    /// The events offered as one job's terminal transcript are not one.
+    ///
+    /// The text is the stream verifier's own, rendered rather than
+    /// nested: its error type is neither `Clone` nor `PartialEq`, and
+    /// this one is both because every record rule here is compared in a
+    /// test. Nothing decides on the string.
+    #[error("terminal transcript: {0}")]
+    Transcript(String),
 }
 
 // ── Records ───────────────────────────────────────────────────────────
@@ -1670,6 +1679,84 @@ pub fn check_prepared_input(
     }
 
     Ok(())
+}
+
+/// Builds the result record for the transcript one invocation of this
+/// job produced.
+///
+/// The only constructor of a [`PaidJobResultV1`] in this crate, and it
+/// takes the whole transcript rather than any digest of it. That is the
+/// point: what makes a result the provider's own is that the events it
+/// summarises verify as one signed chain — this profile's scheme, this
+/// authorization's request commitment, contiguous positions from zero,
+/// and a decodable terminal at the end. None of that can be supplied by
+/// a caller holding a commitment, so no path here accepts one.
+///
+/// The two digests it produces say different things about the same
+/// invocation. `terminal_transcript_commitment` is the last event's own
+/// commitment, so it binds the provider's exact signed framing,
+/// including how the tokens were split across events.
+/// `canonical_output_digest` binds the flattened answer, so two
+/// transcripts that split the same tokens differently agree on it.
+///
+/// # Errors
+///
+/// [`PaidWorkError::Transcript`] when the events are not one verified
+/// terminal transcript for this authorization's request: empty,
+/// mis-signed, out of order, addressed to another request, or ending in
+/// an event that is not a decodable terminal.
+/// [`PaidWorkError::Mismatch`] when they were produced under a key this
+/// channel does not call the provider. Whatever
+/// [`canonical_output_digest`] refuses about the terminal's own counts.
+pub fn terminal_result(
+    channel: &PaidChannel,
+    authorization: &PaidJobAuthorizationV1,
+    transcript: &[OutputEventEnvelope],
+) -> Result<PaidJobResultV1, PaidWorkError> {
+    let input = InputCommitment::from_digest(authorization.request_commitment.digest());
+    let output = verify_output_events(input, Assurance::ProducerSigned, transcript)
+        .map_err(|error| PaidWorkError::Transcript(error.to_string()))?;
+
+    // Verification above establishes that one key signed every event; it
+    // takes that key from the first event, so it cannot say whose key it
+    // is. This is what says it is the provider's — the same compressed
+    // secp256k1 point the payment terms name as a party.
+    if output.producer_key != PublicKey::Secp256k1(channel.provider_key().to_bytes()) {
+        return Err(PaidWorkError::Mismatch {
+            field: "transcript producer key",
+        });
+    }
+
+    let Some(terminal_event) = transcript.last() else {
+        // Unreachable: verification refuses an empty transcript, and a
+        // non-empty slice has a last element. Written as a refusal
+        // because nothing in this module panics; no test isolates it,
+        // and none claims to.
+        return Err(PaidWorkError::Transcript(
+            "the terminal transcript is empty".to_string(),
+        ));
+    };
+
+    // Chunk boundaries are dropped here and nowhere else. The deltas
+    // were verified to start at zero and to be contiguous, so their
+    // concatenation is the answer in position order.
+    let output_token_ids: Vec<u32> = output
+        .token_deltas
+        .iter()
+        .flat_map(|delta| delta.token_ids.iter().copied())
+        .collect();
+
+    let work_id = work_id(channel, authorization);
+    Ok(PaidJobResultV1 {
+        work_id,
+        terminal_transcript_commitment: terminal_event.event_commitment(),
+        canonical_output_digest: canonical_output_digest(
+            channel.network(),
+            work_id,
+            &output_token_ids,
+            &output.terminal,
+        )?,
+    })
 }
 
 /// Checks that a result answers the accepted job, and returns its

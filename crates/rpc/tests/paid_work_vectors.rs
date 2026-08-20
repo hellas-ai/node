@@ -2780,3 +2780,56 @@ fn digest_preimages_are_reproducible_by_hand() {
         "4ffac06a6c7d63aa63a0dad62ce1bb4e37881da550a42091a490d084fa32f00d"
     );
 }
+
+/// Rebuilds the normalized answer's preimage by hand, field by field.
+///
+/// The one digest in this module whose exact layout is fixed outside it:
+/// the client's independent oracle recomputes this from its own
+/// reexecution, so an implementation that agreed with `work.rs` and with
+/// nothing else would be a check the two halves of a payment could pass
+/// while meaning different things. Round-tripping cannot catch a
+/// transposed pair of same-width fields — `final_position` beside
+/// `input_units`, or the three usage counts among themselves — and this
+/// does.
+#[test]
+fn the_canonical_output_preimage_is_reproducible_by_hand() {
+    let id = work_id(&channel(), &authorization());
+    let tokens: [u32; 3] = [7, 0, 0x0001_0203];
+    let terminal = EvaluateTerminal {
+        final_position: 3,
+        stop_reason: EvaluateStopReason::MAX_OUTPUT,
+        text_artifact: Digest::from_bytes([0x60; 32]),
+        usage: EvaluateUsage {
+            input_units: 5,
+            output_units: 3,
+        },
+        billable_units: 8,
+    };
+
+    let mut preimage = b"hellas.work.evaluate-output.v1".to_vec();
+    preimage.push(NETWORK.len() as u8);
+    preimage.extend_from_slice(NETWORK.as_bytes());
+    preimage.extend_from_slice(id.as_bytes());
+    preimage.extend_from_slice(&3_u64.to_be_bytes());
+    preimage.extend_from_slice(&7_u32.to_be_bytes());
+    preimage.extend_from_slice(&0_u32.to_be_bytes());
+    preimage.extend_from_slice(&[0x00, 0x01, 0x02, 0x03]);
+    preimage.extend_from_slice(&3_u64.to_be_bytes());
+    preimage.push(2);
+    preimage.extend_from_slice(&[0x60; 32]);
+    preimage.extend_from_slice(&5_u64.to_be_bytes());
+    preimage.extend_from_slice(&3_u64.to_be_bytes());
+    preimage.extend_from_slice(&8_u64.to_be_bytes());
+    // 30 domain, 16 network, 32 work id, 8 count, 12 tokens, 8 position,
+    // 1 stop reason, 32 artifact, 24 usage.
+    assert_eq!(preimage.len(), 30 + 16 + 32 + 8 + 12 + 8 + 1 + 32 + 24);
+
+    assert_eq!(
+        Digest::hash(&preimage),
+        canonical_output_digest(network(), id, &tokens, &terminal).expect("legal terminal"),
+    );
+    assert_eq!(
+        hex(&Digest::hash(&preimage).into_bytes()),
+        "1e7b7469d057faf8b97e991313a2a052e47a1bef39b2a22d501065ba0b7b7b76"
+    );
+}
