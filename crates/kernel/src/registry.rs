@@ -146,8 +146,16 @@ impl Decode for RegistryNamespace {
 /// Kind of record a reassembled registry value holds.
 ///
 /// Carried by every chunk so a reader knows what it is assembling before
-/// it has assembled it, and so a chunk written under one record kind can
-/// never be read back as another.
+/// it has assembled it.
+///
+/// It is not what keeps a chunk of one record from reading back as
+/// another: today only two pairs are producible — `PaymentClose` with
+/// `PaymentPending`, and `BondLease` with `BondLease` — so the namespace
+/// already fixes the record kind, and both reassembly sites check both
+/// bytes against constants they derive from the same record. This byte
+/// is therefore a second spelling of the first one, and deleting it is a
+/// consensus-schema step (every stored chunk loses a byte and the state
+/// root moves) rather than a local tidy.
 #[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum RegistryRecordTag {
     /// Pending payment state.
