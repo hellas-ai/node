@@ -61,7 +61,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use hellas_kernel::{
-    Decode as _, EarnedCertificate, Encode as _, Key, NetworkId, PayloadHash, Sig, SigVerifier,
+    Decode as _, EarnedCertificate, Encode as _, Key, NetworkId, Sig, SigVerifier,
     WorkPaymentSettlement,
 };
 use hellas_xet::XetFileHasher;
@@ -71,7 +71,8 @@ use crate::protocol::artifacts::PreparedPaidInputV1;
 use crate::protocol::work::{
     CertificateAllocationV1, CreditLedger, InvoiceEntryV1, InvoicedJob, PaidChannel,
     PaidJobAuthorizationV1, PaidJobResultV1, PaidWorkError, PrivateRecord as _, allocation_digest,
-    invoice_digest, next_invoice_entry, prepared_input_digest, result_digest, work_id,
+    invoice_digest, next_invoice_entry, prepared_input_digest, result_digest, signing_hash,
+    work_id,
 };
 use crate::work_store::journal::{Journal, JournalId, JournalKind, MAX_RECORD_BYTES, Role};
 use crate::work_store::{Applied, WorkStoreError, cursor::Cursor, put_u64};
@@ -188,6 +189,12 @@ pub enum JobPhase {
     Delivered,
     /// A signed invoice entry exists for it.
     Invoiced,
+}
+
+impl core::fmt::Display for JobPhase {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.name())
+    }
 }
 
 impl JobPhase {
@@ -675,6 +682,23 @@ impl ChannelState {
         &self.ledger
     }
 
+    /// Returns which half of the channel this journal is.
+    #[must_use]
+    pub const fn role(&self) -> Role {
+        self.role
+    }
+
+    /// Returns what the funded payment edge can settle.
+    ///
+    /// Fixed when the store was opened, from the finalized read that
+    /// established the channel is live. An endpoint built over a
+    /// readiness decision taken at other funding would bound its
+    /// invoices by a different number than this one.
+    #[must_use]
+    pub const fn settlement(&self) -> WorkPaymentSettlement {
+        self.settlement
+    }
+
     /// Returns the next proposal nonce this client may consume.
     #[must_use]
     pub const fn next_proposal_nonce(&self) -> u64 {
@@ -975,7 +999,7 @@ impl ChannelState {
             }));
         }
 
-        if !verifier.verify_sig(client_signature, self.client_key(), payload_of(work_id)) {
+        if !verifier.verify_sig(client_signature, self.client_key(), signing_hash(work_id)) {
             return Err(ChannelStateError::BadSignature {
                 slot: "authorization",
                 party: "the client",
@@ -1055,7 +1079,7 @@ impl ChannelState {
         if !verifier.verify_sig(
             provider_signature,
             self.provider_key(),
-            payload_of(job.work_id),
+            signing_hash(job.work_id),
         ) {
             return Err(ChannelStateError::BadSignature {
                 slot: "authorization",
@@ -1128,7 +1152,7 @@ impl ChannelState {
         if !verifier.verify_sig(
             provider_signature,
             self.provider_key(),
-            payload_of(result_digest(&self.channel, result)),
+            signing_hash(result_digest(&self.channel, result)),
         ) {
             return Err(ChannelStateError::BadSignature {
                 slot: "result",
@@ -1213,7 +1237,7 @@ impl ChannelState {
         if !verifier.verify_sig(
             provider_signature,
             self.provider_key(),
-            payload_of(invoice_digest(&self.channel, entry)),
+            signing_hash(invoice_digest(&self.channel, entry)),
         ) {
             return Err(ChannelStateError::BadSignature {
                 slot: "invoice",
@@ -1258,7 +1282,7 @@ impl ChannelState {
             (
                 "allocation",
                 allocation_signature,
-                payload_of(allocation_digest(&self.channel, allocation)),
+                signing_hash(allocation_digest(&self.channel, allocation)),
             ),
             (
                 "certificate",
@@ -1427,10 +1451,6 @@ impl ChannelState {
         self.delivery_outstanding = total.saturating_sub(used);
         Ok(())
     }
-}
-
-fn payload_of(digest: Digest) -> PayloadHash {
-    PayloadHash::from_bytes(digest.into_bytes())
 }
 
 /// One counterparty's unrecovered loss, keyed by identity rather than by

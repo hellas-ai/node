@@ -552,6 +552,16 @@ impl ReadyChannel {
         self.settlement
     }
 
+    /// Returns the execution policy this readiness was decided under.
+    ///
+    /// The policy an endpoint checks a proposal against must be the one
+    /// whose margins [`Self::check_signable`] measures against and whose
+    /// digest the authorization names. Carrying it here is what stops
+    /// those three from being three copies.
+    pub const fn execution_policy(&self) -> &PaidExecutionPolicyV1 {
+        &self.execution_policy
+    }
+
     /// Returns the finalized height this readiness was decided at.
     pub const fn finalized_height(&self) -> u64 {
         self.finalized_height

@@ -1326,6 +1326,88 @@ pub fn check_execution_policy(policy: &PaidExecutionPolicyV1) -> Result<(), Paid
     Ok(())
 }
 
+/// The three heights one job is bound by.
+///
+/// A struct rather than three positional `u64`s, which are ordered,
+/// interchangeable, and a signature whose mistakes compile.
+///
+/// None of the three is derived from the execution policy, and that is
+/// deliberate: the policy measures *margins* — dispatch, delivery,
+/// oracle grace — and a margin is how much room a deadline needs, never
+/// which height a client wants its answer by. Where the two meet is
+/// `ReadyChannel::check_signable`, which refuses deadlines the measured
+/// margins cannot fit inside.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JobDeadlines {
+    /// Last height at which this authorization may be signed.
+    pub acceptance: u64,
+    /// Last height a terminal result is owed by.
+    pub terminal: u64,
+    /// Last height payment is owed by.
+    pub payment: u64,
+}
+
+/// Builds one job's authorization, deriving every field the channel, the
+/// policy, and the prepared inputs already fix.
+///
+/// The nonce and the three deadlines are the only choices left to the
+/// caller. Every other field is read out of something that already
+/// exists, so a proposal built here cannot name a price the policy does
+/// not fix, an environment its own request does not run in, or an input
+/// digest its own bundle does not hash to.
+///
+/// It checks nothing. [`check_authorization`] and
+/// [`check_prepared_input`] are where the refusals are written, once,
+/// and they are what the *other* party runs; a proposer that skipped
+/// them would only be refused later. What construction here buys is
+/// narrower and worth stating exactly: the fields it derives cannot
+/// disagree with their sources, so the checks that compare them can
+/// only fail on the caller's four choices or on a channel and policy
+/// that were already wrong.
+///
+/// # Errors
+///
+/// [`PaidWorkError::Body`] when the bundle's own bodies are not
+/// canonical, and [`PaidWorkError::Overflow`] when it is too large to
+/// length-prefix.
+pub fn propose_authorization(
+    channel: &PaidChannel,
+    policy: &PaidExecutionPolicyV1,
+    bundle: &PreparedPaidInputV1,
+    proposal_nonce: u64,
+    deadlines: JobDeadlines,
+) -> Result<PaidJobAuthorizationV1, PaidWorkError> {
+    let terms = channel.payment_terms();
+    let request = bundle.parts()?.evaluate_request;
+    Ok(PaidJobAuthorizationV1 {
+        channel_id: channel.id(),
+        bond_edge: terms.bond_edge,
+        bond_terms_hash: terms.bond_terms_hash(),
+        payment_edge: channel.payment_edge(),
+        payment_terms_hash: channel.payment_terms_hash(),
+        execution_policy_digest: execution_policy_digest(channel, policy),
+        prepared_input_digest: prepared_input_digest(channel, bundle)?,
+        proposal_nonce,
+        acceptance_deadline: deadlines.acceptance,
+        request_commitment: Evaluate::commit_request(&request),
+        environment_commitment: request.execution_environment,
+        price: policy.fixed_price,
+        terminal_deadline: deadlines.terminal,
+        payment_deadline: deadlines.payment,
+    })
+}
+
+/// Returns the kernel payload hash one of this module's digests is
+/// signed as.
+///
+/// A digest and a payload hash are both 32 bytes, and a signature is
+/// over the second. Written once so no call site re-wraps it, and so
+/// the two spellings cannot drift apart.
+#[must_use]
+pub const fn signing_hash(digest: Digest) -> PayloadHash {
+    PayloadHash::from_bytes(digest.into_bytes())
+}
+
 /// Checks one authorization against the channel, the policy it names,
 /// and the height it is being signed at, and returns its `work_id`.
 ///
