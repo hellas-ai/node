@@ -20,7 +20,7 @@ use hellas_kernel::{
 use hellas_rpc::evaluate::{EvaluateStopReason, EvaluateTerminal, EvaluateUsage};
 use hellas_rpc::protocol::artifacts::{
     BoundTermId, Canonical, InputAddressed, OutputAddressed, PreparedPaidInputV1, SourceRef,
-    TextArtifact, TextExecution, TextPolicy, TextState, TokenIds,
+    TextArtifact, TextExecution, TextExecutionId, TextPolicy, TextState, TokenIds, completed_text,
 };
 use hellas_rpc::protocol::work::{
     CertificateAllocationV1, CreditLedger, InvoiceEntryV1, InvoicedJob, MAX_ALLOCATION_ENTRIES,
@@ -184,7 +184,7 @@ fn text_policy() -> TextPolicy {
 
 fn identity_artifact() -> TextArtifact {
     TextArtifact::identity(
-        BoundTermId::from_bytes([0x21; 32]),
+        BoundTermId::from_digest(manifest().content_id().digest()),
         "test-model",
         "main",
         "f32",
@@ -580,7 +580,7 @@ fn golden_digests_bind_the_encoded_network() {
     );
     assert_eq!(
         hex(&work_id(&channel, &authorization()).into_bytes()),
-        "c11e6d67bc0781f0f18e1c50e5de3e38eb02d191aad4e10c28c262ed33132f3b"
+        "f80e92feefa240a2323f8eddfbf4e75838485818763e8641ebda92631c9f7524"
     );
 
     let other = channel_on(
@@ -1744,6 +1744,47 @@ fn each_graph_binding_is_checked_on_its_own() {
         })
     );
 
+    // An identity artifact bound to another environment than the one
+    // the request runs in. It is a legal artifact and a legal request;
+    // what is wrong is the edge between them, and the provider reads
+    // the model out of this end of it.
+    let elsewhere = TextArtifact::identity(
+        BoundTermId::from_bytes([0x83; 32]),
+        "test-model",
+        "main",
+        "f32",
+    );
+    let mut rebound_policy = policy;
+    rebound_policy.identity_source_digest =
+        match identity_source_digest(&elsewhere.canonical_bytes()) {
+            Ok(digest) => digest,
+            Err(error) => panic!("the identity hashes: {error}"),
+        };
+    let rebound_execution = TextExecution::new(
+        SourceRef::output(elsewhere.output_id()),
+        prompt_tokens().output_id(),
+        text_policy().output_id(),
+    );
+    let mut rebound_request = evaluate_request();
+    rebound_request.text_execution = rebound_execution.input_id().digest();
+    let rebound = PreparedPaidInputV1::new(
+        &rebound_request,
+        &manifest(),
+        &rebound_execution,
+        &prompt_tokens(),
+        &text_policy(),
+        &elsewhere,
+    );
+    let mut authorization = base;
+    authorization.prepared_input_digest = input_digest(&channel, &rebound);
+    authorization.request_commitment = Evaluate::commit_request(&rebound_request);
+    assert_eq!(
+        check_prepared_input(&channel, &authorization, &rebound_policy, &rebound),
+        Err(PaidWorkError::Mismatch {
+            field: "identity_artifact bound_term"
+        })
+    );
+
     // A bundle whose digest is not the one the authorization named at
     // all: the cheapest check, and the one that must not be the only
     // one.
@@ -2777,7 +2818,7 @@ fn digest_preimages_are_reproducible_by_hand() {
     assert_eq!(preimage.len(), 30 + 16 + 32 + 98);
     assert_eq!(
         hex(&Digest::hash(&preimage).into_bytes()),
-        "4ffac06a6c7d63aa63a0dad62ce1bb4e37881da550a42091a490d084fa32f00d"
+        "53a140ae47ca3abd2a848238aca5bbcb958f48f0c087c2966d66ea1b5e350590"
     );
 }
 
@@ -2830,7 +2871,7 @@ fn the_canonical_output_preimage_is_reproducible_by_hand() {
     );
     assert_eq!(
         hex(&Digest::hash(&preimage).into_bytes()),
-        "1e7b7469d057faf8b97e991313a2a052e47a1bef39b2a22d501065ba0b7b7b76"
+        "277d76e032a9a0218f94a13b859c02935a2861dd2d69a4f90162811d32c37804"
     );
 }
 
@@ -2904,4 +2945,96 @@ fn a_spooled_transcript_decodes_to_the_events_that_were_spooled() {
         panic!("an empty transcript encodes");
     };
     assert_eq!(decode_transcript(&empty, 1 << 20), Ok(Vec::new()));
+}
+
+// ── What one finished execution produced ──────────────────────────────
+
+/// Hand-builds the three canonical bodies a finished execution derives,
+/// and pins the artifact id they add up to.
+///
+/// This is the derivation two implementations depend on and neither
+/// owns: the provider stores these bodies and signs the artifact id
+/// inside its terminal event, and the client's oracle rebuilds the id
+/// from the same inputs with no store at all. Sharing the code makes
+/// them agree; this is what says what they agree *on*, in bytes rather
+/// than by calling the function twice.
+#[test]
+fn the_completed_output_derivation_is_reproducible_by_hand() {
+    const TOKEN_IDS_SCHEMA: &str = "hellas.evaluate.token_ids.v1";
+    const TEXT_STATE_SCHEMA: &str = "hellas.evaluate.text.state.v1";
+    const TEXT_ARTIFACT_OUTPUT_SCHEMA: &str = "hellas.evaluate.text.artifact.output.v1";
+
+    let execution = TextExecutionId::from_bytes([0x41; 32]);
+    let input_ids = [9_u32, 8, 7, 6];
+    let output_tokens = [101_u32, 102, 103];
+    let completed = completed_text(execution, &input_ids, &output_tokens);
+
+    // DAG-CBOR by hand. A text head is `0x60 | len` below 24 and
+    // `0x78, len` up to 255; a byte head for 32 bytes is `0x58, 32`;
+    // an integer is its own value below 24 and `0x18, value` up to 255.
+    fn text(out: &mut Vec<u8>, value: &str) {
+        assert!(value.len() < 256, "the fixture schemas are short");
+        if value.len() < 24 {
+            out.push(0x60 | value.len() as u8);
+        } else {
+            out.push(0x78);
+            out.push(value.len() as u8);
+        }
+        out.extend_from_slice(value.as_bytes());
+    }
+    fn integer(out: &mut Vec<u8>, value: u32) {
+        assert!(value < 256, "the fixture values fit one byte");
+        if value < 24 {
+            out.push(value as u8);
+        } else {
+            out.push(0x18);
+            out.push(value as u8);
+        }
+    }
+    fn digest32(out: &mut Vec<u8>, bytes: &[u8; 32]) {
+        out.extend_from_slice(&[0x58, 32]);
+        out.extend_from_slice(bytes);
+    }
+
+    // `[schema, [tokens...]]`
+    let token_ids_bytes = |tokens: &[u32]| {
+        let mut out = vec![0x82];
+        text(&mut out, TOKEN_IDS_SCHEMA);
+        out.push(0x80 | tokens.len() as u8);
+        for token in tokens {
+            integer(&mut out, *token);
+        }
+        out
+    };
+
+    let generated = token_ids_bytes(&output_tokens);
+    assert_eq!(completed.generated_tokens.canonical_bytes(), generated);
+    let state_tokens = token_ids_bytes(&[9, 8, 7, 6, 101, 102, 103]);
+    assert_eq!(completed.state_tokens.canonical_bytes(), state_tokens);
+
+    // `[schema, tokens_id]`
+    let mut state = vec![0x82];
+    text(&mut state, TEXT_STATE_SCHEMA);
+    digest32(&mut state, Digest::hash(&state_tokens).as_bytes());
+    assert_eq!(completed.state.canonical_bytes(), state);
+
+    // `[schema, execution, position, state_id, generated_id]`
+    let mut artifact = vec![0x85];
+    text(&mut artifact, TEXT_ARTIFACT_OUTPUT_SCHEMA);
+    digest32(&mut artifact, execution.as_bytes());
+    integer(&mut artifact, output_tokens.len() as u32);
+    digest32(&mut artifact, Digest::hash(&state).as_bytes());
+    digest32(&mut artifact, Digest::hash(&generated).as_bytes());
+    assert_eq!(completed.artifact.canonical_bytes(), artifact);
+
+    assert_eq!(
+        hex(completed.artifact.output_id().as_bytes()),
+        "47e767f99550bbafc883a2a3968ecdee60288b47e002038a15898d2e2e34f4d8"
+    );
+
+    // The control: one more input token is a different state and a
+    // different artifact, though the generated tokens are the same.
+    let longer = completed_text(execution, &[9, 8, 7, 6, 5], &output_tokens);
+    assert_eq!(longer.generated_tokens, completed.generated_tokens);
+    assert_ne!(longer.artifact, completed.artifact);
 }

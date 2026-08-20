@@ -594,6 +594,64 @@ impl CanonicalDecode for TextArtifact {
     }
 }
 
+// ── What one finished text execution produced ─────────────────────────
+
+/// The four content-addressed bodies one finished text execution
+/// produces, derived from its inputs and its output tokens alone.
+///
+/// They are returned together because they are one derivation: the
+/// artifact names the state, the state names the state tokens, and the
+/// artifact names the generated tokens. A caller that needed only the
+/// artifact would still have to compute the other three to get it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompletedText {
+    /// The tokens this execution generated.
+    pub generated_tokens: TokenIds,
+    /// Its input tokens followed by the generated ones.
+    pub state_tokens: TokenIds,
+    /// The state those tokens make.
+    pub state: TextState,
+    /// The output artifact naming all of it.
+    pub artifact: TextArtifact,
+}
+
+/// Derives what a finished text execution produced.
+///
+/// This is the one definition, and it has two consumers who must not
+/// disagree: the provider, which records these bodies in its artifact
+/// store and signs the resulting artifact id inside a terminal event,
+/// and an independent oracle, which has neither that store nor those
+/// events and must arrive at the same id from the same inputs. Two
+/// spellings of it would be two answers to "was this the right output",
+/// agreeing until one of them changed.
+///
+/// `input_ids` is the whole prompt as the execution was actually
+/// invoked with it — for a job that starts from an identity artifact
+/// that is exactly the execution's prompt tokens, because an identity
+/// source carries no prior state.
+#[must_use]
+pub fn completed_text(
+    execution: TextExecutionId,
+    input_ids: &[u32],
+    output_tokens: &[u32],
+) -> CompletedText {
+    let generated_tokens = TokenIds::from_u32s(output_tokens.iter().copied());
+    let state_tokens = TokenIds::from_u32s(input_ids.iter().chain(output_tokens).copied());
+    let state = TextState::new(state_tokens.output_id());
+    let artifact = TextArtifact::output(
+        execution,
+        output_tokens.len() as u64,
+        state.output_id(),
+        generated_tokens.output_id(),
+    );
+    CompletedText {
+        generated_tokens,
+        state_tokens,
+        state,
+        artifact,
+    }
+}
+
 // ── The prepared paid-work input bundle ───────────────────────────────
 
 /// The six canonical bodies a paid job is prepared from, in one

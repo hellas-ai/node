@@ -1,0 +1,16 @@
+[package]
+name = "hellas-compute-oracle"
+description = "Independent reexecution check for a paid Evaluate result"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation.workspace = true
+
+[dependencies]
+hellas-kernel.workspace = true
+hellas-rpc = { workspace = true, features = ["work"] }
+thiserror.workspace = true
+
+[dev-dependencies]
+hellas-kernel = { workspace = true, features = ["secp256k1"] }

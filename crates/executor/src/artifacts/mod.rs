@@ -10,7 +10,7 @@ use crate::state::{Invocation, ModelLocator, QuotePlan};
 use hellas_rpc::protocol::artifacts::{
     BoundTermId, Canonical, CanonicalDecode, InputAddressed, OutputAddressed, SourceRef,
     TextArtifact, TextArtifactId, TextExecution, TextExecutionId, TextPolicy, TextPolicyId,
-    TextSource, TextState, TextStateId, TokenIds, TokenIdsId,
+    TextSource, TextState, TextStateId, TokenIds, TokenIdsId, completed_text,
 };
 
 const CANONICAL_PARTITION: &str = "evaluate_canonical";
@@ -285,6 +285,14 @@ impl EvaluateArtifactStore {
         Ok(bytes)
     }
 
+    /// Records what one finished execution produced, and returns the id
+    /// of the artifact naming it.
+    ///
+    /// The ids are not computed here. [`completed_text`] is the one
+    /// definition of what a finished execution produces, and it is
+    /// shared with the client-side oracle that has to arrive at the same
+    /// artifact id without this store; what is done here is storing the
+    /// bodies it derived.
     pub async fn record_completed_text(
         &mut self,
         evaluate_request: &EvaluateRequest,
@@ -294,22 +302,11 @@ impl EvaluateArtifactStore {
         let execution_id = TextExecutionId::from_digest(evaluate_request.text_execution);
         let _ = self.text_execution(execution_id).await?;
 
-        let generated_tokens_id = self
-            .insert_token_ids(TokenIds::from(output_tokens.to_vec()))
-            .await?;
-        let mut state_tokens = invocation.input_ids.clone();
-        state_tokens.extend_from_slice(output_tokens);
-        let state_tokens_id = self.insert_token_ids(TokenIds::from(state_tokens)).await?;
-        let state_id = self
-            .insert_text_state(TextState::new(state_tokens_id))
-            .await?;
-        let artifact = TextArtifact::output(
-            execution_id,
-            output_tokens.len() as u64,
-            state_id,
-            generated_tokens_id,
-        );
-        let artifact_id = self.insert_text_artifact(artifact).await?;
+        let completed = completed_text(execution_id, &invocation.input_ids, output_tokens);
+        self.insert_token_ids(completed.generated_tokens).await?;
+        self.insert_token_ids(completed.state_tokens).await?;
+        self.insert_text_state(completed.state).await?;
+        let artifact_id = self.insert_text_artifact(completed.artifact).await?;
         if !self.outputs_by_execution.contains_key(&execution_id) {
             let stored = self
                 .persist_execution_output(execution_id, artifact_id)

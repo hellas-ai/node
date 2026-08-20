@@ -178,7 +178,7 @@ fn text_policy() -> TextPolicy {
 
 fn identity_artifact() -> TextArtifact {
     TextArtifact::identity(
-        BoundTermId::from_bytes([0x21; 32]),
+        BoundTermId::from_digest(manifest().content_id().digest()),
         "test-model",
         "main",
         "f32",

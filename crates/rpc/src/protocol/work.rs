@@ -1587,11 +1587,22 @@ pub fn check_prepared_input(
     // The identity artifact is the only legal start for this profile: a
     // job that resumed a previous output would be paid for work whose
     // input this bundle does not carry.
-    let TextArtifact::Identity { .. } = parts.identity_artifact else {
+    //
+    // Its bound term is the environment the execution actually resolves
+    // in — a provider materializing this source reads the model from
+    // here, not from the request — so an identity naming another
+    // environment is a job that would fault at dispatch after both
+    // parties had signed for it.
+    let TextArtifact::Identity { bound_term, .. } = &parts.identity_artifact else {
         return Err(PaidWorkError::Mismatch {
             field: "identity_artifact kind",
         });
     };
+    if bound_term.as_bytes() != request.execution_environment.as_bytes() {
+        return Err(PaidWorkError::Mismatch {
+            field: "identity_artifact bound_term",
+        });
+    }
     let identity_id = parts.identity_artifact.output_id();
     if parts.text_execution.from() != &SourceRef::output(identity_id) {
         return Err(PaidWorkError::Mismatch {

@@ -3477,6 +3477,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hellas-compute-oracle"
+version = "0.1.0"
+dependencies = [
+ "hellas-kernel",
+ "hellas-rpc",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "hellas-executor"
 version = "0.1.0"
 dependencies = [
