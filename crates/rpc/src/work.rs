@@ -40,12 +40,34 @@
 //! since cannot unsay it. A *different* proposal while one is in flight
 //! is refused, never queued.
 //!
+//! # Running what was accepted
+//!
+//! [`run_accepted_work`] is the second half, and it obeys the same rule
+//! in the one place it matters most: the running marker is fsynced
+//! before the backend is called. It is not a wire exchange — there is no
+//! Run RPC here — but it is the same journal, the same channel, and the
+//! same `work_id`, so it lives beside the acceptance that authorised it.
+//!
+//! The property it exists for: **for one `work_id`, at most one call in
+//! the lifetime of the journal ever invokes the backend.** Three durable
+//! facts make that hold together, and none of them alone does. The
+//! provider burns each proposal nonce it sees, so one `work_id` opens at
+//! most one job, ever — ending a job does not give its nonce back. The
+//! journal takes a running marker only from the accepted phase, so one
+//! job crosses into running at most once. And a marker found on the
+//! disk by a process that did not write it makes the state
+//! indeterminate, which no automatic step resolves.
+//!
 //! # What this phase does not carry
 //!
-//! Dispatch, result delivery, invoicing, and certificate admission. Each
-//! needs a producer that does not exist yet — an execution backend, a
-//! retained transcript, a semantic oracle — and a message with nothing
-//! on either end of it is not a protocol.
+//! Result delivery, invoicing, and certificate admission. Each needs a
+//! producer that does not exist yet — a spool the plaintext is served
+//! from, a semantic oracle — and a message with nothing on either end of
+//! it is not a protocol. In particular nothing here releases plaintext
+//! or records a delivery-credit debit: the transcript is handed back to
+//! the caller of the one call that produced it and is not retained, so
+//! a second delivery of the same result is not something this phase can
+//! do.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -59,16 +81,18 @@ use crate::pb::work::{
 use crate::protocol::Digest;
 use crate::protocol::artifacts::PreparedPaidInputV1;
 use crate::protocol::work::{
-    JobDeadlines, PaidJobAuthorizationV1, PaidWorkError, PrivateRecord as _, check_authorization,
-    check_prepared_input, propose_authorization, signing_hash, work_id,
+    JobDeadlines, PaidJobAuthorizationV1, PaidJobResultV1, PaidWorkError, PrivateRecord as _,
+    check_authorization, check_prepared_input, propose_authorization, result_digest, signing_hash,
+    terminal_result, work_id,
 };
 use crate::protocol::work_setup::{ReadyChannel, WorkSetupError};
 use crate::services::work::{WorkClientImpl, WorkHandler};
 use crate::work_store::journal::MAX_RECORD_BYTES;
 use crate::work_store::{
-    ChannelRecord, ChannelState, ChannelStateError, ChannelStore, JobPhase, JobState, Role,
+    ChannelRecord, ChannelState, ChannelStateError, ChannelStore, JobEnd, JobPhase, JobState, Role,
     WorkStoreError,
 };
+use crate::{EvaluateRequest, OutputEventEnvelope};
 
 // ── Refusals ──────────────────────────────────────────────────────────
 
@@ -486,6 +510,379 @@ impl ProviderEndpoint {
         (job.work_id() == work_id)
             .then(|| job.provider_signature())
             .flatten()
+    }
+
+    /// Decides whether the backend may be invoked for `work_id`, and
+    /// makes that decision durable before it is returned.
+    ///
+    /// [`RunAdmission::Invoke`] is returned only when the job was
+    /// accepted and not yet running, and only after the running marker
+    /// is on the disk — so a crash between the marker and the answer
+    /// costs the invocation, never a second one. Every other state
+    /// answers with what it already is: a job this process is running,
+    /// a job whose result is already signed, or a job whose marker was
+    /// found by a process that did not write it.
+    ///
+    /// `ready` is a *fresh* readiness decision, and the freshness is the
+    /// caller's to owe in exactly the sense [`ReadyChannel`] already
+    /// documents: nothing on that type re-reads the chain, so a
+    /// contest opened after it was built is invisible here. What is
+    /// checked is that it is this endpoint's own channel, at this
+    /// endpoint's own policy, and that the margins the policy measured
+    /// still fit before the terminal deadline at the height this
+    /// endpoint has processed blocks through.
+    ///
+    /// The request it hands back is rebuilt from the bundle the journal
+    /// holds, never from a quote. That bundle is the one the
+    /// authorization both parties signed commits to: its digest is
+    /// checked before it is stored and again on every replay
+    /// (`ChannelState::apply_proposed`), so a bundle altered on disk
+    /// fails when the journal is opened rather than producing a job
+    /// nobody agreed to.
+    ///
+    /// # Errors
+    ///
+    /// [`RunError::NoSuchJob`] when no open job carries this
+    /// `work_id`, [`RunError::NotAccepted`] before the co-signature
+    /// exists, [`RunError::NoCursor`] before any finalized block has
+    /// been processed, [`RunError::Endpoint`] when `ready` is not this
+    /// endpoint's channel, [`RunError::Policy`] when it carries another
+    /// execution policy, [`RunError::Setup`] when the deadlines can no
+    /// longer be met, [`RunError::Record`] when the stored bundle does
+    /// not parse, and [`RunError::Store`] when the marker cannot be
+    /// made durable.
+    pub fn begin_run(
+        &mut self,
+        work_id: Digest,
+        ready: &ReadyChannel,
+    ) -> Result<RunAdmission, RunError> {
+        let job = self.state().job().ok_or(RunError::NoSuchJob)?;
+        if job.work_id() != work_id {
+            return Err(RunError::NoSuchJob);
+        }
+        // A signed result exists in exactly the three phases past it, so
+        // this is the phase test as well as the answer.
+        if let Some((result, signature)) = job.result() {
+            return Ok(RunAdmission::Ready {
+                result: *result,
+                signature: *signature,
+            });
+        }
+        match job.phase() {
+            JobPhase::Running if self.state().is_indeterminate() => {
+                return Ok(RunAdmission::Indeterminate);
+            }
+            JobPhase::Running => return Ok(RunAdmission::Running),
+            JobPhase::Accepted => {}
+            phase => return Err(RunError::NotAccepted { phase }),
+        }
+
+        bind(ready, &self.store, &self.signer, Role::Provider)?;
+        if ready.execution_policy() != self.ready.execution_policy() {
+            return Err(RunError::Policy);
+        }
+        let Some((cursor_height, _)) = self.state().cursor() else {
+            return Err(RunError::NoCursor);
+        };
+        let authorization = *job.authorization();
+        // The same arithmetic the co-signature was made under, asked
+        // again at the height dispatch is happening at. It is the same
+        // question both times — can the measured dispatch and delivery
+        // margins still fit before the terminal deadline — so it is not
+        // spelled a second way here.
+        ready.check_signable(
+            cursor_height,
+            authorization.terminal_deadline,
+            authorization.payment_deadline,
+        )?;
+
+        let bundle = PreparedPaidInputV1::decode(job.prepared_input(), MAX_RECORD_BYTES)
+            .map_err(PaidWorkError::from)?;
+        let request = bundle
+            .parts()
+            .map_err(PaidWorkError::from)?
+            .evaluate_request;
+
+        self.store
+            .commit(ChannelRecord::JobRunning, &Secp256k1Verifier::new())?;
+        Ok(RunAdmission::Invoke(request))
+    }
+
+    /// Signs the result of the transcript this job's invocation
+    /// produced, and returns it only once it is on the disk.
+    ///
+    /// The transcript is the provider's own: [`terminal_result`] refuses
+    /// events that are not one verified chain for this authorization's
+    /// request under the channel's provider key, and the journal refuses
+    /// the record unless the job is running, is not indeterminate, and
+    /// the result names it. Nothing here accepts a commitment chosen by
+    /// anyone else, because nothing here takes one.
+    ///
+    /// # Errors
+    ///
+    /// [`RunError::NoSuchJob`] when no open job carries this `work_id`,
+    /// [`RunError::Transcript`] when the events are not this job's
+    /// terminal transcript, and [`RunError::Store`] when the journal
+    /// refuses the record — which is what it does for a job that is not
+    /// running, or one left indeterminate by a crash.
+    pub fn record_result(
+        &mut self,
+        work_id: Digest,
+        transcript: &[OutputEventEnvelope],
+    ) -> Result<(PaidJobResultV1, Sig), RunError> {
+        let job = self.state().job().ok_or(RunError::NoSuchJob)?;
+        if job.work_id() != work_id {
+            return Err(RunError::NoSuchJob);
+        }
+        let authorization = *job.authorization();
+        let channel = self.ready.channel();
+        let result =
+            terminal_result(channel, &authorization, transcript).map_err(RunError::Transcript)?;
+        let signature = self
+            .signer
+            .sign(signing_hash(result_digest(channel, &result)));
+        self.store.commit(
+            ChannelRecord::JobResult {
+                result,
+                provider_signature: signature,
+            },
+            &Secp256k1Verifier::new(),
+        )?;
+        Ok((result, signature))
+    }
+
+    /// Ends the open job, releasing what it still holds.
+    ///
+    /// What ending costs is the journal's to decide from how far the job
+    /// got and why it stopped; this only records the decision.
+    ///
+    /// # Errors
+    ///
+    /// [`RunError::NoSuchJob`] when no open job carries this `work_id`,
+    /// and [`RunError::Store`] when the ending cannot be made durable.
+    pub fn end_run(&mut self, work_id: Digest, reason: JobEnd) -> Result<(), RunError> {
+        let job = self.state().job().ok_or(RunError::NoSuchJob)?;
+        if job.work_id() != work_id {
+            return Err(RunError::NoSuchJob);
+        }
+        self.store.commit(
+            ChannelRecord::JobEnded { reason },
+            &Secp256k1Verifier::new(),
+        )?;
+        Ok(())
+    }
+}
+
+// ── Running an accepted job ───────────────────────────────────────────
+
+/// Why the local execution backend produced no transcript.
+///
+/// Opaque on purpose. What the gate does about it — release the job and
+/// charge the client nothing — is the same for every fault a backend can
+/// have, so distinguishing them here would be a distinction nothing
+/// reads.
+#[derive(Clone, Debug, thiserror::Error)]
+#[error("the execution backend failed: {0}")]
+pub struct BackendFault(String);
+
+impl BackendFault {
+    /// Records one backend fault, by its operator-facing text.
+    #[must_use]
+    pub fn new(reason: impl Into<String>) -> Self {
+        Self(reason.into())
+    }
+}
+
+/// The one seam a paid job crosses on its way to real execution.
+///
+/// One method, and it takes the request this endpoint rebuilt from its
+/// own journal rather than anything a peer sent. What comes back is the
+/// complete signed transcript of that invocation — not a digest of one,
+/// because a digest is exactly what a backend that ran nothing could
+/// also return.
+///
+/// Implementors must invoke once per call. That is not a property this
+/// trait can check, and it is not the one the gate rests on: the gate
+/// calls this at most once per `work_id` whatever the implementor does.
+pub trait PaidEvaluateBackend {
+    /// Runs one prepared Evaluate request to its terminal.
+    fn evaluate(
+        &self,
+        request: EvaluateRequest,
+    ) -> impl core::future::Future<Output = Result<Vec<OutputEventEnvelope>, BackendFault>> + Send;
+}
+
+/// What [`ProviderEndpoint::begin_run`] found, and what may be done next.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RunAdmission {
+    /// The marker is durable and the backend has not been called.
+    /// Invoke exactly once, with this request.
+    Invoke(EvaluateRequest),
+    /// This process marked the job and has not recorded its result.
+    Running,
+    /// A signed result already exists.
+    Ready {
+        /// The result.
+        result: PaidJobResultV1,
+        /// The provider's signature over its digest.
+        signature: Sig,
+    },
+    /// A marker was found by a process that did not write it. Whether
+    /// the backend ran is not knowable here, and nothing resolves it
+    /// automatically.
+    Indeterminate,
+}
+
+/// What one run of an accepted job produced.
+///
+/// [`Self::Completed`] is returned by exactly one call per `work_id`,
+/// ever: it is the answer of the call that invoked the backend, and it
+/// is the only one that carries the transcript. A later call finds
+/// [`Self::Ready`] instead, which carries the signed result and not the
+/// bytes it summarises — this phase retains no spool, so the transcript
+/// exists once, in the hand of the caller that caused it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RunOutcome {
+    /// This call invoked the backend and recorded its terminal.
+    Completed {
+        /// The result, now durable.
+        result: PaidJobResultV1,
+        /// The provider's signature over its digest.
+        signature: Sig,
+        /// The transcript the invocation produced.
+        transcript: Vec<OutputEventEnvelope>,
+    },
+    /// A signed result was already durable.
+    Ready {
+        /// The result.
+        result: PaidJobResultV1,
+        /// The provider's signature over its digest.
+        signature: Sig,
+    },
+    /// The job is running in this process. Ask again.
+    Running,
+    /// A crash left the invocation unresolved.
+    Indeterminate,
+}
+
+/// Why one run of an accepted job did not produce a result.
+#[derive(Debug, thiserror::Error)]
+pub enum RunError {
+    /// No open job on this channel carries this `work_id`.
+    #[error("no open job on this channel carries this work id")]
+    NoSuchJob,
+    /// The job has no provider co-signature, so nothing authorises
+    /// running it.
+    #[error("a {phase} job has not been accepted, and may not run")]
+    NotAccepted {
+        /// How far the job has got.
+        phase: JobPhase,
+    },
+    /// No finalized block has been processed, so no deadline can be
+    /// measured.
+    #[error("no finalized block has been processed on this channel")]
+    NoCursor,
+    /// The readiness offered is not this endpoint's own channel.
+    #[error(transparent)]
+    Endpoint(#[from] EndpointError),
+    /// The readiness offered carries another execution policy than the
+    /// one this endpoint accepts work under.
+    #[error("the readiness offered was decided under another execution policy")]
+    Policy,
+    /// The deadlines can no longer be met, or the endpoint is behind.
+    #[error(transparent)]
+    Setup(#[from] WorkSetupError),
+    /// The stored bundle is not a readable prepared input.
+    #[error(transparent)]
+    Record(#[from] PaidWorkError),
+    /// The events offered are not this job's terminal transcript.
+    #[error(transparent)]
+    Transcript(PaidWorkError),
+    /// The backend produced no transcript.
+    #[error(transparent)]
+    Backend(BackendFault),
+    /// The journal refused the step, or could not take it.
+    #[error(transparent)]
+    Store(#[from] WorkStoreError),
+}
+
+/// Runs one accepted job on a real backend, at most once, ever.
+///
+/// The order, and the whole of why it is this order: the running marker
+/// is journaled while the endpoint lock is held, the lock is then
+/// released, and only then is the backend called. Releasing the lock is
+/// deliberate — a synchronous journal must not be held across an
+/// invocation that takes minutes — and it is safe because the marker on
+/// the disk, not the lock, is what excludes a second call. A concurrent
+/// call finds the job running; a call after a restart finds it
+/// indeterminate.
+///
+/// A backend fault, or a transcript that is not this job's, ends the job
+/// as failed. That releases the compute the co-signature reserved and
+/// charges this client nothing, because neither is the client's doing.
+///
+/// # Errors
+///
+/// [`RunError::Backend`] for a backend fault and [`RunError::Transcript`]
+/// for events that are not this job's terminal transcript — in both
+/// cases after the job has been ended. If *that* ending cannot be
+/// journaled, the journal's error is returned in place of the fault:
+/// a job left running by a store that will not take its ending is the
+/// more urgent fact, and it is the one an operator must see. Whatever
+/// [`ProviderEndpoint::begin_run`] and [`ProviderEndpoint::record_result`]
+/// raise otherwise.
+pub async fn run_accepted_work<B>(
+    service: &WorkService,
+    ready: &ReadyChannel,
+    backend: &B,
+    work_id: Digest,
+) -> Result<RunOutcome, RunError>
+where
+    B: PaidEvaluateBackend + Sync,
+{
+    let admission = {
+        let mut endpoint = service.endpoint()?;
+        endpoint.begin_run(work_id, ready)?
+    };
+    let request = match admission {
+        RunAdmission::Invoke(request) => request,
+        RunAdmission::Running => return Ok(RunOutcome::Running),
+        RunAdmission::Indeterminate => return Ok(RunOutcome::Indeterminate),
+        RunAdmission::Ready { result, signature } => {
+            return Ok(RunOutcome::Ready { result, signature });
+        }
+    };
+
+    let transcript = match backend.evaluate(request).await {
+        Ok(transcript) => transcript,
+        Err(fault) => return Err(end_failed(service, work_id, RunError::Backend(fault))),
+    };
+
+    let recorded = {
+        let mut endpoint = service.endpoint()?;
+        endpoint.record_result(work_id, &transcript)
+    };
+    match recorded {
+        Ok((result, signature)) => Ok(RunOutcome::Completed {
+            result,
+            signature,
+            transcript,
+        }),
+        Err(fault @ RunError::Transcript(_)) => Err(end_failed(service, work_id, fault)),
+        Err(error) => Err(error),
+    }
+}
+
+/// Ends the job as failed, and returns `fault` if that ending was
+/// recorded.
+fn end_failed(service: &WorkService, work_id: Digest, fault: RunError) -> RunError {
+    let mut endpoint = match service.endpoint() {
+        Ok(endpoint) => endpoint,
+        Err(error) => return RunError::Endpoint(error),
+    };
+    match endpoint.end_run(work_id, JobEnd::Failed) {
+        Ok(()) => fault,
+        Err(error) => error,
     }
 }
 
