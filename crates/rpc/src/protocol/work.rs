@@ -78,7 +78,7 @@ use crate::evaluate::{EvaluateTerminal, verify_output_events};
 use crate::protocol::artifacts::{
     Canonical, InputAddressed, OutputAddressed, PreparedPaidInputV1, SourceRef, TextArtifact,
 };
-use crate::protocol::value::CanonicalDecodeError;
+use crate::protocol::value::{CanonicalDecodeError, canonical_dag_cbor, decode_dag_cbor};
 use crate::{
     Assurance, ContentId, Digest, Evaluate, EventCommitment, InputCommitment, OutputEventEnvelope,
     PublicKey, RequestCommitment,
@@ -268,12 +268,13 @@ pub enum PaidWorkError {
         /// Which identifier repeated.
         field: &'static str,
     },
-    /// The events offered as one job's terminal transcript are not one.
+    /// The events offered as one job's terminal transcript are not one,
+    /// or the bytes offered are not events at all.
     ///
-    /// The text is the stream verifier's own, rendered rather than
-    /// nested: its error type is neither `Clone` nor `PartialEq`, and
-    /// this one is both because every record rule here is compared in a
-    /// test. Nothing decides on the string.
+    /// The text is the stream verifier's or the codec's own, rendered
+    /// rather than nested: neither error type is `Clone` or `PartialEq`,
+    /// and this one is both because every record rule here is compared
+    /// in a test. Nothing decides on the string.
     #[error("terminal transcript: {0}")]
     Transcript(String),
 }
@@ -1757,6 +1758,58 @@ pub fn terminal_result(
             &output.terminal,
         )?,
     })
+}
+
+// ── Carrying a transcript ─────────────────────────────────────────────
+
+/// Encodes one job's transcript for storage and transport.
+///
+/// DAG-CBOR over the signed envelopes, through the same derived
+/// `Serialize` the rest of this crate's stream types use. Nothing in the
+/// paid protocol hashes these bytes: what binds a transcript to a job is
+/// [`terminal_result`] rebuilding the signed result from the decoded
+/// *events*, so a re-encoding that moved a field would fail that
+/// comparison rather than slip past a byte check. There is therefore no
+/// domain string here and no golden vector: the meaning is checked, not
+/// the spelling.
+///
+/// # Errors
+///
+/// [`PaidWorkError::Transcript`] when the encoder cannot allocate.
+pub fn encode_transcript(transcript: &[OutputEventEnvelope]) -> Result<Vec<u8>, PaidWorkError> {
+    canonical_dag_cbor(&transcript.to_vec())
+        .map_err(|error| PaidWorkError::Transcript(error.to_string()))
+}
+
+/// Reads a transcript back, refusing anything over `budget`.
+///
+/// `budget` is the caller's spool bound. It is checked against the input
+/// before a byte is decoded, because the decoder allocates from what the
+/// bytes claim and a bound applied afterwards would already have paid
+/// for the claim.
+///
+/// # Errors
+///
+/// [`PaidWorkError::OverEnvelope`] above `budget`, and
+/// [`PaidWorkError::Transcript`] when the bytes are not a transcript.
+pub fn decode_transcript(
+    bytes: &[u8],
+    budget: usize,
+) -> Result<Vec<OutputEventEnvelope>, PaidWorkError> {
+    let actual = u64::try_from(bytes.len()).map_err(|_| PaidWorkError::Overflow {
+        field: "transcript length",
+    })?;
+    let limit = u64::try_from(budget).map_err(|_| PaidWorkError::Overflow {
+        field: "transcript budget",
+    })?;
+    if actual > limit {
+        return Err(PaidWorkError::OverEnvelope {
+            field: "transcript length",
+            actual,
+            limit,
+        });
+    }
+    decode_dag_cbor(bytes).map_err(|error| PaidWorkError::Transcript(error.to_string()))
 }
 
 /// Checks that a result answers the accepted job, and returns its

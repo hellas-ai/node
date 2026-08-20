@@ -27,9 +27,9 @@ use hellas_rpc::protocol::work::{
     PaidChannel, PaidChannelPolicyV1, PaidExecutionPolicyV1, PaidJobAuthorizationV1,
     PaidJobResultV1, PaidWorkError, PrivateRecord, allocation_digest, canonical_output_digest,
     check_authorization, check_execution_policy, check_prepared_input, check_result,
-    execution_policy_digest, generation_policy_digest, identity_source_digest, invoice_digest,
-    invoice_empty_root, invoice_entries_root, next_invoice_entry, prepared_input_digest,
-    private_policy_commitment, result_digest, work_id,
+    decode_transcript, encode_transcript, execution_policy_digest, generation_policy_digest,
+    identity_source_digest, invoice_digest, invoice_empty_root, invoice_entries_root,
+    next_invoice_entry, prepared_input_digest, private_policy_commitment, result_digest, work_id,
 };
 use hellas_rpc::{
     Assurance, ContentId, Digest, Evaluate, EvaluateProgramManifest, EvaluateRequest,
@@ -2832,4 +2832,76 @@ fn the_canonical_output_preimage_is_reproducible_by_hand() {
         hex(&Digest::hash(&preimage).into_bytes()),
         "1e7b7469d057faf8b97e991313a2a052e47a1bef39b2a22d501065ba0b7b7b76"
     );
+}
+
+// ── Carrying a transcript ─────────────────────────────────────────────
+
+/// One signed transcript, for a request nothing else here uses.
+fn spool_transcript() -> Vec<hellas_rpc::OutputEventEnvelope> {
+    let Ok(key) = hellas_rpc::ProducerSigningKey::from_secret_bytes([0x42; 32]) else {
+        panic!("a fixed scalar is a producer key");
+    };
+    let request = evaluate_request();
+    let mut builder = hellas_rpc::evaluate::EvaluateOutputTranscriptBuilder::new(
+        hellas_rpc::evaluate::input_commitment(&request),
+        request.assurance,
+        &key,
+    );
+    if let Err(error) = builder.push_token_delta(vec![5, 6, 7]) {
+        panic!("a non-empty delta pushes: {error}");
+    }
+    let usage = EvaluateUsage {
+        input_units: 4,
+        output_units: 3,
+    };
+    match builder.finish(EvaluateTerminal {
+        final_position: 3,
+        stop_reason: EvaluateStopReason::END_OF_SEQUENCE,
+        text_artifact: Digest::from_bytes([0x77; 32]),
+        usage,
+        billable_units: 7,
+    }) {
+        Ok(events) => events,
+        Err(error) => panic!("the fixture transcript finishes: {error}"),
+    }
+}
+
+/// A spooled transcript comes back as the events that were spooled.
+///
+/// Nothing in the protocol hashes these bytes, so what this pins is the
+/// round trip and the budget — not a layout. The pairing that gives the
+/// bytes their meaning is
+/// `work_store::ChannelState`'s rebuild, and it is tested there.
+#[test]
+fn a_spooled_transcript_decodes_to_the_events_that_were_spooled() {
+    let transcript = spool_transcript();
+    let Ok(bytes) = encode_transcript(&transcript) else {
+        panic!("the fixture transcript encodes");
+    };
+    assert_eq!(decode_transcript(&bytes, bytes.len()), Ok(transcript));
+
+    // MUTATION: one byte short of what the bytes need.
+    assert_eq!(
+        decode_transcript(&bytes, bytes.len() - 1),
+        Err(PaidWorkError::OverEnvelope {
+            field: "transcript length",
+            actual: bytes.len() as u64,
+            limit: bytes.len() as u64 - 1,
+        }),
+    );
+
+    // MUTATION: bytes that are not a transcript at all, inside budget.
+    let refused = decode_transcript(b"not a transcript", 1 << 20);
+    assert!(
+        matches!(refused, Err(PaidWorkError::Transcript(_))),
+        "unexpected answer: {refused:?}",
+    );
+
+    // An empty transcript is a legal encoding and an illegal result:
+    // this codec carries events, and `terminal_result` is what refuses
+    // a transcript that is not one job's terminal chain.
+    let Ok(empty) = encode_transcript(&[]) else {
+        panic!("an empty transcript encodes");
+    };
+    assert_eq!(decode_transcript(&empty, 1 << 20), Ok(Vec::new()));
 }

@@ -89,8 +89,8 @@ use crate::protocol::Digest;
 use crate::protocol::artifacts::PreparedPaidInputV1;
 use crate::protocol::work::{
     JobDeadlines, PaidJobAuthorizationV1, PaidJobResultV1, PaidWorkError, PrivateRecord as _,
-    check_authorization, check_prepared_input, propose_authorization, result_digest, signing_hash,
-    terminal_result, work_id,
+    check_authorization, check_prepared_input, encode_transcript, propose_authorization,
+    result_digest, signing_hash, terminal_result, work_id,
 };
 use crate::protocol::work_setup::{ReadyChannel, WorkSetupError};
 use crate::services::work::{WorkClientImpl, WorkHandler};
@@ -296,6 +296,8 @@ const fn channel_refusal(error: &ChannelStateError) -> WorkRefusal {
         | ChannelStateError::UnallocatedGap { .. }
         | ChannelStateError::LossRecorded
         | ChannelStateError::Indeterminate => WorkRefusal::Declined,
+        ChannelStateError::NoCursor { .. } => WorkRefusal::NotReady,
+        ChannelStateError::ReceiptLate { .. } => WorkRefusal::Expired,
         ChannelStateError::Record(_)
         | ChannelStateError::BadSignature { .. }
         | ChannelStateError::WrongRole { .. }
@@ -632,9 +634,10 @@ impl ProviderEndpoint {
     ///
     /// [`RunError::NoSuchJob`] when no open job carries this `work_id`,
     /// [`RunError::Transcript`] when the events are not this job's
-    /// terminal transcript, and [`RunError::Store`] when the journal
-    /// refuses the record — which is what it does for a job that is not
-    /// running, or one left indeterminate by a crash.
+    /// terminal transcript, [`RunError::Record`] when the transcript is
+    /// larger than the signed policy's spool, and [`RunError::Store`]
+    /// when the journal refuses the record — which is what it does for a
+    /// job that is not running, or one left indeterminate by a crash.
     pub fn record_result(
         &mut self,
         work_id: Digest,
@@ -648,6 +651,16 @@ impl ProviderEndpoint {
         let channel = self.ready.channel();
         let result =
             terminal_result(channel, &authorization, transcript).map_err(RunError::Transcript)?;
+        let spool = encode_transcript(transcript).map_err(RunError::Transcript)?;
+        let spooled = u64::try_from(spool.len()).unwrap_or(u64::MAX);
+        let limit = self.ready.execution_policy().max_spool_bytes;
+        if spooled > limit {
+            return Err(RunError::Record(PaidWorkError::OverEnvelope {
+                field: "spooled transcript length",
+                actual: spooled,
+                limit,
+            }));
+        }
         let signature = self
             .signer
             .sign(signing_hash(result_digest(channel, &result)));
@@ -655,6 +668,7 @@ impl ProviderEndpoint {
             ChannelRecord::JobResult {
                 result,
                 provider_signature: signature,
+                transcript: spool,
             },
             &Secp256k1Verifier::new(),
         )?;

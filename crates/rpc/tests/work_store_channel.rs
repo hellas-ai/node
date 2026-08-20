@@ -13,24 +13,29 @@ use hellas_kernel::{
     Parties, PayloadHash, Payout, Secp256k1Signer, Secp256k1Verifier, Sig, WorkPaymentSettlement,
     WorkPaymentTerms, WorkStakeBondTerms, work_payment_settlement,
 };
+use hellas_rpc::evaluate::{
+    EvaluateOutputTranscriptBuilder, EvaluateStopReason, EvaluateTerminal, EvaluateUsage,
+    input_commitment,
+};
 use hellas_rpc::protocol::artifacts::{
     BoundTermId, InputAddressed as _, OutputAddressed as _, PreparedPaidInputV1, SourceRef,
     TextArtifact, TextExecution, TextPolicy, TokenIds,
 };
 use hellas_rpc::protocol::work::{
     CertificateAllocationV1, InvoiceEntryV1, PaidChannel, PaidChannelPolicyV1,
-    PaidJobAuthorizationV1, PaidJobResultV1, PrivateRecord as _, allocation_digest, invoice_digest,
-    invoice_entries_root, next_invoice_entry, prepared_input_digest, private_policy_commitment,
-    result_digest, work_id,
+    PaidJobAuthorizationV1, PaidJobResultV1, PaidWorkError, PrivateRecord as _, allocation_digest,
+    decode_transcript, encode_transcript, invoice_digest, invoice_entries_root, next_invoice_entry,
+    prepared_input_digest, private_policy_commitment, result_digest, terminal_result, work_id,
 };
-use hellas_rpc::protocol::{ContentId, Digest, EventCommitment};
+use hellas_rpc::protocol::{ContentId, Digest};
 use hellas_rpc::work_store::journal::{Journal, JournalError, JournalId, JournalKind};
 use hellas_rpc::work_store::{
     ChannelRecord, ChannelStateError, ChannelStore, CounterpartyLoss, JobEnd, JobPhase, JobState,
     Role, WorkStoreError,
 };
 use hellas_rpc::{
-    Assurance, Evaluate, EvaluateProgramManifest, EvaluateRequest, ProgramManifest, PublicKey,
+    Assurance, Evaluate, EvaluateProgramManifest, EvaluateRequest, OutputEventEnvelope,
+    ProducerSigningKey, ProgramManifest, PublicKey,
 };
 
 // ── Fixture ───────────────────────────────────────────────────────────
@@ -222,11 +227,56 @@ fn bundle_bytes(nonce: u64) -> Vec<u8> {
     }
 }
 
+/// The provider's RPC producer identity: the same scalar its channel
+/// party key is.
+fn provider_producer() -> ProducerSigningKey {
+    match ProducerSigningKey::from_secret_bytes([0x22; 32]) {
+        Ok(key) => key,
+        Err(error) => panic!("a fixed scalar is a producer key: {error}"),
+    }
+}
+
+/// One complete signed transcript answering `request` with `answer`.
+fn transcript_of(request: &EvaluateRequest, answer: &[u32]) -> Vec<OutputEventEnvelope> {
+    let key = provider_producer();
+    let mut builder =
+        EvaluateOutputTranscriptBuilder::new(input_commitment(request), request.assurance, &key);
+    if let Err(error) = builder.push_token_delta(answer.to_vec()) {
+        panic!("a non-empty delta pushes: {error}");
+    }
+    let usage = EvaluateUsage {
+        input_units: prompt_tokens().as_slice().len() as u64,
+        output_units: answer.len() as u64,
+    };
+    let billable_units = match usage.billable_units() {
+        Ok(units) => units,
+        Err(error) => panic!("the fixture usage sums: {error}"),
+    };
+    match builder.finish(EvaluateTerminal {
+        final_position: answer.len() as u64,
+        stop_reason: EvaluateStopReason::END_OF_SEQUENCE,
+        text_artifact: Digest::from_bytes([0x77; 32]),
+        usage,
+        billable_units,
+    }) {
+        Ok(events) => events,
+        Err(error) => panic!("the fixture transcript finishes: {error}"),
+    }
+}
+
+fn spool(transcript: &[OutputEventEnvelope]) -> Vec<u8> {
+    match encode_transcript(transcript) {
+        Ok(bytes) => bytes,
+        Err(error) => panic!("the fixture transcript encodes: {error}"),
+    }
+}
+
 /// Everything one job's records are built from, at one ledger position.
 struct Job {
     authorization: PaidJobAuthorizationV1,
     work_id: Digest,
     result: PaidJobResultV1,
+    transcript: Vec<OutputEventEnvelope>,
     entry: InvoiceEntryV1,
     allocation: CertificateAllocationV1,
     certificate: EarnedCertificate,
@@ -235,12 +285,13 @@ struct Job {
 fn job_at(channel: &PaidChannel, nonce: u64, seq: u64, before: u64) -> Job {
     let authorization = authorization_for(channel, nonce);
     let work_id = work_id(channel, &authorization);
-    let result = PaidJobResultV1 {
-        work_id,
-        terminal_transcript_commitment: EventCommitment::from_digest(Digest::from_bytes(
-            [0x71; 32],
-        )),
-        canonical_output_digest: Digest::from_bytes([0x72; 32]),
+    // The result is derived from a real transcript rather than made up:
+    // the store rebuilds it from the stored events, so a hand-written
+    // pair of digests is not a result any journal here would take.
+    let transcript = transcript_of(&evaluate_request(nonce), &[101, 102, 103]);
+    let result = match terminal_result(channel, &authorization, &transcript) {
+        Ok(result) => result,
+        Err(error) => panic!("the fixture transcript is a terminal: {error}"),
     };
     let entry =
         match next_invoice_entry(channel, &authorization, &result, seq, before, settlement()) {
@@ -266,6 +317,7 @@ fn job_at(channel: &PaidChannel, nonce: u64, seq: u64, before: u64) -> Job {
         authorization,
         work_id,
         result,
+        transcript,
         entry,
         allocation,
         certificate,
@@ -314,6 +366,7 @@ impl Job {
         ChannelRecord::JobResult {
             result: self.result,
             provider_signature: provider().sign(payload(result_digest(channel, &self.result))),
+            transcript: spool(&self.transcript),
         }
     }
 
@@ -349,18 +402,30 @@ fn provider_sequence(channel: &PaidChannel, job: &Job) -> Vec<ChannelRecord> {
 }
 
 /// The client's whole sequence for the same job.
+///
+/// It opens with a cursor because a client records a receipt against a
+/// finalized height: the terminal deadline is what a late delivery is
+/// late against, and a journal with no processed block cannot say.
 fn client_sequence(channel: &PaidChannel, job: &Job) -> Vec<ChannelRecord> {
     vec![
+        ChannelRecord::CursorAdvanced {
+            height: RECEIPT_HEIGHT,
+            payload: [0xc0; 32],
+        },
         ChannelRecord::NonceReserved {
             nonce: job.authorization.proposal_nonce,
         },
         job.proposed(),
         job.accepted(),
         job.result_record(channel),
+        ChannelRecord::ResultVerified,
         job.invoice(channel),
         job.paid(channel),
     ]
 }
+
+/// A finalized height inside every fixture job's terminal deadline.
+const RECEIPT_HEIGHT: u64 = 150;
 
 fn commit_all(store: &mut ChannelStore, records: &[ChannelRecord]) {
     let verifier = Secp256k1Verifier::new();
@@ -416,6 +481,306 @@ fn the_client_credits_the_same_allocation_it_signed() {
     assert_eq!(state.next_proposal_nonce(), 2, "the nonce is burnt");
     assert_eq!(state.ledger().credited_invoice_high_water(), PRICE);
     assert!(state.job().is_none());
+}
+
+// ── A result is its transcript's own ──────────────────────────────────
+
+/// A result must be the one its stored transcript produces.
+///
+/// Two mutations of the same pairing, each varying exactly one side of
+/// it. Neither touches a signature: the second is signed correctly over
+/// the result it carries, which is the whole point — a provider that
+/// signs a result its own events do not summarise is refused by the
+/// rebuild and not by a signature check.
+#[test]
+fn a_result_must_be_the_transcript_it_is_stored_beside() {
+    let dir = temp();
+    let channel = channel();
+    let verifier = Secp256k1Verifier::new();
+    let job = job_at(&channel, 1, 1, 0);
+    let mut store = open(dir.path(), Role::Provider);
+    commit_all(
+        &mut store,
+        &[job.proposed(), job.accepted(), ChannelRecord::JobRunning],
+    );
+
+    // MUTATION: the same signed result, spooled beside a transcript of
+    // a different answer to the same request.
+    let other_answer = transcript_of(&evaluate_request(1), &[201, 202, 203]);
+    let error = store
+        .commit(
+            ChannelRecord::JobResult {
+                result: job.result,
+                provider_signature: provider().sign(payload(result_digest(&channel, &job.result))),
+                transcript: spool(&other_answer),
+            },
+            &verifier,
+        )
+        .expect_err("a result is not another answer's");
+    assert!(
+        matches!(
+            error,
+            WorkStoreError::Channel(ChannelStateError::WrongChannel {
+                field: "result against its transcript"
+            })
+        ),
+        "unexpected error: {error}"
+    );
+
+    // MUTATION: the same transcript, beside a result whose answer digest
+    // is one byte other — and correctly signed over that other result.
+    let mut altered = job.result;
+    let mut digest = altered.canonical_output_digest.into_bytes();
+    digest[0] ^= 1;
+    altered.canonical_output_digest = Digest::from_bytes(digest);
+    let error = store
+        .commit(
+            ChannelRecord::JobResult {
+                result: altered,
+                provider_signature: provider().sign(payload(result_digest(&channel, &altered))),
+                transcript: spool(&job.transcript),
+            },
+            &verifier,
+        )
+        .expect_err("a transcript is not another result's");
+    assert!(
+        matches!(
+            error,
+            WorkStoreError::Channel(ChannelStateError::WrongChannel {
+                field: "result against its transcript"
+            })
+        ),
+        "unexpected error: {error}"
+    );
+
+    // The control: the pair that belongs together is taken, and the
+    // stored bytes are the ones offered.
+    if let Err(error) = store.commit(job.result_record(&channel), &verifier) {
+        panic!("a result and its own transcript record: {error}");
+    }
+    let Some(open) = store.state().job() else {
+        panic!("the job is open");
+    };
+    assert_eq!(open.phase(), JobPhase::Ready);
+    assert_eq!(open.transcript(), spool(&job.transcript));
+}
+
+/// A restart finds the exact transcript the result was derived from.
+///
+/// This is what a spool is for: the process that computed the answer is
+/// gone, and the one that comes back can still hand over the bytes it
+/// was paid to produce — and can still show they rebuild the result it
+/// signed.
+#[test]
+fn a_restart_finds_the_transcript_the_result_was_derived_from() {
+    let dir = temp();
+    let channel = channel();
+    let job = job_at(&channel, 1, 1, 0);
+    {
+        let mut store = open(dir.path(), Role::Provider);
+        commit_all(&mut store, &provider_sequence(&channel, &job)[..4]);
+    }
+
+    let recovered = open(dir.path(), Role::Provider);
+    let Some(open) = recovered.state().job() else {
+        panic!("the job is still open");
+    };
+    assert_eq!(open.phase(), JobPhase::Ready);
+    assert_eq!(open.transcript(), spool(&job.transcript));
+
+    // And the bytes that came back are the answer, not merely bytes:
+    // decoded and rebuilt here, independently of the store that read
+    // them, they are the result the provider signed.
+    let Ok(events) = decode_transcript(open.transcript(), 1 << 20) else {
+        panic!("the recovered spool decodes");
+    };
+    assert_eq!(events, job.transcript);
+    assert_eq!(
+        terminal_result(&channel, &job.authorization, &events),
+        Ok(job.result)
+    );
+}
+
+// ── A receipt has a height, and a verdict is a step ───────────────────
+
+/// A client records a receipt at the terminal deadline and not after it.
+///
+/// One block either side of the deadline the job was signed under, with
+/// the cursor as the only thing varied.
+#[test]
+fn the_terminal_deadline_is_the_last_height_a_receipt_may_be_recorded_at() {
+    let channel = channel();
+    let job = job_at(&channel, 1, 1, 0);
+    let deadline = job.authorization.terminal_deadline;
+    for (height, timely) in [(deadline, true), (deadline + 1, false)] {
+        let dir = temp();
+        let mut store = open(dir.path(), Role::Client);
+        commit_all(
+            &mut store,
+            &[
+                ChannelRecord::CursorAdvanced {
+                    height,
+                    payload: [0xc1; 32],
+                },
+                ChannelRecord::NonceReserved {
+                    nonce: job.authorization.proposal_nonce,
+                },
+                job.proposed(),
+                job.accepted(),
+            ],
+        );
+        let recorded = store.commit(job.result_record(&channel), &Secp256k1Verifier::new());
+        if timely {
+            if let Err(error) = recorded {
+                panic!("a receipt at {height} is timely: {error}");
+            }
+            continue;
+        }
+        let Err(error) = recorded else {
+            panic!("a receipt at {height} is late");
+        };
+        assert!(
+            matches!(
+                error,
+                WorkStoreError::Channel(ChannelStateError::ReceiptLate {
+                    height: found,
+                    deadline: owed,
+                }) if found == height && owed == deadline
+            ),
+            "unexpected error: {error}"
+        );
+    }
+}
+
+/// A client with no processed block records no receipt at all.
+#[test]
+fn a_client_that_has_processed_no_block_records_no_receipt() {
+    let dir = temp();
+    let channel = channel();
+    let job = job_at(&channel, 1, 1, 0);
+    let mut store = open(dir.path(), Role::Client);
+    commit_all(
+        &mut store,
+        &[
+            ChannelRecord::NonceReserved {
+                nonce: job.authorization.proposal_nonce,
+            },
+            job.proposed(),
+            job.accepted(),
+        ],
+    );
+    let error = store
+        .commit(job.result_record(&channel), &Secp256k1Verifier::new())
+        .expect_err("a receipt needs a height to be timely at");
+    assert!(
+        matches!(
+            error,
+            WorkStoreError::Channel(ChannelStateError::NoCursor {
+                step: "recording a delivered result"
+            })
+        ),
+        "unexpected error: {error}"
+    );
+}
+
+/// A client invoices what its oracle checked, not what merely arrived.
+///
+/// The verdict is the only thing varied: the same delivered result, the
+/// same signed entry, refused before it and taken after it.
+#[test]
+fn an_unverified_result_is_not_invoiced() {
+    let dir = temp();
+    let channel = channel();
+    let verifier = Secp256k1Verifier::new();
+    let job = job_at(&channel, 1, 1, 0);
+    let mut store = open(dir.path(), Role::Client);
+    let sequence = client_sequence(&channel, &job);
+    commit_all(&mut store, &sequence[..5]);
+    assert_eq!(
+        store.state().job().map(JobState::phase),
+        Some(JobPhase::Ready)
+    );
+
+    // MUTATION: the invoice offered with the verdict step skipped.
+    let error = store
+        .commit(job.invoice(&channel), &verifier)
+        .expect_err("a result nobody checked is not payable");
+    assert!(
+        matches!(
+            error,
+            WorkStoreError::Channel(ChannelStateError::WrongPhase {
+                step: "issuing an invoice",
+                phase: "ready"
+            })
+        ),
+        "unexpected error: {error}"
+    );
+
+    // The control: with the verdict recorded, the same entry is taken.
+    commit_all(&mut store, &[ChannelRecord::ResultVerified]);
+    assert_eq!(
+        store.state().job().map(JobState::phase),
+        Some(JobPhase::Verified)
+    );
+    if let Err(error) = store.commit(job.invoice(&channel), &verifier) {
+        panic!("a checked result is invoiced: {error}");
+    }
+}
+
+/// A verdict is the client's step, and it needs a result to be about.
+#[test]
+fn a_verdict_belongs_to_a_client_holding_a_result() {
+    let dir = temp();
+    let channel = channel();
+    let verifier = Secp256k1Verifier::new();
+    let job = job_at(&channel, 1, 1, 0);
+
+    // MUTATION: the provider's journal, which has no oracle.
+    let mut provider_store = open(dir.path(), Role::Provider);
+    commit_all(&mut provider_store, &provider_sequence(&channel, &job)[..4]);
+    let error = provider_store
+        .commit(ChannelRecord::ResultVerified, &verifier)
+        .expect_err("a provider does not check its own answer");
+    assert!(
+        matches!(
+            error,
+            WorkStoreError::Channel(ChannelStateError::WrongRole {
+                step: "recording an oracle verdict",
+                expected: "client"
+            })
+        ),
+        "unexpected error: {error}"
+    );
+
+    // MUTATION: a client's journal, one step before the result.
+    let other = temp();
+    let mut store = open(other.path(), Role::Client);
+    let sequence = client_sequence(&channel, &job);
+    commit_all(&mut store, &sequence[..4]);
+    let error = store
+        .commit(ChannelRecord::ResultVerified, &verifier)
+        .expect_err("there is nothing yet to have checked");
+    assert!(
+        matches!(
+            error,
+            WorkStoreError::Channel(ChannelStateError::WrongPhase {
+                step: "recording an oracle verdict",
+                phase: "accepted"
+            })
+        ),
+        "unexpected error: {error}"
+    );
+
+    // The control: with the result recorded, the same step is taken —
+    // and taken again is redundant rather than a second verdict.
+    commit_all(&mut store, &sequence[4..6]);
+    if let Err(error) = store.commit(ChannelRecord::ResultVerified, &verifier) {
+        panic!("a repeated verdict is the same verdict: {error}");
+    }
+    assert_eq!(
+        store.state().job().map(JobState::phase),
+        Some(JobPhase::Verified)
+    );
 }
 
 // ── The defect this phase exists to prevent ───────────────────────────
@@ -493,9 +858,11 @@ fn a_paid_job_is_not_billed_again_after_a_restart() {
         "unexpected error: {error}"
     );
 
-    // And with a fresh nonce — a genuinely new job whose result and
-    // invoice name the *old* `work_id` — the credited-job set is what
-    // refuses it.
+    // And with a fresh nonce — a genuinely new job, offered the paid
+    // job's own signed result and the transcript that produced it — the
+    // reproduction rule refuses it before any ledger is asked. Those
+    // events answer the first job's request commitment, so no result at
+    // all can be rebuilt from them against this authorization.
     let fresh = job_at(&channel, 2, 2, PRICE);
     commit_all(
         &mut recovered,
@@ -508,6 +875,7 @@ fn a_paid_job_is_not_billed_again_after_a_restart() {
     let smuggled = ChannelRecord::JobResult {
         result: first.result,
         provider_signature: provider().sign(payload(result_digest(&channel, &first.result))),
+        transcript: spool(&first.transcript),
     };
     let error = recovered
         .commit(smuggled, &verifier)
@@ -515,7 +883,7 @@ fn a_paid_job_is_not_billed_again_after_a_restart() {
     assert!(
         matches!(
             error,
-            WorkStoreError::Channel(ChannelStateError::WrongChannel { .. })
+            WorkStoreError::Channel(ChannelStateError::Record(PaidWorkError::Transcript(_)))
         ),
         "unexpected error: {error}"
     );
@@ -523,6 +891,12 @@ fn a_paid_job_is_not_billed_again_after_a_restart() {
         recovered.state().ledger().credited_invoice_high_water(),
         PRICE
     );
+
+    // The control: this job's own result and transcript are taken, so
+    // what was refused above is the pairing and not the step.
+    if let Err(error) = recovered.commit(fresh.result_record(&channel), &verifier) {
+        panic!("this job's own result records: {error}");
+    }
 }
 
 /// Re-sending the retained certificate after a crash is not a second
@@ -1610,6 +1984,7 @@ fn a_signature_from_the_wrong_party_is_not_evidence() {
             ChannelRecord::JobResult {
                 result: job.result,
                 provider_signature: provider().sign(payload(job.work_id)),
+                transcript: spool(&job.transcript),
             },
         ),
         (
@@ -2322,6 +2697,30 @@ fn the_record_codec_is_exact_and_ordered() {
     assert_eq!(bytes, expected);
     assert_eq!(ChannelRecord::decode(&bytes), Ok(proposed));
 
+    // The result record: body, then signature, then the transcript as
+    // the whole of the rest.
+    let recorded = job.result_record(&channel);
+    let bytes = recorded.encode();
+    let mut expected = vec![5_u8];
+    expected.extend_from_slice(&job.result.encode());
+    expected.extend_from_slice(
+        provider()
+            .sign(payload(result_digest(&channel, &job.result)))
+            .as_bytes(),
+    );
+    expected.extend_from_slice(&spool(&job.transcript));
+    assert_eq!(bytes, expected);
+    assert_eq!(ChannelRecord::decode(&bytes), Ok(recorded));
+
+    // The two records with no body at all are one byte each, and they
+    // are not each other's.
+    assert_eq!(ChannelRecord::PlaintextReleased.encode(), vec![6_u8]);
+    assert_eq!(ChannelRecord::ResultVerified.encode(), vec![11_u8]);
+    assert_eq!(
+        ChannelRecord::decode(&[11]),
+        Ok(ChannelRecord::ResultVerified)
+    );
+
     let paid = job.paid(&channel);
     let bytes = paid.encode();
     assert_eq!(
@@ -2355,7 +2754,7 @@ fn the_record_codec_is_exact_and_ordered() {
         Err(ChannelStateError::Malformed)
     );
     assert_eq!(
-        ChannelRecord::decode(&[11]),
+        ChannelRecord::decode(&[12]),
         Err(ChannelStateError::Malformed)
     );
     assert_eq!(

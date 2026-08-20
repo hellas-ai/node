@@ -46,7 +46,7 @@
 //!
 //! # What a record is
 //!
-//! Six of the eleven records carry a signed artifact — the
+//! Six of the twelve records carry a signed artifact — the
 //! authorization, the co-signature, the result, the invoice entry, the
 //! certificate with its allocation, and the unsolicited certificate —
 //! and for each of those [`ChannelStore`] verifies the signature
@@ -54,11 +54,18 @@
 //! on commit *and* on replay. A journal that would not have been
 //! accepted a record at a time is not accepted whole.
 //!
-//! The other five — the cursor, the nonce reservation, the running
-//! marker, the plaintext release, and the job ending — are this
-//! endpoint's own statements about itself. Nothing signs them, and
-//! nothing here pretends to check them against anything but the state
-//! they move.
+//! The result carries one thing more, and it is the only record here
+//! checked against something other than a key: the transcript it
+//! summarises rides with it, and the result must be what
+//! [`terminal_result`] rebuilds from those events. A signature says the
+//! provider stands behind two digests; the rebuild says the digests are
+//! that transcript's.
+//!
+//! The other six — the cursor, the nonce reservation, the running
+//! marker, the plaintext release, the oracle verdict, and the job
+//! ending — are this endpoint's own statements about itself. Nothing
+//! signs them, and nothing here pretends to check them against anything
+//! but the state they move.
 //!
 //! None of it defends the file against someone who can write it; see
 //! [`super::journal`].
@@ -87,8 +94,8 @@ use crate::protocol::artifacts::PreparedPaidInputV1;
 use crate::protocol::work::{
     CertificateAllocationV1, CreditLedger, InvoiceEntryV1, InvoicedJob, PaidChannel,
     PaidJobAuthorizationV1, PaidJobResultV1, PaidWorkError, PrivateRecord as _, allocation_digest,
-    invoice_digest, next_invoice_entry, prepared_input_digest, result_digest, signing_hash,
-    work_id,
+    decode_transcript, invoice_digest, next_invoice_entry, prepared_input_digest, result_digest,
+    signing_hash, terminal_result, work_id,
 };
 use crate::work_store::journal::{Journal, JournalId, JournalKind, MAX_RECORD_BYTES, Role};
 use crate::work_store::{Applied, WorkStoreError, cursor::Cursor, hex, put_u64};
@@ -171,6 +178,26 @@ pub enum ChannelStateError {
     /// cannot know the outcome of.
     #[error("the job's invocation is indeterminate after a restart; a result now would be a guess")]
     Indeterminate,
+    /// A step needs a finalized height and none has been processed.
+    #[error("{step} needs a finalized block, and none has been processed")]
+    NoCursor {
+        /// Step that was attempted.
+        step: &'static str,
+    },
+    /// A result reached the client after the height it was owed by.
+    ///
+    /// Late plaintext earns nothing: the provider signed a terminal
+    /// deadline, and a client that recorded a receipt past it would be
+    /// building the evidence for an invoice the same deadline refuses.
+    #[error(
+        "a result received at finalized height {height} is past the terminal deadline {deadline}"
+    )]
+    ReceiptLate {
+        /// Finalized height the client had processed through.
+        height: u64,
+        /// Deadline the authorization carries.
+        deadline: u64,
+    },
     /// The finalized cursor moved backwards or stood still.
     #[error("cursor height {actual} does not advance past {held}")]
     CursorNotAdvancing {
@@ -205,6 +232,8 @@ pub enum JobPhase {
     Running,
     /// A signed terminal result exists.
     Ready,
+    /// The client's oracle reproduced the answer. Client-only.
+    Verified,
     /// The plaintext has left the provider. Provider-only.
     Delivered,
     /// A signed invoice entry exists for it.
@@ -224,6 +253,7 @@ impl JobPhase {
             Self::Accepted => "accepted",
             Self::Running => "running",
             Self::Ready => "ready",
+            Self::Verified => "verified",
             Self::Delivered => "delivered",
             Self::Invoiced => "invoiced",
         }
@@ -237,7 +267,10 @@ impl JobPhase {
     /// have taken — and a job that stopped while running produced
     /// nothing for anyone.
     const fn result_recorded(self) -> bool {
-        matches!(self, Self::Ready | Self::Delivered | Self::Invoiced)
+        matches!(
+            self,
+            Self::Ready | Self::Verified | Self::Delivered | Self::Invoiced
+        )
     }
 
     /// Whether reaching this phase means plaintext left the provider.
@@ -314,15 +347,30 @@ pub enum ChannelRecord {
     },
     /// The provider is about to invoke the backend.
     JobRunning,
-    /// The provider's signed terminal result.
+    /// The provider's signed terminal result, and the signed events it
+    /// summarises.
+    ///
+    /// The transcript rides here because the result is a pair of digests
+    /// over it: a provider that kept only the digests could not deliver
+    /// the answer it was paid for after a restart, and a client that
+    /// kept only the digests could not re-run its oracle without asking
+    /// the provider for the bytes again.
     JobResult {
         /// The result body.
         result: PaidJobResultV1,
         /// The provider's signature over its digest.
         provider_signature: Sig,
+        /// The transcript the result was derived from.
+        transcript: Vec<u8>,
     },
     /// The provider is about to release the plaintext.
     PlaintextReleased,
+    /// The client's oracle reproduced this job's answer.
+    ///
+    /// Client-only, and the whole of what makes a delivered result
+    /// payable: nothing else on this journal distinguishes an answer
+    /// that was checked from one that merely arrived signed.
+    ResultVerified,
     /// The provider's signed invoice entry for the delivered result.
     InvoiceIssued {
         /// The entry.
@@ -371,6 +419,7 @@ mod tag {
     pub(super) const PAID: u8 = 8;
     pub(super) const GIFT: u8 = 9;
     pub(super) const ENDED: u8 = 10;
+    pub(super) const VERIFIED: u8 = 11;
 }
 
 impl ChannelRecord {
@@ -413,12 +462,18 @@ impl ChannelRecord {
             Self::JobResult {
                 result,
                 provider_signature,
+                transcript,
             } => {
                 out.push(tag::RESULT);
                 out.extend_from_slice(&result.encode());
                 out.extend_from_slice(provider_signature.as_bytes());
+                // Last field, and the whole of the rest, for the reason
+                // `JobProposed`'s bundle is: the journal frame already
+                // carries this record's length.
+                out.extend_from_slice(transcript);
             }
             Self::PlaintextReleased => out.push(tag::PLAINTEXT),
+            Self::ResultVerified => out.push(tag::VERIFIED),
             Self::InvoiceIssued {
                 entry,
                 provider_signature,
@@ -461,10 +516,11 @@ impl ChannelRecord {
 
     /// Whether this record carries the open job forward.
     ///
-    /// The six steps between a proposal and its payment. Not the ending,
-    /// which is what stops it; not the proposal, which is what there
-    /// would be no open job without; and not the cursor, the nonce, or
-    /// an unsolicited certificate, which say nothing about a job.
+    /// The seven steps between a proposal and its payment. Not the
+    /// ending, which is what stops it; not the proposal, which is what
+    /// there would be no open job without; and not the cursor, the
+    /// nonce, or an unsolicited certificate, which say nothing about a
+    /// job.
     const fn advances_the_open_job(&self) -> bool {
         matches!(
             self,
@@ -472,6 +528,7 @@ impl ChannelRecord {
                 | Self::JobRunning
                 | Self::JobResult { .. }
                 | Self::PlaintextReleased
+                | Self::ResultVerified
                 | Self::InvoiceIssued { .. }
                 | Self::CertificatePaid { .. }
         )
@@ -506,8 +563,10 @@ impl ChannelRecord {
             tag::RESULT => Self::JobResult {
                 result: private_record(&mut cursor)?,
                 provider_signature: signature(&mut cursor)?,
+                transcript: cursor.rest().to_vec(),
             },
             tag::PLAINTEXT => Self::PlaintextReleased,
+            tag::VERIFIED => Self::ResultVerified,
             tag::INVOICE => Self::InvoiceIssued {
                 entry: private_record(&mut cursor)?,
                 provider_signature: signature(&mut cursor)?,
@@ -586,6 +645,7 @@ pub struct JobState {
     provider_signature: Option<Sig>,
     phase: JobPhase,
     result: Option<(PaidJobResultV1, Sig)>,
+    transcript: Vec<u8>,
     entry: Option<(InvoiceEntryV1, Sig)>,
 }
 
@@ -636,6 +696,20 @@ impl JobState {
     #[must_use]
     pub const fn result(&self) -> Option<&(PaidJobResultV1, Sig)> {
         self.result.as_ref()
+    }
+
+    /// Returns the encoded transcript the result was derived from, or
+    /// an empty slice before there is one.
+    ///
+    /// What makes these the right bytes is not that they were stored.
+    /// The rule that pairs them with the result is applied when the
+    /// record is committed and again when the journal is replayed —
+    /// one function, run by both — so a journal that holds a transcript
+    /// and a result that do not belong together is one that does not
+    /// open.
+    #[must_use]
+    pub fn transcript(&self) -> &[u8] {
+        &self.transcript
     }
 
     /// Returns the signed invoice entry, once it exists.
@@ -928,8 +1002,10 @@ impl ChannelState {
             ChannelRecord::JobResult {
                 result,
                 provider_signature,
-            } => self.apply_result(result, *provider_signature, verifier),
+                transcript,
+            } => self.apply_result(result, *provider_signature, transcript, verifier),
             ChannelRecord::PlaintextReleased => self.apply_plaintext(),
+            ChannelRecord::ResultVerified => self.apply_verified(),
             ChannelRecord::InvoiceIssued {
                 entry,
                 provider_signature,
@@ -1129,6 +1205,7 @@ impl ChannelState {
             provider_signature: None,
             phase: JobPhase::HalfSigned,
             result: None,
+            transcript: Vec::new(),
             entry: None,
         });
         Ok(Applied::Changed)
@@ -1183,15 +1260,32 @@ impl ChannelState {
         Ok(Applied::Changed)
     }
 
+    /// Records the provider's signed result and the transcript it
+    /// summarises.
+    ///
+    /// The rule that makes this more than a signature check is the
+    /// reproduction below: [`terminal_result`] is handed the stored
+    /// events and this job's own authorization, and what it builds must
+    /// be the result byte for byte. That establishes, on commit and on
+    /// every replay, that the events are one verified signed chain for
+    /// the request both parties authorized, under the key this channel
+    /// calls the provider, and that both digests in the result are that
+    /// chain's own.
+    ///
+    /// It subsumes a separate `result.work_id == job.work_id` check,
+    /// which is why there is not one: the work id is a field of what is
+    /// rebuilt, so a result naming another job differs from the rebuilt
+    /// one in exactly that field.
     fn apply_result<V: SigVerifier>(
         &mut self,
         result: &PaidJobResultV1,
         provider_signature: Sig,
+        transcript: &[u8],
         verifier: &V,
     ) -> Result<Applied, ChannelStateError> {
         let mut job = self.open_job("recording a result")?;
         if let Some((held, signature)) = &job.result {
-            if held == result && *signature == provider_signature {
+            if held == result && *signature == provider_signature && job.transcript == transcript {
                 return Ok(Applied::Redundant);
             }
             return Err(ChannelStateError::Conflict {
@@ -1217,9 +1311,33 @@ impl ChannelState {
                 phase: job.phase.name(),
             });
         }
-        if result.work_id.as_bytes() != job.work_id.as_bytes() {
+
+        // A client records what was delivered to it, and delivery has a
+        // deadline. The height is this journal's own cursor, so what it
+        // measures is when this endpoint had *processed* a block, not
+        // when a peer said one existed; how fresh that cursor is stays
+        // the caller's, in the sense `ReadyChannel` already documents.
+        // A provider is not bounded here: its own release gate is what
+        // stops late plaintext, and journaling a result it computed but
+        // may not release is honest evidence rather than a step.
+        if self.role == Role::Client {
+            let Some((height, _)) = self.cursor else {
+                return Err(ChannelStateError::NoCursor {
+                    step: "recording a delivered result",
+                });
+            };
+            if height > job.authorization.terminal_deadline {
+                return Err(ChannelStateError::ReceiptLate {
+                    height,
+                    deadline: job.authorization.terminal_deadline,
+                });
+            }
+        }
+
+        let events = decode_transcript(transcript, MAX_RECORD_BYTES)?;
+        if terminal_result(&self.channel, &job.authorization, &events)? != *result {
             return Err(ChannelStateError::WrongChannel {
-                field: "result work_id",
+                field: "result against its transcript",
             });
         }
         if !verifier.verify_sig(
@@ -1233,7 +1351,35 @@ impl ChannelState {
             });
         }
         job.result = Some((*result, provider_signature));
+        job.transcript = transcript.to_vec();
         job.phase = JobPhase::Ready;
+        self.job = Some(job);
+        Ok(Applied::Changed)
+    }
+
+    /// Records that this client's oracle reproduced the answer.
+    ///
+    /// It checks that there is a checked-out result to have an opinion
+    /// about and that this journal is a client's. What it cannot check
+    /// is the verdict itself: the oracle is the caller's, and this
+    /// records a decision rather than making one. That is why the
+    /// verdict is a step of its own rather than a flag on the result —
+    /// a receipt is timely or late whatever an oracle later says, and
+    /// the two are decided at different heights.
+    fn apply_verified(&mut self) -> Result<Applied, ChannelStateError> {
+        self.require_role("recording an oracle verdict", Role::Client)?;
+        let mut job = self.open_job("recording an oracle verdict")?;
+        match job.phase {
+            JobPhase::Verified | JobPhase::Invoiced => return Ok(Applied::Redundant),
+            JobPhase::Ready => {}
+            phase => {
+                return Err(ChannelStateError::WrongPhase {
+                    step: "recording an oracle verdict",
+                    phase: phase.name(),
+                });
+            }
+        }
+        job.phase = JobPhase::Verified;
         self.job = Some(job);
         Ok(Applied::Changed)
     }
@@ -1272,11 +1418,12 @@ impl ChannelState {
             });
         }
         // A provider invoices what it has delivered. A client has no
-        // delivery marker of its own; what it has is the result it
-        // verified.
+        // delivery marker of its own; what it has is the verdict its
+        // own oracle reached, and a result that merely arrived is not
+        // one an honest client asks to be billed for.
         let expected = match self.role {
             Role::Provider => JobPhase::Delivered,
-            Role::Client => JobPhase::Ready,
+            Role::Client => JobPhase::Verified,
         };
         if job.phase != expected {
             return Err(ChannelStateError::WrongPhase {
