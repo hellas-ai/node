@@ -7,6 +7,8 @@ mod fetch;
 #[cfg(feature = "iroh")]
 pub mod iroh;
 mod run_ticket;
+#[cfg(feature = "work")]
+pub mod work;
 
 pub use error::{ClientError, ClientResult};
 #[cfg(feature = "evaluate")]

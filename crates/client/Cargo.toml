@@ -21,11 +21,17 @@ iroh = [
     "hellas-wire/discovery-mdns",
 ]
 evaluate = ["hellas-rpc/evaluate"]
+# The paid-work half: the acceptance and delivery wire, and the
+# independent reexecution check the client makes before a result is
+# payable. Off by default because it pulls the consensus kernel and the
+# oracle crate into a client that may only want to fetch.
+work = ["dep:hellas-compute-oracle", "hellas-rpc/work"]
 
 [dependencies]
 async-stream = { version = "0.3", optional = true }
 futures = { workspace = true, optional = true }
 hellas-rpc = { workspace = true, features = ["execute", "fetch"] }
+hellas-compute-oracle = { workspace = true, optional = true }
 hellas-attestation = { workspace = true, features = [
     "apple-app-attest",
 ], optional = true }
@@ -37,10 +43,18 @@ thiserror.workspace = true
 
 [dev-dependencies]
 base64.workspace = true
+bytes.workspace = true
 ciborium.workspace = true
+hellas-kernel = { workspace = true, features = ["secp256k1"] }
+# The paid-work path runs over a real multiplexed transport rather than a
+# handler call: framing, method routing, and trailers are where a
+# wire-shaped mistake actually shows up.
+hellas-wire = { workspace = true, features = ["mux"] }
 hex.workspace = true
 p256.workspace = true
 serde.workspace = true
 serde_bytes.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+tempfile = "3"
+tokio.workspace = true

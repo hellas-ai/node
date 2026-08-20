@@ -1,10 +1,14 @@
-//! Delivering one job's answer: what leaves the provider, what it costs
-//! the moment it does, and what the client will take.
+//! One paid job, end to end, from the client's side: proposed,
+//! computed by a real provider endpoint, delivered, and then checked by
+//! an engine that never speaks to the provider.
 //!
-//! The happy path runs over a real multiplexed transport, so the request
-//! is framed, routed by method id, decoded, and answered rather than
-//! handed to a function. Every crash is a real one: the store is dropped
-//! and reopened over its own files.
+//! Both endpoints are real and hold real journals, and the exchange runs
+//! over a real multiplexed transport, framed and routed by method id.
+//! The one double is the reexecution engine, because this repository has
+//! no second implementation of the model to plug in — so what these
+//! tests establish is the orchestration around the check and the
+//! consequences of its verdict, not that any particular model
+//! reproduces.
 
 #![cfg(feature = "work")]
 
@@ -12,6 +16,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::Bytes;
+use hellas_client::work::{CheckedResult, CollectError, CollectOutcome, collect_checked_result};
+use hellas_compute_oracle::{OracleFault, Reexecuted, Reexecution, ReexecutionRequest};
 use hellas_kernel::{
     BlockHeight, Decode as _, Edge, EdgeId, EdgeValues, Fees, Key, LeaseSlots, List,
     MAX_EDGE_OUTPUTS, NetworkId, Parties, Payout, PendingSlot, RegistryChunk, RegistryNamespace,
@@ -22,28 +28,23 @@ use hellas_rpc::evaluate::{
     EvaluateOutputTranscriptBuilder, EvaluateStopReason, EvaluateTerminal, EvaluateUsage,
     input_commitment,
 };
-use hellas_rpc::pb::work::{
-    DeliverResultRequest, DeliverResultResponse, WorkDelivered, WorkRefusalCode,
-    deliver_result_response::Outcome,
-};
 use hellas_rpc::protocol::artifacts::{
     BoundTermId, Canonical as _, InputAddressed as _, OutputAddressed as _, PreparedPaidInputV1,
-    SourceRef, TextArtifact, TextExecution, TextPolicy, TokenIds,
+    SourceRef, TextArtifact, TextExecution, TextExecutionId, TextPolicy, TokenIds, completed_text,
 };
 use hellas_rpc::protocol::work::{
     JobDeadlines, PaidChannelPolicyV1, PaidExecutionPolicyV1, PaidJobAuthorizationV1,
-    PrivateRecord as _, encode_transcript, generation_policy_digest, identity_source_digest,
-    private_policy_commitment, propose_authorization, signing_hash, terminal_result, work_id,
+    generation_policy_digest, identity_source_digest, private_policy_commitment,
+    propose_authorization, signing_hash, work_id,
 };
 use hellas_rpc::protocol::work_setup::{
-    ObservedChannel, ReadyChannel, WorkChannelConfig, WorkChannelDescriptor, WorkSetupError,
-    payment_terms_hash,
+    ObservedChannel, ReadyChannel, WorkChannelConfig, WorkChannelDescriptor, payment_terms_hash,
 };
 use hellas_rpc::protocol::{ContentId, Digest};
-use hellas_rpc::services::work::{WorkClientImpl, WorkServer};
+use hellas_rpc::services::work::WorkServer;
 use hellas_rpc::work::{
-    BackendFault, ClientEndpoint, DeliverError, PaidEvaluateBackend, ProviderEndpoint, RunOutcome,
-    WorkService, fetch_result, run_accepted_work,
+    BackendFault, ClientEndpoint, PaidEvaluateBackend, ProviderEndpoint, RunOutcome, WorkService,
+    run_accepted_work,
 };
 use hellas_rpc::work_store::{ChannelRecord, ChannelStore, JobPhase, JobState, Role};
 use hellas_rpc::{
@@ -71,8 +72,6 @@ const CURSOR: u64 = 10;
 const CURSOR_PAYLOAD: [u8; 32] = [0xc0; 32];
 /// The prompt this fixture's bundle carries, in tokens.
 const PROMPT_TOKENS: u64 = 4;
-/// A frame bound no legal delivery here comes close to.
-const WIDE_FRAME: u32 = 262_144;
 
 const fn deadlines() -> JobDeadlines {
     JobDeadlines {
@@ -81,10 +80,6 @@ const fn deadlines() -> JobDeadlines {
         payment: 200,
     }
 }
-
-/// The last height at which the signed delivery margin still fits
-/// before the terminal deadline.
-const LAST_RELEASE: u64 = deadlines().terminal - 2;
 
 fn network() -> NetworkId {
     let Some(network) = NetworkId::new("hellas-test") else {
@@ -153,9 +148,7 @@ fn payment_terms() -> WorkPaymentTerms {
     }
 }
 
-/// The execution policy, with the one bound a test varies as its
-/// argument.
-fn policy_with(max_encoded_result_frame: u32) -> PaidExecutionPolicyV1 {
+fn execution_policy() -> PaidExecutionPolicyV1 {
     PaidExecutionPolicyV1 {
         allowed_environment: manifest().content_id(),
         generation_policy_digest: match generation_policy_digest(&text_policy().canonical_bytes()) {
@@ -172,17 +165,13 @@ fn policy_with(max_encoded_result_frame: u32) -> PaidExecutionPolicyV1 {
         max_stop_token_ids: 4,
         max_canonical_output_bytes: 65_536,
         max_spool_bytes: 1_048_576,
-        max_encoded_result_frame,
+        max_encoded_result_frame: 262_144,
         max_encoded_quote_response: 1_048_576,
         dispatch_margin_blocks: 4,
         delivery_margin_blocks: 2,
         oracle_grace_blocks: 6,
         fixed_price: PRICE,
     }
-}
-
-fn execution_policy() -> PaidExecutionPolicyV1 {
-    policy_with(WIDE_FRAME)
 }
 
 fn payment_values() -> EdgeValues {
@@ -223,12 +212,8 @@ fn ready_of(descriptor: &WorkChannelDescriptor, height: u64) -> ReadyChannel {
     }
 }
 
-fn ready_at(height: u64) -> ReadyChannel {
-    ready_of(&descriptor_with(execution_policy()), height)
-}
-
 fn ready() -> ReadyChannel {
-    ready_at(CURSOR)
+    ready_of(&descriptor_with(execution_policy()), CURSOR)
 }
 
 fn settlement() -> WorkPaymentSettlement {
@@ -268,21 +253,6 @@ fn store_at(root: &std::path::Path, ready: &ReadyChannel, role: Role, height: u6
     store
 }
 
-/// Moves one store's finalized cursor forward, as a running P8a
-/// catch-up will.
-fn advance(store: &mut ChannelStore, height: u64) {
-    if store.state().cursor() == Some((height, CURSOR_PAYLOAD)) {
-        return;
-    }
-    commit(
-        store,
-        ChannelRecord::CursorAdvanced {
-            height,
-            payload: CURSOR_PAYLOAD,
-        },
-    );
-}
-
 fn commit(store: &mut ChannelStore, record: ChannelRecord) {
     if let Err(error) = store.commit(record, &Secp256k1Verifier::new()) {
         panic!("the fixture record commits: {error}");
@@ -304,8 +274,12 @@ fn manifest() -> ProgramManifest {
     })
 }
 
+/// The prompt every job here runs on. It is the whole input, because
+/// this profile starts from an identity artifact.
+const PROMPT: [u32; 4] = [9, 8, 7, 6];
+
 fn prompt_tokens() -> TokenIds {
-    TokenIds::from([9, 8, 7, 6])
+    TokenIds::from(PROMPT.to_vec())
 }
 
 fn text_policy() -> TextPolicy {
@@ -425,10 +399,22 @@ fn transcript_for(request: &EvaluateRequest, answer: &[u32]) -> Vec<OutputEventE
         Ok(units) => units,
         Err(error) => panic!("the fixture usage sums: {error}"),
     };
+    // The artifact a provider's own store records for this execution.
+    // A placeholder would do for the tests that never reexecute; here
+    // it would make an honest provider look wrong, because the answer
+    // digest binds this field and the oracle derives it.
+    let text_artifact = completed_text(
+        TextExecutionId::from_digest(request.text_execution),
+        &PROMPT,
+        answer,
+    )
+    .artifact
+    .output_id()
+    .digest();
     match builder.finish(EvaluateTerminal {
         final_position: answer.len() as u64,
         stop_reason: EvaluateStopReason::END_OF_SEQUENCE,
-        text_artifact: Digest::from_bytes([0x77; 32]),
+        text_artifact,
         usage,
         billable_units,
     }) {
@@ -528,374 +514,141 @@ fn serve(transport: MuxTransport, service: WorkService) -> tokio::task::JoinHand
     })
 }
 
-fn refusal_code(response: &DeliverResultResponse) -> WorkRefusalCode {
-    match &response.outcome {
-        Some(Outcome::Refused(refused)) => match WorkRefusalCode::try_from(refused.code) {
-            Ok(code) => code,
-            Err(error) => panic!("the refusal code is one of the six: {error}"),
-        },
-        other => panic!("expected a refusal, got {other:?}"),
+// ── The reexecution engine double ─────────────────────────────────────
+
+/// An engine that answers with fixed tokens, or refuses.
+///
+/// It is handed a question derived from the accepted bundle and has no
+/// other input, which is the property that makes it stand in for an
+/// independent implementation at all: nothing it can see comes from the
+/// provider's answer.
+struct FixedEngine {
+    answer: Result<Reexecuted, OracleFault>,
+}
+
+impl FixedEngine {
+    fn answering(tokens: &[u32]) -> Self {
+        Self {
+            answer: Ok(Reexecuted {
+                output_token_ids: tokens.to_vec(),
+                stop_reason: EvaluateStopReason::END_OF_SEQUENCE,
+            }),
+        }
+    }
+
+    fn agreeing() -> Self {
+        Self::answering(&ANSWER)
+    }
+
+    fn failing(reason: &str) -> Self {
+        Self {
+            answer: Err(OracleFault::Engine(reason.to_string())),
+        }
     }
 }
 
-// ── One answer, over the wire, debited once ───────────────────────────
+impl Reexecution for FixedEngine {
+    fn reexecute(&self, _request: &ReexecutionRequest) -> Result<Reexecuted, OracleFault> {
+        self.answer.clone()
+    }
+}
 
-/// One job's answer crosses a real transport, lands on the client's
-/// disk, and costs the provider exactly one job's delivery credit
-/// however many times it is fetched.
+// ── The whole path ────────────────────────────────────────────────────
+
+/// One job, proposed and computed and delivered and checked, and a
+/// client journal that ends in the phase an invoice may be asked from.
 #[tokio::test]
-async fn one_answer_crosses_the_wire_and_is_debited_once() {
+async fn a_checked_answer_is_the_only_thing_that_reaches_the_verified_phase() {
     let client_root = temp();
     let provider_root = temp();
     let ready = ready();
     let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR);
     let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
-    let (id, authorization) = accept(
+    let (id, _) = accept(
         &execution_policy(),
         &mut [&mut client_store, &mut provider_store],
         1,
     );
-
     let Ok(provider_endpoint) = ProviderEndpoint::new(ready.clone(), provider_store, provider())
     else {
         panic!("the provider endpoint binds");
     };
     let service = WorkService::new(provider_endpoint);
-    run_to_result(&service, &ready, id).await;
-
-    let (transport, server_transport) = transport_pair();
-    let serving = serve(server_transport, service.clone());
     let Ok(mut endpoint) = ClientEndpoint::new(ready.clone(), client_store, client()) else {
         panic!("the client endpoint binds");
     };
+    let engine = FixedEngine::agreeing();
 
-    let delivered = match fetch_result(transport, &mut endpoint, &ready, id).await {
-        Ok(delivery) => delivery,
-        Err(error) => panic!("the fixture delivery completes: {error}"),
-    };
-
-    // The answer the client holds is the answer the provider computed,
-    // rebuilt here from the delivered events rather than trusted.
-    let Ok(events) = hellas_rpc::protocol::work::decode_transcript(&delivered.transcript, 1 << 20)
-    else {
-        panic!("the delivered transcript decodes");
-    };
-    assert_eq!(
-        terminal_result(ready.channel(), &authorization, &events),
-        Ok(delivered.result),
+    // Before the provider has run anything, asking is a wait rather than
+    // a failure, and nothing is recorded.
+    let (transport, server) = transport_pair();
+    let serving = serve(server, service.clone());
+    let waiting = collect_checked_result(transport, &mut endpoint, &ready, &engine, id).await;
+    serving.abort();
+    assert!(
+        matches!(waiting, Ok(CollectOutcome::NotReady { .. })),
+        "unexpected outcome: {waiting:?}",
     );
-    assert_eq!(delivered.result.work_id, id);
+    assert_eq!(
+        endpoint.state().job().map(JobState::phase),
+        Some(JobPhase::Accepted),
+    );
 
-    // One debit on the provider's side, and the client is at Ready with
-    // no verdict yet.
+    run_to_result(&service, &ready, id).await;
+
+    let (transport, server) = transport_pair();
+    let serving = serve(server, service.clone());
+    let collected = collect_checked_result(transport, &mut endpoint, &ready, &engine, id).await;
+    serving.abort();
+    let Ok(CollectOutcome::Checked(CheckedResult { result, transcript })) = collected else {
+        panic!("the checked answer is collected: {collected:?}");
+    };
+    assert_eq!(result.work_id, id);
+    assert!(!transcript.is_empty());
+    assert_eq!(
+        endpoint.state().job().map(JobState::phase),
+        Some(JobPhase::Verified),
+    );
+
+    // A second call is the same call: the provider answers from its
+    // spool at no second delivery debit, and the verdict is the same
+    // verdict.
+    let (transport, server) = transport_pair();
+    let serving = serve(server, service.clone());
+    let again = collect_checked_result(transport, &mut endpoint, &ready, &engine, id).await;
+    serving.abort();
+    assert!(
+        matches!(again, Ok(CollectOutcome::Checked(_))),
+        "unexpected outcome: {again:?}",
+    );
     {
         let Ok(provider) = service.endpoint() else {
             panic!("the endpoint is reachable");
         };
         assert_eq!(provider.state().delivery_outstanding(), PRICE);
-        assert_eq!(
-            provider.state().job().map(JobState::phase),
-            Some(JobPhase::Delivered)
-        );
     }
-    assert_eq!(
-        endpoint.state().job().map(JobState::phase),
-        Some(JobPhase::Ready)
-    );
 
-    // The retry a client makes when its response was lost: the same
-    // bytes, and no second debit.
-    let (transport, second) = transport_pair();
-    let serving_again = serve(second, service.clone());
-    let again = match fetch_result(transport, &mut endpoint, &ready, id).await {
-        Ok(delivery) => delivery,
-        Err(error) => panic!("a replayed delivery completes: {error}"),
-    };
-    assert_eq!(again, delivered, "the same answer came back");
-    let Ok(provider) = service.endpoint() else {
-        panic!("the endpoint is reachable");
-    };
-    assert_eq!(
-        provider.state().delivery_outstanding(),
-        PRICE,
-        "a replay reuses the debit it already made",
-    );
-    drop(provider);
-
-    // The verdict is the client's own step, and it moves the phase.
-    if let Err(error) = endpoint.verified(id) {
-        panic!("the client records its verdict: {error}");
-    }
-    assert_eq!(
-        endpoint.state().job().map(JobState::phase),
-        Some(JobPhase::Verified)
-    );
-
-    serving.abort();
-    serving_again.abort();
+    // And it is on the disk: reopened from the files by a process that
+    // saw none of this, the job is still checked.
     drop(endpoint);
     drop(service);
-
-    // And it is all on the disk: reopened from the files, the client's
-    // journal still holds the result and the transcript it came with.
     let recovered = store_at(client_root.path(), &ready, Role::Client, CURSOR);
     let Some(job) = recovered.state().job() else {
         panic!("the job is still open");
     };
     assert_eq!(job.phase(), JobPhase::Verified);
-    assert_eq!(
-        job.result().map(|(result, _)| *result),
-        Some(delivered.result)
-    );
-    assert_eq!(job.transcript(), delivered.transcript);
+    assert_eq!(job.result().map(|(result, _)| *result), Some(result));
 }
 
-// ── The gate in front of the first byte ───────────────────────────────
-
-/// A release whose measured margin no longer fits before the terminal
-/// deadline sends nothing and debits nothing.
+/// An answer the client's own engine does not reproduce is refused, and
+/// stays refused across a restart.
 ///
-/// One block either side of the boundary the signed policy measures,
-/// with the provider's processed height as the only thing varied.
+/// The provider here is honest in every checkable way: its result is
+/// signed over its own transcript, its transcript is signed under the
+/// channel's provider key, and its delivery is timely. The only thing
+/// wrong with it is the answer, and nothing but reexecution can say so.
 #[tokio::test]
-async fn the_last_height_the_delivery_margin_fits_is_the_last_that_may_release() {
-    for (height, may_release) in [(LAST_RELEASE, true), (LAST_RELEASE + 1, false)] {
-        // The job is accepted and run early, because the dispatch gate
-        // has its own margin; only the release height is varied.
-        let provider_root = temp();
-        let early = ready_at(CURSOR);
-        let mut provider_store = store_at(provider_root.path(), &early, Role::Provider, CURSOR);
-        let (id, _) = accept(&execution_policy(), &mut [&mut provider_store], 1);
-        let Ok(endpoint) = ProviderEndpoint::new(early.clone(), provider_store, provider()) else {
-            panic!("the provider endpoint binds");
-        };
-        let service = WorkService::new(endpoint);
-        run_to_result(&service, &early, id).await;
-        drop(service);
-
-        let ready = ready_at(height);
-        let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, height);
-        advance(&mut provider_store, height);
-        let Ok(mut endpoint) = ProviderEndpoint::new(ready.clone(), provider_store, provider())
-        else {
-            panic!("the provider endpoint binds at the release height");
-        };
-        let released = endpoint.deliver(id, &ready);
-        if may_release {
-            if let Err(error) = released {
-                panic!("at {height} the margin still fits: {error}");
-            }
-            assert_eq!(endpoint.state().delivery_outstanding(), PRICE);
-            continue;
-        }
-        let Err(DeliverError::Setup(WorkSetupError::DeliveryUnreachable { terminal, .. })) =
-            released
-        else {
-            panic!("at {height} the margin does not fit: {released:?}");
-        };
-        assert_eq!(terminal, deadlines().terminal);
-        assert_eq!(
-            endpoint.state().delivery_outstanding(),
-            0,
-            "nothing left, so nothing was debited",
-        );
-        assert_eq!(
-            endpoint.state().job().map(JobState::phase),
-            Some(JobPhase::Ready),
-            "and nothing was marked released",
-        );
-    }
-}
-
-/// A job with no signed result has no answer to release, and says so
-/// as a wait rather than a refusal.
-///
-/// The difference is the whole of how a client learns the answer
-/// exists: `NOT_READY` is the provider saying "ask again", and it is
-/// what an accepted job in flight answers.
-#[tokio::test]
-async fn a_job_with_no_result_releases_nothing_yet() {
-    let provider_root = temp();
-    let ready = ready();
-    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
-    let (id, _) = accept(&execution_policy(), &mut [&mut provider_store], 1);
-    let Ok(endpoint) = ProviderEndpoint::new(ready.clone(), provider_store, provider()) else {
-        panic!("the provider endpoint binds");
-    };
-    let service = WorkService::new(endpoint);
-
-    let (transport, server_transport) = transport_pair();
-    let serving = serve(server_transport, service.clone());
-    let response = match WorkClientImpl::new(transport)
-        .deliver_result(DeliverResultRequest {
-            work_id: id.as_bytes().to_vec(),
-        })
-        .await
-    {
-        Ok(response) => response,
-        Err(status) => panic!("the call completes: {status}"),
-    };
-    serving.abort();
-    assert_eq!(refusal_code(&response), WorkRefusalCode::NotReady);
-
-    {
-        let Ok(endpoint) = service.endpoint() else {
-            panic!("the endpoint is reachable");
-        };
-        assert_eq!(endpoint.state().delivery_outstanding(), 0);
-    }
-
-    // The control: the same request, once the job has a result.
-    run_to_result(&service, &ready, id).await;
-    let (transport, server_transport) = transport_pair();
-    let serving = serve(server_transport, service.clone());
-    let response = match WorkClientImpl::new(transport)
-        .deliver_result(DeliverResultRequest {
-            work_id: id.as_bytes().to_vec(),
-        })
-        .await
-    {
-        Ok(response) => response,
-        Err(status) => panic!("the call completes: {status}"),
-    };
-    serving.abort();
-    assert!(
-        matches!(response.outcome, Some(Outcome::Delivered(_))),
-        "a finished job delivers: {response:?}",
-    );
-}
-
-/// A `work_id` that is not this channel's open job is refused, and a
-/// `work_id` that is not 32 bytes never reaches a journal.
-#[tokio::test]
-async fn a_delivery_named_for_another_job_finds_nothing() {
-    let provider_root = temp();
-    let ready = ready();
-    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
-    let (id, _) = accept(&execution_policy(), &mut [&mut provider_store], 1);
-    let Ok(endpoint) = ProviderEndpoint::new(ready.clone(), provider_store, provider()) else {
-        panic!("the provider endpoint binds");
-    };
-    let service = WorkService::new(endpoint);
-    run_to_result(&service, &ready, id).await;
-
-    let other = work_id(ready.channel(), &authorization(&execution_policy(), 2));
-    assert_ne!(other, id);
-    for (name, work_id) in [
-        ("another job", other.as_bytes().to_vec()),
-        ("a truncated id", other.as_bytes()[..31].to_vec()),
-    ] {
-        let (transport, server_transport) = transport_pair();
-        let serving = serve(server_transport, service.clone());
-        let response = match WorkClientImpl::new(transport)
-            .deliver_result(DeliverResultRequest { work_id })
-            .await
-        {
-            Ok(response) => response,
-            Err(status) => panic!("the call for {name} completes: {status}"),
-        };
-        serving.abort();
-        assert!(
-            matches!(response.outcome, Some(Outcome::Refused(_))),
-            "{name} is refused: {response:?}",
-        );
-    }
-
-    let Ok(endpoint) = service.endpoint() else {
-        panic!("the endpoint is reachable");
-    };
-    assert_eq!(endpoint.state().delivery_outstanding(), 0);
-    assert_eq!(
-        endpoint.state().job().map(JobState::phase),
-        Some(JobPhase::Ready),
-    );
-}
-
-// ── What the client will take ─────────────────────────────────────────
-
-/// The client refuses a delivery larger than the frame it signed a
-/// bound for.
-///
-/// The bound is the only thing varied: the same job, the same answer,
-/// under two channels that differ in `max_encoded_result_frame` alone.
-#[tokio::test]
-async fn a_client_refuses_a_frame_over_the_bound_it_signed() {
-    // Measure the legal delivery first, then re-run the whole exchange
-    // under a policy whose bound is one byte below it.
-    let generous = delivered_frame_len(WIDE_FRAME).await;
-    let tight = u32::try_from(generous - 1).unwrap_or(u32::MAX);
-
-    let client_root = temp();
-    let provider_root = temp();
-    let policy = policy_with(tight);
-    let descriptor = descriptor_with(policy);
-    let ready = ready_of(&descriptor, CURSOR);
-    let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR);
-    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
-    let (id, _) = accept(&policy, &mut [&mut client_store, &mut provider_store], 1);
-    let Ok(provider_endpoint) = ProviderEndpoint::new(ready.clone(), provider_store, provider())
-    else {
-        panic!("the provider endpoint binds");
-    };
-    let service = WorkService::new(provider_endpoint);
-    run_to_result(&service, &ready, id).await;
-
-    let (transport, server_transport) = transport_pair();
-    let serving = serve(server_transport, service.clone());
-    let Ok(mut endpoint) = ClientEndpoint::new(ready.clone(), client_store, client()) else {
-        panic!("the client endpoint binds");
-    };
-    let refused = fetch_result(transport, &mut endpoint, &ready, id).await;
-    serving.abort();
-
-    let Err(DeliverError::OverFrame { actual, limit }) = refused else {
-        panic!("an oversized frame is refused: {refused:?}");
-    };
-    assert_eq!(actual, generous);
-    assert_eq!(limit, u64::from(tight));
-    assert_eq!(
-        endpoint.state().job().map(JobState::phase),
-        Some(JobPhase::Accepted),
-        "nothing was recorded",
-    );
-}
-
-/// Returns the encoded length of one legal delivery under `frame`.
-async fn delivered_frame_len(frame: u32) -> u64 {
-    use prost::Message as _;
-
-    let provider_root = temp();
-    let policy = policy_with(frame);
-    let ready = ready_of(&descriptor_with(policy), CURSOR);
-    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
-    let (id, _) = accept(&policy, &mut [&mut provider_store], 1);
-    let Ok(endpoint) = ProviderEndpoint::new(ready.clone(), provider_store, provider()) else {
-        panic!("the provider endpoint binds");
-    };
-    let service = WorkService::new(endpoint);
-    run_to_result(&service, &ready, id).await;
-    let Ok(mut endpoint) = service.endpoint() else {
-        panic!("the endpoint is reachable");
-    };
-    let Ok(delivery) = endpoint.deliver(id, &ready) else {
-        panic!("the fixture delivery is released");
-    };
-    WorkDelivered {
-        result: delivery.result.encode(),
-        provider_signature: delivery.signature.as_bytes().to_vec(),
-        transcript: delivery.transcript,
-    }
-    .encoded_len() as u64
-}
-
-/// A transcript swapped in transit is not recorded, however well the
-/// result beside it is signed.
-///
-/// This is the tamper the client's own rebuild exists for: the provider
-/// signed the result honestly, and something between the two endpoints
-/// replaced the events it summarises.
-#[tokio::test]
-async fn a_transcript_swapped_in_transit_is_not_recorded() {
+async fn an_answer_the_engine_does_not_reproduce_never_becomes_payable() {
     let client_root = temp();
     let provider_root = temp();
     let ready = ready();
@@ -912,58 +665,68 @@ async fn a_transcript_swapped_in_transit_is_not_recorded() {
     };
     let service = WorkService::new(provider_endpoint);
     run_to_result(&service, &ready, id).await;
-    let Ok(mut provider) = service.endpoint() else {
-        panic!("the endpoint is reachable");
-    };
-    let Ok(delivery) = provider.deliver(id, &ready) else {
-        panic!("the fixture delivery is released");
-    };
-    drop(provider);
-
     let Ok(mut endpoint) = ClientEndpoint::new(ready.clone(), client_store, client()) else {
         panic!("the client endpoint binds");
     };
-    let honest = WorkDelivered {
-        result: delivery.result.encode(),
-        provider_signature: delivery.signature.as_bytes().to_vec(),
-        transcript: delivery.transcript.clone(),
-    };
 
-    // MUTATION: the same signed result, beside a valid signed transcript
-    // of a different answer to the same request.
-    let Ok(other) = encode_transcript(&transcript_for(&evaluate_request(1), &[7, 7, 7])) else {
-        panic!("the other transcript encodes");
-    };
-    assert_ne!(other, delivery.transcript);
-    let tampered = WorkDelivered {
-        transcript: other,
-        ..honest.clone()
-    };
-    let refused = endpoint.receive(id, &ready, &tampered);
+    // MUTATION: the engine's answer differs from the provider's in one
+    // token. Everything else about the exchange is unchanged.
+    let mut other = ANSWER;
+    other[2] = 999;
+    let engine = FixedEngine::answering(&other);
+
+    let (transport, server) = transport_pair();
+    let serving = serve(server, service.clone());
+    let refused = collect_checked_result(transport, &mut endpoint, &ready, &engine, id).await;
+    serving.abort();
     assert!(
-        matches!(refused, Err(DeliverError::Store(_))),
-        "a swapped transcript is refused: {refused:?}",
-    );
-    assert_eq!(
-        endpoint.state().job().map(JobState::phase),
-        Some(JobPhase::Accepted),
-        "nothing was recorded",
+        matches!(refused, Err(CollectError::Refuted(OracleFault::Mismatch))),
+        "unexpected outcome: {refused:?}",
     );
 
-    // The control: the untampered delivery is taken.
-    if let Err(error) = endpoint.receive(id, &ready, &honest) {
-        panic!("the honest delivery records: {error}");
-    }
+    // The delivered result is kept as evidence, and is not checked.
     assert_eq!(
         endpoint.state().job().map(JobState::phase),
         Some(JobPhase::Ready),
     );
+    drop(endpoint);
+    let recovered = store_at(client_root.path(), &ready, Role::Client, CURSOR);
+    assert_eq!(
+        recovered.state().job().map(JobState::phase),
+        Some(JobPhase::Ready),
+        "a restart does not turn an unchecked result into a checked one",
+    );
+
+    // The control: the same delivery, checked by an engine that agrees,
+    // reaches the verified phase. Only the engine's answer is varied.
+    let Ok(mut endpoint) = ClientEndpoint::new(ready.clone(), recovered, client()) else {
+        panic!("the client endpoint binds");
+    };
+    let (transport, server) = transport_pair();
+    let serving = serve(server, service.clone());
+    let checked = collect_checked_result(
+        transport,
+        &mut endpoint,
+        &ready,
+        &FixedEngine::agreeing(),
+        id,
+    )
+    .await;
+    serving.abort();
+    assert!(
+        matches!(checked, Ok(CollectOutcome::Checked(_))),
+        "unexpected outcome: {checked:?}",
+    );
+    assert_eq!(
+        endpoint.state().job().map(JobState::phase),
+        Some(JobPhase::Verified),
+    );
 }
 
-/// A client that has not caught up to its own readiness records no
-/// receipt.
+/// An engine that cannot run says so, and its silence is not a verdict
+/// either way.
 #[tokio::test]
-async fn a_client_behind_its_readiness_records_no_receipt() {
+async fn an_engine_that_cannot_run_records_no_verdict() {
     let client_root = temp();
     let provider_root = temp();
     let ready = ready();
@@ -980,69 +743,24 @@ async fn a_client_behind_its_readiness_records_no_receipt() {
     };
     let service = WorkService::new(provider_endpoint);
     run_to_result(&service, &ready, id).await;
-    let Ok(mut provider) = service.endpoint() else {
-        panic!("the endpoint is reachable");
-    };
-    let Ok(delivery) = provider.deliver(id, &ready) else {
-        panic!("the fixture delivery is released");
-    };
-    drop(provider);
-
-    let delivered = WorkDelivered {
-        result: delivery.result.encode(),
-        provider_signature: delivery.signature.as_bytes().to_vec(),
-        transcript: delivery.transcript,
-    };
     let Ok(mut endpoint) = ClientEndpoint::new(ready.clone(), client_store, client()) else {
         panic!("the client endpoint binds");
     };
 
-    // MUTATION: a readiness decided at a later block than this endpoint
-    // has processed. The blocks between are where a contest it must not
-    // build evidence over would appear.
-    let ahead = ready_at(CURSOR + 1);
-    let refused = endpoint.receive(id, &ahead, &delivered);
-    assert!(
-        matches!(
-            refused,
-            Err(DeliverError::Setup(WorkSetupError::CursorBehind {
-                cursor: CURSOR,
-                height: 11
-            }))
-        ),
-        "unexpected answer: {refused:?}",
-    );
+    let engine = FixedEngine::failing("the weights did not load");
+    let (transport, server) = transport_pair();
+    let serving = serve(server, service.clone());
+    let unchecked = collect_checked_result(transport, &mut endpoint, &ready, &engine, id).await;
+    serving.abort();
 
-    // The control: the readiness this endpoint has caught up to.
-    if let Err(error) = endpoint.receive(id, &ready, &delivered) {
-        panic!("a caught-up client records the receipt: {error}");
-    }
-}
-
-/// A verdict names the job the client holds, and nothing else.
-#[tokio::test]
-async fn a_verdict_names_the_job_the_client_holds() {
-    let client_root = temp();
-    let ready = ready();
-    let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR);
-    let (id, _) = accept(&execution_policy(), &mut [&mut client_store], 1);
-    let Ok(mut endpoint) = ClientEndpoint::new(ready.clone(), client_store, client()) else {
-        panic!("the client endpoint binds");
+    let Err(CollectError::Unchecked(OracleFault::Engine(reason))) = unchecked else {
+        panic!("an engine fault is reported as one: {unchecked:?}");
     };
-
-    let other = work_id(ready.channel(), &authorization(&execution_policy(), 2));
-    assert_ne!(other, id);
-    assert!(
-        matches!(endpoint.verified(other), Err(DeliverError::NoSuchJob)),
-        "a verdict about another job is not this job's",
-    );
-
-    // And a verdict about a job with no result at all is refused by the
-    // journal rather than recorded.
-    let refused = endpoint.verified(id);
-    assert!(
-        matches!(refused, Err(DeliverError::Store(_))),
-        "unexpected answer: {refused:?}",
+    assert!(reason.contains("the weights did not load"), "{reason}");
+    assert_eq!(
+        endpoint.state().job().map(JobState::phase),
+        Some(JobPhase::Ready),
+        "a check that did not happen is not a check that passed",
     );
 }
 

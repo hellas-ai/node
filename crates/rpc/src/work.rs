@@ -131,8 +131,9 @@ use crate::{EvaluateRequest, OutputEventEnvelope};
 /// and the second of those is the expensive mistake.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkRefusal {
-    /// The provider has not processed a finalized block it can admit
-    /// work at. Retryable unchanged.
+    /// The provider cannot answer yet: it has not processed a finalized
+    /// block it can admit work at, or the job it accepted has not
+    /// finished. Retryable unchanged.
     NotReady,
     /// A deadline or the channel's admission horizon has passed.
     /// Permanent for these bytes; a fresh proposal may still be
@@ -1061,18 +1062,22 @@ pub enum DeliverError {
 impl From<DeliverError> for Refusal {
     /// What a provider says on the wire when it will not deliver.
     ///
-    /// Only three shapes reach it. A job that is not here or not
-    /// finished is a refusal about *this* request, a deadline that has
-    /// passed is permanent, a cursor that has not caught up is the
-    /// provider's own lag, and a journal that will not take the release
-    /// is the provider's storage. The client-only arms are mapped so
-    /// the match is total; a provider never builds one, and no test
-    /// claims it does.
+    /// The distinction the client's orchestration turns on is
+    /// retryable-or-not. A job that has been accepted and has not
+    /// finished is `NotReady` — asking again is exactly the right thing
+    /// and is how a client learns the answer exists — while a job this
+    /// channel does not have is `Declined`, because no wait produces
+    /// one. A passed deadline is permanent, a cursor that has not caught
+    /// up is the provider's own lag, and a journal that will not take
+    /// the release is the provider's storage.
+    ///
+    /// The client-only arms are mapped so the match is total; a provider
+    /// never builds one, and no test claims it does.
     fn from(error: DeliverError) -> Self {
         let reason = error.to_string();
         let code = match error {
-            DeliverError::NoSuchJob | DeliverError::NoResult { .. } => WorkRefusal::Declined,
-            DeliverError::NoCursor => WorkRefusal::NotReady,
+            DeliverError::NoSuchJob => WorkRefusal::Declined,
+            DeliverError::NoResult { .. } | DeliverError::NoCursor => WorkRefusal::NotReady,
             DeliverError::Setup(setup) => return Refusal::from(setup),
             DeliverError::Store(store) => return Refusal::from(store),
             _ => WorkRefusal::Invalid,

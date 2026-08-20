@@ -3459,9 +3459,12 @@ version = "0.1.0"
 dependencies = [
  "async-stream",
  "base64 0.22.1",
+ "bytes",
  "ciborium",
  "futures",
  "hellas-attestation",
+ "hellas-compute-oracle",
+ "hellas-kernel",
  "hellas-rpc",
  "hellas-wire",
  "hex",
@@ -3473,7 +3476,9 @@ dependencies = [
  "serde_bytes",
  "serde_json",
  "sha2 0.11.0",
+ "tempfile",
  "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]
