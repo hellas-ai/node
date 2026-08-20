@@ -1,33 +1,28 @@
 //! The executor's execution path: run-ticket validation, backend
 //! dispatch, and the signed event stream a job produces.
 //!
-//! # Owed here by P5: the backend-neutral terminal event commitment
+//! # The terminal event commitment this file used to owe
 //!
-//! The cutover deleted the Receipt and Settle handlers, and took with
-//! them the one helper that answered a question neither of them owned:
-//! *what is the terminal event commitment of the provider's own
-//! completed transcript for this request, from whichever engine ran
-//! it?* Nothing in `crates/executor/src` derives that value today, from
-//! a live transcript or from a durable completed record. §2.1 of
-//! `workflows/roadmap/compute-flow-plan.md` required extracting it
-//! before the deletion; it was deleted whole instead, and this note is
-//! the record of that debt rather than a re-added function with no
-//! caller.
+//! Paid, and the debt is closed. The cutover deleted the Receipt and
+//! Settle handlers and took the private `terminal_commitment` helper
+//! with them; the note that stood here recorded that, and named
+//! `957162c` as where to read the old shape.
 //!
-//! Recover it from `git show
-//! 957162c:crates/executor/src/executor/actor/execution.rs`, the
-//! private `terminal_commitment` method (lines 283–320 there). The
-//! behaviour, precisely: replay the provider's own completed transcript
-//! for a request commitment — Fetch's durable `replay_completed` first,
-//! then Evaluate's replayed `WorkFinished` — take the last output
-//! event, and return its `event_commitment` bytes; refuse when no
-//! completed transcript exists, when one exists but is empty, and when
-//! the replayed terminal event does not decode.
+//! It came back as `hellas_rpc::protocol::work::terminal_result`, and
+//! deliberately not in the shape it left. The deleted helper answered
+//! "what is the terminal commitment of my completed transcript for this
+//! *request commitment*", by looking one up — Fetch's durable
+//! `replay_completed` first, then Evaluate's replayed `WorkFinished`.
+//! A lookup by request commitment is the wrong question for a paid job:
+//! two accepted jobs can carry one request, and the second would be
+//! answered out of the first one's transcript with nothing invoked. The
+//! new function is handed the transcript one invocation produced and
+//! checks it against the authorization that paid for it, so the three
+//! refusals the old one made — no transcript, an empty one, a terminal
+//! that does not decode — survive, and two it could not make are added.
 //!
-//! P5b is what owes it, not P5a: §9 fixes that `PaidJobResultV1` may be
-//! constructed only from the provider's durably recorded terminal
-//! artifact, and that is this value. The Receipt type that used to own
-//! its only caller is gone for good and must not come back with it.
+//! The Receipt type that owned its only caller is gone for good and did
+//! not come back with it.
 
 use crate::ExecutorError;
 use crate::StateError;

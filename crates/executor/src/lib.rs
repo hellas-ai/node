@@ -25,6 +25,7 @@ mod metrics;
 mod model;
 mod scheme;
 mod state;
+mod work;
 #[cfg(feature = "evaluate")]
 mod worker;
 

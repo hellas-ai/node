@@ -96,6 +96,17 @@ pub(crate) enum ExecutorMessage {
         request: RunTicketRequest,
         reply: oneshot::Sender<Result<ExecuteOutcome, ExecutorError>>,
     },
+    /// Start one already-authorized paid job.
+    ///
+    /// No ticket, no quote, and no admission of its own: the paid
+    /// endpoint decided this invocation was owed and made that decision
+    /// durable before this message was sent. What is left for the engine
+    /// is whether it *can* run the request — the artifacts, the dtype,
+    /// the policy, the weights on this disk.
+    RunPaidEvaluate {
+        request: hellas_rpc::EvaluateRequest,
+        reply: oneshot::Sender<Result<ExecuteOutcome, ExecutorError>>,
+    },
     #[cfg(feature = "evaluate")]
     SchemeFinished(Box<dyn crate::scheme::SchemeCompletion>),
     FetchFinished(FetchCompletion),

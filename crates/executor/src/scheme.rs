@@ -90,6 +90,23 @@ pub trait SchemeEngine: Send + Sync {
         ctx: SchemeRunContext,
     ) -> Result<ExecuteOutcome, ExecutorError>;
 
+    /// Resolves one request and starts it, with no quote and no ticket.
+    ///
+    /// The paid path's only way in. It exists because the quote store is
+    /// transient and the paid endpoint's journal is not: a provider that
+    /// accepted a job and then restarted must execute exactly the job it
+    /// accepted, from the bundle on its disk, and a quote lookup could
+    /// only fail there.
+    ///
+    /// It is not an unpaid execution route. Nothing outside this crate
+    /// can reach it, and the one caller that can — the paid work backend
+    /// — has already been told by a durable running marker that this
+    /// invocation is owed.
+    async fn start_request(
+        &mut self,
+        request: hellas_rpc::EvaluateRequest,
+    ) -> Result<ExecuteOutcome, ExecutorError>;
+
     async fn replay_completed(
         &self,
         _request_commitment: [u8; 32],

@@ -39,6 +39,7 @@ hellas-rpc = { workspace = true, features = [
     "evaluate",
     "fetch",
     "courtesy",
+    "work",
 ] }
 hellas-wire = { workspace = true }
 prometheus-client = { workspace = true }

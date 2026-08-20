@@ -48,7 +48,7 @@ type DecodeTokensStream =
     Pin<Box<dyn Stream<Item = Result<DecodeTokensResponse, WireStatus>> + Send>>;
 
 impl ExecutorHandle {
-    async fn send<T>(
+    pub(crate) async fn send<T>(
         &self,
         make_message: impl FnOnce(oneshot::Sender<Result<T, ExecutorError>>) -> ExecutorMessage,
     ) -> Result<T, ExecutorError> {

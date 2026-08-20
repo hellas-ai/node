@@ -308,6 +308,13 @@ impl Executor {
                 ExecutorMessage::Execute { request, reply } => {
                     let _ = reply.send(self.handle_execute(request).await);
                 }
+                ExecutorMessage::RunPaidEvaluate { request, reply } => {
+                    let result = match self.evaluate.as_mut() {
+                        Some(engine) => engine.start_request(request).await,
+                        None => Err(evaluate_disabled()),
+                    };
+                    let _ = reply.send(result);
+                }
                 #[cfg(feature = "evaluate")]
                 ExecutorMessage::SchemeFinished(completion) => {
                     if let Some(engine) = self.evaluate.as_mut() {

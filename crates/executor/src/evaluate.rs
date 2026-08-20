@@ -36,7 +36,7 @@ use crate::scheme::{SchemeEngine, SchemeJob, SchemeRunContext};
 use crate::state::{
     ExecutorState, Invocation, LocalModelStatus, ModelLocator, QUOTE_AMOUNT, QUOTE_TTL, QuoteKind,
     QuotePlan, QuoteRecord, StopReason, Termination, evaluate_request_to_pb, model_spec,
-    quote_ticket, refusal_for, resolve_accept_dtypes,
+    new_execution_id, quote_ticket, refusal_for, resolve_accept_dtypes,
 };
 use crate::worker::{
     EnqueueError, ExecuteJob, ExecuteWorker, WorkerCompletion, WorkerCompletionResult,
@@ -228,25 +228,23 @@ impl EvaluateEngine {
     fn resolve_accept_dtypes(&self, prefs: &[String]) -> Result<Dtype, ExecutorError> {
         resolve_accept_dtypes(prefs, &self.supported_dtypes)
     }
-}
 
-fn evaluate_stop_reason(stop_reason: StopReason) -> EvaluateStopReason {
-    match stop_reason {
-        StopReason::EndOfSequence => EvaluateStopReason::END_OF_SEQUENCE,
-        StopReason::MaxNewTokens => EvaluateStopReason::MAX_OUTPUT,
-        StopReason::Cancelled => unreachable!("cancellation is not a success terminal"),
-    }
-}
-
-#[async_trait]
-impl SchemeEngine for EvaluateEngine {
-    async fn quote_evaluate(
+    /// Resolves one request into the job that would execute it, and
+    /// refuses it if this node may not.
+    ///
+    /// Every admission this engine has that is about the *request* — the
+    /// assurance it was made under, the artifacts it names, the dtype,
+    /// the execute policy, and whether the weights are on this disk —
+    /// runs here, once, so the quoted path and the paid path cannot
+    /// disagree about what this node will run.
+    ///
+    /// It says nothing about payment. Whether the job may run at all is
+    /// the paid endpoint's question, and it is answered before this is
+    /// reached.
+    async fn prepare_job(
         &mut self,
-        store: &mut ExecutorState,
-        request: PbEvaluateRequest,
-    ) -> Result<TicketOutcome<Ticket>, ExecutorError> {
-        store.prune_expired_quotes(Instant::now());
-        let evaluate_request = crate::state::evaluate_request_from_pb(request)?;
+        evaluate_request: EvaluateRequest,
+    ) -> Result<EvaluateJob, ExecutorError> {
         ensure_supported_assurance(evaluate_request.assurance, self.provider.assurance)?;
         let resolved = self
             .artifacts
@@ -268,33 +266,53 @@ impl SchemeEngine for EvaluateEngine {
                 resolved.locator.spec()
             )));
         }
-        // The other way in. This quote does not build a manifest — the
-        // model comes from a stored artifact, and an artifact can be put
-        // here over the wire — so nothing above has yet established that
-        // the model is on this disk. Without this, a ticket issued here
-        // would be redeemed later by a worker whose loader downloads
-        // whatever it does not find: the same hole, one round trip
+        // The other way in. Nothing above has established that the model
+        // is on this disk — the model comes from a stored artifact, and
+        // an artifact can be put here over the wire — so without this a
+        // job admitted here would be run later by a worker whose loader
+        // downloads whatever it does not find: the same hole, one step
         // further away.
         let spec = resolved.locator.spec();
         hellas_models::require_program_files(&spec).map_err(|err| refusal_for(&spec, err))?;
-        let request_commitment = Evaluate::commit_request(&evaluate_request);
+        Ok(EvaluateJob {
+            evaluate_request,
+            locator: resolved.locator,
+            invocation: resolved.invocation,
+            model_id: spec,
+        })
+    }
+}
+
+fn evaluate_stop_reason(stop_reason: StopReason) -> EvaluateStopReason {
+    match stop_reason {
+        StopReason::EndOfSequence => EvaluateStopReason::END_OF_SEQUENCE,
+        StopReason::MaxNewTokens => EvaluateStopReason::MAX_OUTPUT,
+        StopReason::Cancelled => unreachable!("cancellation is not a success terminal"),
+    }
+}
+
+#[async_trait]
+impl SchemeEngine for EvaluateEngine {
+    async fn quote_evaluate(
+        &mut self,
+        store: &mut ExecutorState,
+        request: PbEvaluateRequest,
+    ) -> Result<TicketOutcome<Ticket>, ExecutorError> {
+        store.prune_expired_quotes(Instant::now());
+        let evaluate_request = crate::state::evaluate_request_from_pb(request)?;
+        let job = self.prepare_job(evaluate_request).await?;
+        let request_commitment = Evaluate::commit_request(&job.evaluate_request);
         let (terms, ticket) = quote_ticket(
             request_commitment,
             self.provider.genesis.as_slice(),
-            evaluate_request.assurance,
+            job.evaluate_request.assurance,
         )?;
-        let model_id = resolved.locator.spec();
         let request_commitment_bytes = store.create_quote(QuoteRecord {
             terms,
             expires_at: Instant::now() + QUOTE_TTL,
-            model_id: model_id.clone(),
-            runner_public_key: evaluate_request.runner_public_key,
-            kind: QuoteKind::Scheme(Box::new(EvaluateJob {
-                evaluate_request,
-                locator: resolved.locator,
-                invocation: resolved.invocation,
-                model_id,
-            })),
+            model_id: job.model_id.clone(),
+            runner_public_key: job.evaluate_request.runner_public_key,
+            kind: QuoteKind::Scheme(Box::new(job)),
         });
 
         Ok(TicketOutcome {
@@ -612,6 +630,26 @@ impl SchemeEngine for EvaluateEngine {
             },
             events: receiver,
         })
+    }
+
+    async fn start_request(
+        &mut self,
+        request: EvaluateRequest,
+    ) -> Result<ExecuteOutcome, ExecutorError> {
+        let request_commitment = *Evaluate::commit_request(&request).as_bytes();
+        let job = self.prepare_job(request).await?;
+        // Deliberately not `replay_completed`: that map is keyed by
+        // request commitment and would answer a second paid job for the
+        // same request out of the first one's transcript, without
+        // invoking anything. A paid job is invoked because its journal
+        // says so, and this is the invocation.
+        self.start(
+            Box::new(job),
+            SchemeRunContext {
+                execution_id: new_execution_id(),
+                request_commitment,
+            },
+        )
     }
 
     async fn replay_completed(
