@@ -252,8 +252,9 @@ impl From<WorkStoreError> for Refusal {
 /// `a_journal_accepted_a_record_at_a_time_reopens_whole`'s.
 ///
 /// The rest belong to steps this phase does not carry — a result, an
-/// invoice, a cursor — and are mapped so the match is total, not because
-/// a proposal can produce them.
+/// invoice, a cursor, a job whose ending is already on the disk — and
+/// are mapped so the match is total, not because a proposal can produce
+/// them.
 const fn channel_refusal(error: &ChannelStateError) -> WorkRefusal {
     match error {
         ChannelStateError::Nonce { .. } | ChannelStateError::Conflict { .. } => {
@@ -262,6 +263,7 @@ const fn channel_refusal(error: &ChannelStateError) -> WorkRefusal {
         ChannelStateError::WrongPhase { .. }
         | ChannelStateError::OverCredit { .. }
         | ChannelStateError::UnallocatedGap { .. }
+        | ChannelStateError::LossRecorded
         | ChannelStateError::Indeterminate => WorkRefusal::Declined,
         ChannelStateError::Record(_)
         | ChannelStateError::BadSignature { .. }

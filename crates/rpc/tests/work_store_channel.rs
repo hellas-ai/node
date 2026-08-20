@@ -1324,6 +1324,93 @@ fn channel_journal_id(root: &std::path::Path, role: Role) -> JournalId {
     }
 }
 
+/// A job whose loss is already on the disk goes no further than its
+/// ending.
+///
+/// Ending a job writes two files, the loss first. The crash between them
+/// leaves the loss counted and the job reading as open, and from there
+/// the phase rules alone would let it be carried forward and paid for —
+/// crediting the client for a job whose price stays in a ledger that
+/// never gives anything back. The client would have paid *and* be short
+/// of that much credit, for good.
+#[test]
+fn a_job_whose_loss_is_recorded_takes_no_step_but_its_ending() {
+    let channel = channel();
+    let verifier = Secp256k1Verifier::new();
+
+    // Both crash points where a loss is already owed: after the result,
+    // and after the invoice. The record offered next is the one the
+    // interrupted process would have gone on to write.
+    let cases: Vec<(&str, usize, u64, u64)> =
+        vec![("ready", 4, PRICE, 0), ("invoiced", 6, PRICE, PRICE)];
+
+    for (label, prefix, compute, delivery) in cases {
+        let dir = temp();
+        let job = job_at(&channel, 1, 1, 0);
+        {
+            let mut store = open(dir.path(), Role::Provider);
+            commit_all(&mut store, &provider_sequence(&channel, &job)[..prefix]);
+        }
+
+        // Exactly what the interrupted commit left: the loss fsynced,
+        // and no ending in the channel journal to match it.
+        {
+            let mut ledger = match CounterpartyLoss::open(
+                dir.path(),
+                network(),
+                client().party_key(),
+                Role::Provider,
+            ) {
+                Ok(ledger) => ledger,
+                Err(error) => panic!("case {label}: the loss ledger opens: {error}"),
+            };
+            if let Err(error) = ledger.record(job.work_id, compute, delivery) {
+                panic!("case {label}: the loss records: {error}");
+            }
+        }
+
+        let mut recovered = open(dir.path(), Role::Provider);
+        assert_eq!(recovered.loss().compute, compute, "case {label}");
+        let Some(open_job) = recovered.state().job() else {
+            panic!("case {label}: the job still reads as open");
+        };
+        assert_eq!(open_job.work_id(), job.work_id);
+
+        let next = provider_sequence(&channel, &job)[prefix].clone();
+        let before = recovered.len();
+        let error = recovered
+            .commit(next, &verifier)
+            .expect_err("this job's ending was already decided");
+        assert!(
+            matches!(
+                error,
+                WorkStoreError::Channel(ChannelStateError::LossRecorded)
+            ),
+            "case {label}: unexpected error: {error}"
+        );
+        assert_eq!(recovered.len(), before, "case {label}: nothing is written");
+
+        // The one step that is left, and the loss it already wrote is
+        // counted once.
+        if let Err(error) = recovered.commit(
+            ChannelRecord::JobEnded {
+                reason: JobEnd::Expired,
+            },
+            &verifier,
+        ) {
+            panic!("case {label}: the ending re-commits: {error}");
+        }
+        assert!(recovered.state().job().is_none(), "case {label}");
+        assert_eq!(recovered.loss().compute, compute, "case {label}");
+        assert_eq!(recovered.loss().delivery, delivery, "case {label}");
+        assert_eq!(
+            recovered.state().ledger().credited_invoice_high_water(),
+            0,
+            "case {label}: nothing was paid for"
+        );
+    }
+}
+
 // ── The unallocated gap ───────────────────────────────────────────────
 
 /// A certificate the invoice prefix cannot account for stops new work,
