@@ -146,6 +146,20 @@ pub enum WorkSetupError {
         /// Deadline the authorization carries.
         terminal: u64,
     },
+    /// The measured delivery margin no longer fits before the terminal
+    /// deadline, so plaintext released now would not arrive in time.
+    #[error(
+        "height {height} plus the delivery margin {delivery} exceeds \
+         the terminal deadline {terminal}"
+    )]
+    DeliveryUnreachable {
+        /// Finalized height the release would begin at.
+        height: u64,
+        /// Blocks the policy allows to deliver.
+        delivery: u64,
+        /// Deadline the authorization carries.
+        terminal: u64,
+    },
     /// The gap between terminal and payment deadlines is under the
     /// oracle grace the policy measured.
     #[error(
@@ -611,12 +625,7 @@ impl ReadyChannel {
         terminal_deadline: u64,
         payment_deadline: u64,
     ) -> Result<(), WorkSetupError> {
-        if cursor_height < self.finalized_height {
-            return Err(WorkSetupError::CursorBehind {
-                cursor: cursor_height,
-                height: self.finalized_height,
-            });
-        }
+        self.check_caught_up(cursor_height)?;
         if cursor_height >= self.admission_horizon {
             return Err(WorkSetupError::HorizonPassed {
                 height: cursor_height,
@@ -652,6 +661,71 @@ impl ReadyChannel {
                 payment: payment_deadline,
                 actual: grace,
                 grace: policy.oracle_grace_blocks,
+            });
+        }
+        Ok(())
+    }
+
+    /// Checks that this endpoint has processed finalized blocks through
+    /// the height this readiness was decided at.
+    ///
+    /// Every decision taken against a `ReadyChannel` needs this and
+    /// only this in common: a snapshot the endpoint has not caught up
+    /// to is a state it cannot yet act on, because the blocks between
+    /// are where the fact that would change the decision would appear.
+    /// It is written once here and called by each of them.
+    ///
+    /// # Errors
+    ///
+    /// [`WorkSetupError::CursorBehind`] when the cursor is behind.
+    pub const fn check_caught_up(&self, cursor_height: u64) -> Result<(), WorkSetupError> {
+        if cursor_height < self.finalized_height {
+            return Err(WorkSetupError::CursorBehind {
+                cursor: cursor_height,
+                height: self.finalized_height,
+            });
+        }
+        Ok(())
+    }
+
+    /// Checks that plaintext released now can still reach the client
+    /// before the deadline it was promised by.
+    ///
+    /// The dispatch margin is deliberately absent: by the time there is
+    /// plaintext to release it has already been spent, and charging it
+    /// again would refuse a delivery that is in fact on time. What
+    /// remains is the transfer the policy measured for the largest
+    /// legal result.
+    ///
+    /// The admission horizon is likewise absent, and does not need to be
+    /// here: `check_authorization` fixes `terminal < payment < horizon`
+    /// for every signed job, so a height inside the terminal deadline is
+    /// inside the horizon.
+    ///
+    /// # Errors
+    ///
+    /// [`WorkSetupError::CursorBehind`] when the endpoint has not
+    /// processed blocks through the height this was decided at,
+    /// [`WorkSetupError::DeliveryUnreachable`] when the measured margin
+    /// no longer fits, and [`WorkSetupError::Record`] when that
+    /// arithmetic would overflow.
+    pub fn check_releasable(
+        &self,
+        cursor_height: u64,
+        terminal_deadline: u64,
+    ) -> Result<(), WorkSetupError> {
+        self.check_caught_up(cursor_height)?;
+        let delivery = self.execution_policy.delivery_margin_blocks;
+        let arrives = cursor_height
+            .checked_add(delivery)
+            .ok_or(PaidWorkError::Overflow {
+                field: "delivery margin",
+            })?;
+        if arrives > terminal_deadline {
+            return Err(WorkSetupError::DeliveryUnreachable {
+                height: cursor_height,
+                delivery,
+                terminal: terminal_deadline,
             });
         }
         Ok(())

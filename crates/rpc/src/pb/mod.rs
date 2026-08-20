@@ -169,9 +169,10 @@ mod id_pins {
     #[cfg(feature = "work")]
     #[test]
     fn work_ids_are_stable() {
-        use super::services::work::{AcceptWork, Work};
-        assert_eq!(<Work as ServiceMarker>::SERVICE_ID, 0x466a_8166);
+        use super::services::work::{AcceptWork, DeliverResult, Work};
+        assert_eq!(<Work as ServiceMarker>::SERVICE_ID, 0x111b_7616);
         assert_eq!(<AcceptWork as MethodMarker>::METHOD_ID, 0xaae4_0060);
+        assert_eq!(<DeliverResult as MethodMarker>::METHOD_ID, 0x0300_4659);
     }
 
     #[cfg(feature = "chain")]

@@ -721,17 +721,11 @@ async fn one_accepted_job_reaches_the_backend_once() {
         let service = serving(store);
 
         let outcome = run_accepted_work(&service, &ready(), &backend, id).await;
-        let RunOutcome::Completed {
-            result,
-            signature,
-            transcript,
-        } = expect_outcome(outcome)
-        else {
+        let RunOutcome::Completed { result, signature } = expect_outcome(outcome) else {
             panic!("the first run invokes and completes");
         };
         assert_eq!(backend.calls(), 1);
         assert_eq!(result.work_id, id);
-        assert_eq!(transcript.len(), 3, "two deltas and a terminal");
 
         // The retry: the same answer, and no second invocation.
         let again = expect_outcome(run_accepted_work(&service, &ready(), &backend, id).await);

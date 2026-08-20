@@ -15,6 +15,17 @@ service Work {
   // already signed; the provider answers with its co-signature or with
   // one refusal code.
   rpc AcceptWork(AcceptWorkRequest) returns (AcceptWorkResponse);
+
+  // One whole delivery. The client names an accepted job; the provider
+  // answers with the complete signed result and the transcript it was
+  // derived from, or with one refusal code.
+  //
+  // Unary and buffered, which is this profile's rule rather than a
+  // simplification: no plaintext token leaves the provider before the
+  // terminal result is durable and the job's price is reserved as
+  // delivery credit, so there is nothing to stream. A replay of the
+  // same call returns the same bytes and costs the same one debit.
+  rpc DeliverResult(DeliverResultRequest) returns (DeliverResultResponse);
 }
 
 message AcceptWorkRequest {
@@ -42,6 +53,33 @@ message WorkAccepted {
   // The provider's compact secp256k1 signature over the same work id:
   // exactly 64 bytes.
   bytes provider_signature = 1;
+}
+
+message DeliverResultRequest {
+  // The accepted job's `work_id`: the authorization's own digest,
+  // exactly 32 bytes. There is one job in flight per channel, so this
+  // names it rather than selecting among many.
+  bytes work_id = 1;
+}
+
+message DeliverResultResponse {
+  oneof outcome {
+    WorkDelivered delivered = 1;
+    WorkRefused refused = 2;
+  }
+}
+
+message WorkDelivered {
+  // Canonical `PaidJobResultV1`, envelope included.
+  bytes result = 1;
+  // The provider's compact secp256k1 signature over the result digest:
+  // exactly 64 bytes.
+  bytes provider_signature = 2;
+  // The signed output events the result summarises, in the encoding
+  // `hellas_rpc::protocol::work::decode_transcript` reads. Nothing
+  // hashes these bytes: the client rebuilds the result from the decoded
+  // events and requires it to be the one above.
+  bytes transcript = 3;
 }
 
 message WorkRefused {

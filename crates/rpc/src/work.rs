@@ -65,25 +65,43 @@
 //! phase already does — it stops the *resolution*: a recovered process
 //! may not sign a result for an invocation it cannot know it made.
 //!
+//! # Delivering the answer
+//!
+//! [`ProviderEndpoint::deliver`] and [`ClientEndpoint::receive`] are the
+//! third exchange, and they obey the same rule at the one moment it is
+//! irreversible: the release marker — which is what debits this client's
+//! delivery credit — is fsynced before a byte of plaintext is returned.
+//!
+//! It is one unary call carrying the whole answer, and that is the
+//! profile rather than a shortcut. Nothing is released before the
+//! terminal result is durable and its price is reserved, so there is no
+//! prefix to stream; what the client gets is the signed result and the
+//! transcript the provider's own journal holds, and what it does with
+//! them is rebuild one from the other before anything is stored.
+//!
+//! A lost response costs a round trip. The provider answers a second
+//! call from the same spool and re-commits the same marker as a
+//! redundant step, so one job's plaintext is debited once however many
+//! times it is fetched.
+//!
 //! # What this phase does not carry
 //!
-//! Result delivery, invoicing, and certificate admission. Each needs a
-//! producer that does not exist yet — a spool the plaintext is served
-//! from, a semantic oracle — and a message with nothing on either end of
-//! it is not a protocol. In particular nothing here releases plaintext
-//! or records a delivery-credit debit: the transcript is handed back to
-//! the caller of the one call that produced it and is not retained, so
-//! a second delivery of the same result is not something this phase can
-//! do.
+//! Invoicing and certificate admission. Both need a producer that does
+//! not exist yet, and a message with nothing on either end of it is not
+//! a protocol. [`ClientEndpoint::verified`] is the step an invoice will
+//! be asked for from; nothing here asks.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use hellas_kernel::{Secp256k1Signer, Secp256k1Verifier, Sig};
 use hellas_wire::{StreamTransport, WireStatus};
 
+use prost::Message as _;
+
 use crate::pb::work::{
-    AcceptWorkRequest, AcceptWorkResponse, WorkAccepted, WorkRefusalCode, WorkRefused,
-    accept_work_response::Outcome,
+    AcceptWorkRequest, AcceptWorkResponse, DeliverResultRequest, DeliverResultResponse,
+    WorkAccepted, WorkDelivered, WorkRefusalCode, WorkRefused, accept_work_response::Outcome,
+    deliver_result_response::Outcome as DeliverOutcome,
 };
 use crate::protocol::Digest;
 use crate::protocol::artifacts::PreparedPaidInputV1;
@@ -675,6 +693,74 @@ impl ProviderEndpoint {
         Ok((result, signature))
     }
 
+    /// Releases the answer for a job whose result is signed and durable.
+    ///
+    /// The order is the module's rule applied to plaintext: the release
+    /// is journaled — which is what debits this client's delivery
+    /// credit — before a byte of the answer is returned. A crash between
+    /// the two costs a round trip and no credit: the retry finds the job
+    /// already delivered, re-commits the same marker as a redundant
+    /// step, and hands back the same bytes.
+    ///
+    /// That is the whole of the idempotence claim, and it is worth being
+    /// exact about its key. The marker is per open job, not per
+    /// `(work_id, result_digest)` pair, because a job has at most one
+    /// result: the journal refuses a second one for the same job
+    /// outright. So a replay carrying a different result is not a
+    /// conflict resolved here — it is a request this endpoint has no
+    /// second answer to give.
+    ///
+    /// The deadline is checked on every call, including replays. A
+    /// release begun too late to arrive is refused even though the
+    /// plaintext already left on the first attempt, because the client's
+    /// own journal refuses a receipt past the same deadline: bytes it
+    /// may not record are bytes it cannot pay for.
+    ///
+    /// # Errors
+    ///
+    /// [`DeliverError::NoSuchJob`] when no open job carries this
+    /// `work_id`, [`DeliverError::NoResult`] before the result is
+    /// signed, [`DeliverError::Endpoint`] when `ready` is not this
+    /// endpoint's channel, [`DeliverError::Policy`] when it carries
+    /// another execution policy, [`DeliverError::NoCursor`] before any
+    /// finalized block has been processed, [`DeliverError::Setup`] when
+    /// the delivery margin no longer fits, and [`DeliverError::Store`]
+    /// when the release cannot be made durable — which is what happens
+    /// when this client's delivery credit is exhausted.
+    pub fn deliver(
+        &mut self,
+        work_id: Digest,
+        ready: &ReadyChannel,
+    ) -> Result<Delivery, DeliverError> {
+        let job = self.state().job().ok_or(DeliverError::NoSuchJob)?;
+        if job.work_id() != work_id {
+            return Err(DeliverError::NoSuchJob);
+        }
+        let Some((result, signature)) = job.result() else {
+            return Err(DeliverError::NoResult { phase: job.phase() });
+        };
+        let (result, signature) = (*result, *signature);
+        let transcript = job.transcript().to_vec();
+        let terminal_deadline = job.authorization().terminal_deadline;
+
+        bind(ready, &self.store, &self.signer, Role::Provider)?;
+        if ready.execution_policy() != self.ready.execution_policy() {
+            return Err(DeliverError::Policy);
+        }
+        let Some((cursor_height, _)) = self.state().cursor() else {
+            return Err(DeliverError::NoCursor);
+        };
+        ready.check_releasable(cursor_height, terminal_deadline)?;
+
+        self.store
+            .commit(ChannelRecord::PlaintextReleased, &Secp256k1Verifier::new())?;
+        Ok(Delivery {
+            result,
+            signature,
+            transcript,
+        })
+    }
+
     /// Ends the open job, releasing what it still holds.
     ///
     /// What ending costs is the journal's to decide from how far the job
@@ -760,16 +846,16 @@ pub enum RunAdmission {
 /// What one run of an accepted job produced.
 ///
 /// [`Self::Completed`] is returned by at most one call per `work_id`,
-/// ever: it is the answer of the call that invoked the backend, and it
-/// is the only one that carries the transcript. It is *at most* rather
-/// than exactly one because that call can still fault — a backend that
-/// refuses, or a journal that will not take the result, leaves a job
-/// whose `Completed` never comes.
+/// ever: it is the answer of the call that invoked the backend. It is
+/// *at most* rather than exactly one because that call can still fault —
+/// a backend that refuses, or a journal that will not take the result,
+/// leaves a job whose `Completed` never comes.
 ///
-/// A later call finds [`Self::Ready`] instead, which carries the signed
-/// result and not the bytes it summarises. This phase retains no spool,
-/// so the transcript exists once, in the hand of the caller that caused
-/// it.
+/// Neither variant carries the transcript, and no caller needs one to:
+/// the invocation's events are journaled beside the result, and
+/// [`ProviderEndpoint::deliver`] is what serves them. Handing them back
+/// here as well would put the answer in two places and make the second
+/// one look authoritative.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RunOutcome {
     /// This call invoked the backend and recorded its terminal.
@@ -778,8 +864,6 @@ pub enum RunOutcome {
         result: PaidJobResultV1,
         /// The provider's signature over its digest.
         signature: Sig,
-        /// The transcript the invocation produced.
-        transcript: Vec<OutputEventEnvelope>,
     },
     /// A signed result was already durable.
     Ready {
@@ -892,13 +976,108 @@ where
         endpoint.record_result(work_id, &transcript)
     };
     match recorded {
-        Ok((result, signature)) => Ok(RunOutcome::Completed {
-            result,
-            signature,
-            transcript,
-        }),
+        Ok((result, signature)) => Ok(RunOutcome::Completed { result, signature }),
         Err(fault @ RunError::Transcript(_)) => Err(end_failed(service, work_id, fault)),
         Err(error) => Err(error),
+    }
+}
+
+// ── Delivering the answer ─────────────────────────────────────────────
+
+/// One whole delivery: the signed result and the transcript it
+/// summarises.
+///
+/// The two travel together because neither is the answer alone. The
+/// result is a pair of digests the provider stands behind; the
+/// transcript is the signed events those digests are over, and the
+/// tokens the client actually wanted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Delivery {
+    /// The provider's signed result.
+    pub result: PaidJobResultV1,
+    /// The provider's signature over its digest.
+    pub signature: Sig,
+    /// The encoded transcript, as [`decode_transcript`] reads it.
+    pub transcript: Vec<u8>,
+}
+
+/// Why one delivery did not happen.
+#[derive(Debug, thiserror::Error)]
+pub enum DeliverError {
+    /// No open job on this channel carries this `work_id`.
+    #[error("no open job on this channel carries this work id")]
+    NoSuchJob,
+    /// The job has no signed result, so there is nothing to deliver.
+    #[error("a {phase} job has no result to deliver")]
+    NoResult {
+        /// How far the job has got.
+        phase: JobPhase,
+    },
+    /// The readiness offered is not this endpoint's own channel.
+    #[error(transparent)]
+    Endpoint(#[from] EndpointError),
+    /// The readiness offered carries another execution policy than the
+    /// one this endpoint works under.
+    #[error("the readiness offered was decided under another execution policy")]
+    Policy,
+    /// No finalized block has been processed, so no deadline can be
+    /// measured.
+    #[error("no finalized block has been processed on this channel")]
+    NoCursor,
+    /// The delivery margin no longer fits, or the endpoint is behind.
+    #[error(transparent)]
+    Setup(#[from] WorkSetupError),
+    /// The response is larger than the frame both parties authorized.
+    #[error("the delivered frame is {actual} bytes, over the authorized {limit}")]
+    OverFrame {
+        /// Bytes the encoded delivery occupies.
+        actual: u64,
+        /// Bytes the signed execution policy allows.
+        limit: u64,
+    },
+    /// A private-record rule refused the delivered bytes.
+    #[error(transparent)]
+    Record(#[from] PaidWorkError),
+    /// The journal refused the step, or could not take it.
+    #[error(transparent)]
+    Store(#[from] WorkStoreError),
+    /// The provider refused to deliver.
+    #[error("the provider refused as {refusal}: {reason}")]
+    Refused {
+        /// Which of the six answers came back.
+        refusal: WorkRefusal,
+        /// The provider's diagnostic text, unchecked and uncovered by
+        /// any digest.
+        reason: String,
+    },
+    /// The response was not one of the shapes the service defines.
+    #[error("the provider's response has no readable {0}")]
+    Malformed(&'static str),
+    /// The call did not complete.
+    #[error("the work call failed: {0}")]
+    Transport(#[from] WireStatus),
+}
+
+impl From<DeliverError> for Refusal {
+    /// What a provider says on the wire when it will not deliver.
+    ///
+    /// Only three shapes reach it. A job that is not here or not
+    /// finished is a refusal about *this* request, a deadline that has
+    /// passed is permanent, a cursor that has not caught up is the
+    /// provider's own lag, and a journal that will not take the release
+    /// is the provider's storage. The client-only arms are mapped so
+    /// the match is total; a provider never builds one, and no test
+    /// claims it does.
+    fn from(error: DeliverError) -> Self {
+        let reason = error.to_string();
+        let code = match error {
+            DeliverError::NoSuchJob | DeliverError::NoResult { .. } => WorkRefusal::Declined,
+            DeliverError::NoCursor => WorkRefusal::NotReady,
+            DeliverError::Setup(setup) => return Refusal::from(setup),
+            DeliverError::Store(store) => return Refusal::from(store),
+            _ => WorkRefusal::Invalid,
+        };
+        Self::new(code, reason)
     }
 }
 
@@ -962,6 +1141,40 @@ impl WorkService {
             },
         }
     }
+
+    /// Releases one job's answer, or says why not.
+    ///
+    /// The readiness it releases against is this service's own, which is
+    /// the endpoint's — the one the channel was configured with, at the
+    /// height it was decided at. Its freshness is the operator's in
+    /// exactly the sense [`ReadyChannel`] documents; what is measured
+    /// against it is the height this endpoint has actually processed
+    /// finalized blocks through.
+    fn release(&self, request: &DeliverResultRequest) -> DeliverResultResponse {
+        let outcome = match self.endpoint() {
+            Ok(mut endpoint) => match work_id_bytes(&request.work_id) {
+                Some(work_id) => {
+                    let ready = endpoint.ready.clone();
+                    endpoint.deliver(work_id, &ready).map_err(Refusal::from)
+                }
+                None => Err(Refusal::invalid("the work id is not 32 bytes")),
+            },
+            Err(error) => Err(Refusal::new(WorkRefusal::Unavailable, error.to_string())),
+        };
+        DeliverResultResponse {
+            outcome: Some(match outcome {
+                Ok(delivery) => DeliverOutcome::Delivered(WorkDelivered {
+                    result: delivery.result.encode(),
+                    provider_signature: delivery.signature.as_bytes().to_vec(),
+                    transcript: delivery.transcript,
+                }),
+                Err(refusal) => DeliverOutcome::Refused(WorkRefused {
+                    code: refusal.code.code() as i32,
+                    reason: refusal.reason,
+                }),
+            }),
+        }
+    }
 }
 
 impl WorkHandler for WorkService {
@@ -973,6 +1186,25 @@ impl WorkHandler for WorkService {
     > + Send {
         core::future::ready(Ok(self.answer(&request)))
     }
+
+    fn deliver_result(
+        &self,
+        request: DeliverResultRequest,
+    ) -> impl core::future::Future<
+        Output = Result<
+            impl Into<crate::call::WithTrailer<DeliverResultResponse>> + Send,
+            WireStatus,
+        >,
+    > + Send {
+        core::future::ready(Ok(self.release(&request)))
+    }
+}
+
+/// Reads a `work_id` from exactly its 32 bytes.
+fn work_id_bytes(bytes: &[u8]) -> Option<Digest> {
+    <[u8; Digest::LEN]>::try_from(bytes)
+        .ok()
+        .map(Digest::from_bytes)
 }
 
 // ── The client ────────────────────────────────────────────────────────
@@ -1208,6 +1440,146 @@ impl ClientEndpoint {
             &Secp256k1Verifier::new(),
         )?;
         Ok(work_id)
+    }
+}
+
+impl ClientEndpoint {
+    /// Takes one delivered answer, and makes it durable before it is
+    /// returned.
+    ///
+    /// What this establishes, and the order it establishes it in: the
+    /// encoded delivery is inside the frame both parties signed a bound
+    /// for; the result parses as this profile's record; and the store
+    /// takes it, which is where the three rules that matter live —
+    /// the transcript rebuilds exactly this result, the signature is
+    /// the provider's over its digest, and the receipt is at or before
+    /// the terminal deadline. None of those is spelled a second time
+    /// here.
+    ///
+    /// What it does *not* establish is that the answer is right. That
+    /// is the oracle's, it runs on the bytes this returns, and its
+    /// verdict is a separate durable step.
+    ///
+    /// # Errors
+    ///
+    /// [`DeliverError::NoSuchJob`] when no open job carries this
+    /// `work_id`, [`DeliverError::Endpoint`] when `ready` is not this
+    /// endpoint's channel, [`DeliverError::Policy`] when it carries
+    /// another execution policy, [`DeliverError::NoCursor`] before any
+    /// finalized block has been processed, [`DeliverError::Setup`] when
+    /// this endpoint has not caught up to that readiness,
+    /// [`DeliverError::OverFrame`] above the signed frame bound,
+    /// [`DeliverError::Malformed`] for a signature that is not 64
+    /// bytes, [`DeliverError::Record`] when the result does not parse,
+    /// and [`DeliverError::Store`] for every rule above.
+    pub fn receive(
+        &mut self,
+        work_id: Digest,
+        ready: &ReadyChannel,
+        delivered: &WorkDelivered,
+    ) -> Result<Delivery, DeliverError> {
+        let job = self.state().job().ok_or(DeliverError::NoSuchJob)?;
+        if job.work_id() != work_id {
+            return Err(DeliverError::NoSuchJob);
+        }
+
+        bind(ready, &self.store, &self.signer, Role::Client)?;
+        if ready.execution_policy() != self.ready.execution_policy() {
+            return Err(DeliverError::Policy);
+        }
+        let Some((cursor_height, _)) = self.state().cursor() else {
+            return Err(DeliverError::NoCursor);
+        };
+        ready.check_caught_up(cursor_height)?;
+
+        // The bound is on the encoded message, which is what this
+        // endpoint agreed to hold; the transport's own framing around
+        // it is the transport's and is not measured here.
+        let limit = u64::from(ready.execution_policy().max_encoded_result_frame);
+        let actual = u64::try_from(delivered.encoded_len()).unwrap_or(u64::MAX);
+        if actual > limit {
+            return Err(DeliverError::OverFrame { actual, limit });
+        }
+
+        let result = PaidJobResultV1::decode(&delivered.result)?;
+        let signature = signature(&delivered.provider_signature)
+            .ok_or(DeliverError::Malformed("provider signature"))?;
+        self.store.commit(
+            ChannelRecord::JobResult {
+                result,
+                provider_signature: signature,
+                transcript: delivered.transcript.clone(),
+            },
+            &Secp256k1Verifier::new(),
+        )?;
+        Ok(Delivery {
+            result,
+            signature,
+            transcript: delivered.transcript.clone(),
+        })
+    }
+
+    /// Records that this client's own oracle reproduced the answer.
+    ///
+    /// It takes no verdict argument, and that is deliberate: a function
+    /// that could be handed `false` would be a function some caller
+    /// could hand `true`. The only way to record a verdict is to have
+    /// one, and the caller that has one calls this.
+    ///
+    /// # Errors
+    ///
+    /// [`DeliverError::NoSuchJob`] when no open job carries this
+    /// `work_id`, and [`DeliverError::Store`] when the job has no
+    /// recorded result or the verdict cannot be made durable.
+    pub fn verified(&mut self, work_id: Digest) -> Result<(), DeliverError> {
+        let job = self.state().job().ok_or(DeliverError::NoSuchJob)?;
+        if job.work_id() != work_id {
+            return Err(DeliverError::NoSuchJob);
+        }
+        self.store
+            .commit(ChannelRecord::ResultVerified, &Secp256k1Verifier::new())?;
+        Ok(())
+    }
+}
+
+/// Asks for one accepted job's answer over a live transport and makes it
+/// durable.
+///
+/// Idempotent by the same rule as the exchange above: a lost response
+/// costs a round trip, because the provider answers a second call from
+/// its own spool and this endpoint's store takes the same result twice
+/// as one.
+///
+/// # Errors
+///
+/// [`DeliverError::Transport`] when the call does not complete,
+/// [`DeliverError::Refused`] for a refusal, [`DeliverError::Malformed`]
+/// for a response this service does not define, and whatever
+/// [`ClientEndpoint::receive`] raises.
+pub async fn fetch_result<T>(
+    transport: T,
+    endpoint: &mut ClientEndpoint,
+    ready: &ReadyChannel,
+    work_id: Digest,
+) -> Result<Delivery, DeliverError>
+where
+    T: StreamTransport + Sync,
+    T::Error: std::error::Error + Send + Sync + 'static,
+    T::Stream: 'static,
+{
+    let response = WorkClientImpl::new(transport)
+        .deliver_result(DeliverResultRequest {
+            work_id: work_id.as_bytes().to_vec(),
+        })
+        .await?;
+    match response.outcome {
+        Some(DeliverOutcome::Delivered(delivered)) => endpoint.receive(work_id, ready, &delivered),
+        Some(DeliverOutcome::Refused(refused)) => Err(DeliverError::Refused {
+            refusal: WorkRefusal::from_code(refused.code)
+                .ok_or(DeliverError::Malformed("refusal code"))?,
+            reason: refused.reason,
+        }),
+        None => Err(DeliverError::Malformed("outcome")),
     }
 }
 
