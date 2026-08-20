@@ -159,10 +159,18 @@ pub const MAX_REGISTRY_CHUNKS: usize = u8::MAX as usize;
 /// This one *is* a policy choice: it is the width of the
 /// [`crate::RegistryDiff`] every apply returns, so it bounds the host's
 /// per-operation replay work and the memory an operation's result costs.
-/// A transition that needs a thirteenth slot is a chain-version change,
-/// not a wider array — the point of a fixed bound is that no operation
-/// can make the host do unpriced work.
-pub const MAX_REGISTRY_MUTATIONS: usize = 12;
+/// A transition that needs a third slot is a chain-version change, not a
+/// wider array — the point of a fixed bound is that no operation can
+/// make the host do unpriced work.
+///
+/// Two is what the widest transition in this kernel actually writes: a
+/// payment open creates both chunks of a [`crate::BondLease`], and a
+/// leased bond's timeout deletes both. `lease.rs` asserts that
+/// correspondence at compile time, so the bound cannot quietly become
+/// smaller than the record it is bounding. A bound above the widest
+/// reachable write is not headroom, it is an array every applied
+/// operation carries and no transition can fill.
+pub const MAX_REGISTRY_MUTATIONS: usize = 2;
 
 // ── Domain separators (Xet binding prefixes) ─────────────────────────
 //

@@ -75,6 +75,15 @@ const BOND_LEASE_VERSION: u8 = 2;
 /// look partial.
 pub const BOND_LEASE_CHUNKS: u8 = 2;
 
+/// A payment open writes every chunk of the lease in one diff, and a
+/// leased bond's timeout deletes every chunk of it in one diff. That
+/// makes this record the widest registry write the kernel makes, and
+/// [`crate::MAX_REGISTRY_MUTATIONS`] is set to it rather than beside it.
+const _: () = assert!(
+    BOND_LEASE_CHUNKS as usize <= crate::consts::MAX_REGISTRY_MUTATIONS,
+    "a lease must fit one registry diff"
+);
+
 /// The exclusive lease one payment channel holds over one work-stake
 /// bond.
 ///

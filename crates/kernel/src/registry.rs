@@ -887,17 +887,20 @@ mod tests {
             .expect("seed");
         seed.fold(&mut batch).expect("seed folds");
 
+        // The widest diff this kernel produces, and the two kinds mixed:
+        // a fold that stopped after the write would leave the deleted
+        // slot occupied, which is the prefix its host was promised was
+        // whole.
         let mut diff = RegistryDiff::empty();
         diff.push(RegistryMutation::write(slot_id(0), chunk(0x66)))
             .expect("first");
-        diff.push(RegistryMutation::write(slot_id(1), chunk(0x77)))
-            .expect("second");
         diff.push(RegistryMutation::delete(slot_id(3)))
-            .expect("third");
+            .expect("second");
+        assert_eq!(diff.len(), MAX_REGISTRY_MUTATIONS);
         diff.fold(&mut batch).expect("diff folds");
 
         assert_eq!(batch.registry_chunk(slot_id(0)), Some(chunk(0x66)));
-        assert_eq!(batch.registry_chunk(slot_id(1)), Some(chunk(0x77)));
+        assert_eq!(batch.registry_chunk(slot_id(1)), None);
         assert_eq!(batch.registry_chunk(slot_id(2)), None);
         assert_eq!(batch.registry_chunk(slot_id(3)), None);
     }
