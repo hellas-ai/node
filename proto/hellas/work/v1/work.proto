@@ -1,0 +1,79 @@
+syntax = "proto3";
+
+package hellas.work.v1;
+
+// The paid-work service: the wire by which a client proposes one job on
+// one payment channel and a provider accepts or refuses it.
+//
+// Nothing here is hashed. Every digest and every signature in the paid
+// protocol is taken over the canonical private records in
+// `hellas_rpc::protocol::work`, and the `bytes` fields below carry those
+// exact encodings. A protobuf re-spelling of an authorization would be a
+// second definition of what both parties signed.
+service Work {
+  // One bilateral acceptance. The client sends the authorization it has
+  // already signed; the provider answers with its co-signature or with
+  // one refusal code.
+  rpc AcceptWork(AcceptWorkRequest) returns (AcceptWorkResponse);
+}
+
+message AcceptWorkRequest {
+  // Canonical `PaidJobAuthorizationV1`, envelope included.
+  bytes authorization = 1;
+  // The client's compact secp256k1 signature over the work id: exactly
+  // 64 bytes. The channel key is native by construction, so there is no
+  // key-kind discriminator to disagree with the payment terms.
+  bytes client_signature = 2;
+  // Canonical `PreparedPaidInputV1`: the inputs the authorization's
+  // `prepared_input_digest` commits to, carried so the provider can
+  // still execute the job it accepted after the quote that produced
+  // them is gone.
+  bytes prepared_input = 3;
+}
+
+message AcceptWorkResponse {
+  oneof outcome {
+    WorkAccepted accepted = 1;
+    WorkRefused refused = 2;
+  }
+}
+
+message WorkAccepted {
+  // The provider's compact secp256k1 signature over the same work id:
+  // exactly 64 bytes.
+  bytes provider_signature = 1;
+}
+
+message WorkRefused {
+  WorkRefusalCode code = 1;
+  // Diagnostic text for an operator reading a log. Nothing decides on
+  // it, and no test asserts its wording.
+  string reason = 2;
+}
+
+// Why a proposal was not accepted. Closed, and each value says what the
+// caller may do next.
+enum WorkRefusalCode {
+  // Never sent. A response carrying it is malformed.
+  WORK_REFUSAL_CODE_UNSPECIFIED = 0;
+  // The provider has not caught up to a finalized state it can admit
+  // work at. Retryable unchanged.
+  WORK_REFUSAL_CODE_NOT_READY = 1;
+  // A deadline or the channel's admission horizon has passed. Retrying
+  // these bytes cannot succeed; a fresh proposal may.
+  WORK_REFUSAL_CODE_EXPIRED = 2;
+  // The request is not a well-formed proposal on this channel. Permanent
+  // for these bytes, and never a reason to retry as a new paid job
+  // without changing them.
+  WORK_REFUSAL_CODE_INVALID = 3;
+  // A different proposal already occupies this key. Permanent until the
+  // job holding it ends.
+  WORK_REFUSAL_CODE_CONFLICT = 4;
+  // Well-formed and refused by the provider's own admission state:
+  // credit exhausted, an unallocated certificate gap, or a job already
+  // in flight.
+  WORK_REFUSAL_CODE_DECLINED = 5;
+  // The provider could not make the state durable. Retryable, and
+  // nothing was released.
+  WORK_REFUSAL_CODE_UNAVAILABLE = 6;
+}

@@ -56,6 +56,14 @@ pub mod hellas {
             include!(concat!(env!("OUT_DIR"), "/hellas.chain.v1.rs"));
         }
     }
+
+    #[cfg(feature = "work")]
+    #[allow(dead_code)]
+    pub mod work {
+        pub mod v1 {
+            include!(concat!(env!("OUT_DIR"), "/hellas.work.v1.rs"));
+        }
+    }
 }
 
 /// Re-exports of the Hellas core execution types (`hellas.v1`).
@@ -92,6 +100,12 @@ pub mod swarm {
 #[cfg(feature = "chain")]
 pub mod chain {
     pub use crate::pb::hellas::chain::v1::*;
+}
+
+/// Re-exports of `hellas.work.v1`.
+#[cfg(feature = "work")]
+pub mod work {
+    pub use crate::pb::hellas::work::v1::*;
 }
 
 /// Service / method markers, typed client traits, and server dispatchers.
@@ -150,6 +164,14 @@ mod id_pins {
         assert_eq!(<QuotePreparedText as MethodMarker>::METHOD_ID, 0x58689a09);
         assert_eq!(<QuotePrompt as MethodMarker>::METHOD_ID, 0x6174018e);
         assert_eq!(<QuoteChatPrompt as MethodMarker>::METHOD_ID, 0xae272694);
+    }
+
+    #[cfg(feature = "work")]
+    #[test]
+    fn work_ids_are_stable() {
+        use super::services::work::{AcceptWork, Work};
+        assert_eq!(<Work as ServiceMarker>::SERVICE_ID, 0x466a_8166);
+        assert_eq!(<AcceptWork as MethodMarker>::METHOD_ID, 0xaae4_0060);
     }
 
     #[cfg(feature = "chain")]

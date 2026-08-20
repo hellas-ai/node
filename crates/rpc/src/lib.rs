@@ -22,6 +22,10 @@ pub mod serve;
 pub mod spec;
 #[cfg(feature = "execute")]
 pub mod stream;
+/// The paid-work RPC: the acceptance exchange, its two endpoints, and
+/// the refusals they answer with.
+#[cfg(feature = "work")]
+pub mod work;
 /// Durable endpoint state for paid work: the setup journal, the channel
 /// journal, and the counterparty loss ledger.
 #[cfg(feature = "work")]

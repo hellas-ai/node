@@ -41,7 +41,7 @@ all-protocols = ["swarm", "courtesy", "execute", "evaluate", "fetch", "chain"]
 # and the edge/terms commitments — and a wasm or fetch-only client has no
 # use for them. The alternative was restating those kernel types here,
 # which is how two definitions of a signed digest start.
-work = ["dep:hellas-kernel", "evaluate"]
+work = ["dep:hellas-kernel", "evaluate", "hellas-kernel/secp256k1"]
 
 [dependencies]
 bytes = "1"
@@ -80,5 +80,9 @@ syn = { version = "2", features = ["full"] }
 # secp256k1 signer, not a placeholder that proves nothing about the keys
 # a channel actually settles with.
 hellas-kernel = { workspace = true, features = ["secp256k1"] }
+# The paid-work acceptance test runs over a real multiplexed transport
+# rather than a handler call: framing, method routing, and trailers are
+# where a wire-shaped mistake actually shows up.
+hellas-wire = { workspace = true, features = ["mux"] }
 tempfile = "3"
 tokio.workspace = true

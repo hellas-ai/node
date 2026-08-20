@@ -66,8 +66,9 @@ let
     # The whole package runs, not one named test file: `work` pulls
     # `evaluate` and therefore `execute`, so this line is also what
     # compiles `pb::id_pins` — the wire-id pins that no other gate here
-    # reaches. Naming a single `--test` target would leave a rotated
-    # service id unnoticed, which is exactly what happened once.
+    # reaches, the `hellas.work.v1` service and method among them.
+    # Naming a single `--test` target would leave a rotated service id
+    # unnoticed, which is exactly what happened once.
     rpc-work =
       mk "check-rpc-work"
         "cargo test -p hellas-rpc --features work && cargo clippy -p hellas-rpc --features work --all-targets -- -D warnings"
