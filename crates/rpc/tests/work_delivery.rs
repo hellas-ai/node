@@ -765,6 +765,55 @@ async fn a_job_with_no_result_releases_nothing_yet() {
     );
 }
 
+/// A release the deadline has passed is `EXPIRED` on the wire, not a
+/// wait.
+///
+/// The difference is what a client does next. `NOT_READY` says ask
+/// again; `EXPIRED` says no later height makes this answer payable, and
+/// a client that could not tell them apart would poll a job it can
+/// never be paid for until its own deadline ran out too.
+#[tokio::test]
+async fn a_release_past_the_deadline_is_expired_on_the_wire() {
+    let provider_root = temp();
+    let early = ready_at(CURSOR);
+    let mut provider_store = store_at(provider_root.path(), &early, Role::Provider, CURSOR);
+    let (id, _) = accept(&execution_policy(), &mut [&mut provider_store], 1);
+    let Ok(endpoint) = ProviderEndpoint::new(early.clone(), provider_store, provider()) else {
+        panic!("the provider endpoint binds");
+    };
+    let service = WorkService::new(endpoint);
+    run_to_result(&service, &early, id).await;
+    drop(service);
+
+    let late = LAST_RELEASE + 1;
+    let ready = ready_at(late);
+    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, late);
+    advance(&mut provider_store, late);
+    let Ok(endpoint) = ProviderEndpoint::new(ready, provider_store, provider()) else {
+        panic!("the provider endpoint binds at the late height");
+    };
+    let service = WorkService::new(endpoint);
+
+    let (transport, server_transport) = transport_pair();
+    let serving = serve(server_transport, service.clone());
+    let response = match WorkClientImpl::new(transport)
+        .deliver_result(DeliverResultRequest {
+            work_id: id.as_bytes().to_vec(),
+        })
+        .await
+    {
+        Ok(response) => response,
+        Err(status) => panic!("the call completes: {status}"),
+    };
+    serving.abort();
+    assert_eq!(refusal_code(&response), WorkRefusalCode::Expired);
+
+    let Ok(endpoint) = service.endpoint() else {
+        panic!("the endpoint is reachable");
+    };
+    assert_eq!(endpoint.state().delivery_outstanding(), 0);
+}
+
 /// A `work_id` that is not this channel's open job is refused, and a
 /// `work_id` that is not 32 bytes never reaches a journal.
 #[tokio::test]

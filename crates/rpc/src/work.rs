@@ -247,12 +247,13 @@ impl From<PaidWorkError> for Refusal {
 }
 
 impl From<WorkSetupError> for Refusal {
-    /// `check_signable` is the only producer on this path. `CursorBehind`
-    /// is the provider's own lag. `HorizonPassed` and
-    /// `TerminalUnreachable` are height-dependent and one-way: no later
-    /// height makes either pass again. `OracleGraceTooShort` compares two
-    /// carried deadlines to each other and to no height at all, so it is
-    /// wrong rather than late — and its overflow sibling, which the same
+    /// `check_signable` and `check_releasable` are the two producers on
+    /// this path. `CursorBehind` is the provider's own lag.
+    /// `HorizonPassed`, `TerminalUnreachable`, and `DeliveryUnreachable`
+    /// are height-dependent and one-way: no later height makes any of
+    /// them pass again. `OracleGraceTooShort` compares two carried
+    /// deadlines to each other and to no height at all, so it is wrong
+    /// rather than late — and its overflow sibling, which the same
     /// arithmetic raises, is wrong for the same reason.
     ///
     /// The rest belong to `check_ready`, which runs before an endpoint is
@@ -261,9 +262,9 @@ impl From<WorkSetupError> for Refusal {
     fn from(error: WorkSetupError) -> Self {
         let code = match error {
             WorkSetupError::CursorBehind { .. } => WorkRefusal::NotReady,
-            WorkSetupError::HorizonPassed { .. } | WorkSetupError::TerminalUnreachable { .. } => {
-                WorkRefusal::Expired
-            }
+            WorkSetupError::HorizonPassed { .. }
+            | WorkSetupError::TerminalUnreachable { .. }
+            | WorkSetupError::DeliveryUnreachable { .. } => WorkRefusal::Expired,
             WorkSetupError::OracleGraceTooShort { .. } | WorkSetupError::Record(_) => {
                 WorkRefusal::Invalid
             }

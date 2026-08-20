@@ -1274,8 +1274,7 @@ impl ChannelState {
     ///
     /// It subsumes a separate `result.work_id == job.work_id` check,
     /// which is why there is not one: the work id is a field of what is
-    /// rebuilt, so a result naming another job differs from the rebuilt
-    /// one in exactly that field.
+    /// rebuilt, so a result naming another job cannot equal it.
     fn apply_result<V: SigVerifier>(
         &mut self,
         result: &PaidJobResultV1,
