@@ -229,12 +229,15 @@ impl JobPhase {
         }
     }
 
-    /// Whether reaching this phase means compute was actually spent.
-    const fn compute_spent(self) -> bool {
-        matches!(
-            self,
-            Self::Running | Self::Ready | Self::Delivered | Self::Invoiced
-        )
+    /// Whether reaching this phase means a signed result exists.
+    ///
+    /// Deliberately not "compute was spent", which the running phase
+    /// also means. A client owes for compute it could have been paid
+    /// for — which is compute that produced a result the client could
+    /// have taken — and a job that stopped while running produced
+    /// nothing for anyone.
+    const fn result_recorded(self) -> bool {
+        matches!(self, Self::Ready | Self::Delivered | Self::Invoiced)
     }
 
     /// Whether reaching this phase means plaintext left the provider.
@@ -245,8 +248,13 @@ impl JobPhase {
 
 /// Why one job stopped without being paid.
 ///
-/// Journaled as evidence. It does not move the ledgers: what a job cost
-/// is decided by how far it got, not by what it was called.
+/// It decides who bears the cost, which is why it is journaled and why
+/// [`ChannelState::loss_of`] reads it. Only [`Self::Expired`] can charge
+/// this counterparty, and only for a job that got far enough to have
+/// produced something the client could have paid for. The other two name
+/// the provider's own side going wrong, and the provider bears those:
+/// otherwise a provider could exhaust a client's identity-wide credit by
+/// accepting jobs and failing them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum JobEnd {
     /// A deadline passed with the job unfinished or unpaid.
@@ -1434,14 +1442,13 @@ impl ChannelState {
         Ok(Applied::Changed)
     }
 
-    /// Ends the open job, releasing its reservations.
+    /// Ends the open job, releasing everything it still holds.
     ///
-    /// The reason is journaled and does not appear here: what a job
-    /// cost is decided by how far it got. A job that never ran releases
-    /// its compute reservation whole; one that ran and was never paid
-    /// for turns that reservation into loss, and one whose plaintext
-    /// left turns its delivery reservation into loss as well. The loss
-    /// itself is the counterparty ledger's, written before this.
+    /// Both reservations come off here, whatever the ending was. What
+    /// the ending *cost* is [`Self::loss_of`]'s, is written to the
+    /// counterparty ledger before this, and is already installed in
+    /// [`Self::loss`] by the time this runs — so the release below never
+    /// gives back something the ledger has just taken.
     fn apply_ended(&mut self, reason: JobEnd) -> Result<Applied, ChannelStateError> {
         let _ = reason;
         let job = self.open_job("ending a job")?;
@@ -1455,15 +1462,38 @@ impl ChannelState {
         Ok(Applied::Changed)
     }
 
-    /// Returns what ending the open job costs this counterparty
-    /// permanently, if anything.
-    fn loss_of(&self) -> Option<(Digest, u64, u64)> {
+    /// Returns what ending the open job for `reason` costs this
+    /// counterparty permanently, if anything.
+    ///
+    /// Two questions, and both must answer yes. *Whose fault* — only an
+    /// expiry is the client's, because only an expiry is this client
+    /// staying silent through a deadline it signed. A failure and an
+    /// indeterminate marker are the provider's own side going wrong, and
+    /// charging them here would let a provider drain a client's credit
+    /// across every channel it has, by accepting work and failing it.
+    /// Then *how far it got* — compute is owed for a result that exists
+    /// and was not paid for, delivery for plaintext that left. A job
+    /// that expired while still running produced nothing the client
+    /// could have paid for, so it costs the client nothing.
+    ///
+    /// This is the ledger's whole opinion about cause. It is not a claim
+    /// that an expiry was the client's fault in any richer sense: the
+    /// journal does not know why a deadline passed, only that one did
+    /// with a signed result unpaid.
+    fn loss_of(&self, reason: JobEnd) -> Option<(Digest, u64, u64)> {
         let job = self.job.as_ref()?;
         if self.role != Role::Provider {
             return None;
         }
+        let JobEnd::Expired = reason else {
+            return None;
+        };
         let price = job.authorization.price;
-        let compute = if job.phase.compute_spent() { price } else { 0 };
+        let compute = if job.phase.result_recorded() {
+            price
+        } else {
+            0
+        };
         let delivery = if job.phase.delivered() { price } else { 0 };
         if compute == 0 && delivery == 0 {
             return None;
@@ -1734,7 +1764,7 @@ impl ChannelStore {
             // exactly as the ledger being reconstructed counts it, so
             // what one job cost is added once however it is recorded.
             let ending = match record {
-                ChannelRecord::JobEnded { .. } => state.loss_of(),
+                ChannelRecord::JobEnded { reason } => state.loss_of(reason),
                 _ => None,
             };
             state.apply(&record, verifier)?;
@@ -1825,7 +1855,7 @@ impl ChannelStore {
         // neither the file nor the state touched.
         let mut next = self.state.clone();
         let loss = match record {
-            ChannelRecord::JobEnded { .. } => next.loss_of(),
+            ChannelRecord::JobEnded { reason } => next.loss_of(reason),
             _ => None,
         };
         // Read before the record is applied, because a payment is one

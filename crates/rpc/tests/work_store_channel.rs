@@ -701,8 +701,10 @@ fn an_interrupted_invocation_stays_indeterminate() {
         "unexpected error: {error}"
     );
 
-    // The only way out is an explicit ending, and the compute it may
-    // have spent is a loss against this client.
+    // The only way out is an explicit ending, and the compute this
+    // provider may have spent is the provider's own to bear: the client
+    // ordered a job and was shown nothing, so its credit is untouched
+    // and the channel is free to admit the next job.
     if let Err(error) = recovered.commit(
         ChannelRecord::JobEnded {
             reason: JobEnd::Indeterminate,
@@ -713,8 +715,101 @@ fn an_interrupted_invocation_stays_indeterminate() {
     }
     assert!(!recovered.state().is_indeterminate());
     assert_eq!(recovered.state().compute_outstanding(), 0);
-    assert_eq!(recovered.loss().compute, PRICE);
+    assert_eq!(recovered.loss().compute, 0, "the provider bears this one");
     assert_eq!(recovered.loss().delivery, 0, "nothing was delivered");
+}
+
+/// A job the provider's own side failed costs this client nothing, and
+/// leaves its credit whole.
+///
+/// The rule this is about is `loss_of`'s first question — whose fault —
+/// and the attack it refuses is a provider that accepts a client's work
+/// and fails it, over and over, until that client's identity-wide credit
+/// is spent and no honest provider will take it either. The second job
+/// below is the whole point: it is admitted, at the same price, on a
+/// channel whose limit is two prices.
+#[test]
+fn a_provider_fault_is_not_the_clients_debt() {
+    let dir = temp();
+    let channel = channel_with(EdgeId::from_bytes([0xe6; 32]), limits(2 * PRICE, 2 * PRICE));
+    let verifier = Secp256k1Verifier::new();
+    let mut store = open_on(dir.path(), channel.clone(), Role::Provider);
+
+    // Two runs that got as far as compute can get without a result.
+    for (nonce, reason) in [(1, JobEnd::Failed), (2, JobEnd::Indeterminate)] {
+        let job = job_at(&channel, nonce, 1, 0);
+        commit_all(
+            &mut store,
+            &[job.proposed(), job.accepted(), ChannelRecord::JobRunning],
+        );
+        if let Err(error) = store.commit(ChannelRecord::JobEnded { reason }, &verifier) {
+            panic!("the ending commits: {error}");
+        }
+        assert_eq!(store.loss().compute, 0, "ended as {reason}");
+        assert_eq!(store.state().compute_outstanding(), 0);
+    }
+
+    // Twenty prices of provider faults later, this client may still
+    // order the two jobs its limit allows.
+    for nonce in 3..=4 {
+        let job = job_at(&channel, nonce, 1, 0);
+        if let Err(error) = store.commit(job.proposed(), &verifier) {
+            panic!("an honest client's credit is untouched: {error}");
+        }
+        if let Err(error) = store.commit(
+            ChannelRecord::JobEnded {
+                reason: JobEnd::Failed,
+            },
+            &verifier,
+        ) {
+            panic!("the ending commits: {error}");
+        }
+    }
+
+    // And the control: the same phase, ended as the client's own
+    // silence, is the client's debt.
+    let expired = job_at(&channel, 5, 1, 0);
+    commit_all(&mut store, &provider_sequence(&channel, &expired)[..4]);
+    if let Err(error) = store.commit(
+        ChannelRecord::JobEnded {
+            reason: JobEnd::Expired,
+        },
+        &verifier,
+    ) {
+        panic!("the ending commits: {error}");
+    }
+    assert_eq!(store.loss().compute, PRICE);
+    assert_eq!(store.loss().delivery, 0, "the plaintext never left");
+}
+
+/// A job that expired while it was still running costs this client
+/// nothing either.
+///
+/// `loss_of`'s second question, isolated from its first: this ending
+/// *is* the one that can charge, and it does not, because the running
+/// phase produced no result the client could have paid for. The
+/// delivered control for the same reason is
+/// `a_delivered_unpaid_job_is_loss_in_both_currencies`.
+#[test]
+fn a_job_that_expired_before_its_result_is_not_the_clients_debt() {
+    let dir = temp();
+    let channel = channel();
+    let job = job_at(&channel, 1, 1, 0);
+    let mut store = open(dir.path(), Role::Provider);
+    commit_all(
+        &mut store,
+        &[job.proposed(), job.accepted(), ChannelRecord::JobRunning],
+    );
+    if let Err(error) = store.commit(
+        ChannelRecord::JobEnded {
+            reason: JobEnd::Expired,
+        },
+        &Secp256k1Verifier::new(),
+    ) {
+        panic!("the ending commits: {error}");
+    }
+    assert_eq!(store.loss().compute, 0, "no result was ever signed");
+    assert_eq!(store.state().compute_outstanding(), 0);
 }
 
 /// A job that never ran costs its counterparty nothing.
@@ -807,17 +902,14 @@ fn compute_credit_bounds_what_may_be_co_signed() {
     // started.
     assert_eq!(store.loss().compute, 0);
 
-    // Now spend the credit for real: two jobs that run and are never
-    // paid for.
+    // Now spend the credit for real: two jobs whose results were signed
+    // and whose deadlines then passed unpaid.
     for nonce in 3..=4 {
         let job = job_at(&channel, nonce, 1, 0);
-        commit_all(
-            &mut store,
-            &[job.proposed(), job.accepted(), ChannelRecord::JobRunning],
-        );
+        commit_all(&mut store, &provider_sequence(&channel, &job)[..4]);
         if let Err(error) = store.commit(
             ChannelRecord::JobEnded {
-                reason: JobEnd::Failed,
+                reason: JobEnd::Expired,
             },
             &verifier,
         ) {
@@ -940,13 +1032,10 @@ fn loss_outlives_the_channel_it_was_lost_on() {
         let mut store = open_on(dir.path(), first.clone(), Role::Provider);
         for nonce in 1..=2 {
             let job = job_at(&first, nonce, 1, 0);
-            commit_all(
-                &mut store,
-                &[job.proposed(), job.accepted(), ChannelRecord::JobRunning],
-            );
+            commit_all(&mut store, &provider_sequence(&first, &job)[..4]);
             if let Err(error) = store.commit(
                 ChannelRecord::JobEnded {
-                    reason: JobEnd::Failed,
+                    reason: JobEnd::Expired,
                 },
                 &verifier,
             ) {
@@ -1025,9 +1114,10 @@ fn a_journal_accepted_a_record_at_a_time_reopens_whole() {
         second.proposed(),
         second.accepted(),
         ChannelRecord::JobRunning,
+        second.result_record(&channel),
         // And now the recorded compute loss *is* the limit.
         ChannelRecord::JobEnded {
-            reason: JobEnd::Failed,
+            reason: JobEnd::Expired,
         },
     ];
     every_prefix_reopens_as_it_was(&channel, &sequence);
@@ -1167,13 +1257,10 @@ fn a_journal_reopens_when_the_clients_loss_has_passed_this_channels_limit() {
         let mut store = open_on(dir.path(), roomy.clone(), Role::Provider);
         for nonce in 1..=3 {
             let job = job_at(&roomy, nonce, 1, 0);
-            commit_all(
-                &mut store,
-                &[job.proposed(), job.accepted(), ChannelRecord::JobRunning],
-            );
+            commit_all(&mut store, &provider_sequence(&roomy, &job)[..4]);
             if let Err(error) = store.commit(
                 ChannelRecord::JobEnded {
-                    reason: JobEnd::Failed,
+                    reason: JobEnd::Expired,
                 },
                 &verifier,
             ) {
@@ -1242,13 +1329,10 @@ fn replay_refuses_a_reservation_this_journals_own_losses_forbid() {
         let mut store = open_on(dir.path(), channel.clone(), Role::Provider);
         for nonce in 1..=2 {
             let job = job_at(&channel, nonce, 1, 0);
-            commit_all(
-                &mut store,
-                &[job.proposed(), job.accepted(), ChannelRecord::JobRunning],
-            );
+            commit_all(&mut store, &provider_sequence(&channel, &job)[..4]);
             if let Err(error) = store.commit(
                 ChannelRecord::JobEnded {
-                    reason: JobEnd::Failed,
+                    reason: JobEnd::Expired,
                 },
                 &verifier,
             ) {
@@ -1270,7 +1354,7 @@ fn replay_refuses_a_reservation_this_journals_own_losses_forbid() {
             Ok(opened) => opened,
             Err(error) => panic!("the journal opens: {error}"),
         };
-        assert_eq!(replay.records.len(), 8, "two jobs of four records");
+        assert_eq!(replay.records.len(), 10, "two jobs of five records");
         if let Err(error) = journal.append(&third.proposed().encode()) {
             panic!("the record appends: {error}");
         }
