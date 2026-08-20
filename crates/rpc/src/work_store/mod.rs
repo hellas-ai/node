@@ -108,3 +108,18 @@ pub(crate) enum Applied {
 pub(crate) fn put_u64(out: &mut Vec<u8>, value: u64) {
     out.extend_from_slice(&value.to_be_bytes());
 }
+
+/// Renders a journal key as the lowercase hex a file is named with.
+///
+/// One spelling for all three journals: a key rendered two ways is two
+/// file names for one journal, and the second one is a store with no
+/// history in it.
+pub(crate) fn hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(char::from(HEX[usize::from(byte >> 4)]));
+        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    out
+}

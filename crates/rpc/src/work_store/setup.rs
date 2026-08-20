@@ -39,7 +39,7 @@ use hellas_xet::XetFileHasher;
 use crate::protocol::Digest;
 use crate::protocol::work_bundle::{SetupBundleError, WorkChannelSetupBundleV1};
 use crate::work_store::journal::{Journal, JournalId, JournalKind, Role};
-use crate::work_store::{Applied, WorkStoreError, cursor::Cursor, put_u64};
+use crate::work_store::{Applied, WorkStoreError, cursor::Cursor, hex, put_u64};
 
 /// Domain of the setup journal's key.
 const SETUP_KEY: &[u8] = b"hellas.work.setup-journal-key.v1";
@@ -880,14 +880,4 @@ pub fn setup_key(network: NetworkId, bond_edge: EdgeId) -> Digest {
     hasher.update(network.as_str().as_bytes());
     hasher.update(&bond_edge.to_bytes());
     hasher.finalize()
-}
-
-fn hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(char::from(HEX[usize::from(byte >> 4)]));
-        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    out
 }

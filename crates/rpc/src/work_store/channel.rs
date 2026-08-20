@@ -91,7 +91,7 @@ use crate::protocol::work::{
     work_id,
 };
 use crate::work_store::journal::{Journal, JournalId, JournalKind, MAX_RECORD_BYTES, Role};
-use crate::work_store::{Applied, WorkStoreError, cursor::Cursor, put_u64};
+use crate::work_store::{Applied, WorkStoreError, cursor::Cursor, hex, put_u64};
 
 /// Domain of a channel journal's key.
 const CHANNEL_KEY: &[u8] = b"hellas.work.channel-journal-key.v1";
@@ -719,8 +719,12 @@ impl ChannelState {
             role,
             loss,
             ledger: CreditLedger::new(),
-            // The serialized client-proposer profile starts at one, and
-            // zero is a nonce no authorization may carry.
+            // A client's own nonces start at one and only advance, so
+            // this is the first one it may reserve. It is not a claim
+            // about every authorization: a provider takes the nonce the
+            // client's signature carries, whatever number that is, and
+            // what it enforces is that it never takes the same one
+            // twice.
             next_proposal_nonce: 1,
             reserved_nonce: None,
             used_nonces: BTreeSet::new(),
@@ -1885,14 +1889,4 @@ fn loss_key(network: NetworkId, client: Key) -> Digest {
     hasher.update(network.as_str().as_bytes());
     hasher.update(&client.to_bytes());
     hasher.finalize()
-}
-
-fn hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(char::from(HEX[usize::from(byte >> 4)]));
-        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    out
 }
