@@ -42,7 +42,6 @@ fn terms_hash_commits_to_basic_fields() {
     let other_outputs = payouts(Payout::new(maker, 5), Payout::new(taker, 5));
     let terms = Terms::basic(ProtocolCode::new(7), parties, timeout, outputs.clone());
 
-    assert_eq!(terms.protocol(), ProtocolCode::new(7));
     assert_eq!(terms.parties(), parties);
     assert_eq!(terms.timeout(), timeout);
     assert_eq!(terms.timeout_outputs(), Some(&outputs));

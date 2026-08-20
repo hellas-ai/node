@@ -523,10 +523,10 @@ impl Decode for StartId {
 ///
 /// Before releasing this signature an endpoint closes its own certificate
 /// gate and records the exact signed body: the opener must not still be
-/// admitting (or issuing) certificates it is about to leave out. That
-/// cutoff is durable but not permanent — see
-/// [`StartAuthorization::may_reopen_gate`], which is the corrected rule
-/// for retiring an authorization that never landed.
+/// admitting (or issuing) certificates it is about to leave out. Retiring
+/// a cutoff whose signature never landed is an endpoint's decision, taken
+/// against a finalized view, and it belongs to the endpoint that took it;
+/// no kernel rule reads it, so no kernel type states it.
 #[derive(Debug, Clone, Eq, Hash, PartialEq)]
 pub struct PaymentCloseStart {
     payment_edge: EdgeId,
@@ -607,16 +607,6 @@ impl PaymentCloseStart {
     #[must_use]
     pub const fn action_sig(&self) -> Sig {
         self.action_sig
-    }
-
-    /// Returns the amount this start claims: the certificate's cumulative
-    /// value, or zero.
-    #[must_use]
-    pub const fn claimed_cumulative(&self) -> u64 {
-        match &self.certificate {
-            Some((certificate, _)) => certificate.earned_cumulative,
-            None => 0,
-        }
     }
 
     /// Returns the deterministic cost of applying this start.
@@ -1466,33 +1456,12 @@ impl Decode for PendingPaymentClose {
     }
 }
 
-// ── The write-ahead cutoff ────────────────────────────────────────────
-
-/// A start an endpoint has signed but not yet seen included.
-///
-/// Signing a start is a write-ahead commitment: the signer stops
-/// admitting (or issuing) certificates first, so the amount it claimed is
-/// the greatest amount it can be contradicted on. Left there, a crash
-/// between signing and broadcasting would shut that gate permanently and
-/// kill the channel's payment issuance for good, which is the defect
-/// [`Self::may_reopen_gate`] fixes.
-///
-/// The gate reopens only on proof, and only on three facts at once. Any
-/// one of them missing leaves the cutoff standing.
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
-pub struct StartAuthorization {
-    payment_edge: EdgeId,
-    valid_through_height: u64,
-}
-
 /// What was found in the slot that holds one payment edge's contest.
 ///
 /// Three states, not two. A malformed present chunk is its own answer
 /// precisely because reading it as absence is the mistake this type
-/// exists to make unrepresentable. Absence is a permission twice over:
-/// it lets an endpoint retire an unincluded start
-/// ([`StartAuthorization::may_reopen_gate`]) and it lets a channel admit
-/// new work at all.
+/// exists to make unrepresentable. Absence is a permission: it is what
+/// lets a channel admit new work at all.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 pub enum PendingSlot {
     /// The derived slot is empty.
@@ -1501,56 +1470,6 @@ pub enum PendingSlot {
     Present(PendingPaymentClose),
     /// The derived slot holds something that is not this edge's record.
     Faulty(PendingCloseFault),
-}
-
-impl StartAuthorization {
-    /// Records a start signature the endpoint has released.
-    #[must_use]
-    pub const fn new(payment_edge: EdgeId, valid_through_height: u64) -> Self {
-        Self {
-            payment_edge,
-            valid_through_height,
-        }
-    }
-
-    /// Returns the payment edge this authorization would close.
-    #[must_use]
-    pub const fn payment_edge(&self) -> EdgeId {
-        self.payment_edge
-    }
-
-    /// Returns the last height this authorization can be included at.
-    #[must_use]
-    pub const fn valid_through_height(&self) -> u64 {
-        self.valid_through_height
-    }
-
-    /// Returns true when the endpoint may retire this authorization and
-    /// reopen its certificate gate at the retained high-water.
-    ///
-    /// All three facts, read from a *finalized* view:
-    ///
-    /// 1. `finalized_height` is strictly past `valid_through_height`, so
-    ///    the signature is no longer includable. An unfinalized tip, a
-    ///    wall clock, or a broadcast error proves nothing — a reorg can
-    ///    take an unfinalized height back, and this decision cannot be
-    ///    taken back.
-    /// 2. The payment edge is still live, so no close consumed it.
-    /// 3. The derived pending slot is exactly absent, so no start landed.
-    ///
-    /// The endpoint is left with the cutoff standing in every other case,
-    /// which costs it issuance and never costs it money.
-    #[must_use]
-    pub const fn may_reopen_gate(
-        &self,
-        finalized_height: u64,
-        payment_edge_live: bool,
-        pending: PendingSlot,
-    ) -> bool {
-        finalized_height > self.valid_through_height
-            && payment_edge_live
-            && matches!(pending, PendingSlot::Absent)
-    }
 }
 
 #[cfg(test)]

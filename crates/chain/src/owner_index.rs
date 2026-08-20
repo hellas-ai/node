@@ -572,7 +572,7 @@ mod tests {
     use commonware_utils::non_empty_range;
     use hellas_kernel::SoftPasskey;
     use hellas_kernel::{
-        Auth, CloseKind, List, MAX_EDGE_OUTPUTS, Parties, Payout, Proof, Terms, Tx,
+        Auth, CloseKind, List, MAX_EDGE_OUTPUTS, Parties, Payout, Proof, ProtocolCode, Terms, Tx,
     };
 
     fn block(parent: &HellasBlock, txs: Vec<Transaction>) -> HellasBlock {
@@ -782,7 +782,7 @@ mod tests {
         *payout_values.get_mut(1).expect("second payout slot") = Payout::new(party, 60);
         let outputs = List::take(payout_values, 2);
         let terms = Terms::basic(
-            template.terms.protocol(),
+            ProtocolCode::new(1),
             Parties::new(party, party),
             template.terms.timeout(),
             outputs.clone(),

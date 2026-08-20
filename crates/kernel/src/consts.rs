@@ -66,13 +66,6 @@ pub const MAX_EDGE_OUTPUTS: usize = 4;
 
 // ── Work-channel bounds ───────────────────────────────────────────────
 
-/// Chain-version-local protocol code of the kernel-owned correctness
-/// game. Work-payment and work-stake-bond terms must name it: the
-/// transition rules for those shapes are the game's rules, so a body
-/// naming any other protocol would be asking the kernel to enforce a
-/// game it does not implement.
-pub(crate) const CATENA_FRAUD_PROTOCOL_CODE: u8 = 5;
-
 /// Largest response window a work-payment channel may commit.
 pub const MAX_OMIT_RESPONSE_BLOCKS: u64 = 4096;
 

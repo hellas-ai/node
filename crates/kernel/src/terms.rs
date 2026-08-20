@@ -263,17 +263,6 @@ impl Terms {
         }
     }
 
-    /// Returns the chain-version-local protocol code.
-    #[must_use]
-    pub const fn protocol(&self) -> ProtocolCode {
-        match &self.body {
-            TermsBody::Basic { protocol, .. } => *protocol,
-            TermsBody::WorkPayment(_) | TermsBody::WorkStakeBond(_) => {
-                ProtocolCode::CATENA_FRAUD_V2
-            }
-        }
-    }
-
     /// Returns the committed parties.
     #[must_use]
     pub const fn parties(&self) -> Parties {

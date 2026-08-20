@@ -385,6 +385,13 @@ impl Decode for Sig {
 
 /// Compact chain-version-local protocol code.
 ///
+/// A deployment's own label on a [`crate::Terms::basic`] edge, carried in
+/// the terms preimage and therefore in the edge id. No kernel rule reads
+/// it: it separates one operator's Basic edges from another's — the
+/// faucet's from the CLI's — and that separation is the whole of its
+/// behaviour. It has no meaning on the work-payment or work-stake bodies,
+/// which do not carry it.
+///
 /// This is deliberately one byte in v1: protocol tags are scarce, governed hot
 /// path identifiers. Widening it changes terms commitments and requires a chain
 /// version boundary.
@@ -392,14 +399,6 @@ impl Decode for Sig {
 pub struct ProtocolCode(u8);
 
 impl ProtocolCode {
-    /// The kernel-owned correctness game.
-    ///
-    /// Unlike the chain-local codes a marketplace assigns, this one
-    /// selects transition rules the kernel implements itself, so it is
-    /// reserved here rather than by a deployment. Renumbering it is a
-    /// hard fork.
-    pub const CATENA_FRAUD_V2: Self = Self(crate::consts::CATENA_FRAUD_PROTOCOL_CODE);
-
     /// Creates a protocol code.
     #[must_use]
     pub const fn new(value: u8) -> Self {

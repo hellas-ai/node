@@ -84,18 +84,25 @@ pub const BOND_LEASE_CHUNKS: u8 = 2;
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 pub struct BondLease {
     bond_edge: EdgeId,
-    // The four fields below are written by the payment open and read
-    // back by no production path in this crate or its hosts. Exclusivity
-    // is decided by the slot being occupied and by `bond_edge`; the
-    // horizon a timeout waits for is the bond edge's own
-    // `Terms::timeout()`, not this copy of it. They are carried, not
-    // deleted, only because §2.3 of
-    // `workflows/roadmap/compute-flow-plan.md` deletes them in one step
-    // with the record itself: with them gone the lease is 35 bytes, one
-    // chunk rather than two, and the single-chunk registry that implies
-    // is the next row of the same table. No later consumer is promised
-    // them — the game slice and the snapshot verifier both read live
-    // payment terms, not this record.
+    // `payment_edge` is read: it is what separates "this bond is leased
+    // by my channel" from "this bond is leased by somebody else", which
+    // is a different answer and a different outcome at both endpoint
+    // sites that ask — `hellas_rpc::protocol::work_setup`'s readiness
+    // gate and `hellas_rpc::work_store::setup`'s recovery decision,
+    // whose `LeasedElsewhere` fault has no other source. `bond_edge`
+    // alone cannot say it: every lease on this bond names this bond.
+    //
+    // The three below are written by the payment open and read by no
+    // production path in this crate or its hosts. The horizon a timeout
+    // waits for is the bond edge's own `Terms::timeout()`, not this copy
+    // of it, and the terms hash and policy commitment are read from the
+    // live payment terms. They are carried, not deleted, because their
+    // deletion is not separable from the record's shape: any one of them
+    // gone takes the encoding under 121 bytes, which takes the lease to
+    // one chunk, which makes `BondLeaseFault::Partial` and the
+    // two-chunk reassembly rules unreachable. That is §2.3 of
+    // `workflows/roadmap/compute-flow-plan.md`, a consensus-schema step
+    // with its own recomputed goldens — not a field deletion.
     payment_edge: EdgeId,
     payment_terms_hash: TermsHash,
     private_policy_commitment: [u8; HASH_LENGTH],

@@ -358,10 +358,10 @@ fn work_payment_open_rejects_a_bond_it_does_not_match() {
 
 use hellas_kernel::{
     Batch as _, Decode, EarnedCertificate, Encode as _, InvalidMoveReason, Move, NetworkId, Party,
-    PaymentCloseResponse, PaymentCloseStart, PendingCloseFault, PendingPaymentClose, PendingSlot,
-    RegistryChunk, RegistryChunkId, RegistryNamespace, RegistryRecordTag, StartAuthorization,
-    StartId, Store as _, freeze_digest, no_earned_digest, pending_payment_close_slot,
-    response_digest, settlement_commitment, start_digest, start_id,
+    PaymentCloseResponse, PaymentCloseStart, PendingCloseFault, PendingPaymentClose, RegistryChunk,
+    RegistryChunkId, RegistryNamespace, RegistryRecordTag, StartId, Store as _, freeze_digest,
+    no_earned_digest, pending_payment_close_slot, response_digest, settlement_commitment,
+    start_digest, start_id,
 };
 
 /// Value the payment edge locks: the client's whole funding coin, since
@@ -1819,51 +1819,6 @@ fn a_present_but_unreadable_contest_is_never_read_as_absence() {
             ),
             InvalidProofReason::ClosePendingFault { fault },
         );
-    }
-}
-
-// ── The write-ahead cutoff ────────────────────────────────────────────
-
-/// Signing a start closes the signer's certificate gate. Left there, a
-/// crash between signing and broadcasting would shut that gate for good
-/// and kill the channel's payment issuance; the rule below is the
-/// correction, and it reopens on three proved facts and nothing less.
-#[test]
-fn an_unincluded_start_retires_only_on_all_three_facts() {
-    let authorization = StartAuthorization::new(payment_edge_id(), 20);
-    assert_eq!(authorization.valid_through_height(), 20);
-    assert_eq!(authorization.payment_edge(), payment_edge_id());
-
-    // All three: past the last includable height, edge still live, slot
-    // exactly empty.
-    assert!(authorization.may_reopen_gate(21, true, PendingSlot::Absent));
-
-    // The signature is still includable at its last height, and a
-    // finalized view *at* that height proves nothing about it. Strictly
-    // greater or nothing.
-    assert!(!authorization.may_reopen_gate(20, true, PendingSlot::Absent));
-    assert!(!authorization.may_reopen_gate(19, true, PendingSlot::Absent));
-
-    // The edge is gone: some close consumed it, so reopening a gate on
-    // it would be reopening a gate on a channel that no longer exists.
-    assert!(!authorization.may_reopen_gate(21, false, PendingSlot::Absent));
-
-    // A contest is live: the start landed after all.
-    let mut state = open_payment_state();
-    apply_move(&mut state, CONTEXT, &start_tx(Party::Taker, Some(5)));
-    let Some(record) = pending_record(&state) else {
-        panic!("the start wrote a contest");
-    };
-    assert!(!authorization.may_reopen_gate(21, true, PendingSlot::Present(record)));
-
-    // A present malformed chunk is not absence here either. This is the
-    // endpoint-side half of the same rule the transitions enforce.
-    for fault in [
-        PendingCloseFault::Shape,
-        PendingCloseFault::Body,
-        PendingCloseFault::Edge,
-    ] {
-        assert!(!authorization.may_reopen_gate(21, true, PendingSlot::Faulty(fault)));
     }
 }
 

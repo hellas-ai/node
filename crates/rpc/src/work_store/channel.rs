@@ -811,19 +811,13 @@ impl ChannelState {
         self.indeterminate
     }
 
-    /// Returns the largest valid certificate held, and its signature.
-    ///
-    /// The most this channel has been shown it earned. A certificate
-    /// the client signed is one it cannot repudiate, so a close that
-    /// named less than this would be a close below what was already
-    /// earned. Nothing here builds a close, and nothing here enforces
-    /// that; this is the value such a builder must start from.
-    #[must_use]
-    pub const fn executable_certificate(&self) -> Option<&(EarnedCertificate, Sig)> {
-        self.executable.as_ref()
-    }
-
     /// Returns the largest cumulative any held certificate names.
+    ///
+    /// The most this channel has been shown it earned. A certificate the
+    /// client signed is one it cannot repudiate, so a close that named
+    /// less than this would be a close below what was already earned.
+    /// Nothing here builds a close, and nothing here enforces that; this
+    /// is the value such a builder must start from.
     #[must_use]
     pub fn max_executable_certificate(&self) -> u64 {
         self.executable
