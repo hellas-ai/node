@@ -1668,6 +1668,7 @@ pub struct ChannelStore {
     journal: Journal,
     loss: CounterpartyLoss,
     state: ChannelState,
+    torn_tail: bool,
 }
 
 impl ChannelStore {
@@ -1753,7 +1754,20 @@ impl ChannelStore {
             journal,
             loss,
             state,
+            torn_tail: replay.truncated_tail,
         })
+    }
+
+    /// Returns whether opening removed an interrupted write.
+    ///
+    /// True says the last thing this endpoint tried to record did not
+    /// finish reaching the disk, and the state above is the state
+    /// before it. Nothing was acknowledged, so nothing here is wrong —
+    /// but a clean shutdown does not produce it, and an operator who
+    /// sees it has been told the truth about a crash.
+    #[must_use]
+    pub const fn recovered_torn_tail(&self) -> bool {
+        self.torn_tail
     }
 
     /// Returns what this endpoint durably knows.

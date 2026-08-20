@@ -1920,6 +1920,250 @@ fn a_corrupt_channel_journal_is_not_replayed_as_an_earlier_state() {
     );
 }
 
+/// A last frame that does not verify is the write that was interrupted,
+/// whatever shape the interruption left it in.
+///
+/// A dead process leaves a short prefix, which the test above covers. A
+/// dead machine leaves whatever reached the platter: a frame that is
+/// full-length with a hole in it, a digest from a write that never
+/// finished, or a length field that is not a length. None of those was
+/// acknowledged, and refusing them all — as this journal once did — puts
+/// the endpoint permanently out of business over its most likely
+/// failure.
+#[test]
+fn an_interrupted_final_frame_is_removed_rather_than_refused() {
+    let channel = channel();
+    let job = job_at(&channel, 1, 1, 0);
+    let sequence = provider_sequence(&channel, &job);
+
+    let mut damage = verifiable_damage();
+    damage.push(("a length field that is not a length", unreadable_length));
+
+    for (label, break_it) in damage {
+        let dir = temp();
+        let (path, starts) = frames_of(dir.path(), &channel, &sequence);
+        let (Some(last), Some(end)) = (
+            starts.get(starts.len() - 2).copied(),
+            starts.last().copied(),
+        ) else {
+            panic!("case {label}: the journal has frames");
+        };
+        let Ok(mut bytes) = std::fs::read(&path) else {
+            panic!("case {label}: the journal reads");
+        };
+        break_it(&mut bytes, (last, end));
+        if let Err(error) = std::fs::write(&path, &bytes) {
+            panic!("case {label}: the damaged journal writes: {error}");
+        }
+
+        let recovered = open(dir.path(), Role::Provider);
+        assert!(
+            recovered.recovered_torn_tail(),
+            "case {label}: the tear is reported"
+        );
+        assert_eq!(
+            recovered.len(),
+            sequence.len() as u64 - 1,
+            "case {label}: the interrupted record is gone"
+        );
+        // Which record: the payment. What is left is the state before
+        // it, and it is a state this endpoint may still act from.
+        assert_eq!(
+            recovered
+                .state()
+                .job()
+                .map(hellas_rpc::work_store::JobState::phase),
+            Some(JobPhase::Invoiced),
+            "case {label}"
+        );
+        assert_eq!(
+            recovered.state().ledger().credited_invoice_high_water(),
+            0,
+            "case {label}"
+        );
+        // And the bytes are gone, not skipped: the next append lands
+        // where the next frame's digest says it does.
+        drop(recovered);
+        let Ok(after) = std::fs::metadata(&path).map(|meta| meta.len()) else {
+            panic!("case {label}: the journal is measurable");
+        };
+        assert_eq!(after, last as u64, "case {label}: truncated to the frame");
+    }
+}
+
+/// The same damage with a frame after it is not an interrupted write.
+///
+/// Those later bytes were written after this frame was whole, so
+/// whatever changed it was not a crash — and reconstructing a state the
+/// endpoint may already have acted past is worse than refusing.
+///
+/// With one named exception, which is the price of reading a file by
+/// following its length fields: a length that is not a length says the
+/// file ends inside this frame, and nothing that follows can be found to
+/// contradict it. That case truncates, and takes records this endpoint
+/// *was* told it had written with it. It is pinned here because it is
+/// real, not because it is wanted.
+#[test]
+fn damage_with_a_frame_after_it_is_not_treated_as_a_tear() {
+    let channel = channel();
+    let job = job_at(&channel, 1, 1, 0);
+    let sequence = provider_sequence(&channel, &job);
+    // The result record: three frames still follow it.
+    let wounded = 3;
+
+    for (label, break_it) in verifiable_damage() {
+        let dir = temp();
+        let (path, starts) = frames_of(dir.path(), &channel, &sequence);
+        let Ok(mut bytes) = std::fs::read(&path) else {
+            panic!("case {label}: the journal reads");
+        };
+        break_it(&mut bytes, (starts[wounded], starts[wounded + 1]));
+        if let Err(error) = std::fs::write(&path, &bytes) {
+            panic!("case {label}: the damaged journal writes: {error}");
+        }
+        let error = ChannelStore::open(
+            dir.path(),
+            channel.clone(),
+            settlement(),
+            Role::Provider,
+            &Secp256k1Verifier::new(),
+        )
+        .expect_err("a frame with records after it was whole once");
+        assert!(
+            matches!(error, WorkStoreError::Journal(JournalError::Corrupt { .. })),
+            "case {label}: unexpected error: {error}"
+        );
+    }
+
+    // The exception, exactly as far as it goes.
+    let dir = temp();
+    let (path, starts) = frames_of(dir.path(), &channel, &sequence);
+    let Ok(mut bytes) = std::fs::read(&path) else {
+        panic!("the journal reads");
+    };
+    unreadable_length(&mut bytes, (starts[wounded], starts[wounded + 1]));
+    if let Err(error) = std::fs::write(&path, &bytes) {
+        panic!("the damaged journal writes: {error}");
+    }
+    let recovered = open(dir.path(), Role::Provider);
+    assert!(recovered.recovered_torn_tail());
+    assert_eq!(
+        recovered.len(),
+        wounded as u64,
+        "everything from the unreadable length onwards is gone"
+    );
+}
+
+/// A creation interrupted inside the header is written again.
+///
+/// Nothing can have been recorded under half a header, so there is no
+/// state to lose and nobody to disagree with — while refusing it as
+/// another endpoint's file leaves a channel that cannot be opened by
+/// the endpoint that just created it.
+#[test]
+fn a_journal_torn_inside_its_header_is_written_again() {
+    let dir = temp();
+    let channel = channel();
+    let job = job_at(&channel, 1, 1, 0);
+    {
+        let mut store = open(dir.path(), Role::Provider);
+        commit_all(&mut store, &[job.proposed()]);
+    }
+    let path = channel_journal(dir.path());
+    let Ok(whole) = std::fs::read(&path) else {
+        panic!("the journal reads");
+    };
+    if let Err(error) = std::fs::write(&path, &whole[..10]) {
+        panic!("the torn header writes: {error}");
+    }
+
+    let mut recovered = open(dir.path(), Role::Provider);
+    assert!(recovered.recovered_torn_tail());
+    assert!(recovered.is_empty(), "there was never a record under it");
+    assert!(recovered.state().job().is_none());
+    // And it is a journal again, not a file that half exists.
+    if let Err(error) = recovered.commit(job.proposed(), &Secp256k1Verifier::new()) {
+        panic!("the rewritten journal takes a record: {error}");
+    }
+    drop(recovered);
+    assert_eq!(open(dir.path(), Role::Provider).len(), 1);
+
+    // A file that is not a prefix of this header is still another
+    // journal, and still refused.
+    let mut foreign = whole;
+    foreign[3] ^= 0xff;
+    if let Err(error) = std::fs::write(&path, &foreign) {
+        panic!("the foreign journal writes: {error}");
+    }
+    let error = ChannelStore::open(
+        dir.path(),
+        channel,
+        settlement(),
+        Role::Provider,
+        &Secp256k1Verifier::new(),
+    )
+    .expect_err("that is not this endpoint's journal");
+    assert!(
+        matches!(
+            error,
+            WorkStoreError::Journal(JournalError::HeaderMismatch { .. })
+        ),
+        "unexpected error: {error}"
+    );
+}
+
+/// What an interruption did to one frame, given where it starts and
+/// where it ends.
+type Damage = fn(&mut [u8], (usize, usize));
+
+/// The two damages a reader can *see*: the frame is where its length
+/// says it is, and it does not verify there.
+fn verifiable_damage() -> Vec<(&'static str, Damage)> {
+    vec![
+        ("a hole punched through it", |bytes, (start, end)| {
+            bytes[start + 4..end - Digest::LEN].fill(0);
+        }),
+        ("a digest its payload never had", |bytes, (_, end)| {
+            bytes[end - Digest::LEN..end].fill(0xab);
+        }),
+    ]
+}
+
+/// The damage a reader cannot see past: a length that says the file
+/// ends inside this frame.
+fn unreadable_length(bytes: &mut [u8], (start, _): (usize, usize)) {
+    bytes[start..start + 4].copy_from_slice(&u32::MAX.to_be_bytes());
+}
+
+/// Writes one journal a record at a time and returns where each frame
+/// begins, measured rather than computed: the file's length before a
+/// record is committed is where that record's frame starts.
+fn frames_of(
+    root: &std::path::Path,
+    channel: &PaidChannel,
+    records: &[ChannelRecord],
+) -> (std::path::PathBuf, Vec<usize>) {
+    let verifier = Secp256k1Verifier::new();
+    let mut store = open_on(root, channel.clone(), Role::Provider);
+    let path = channel_journal(root);
+    let mut starts = Vec::new();
+    for record in records {
+        starts.push(file_len(&path));
+        if let Err(error) = store.commit(record.clone(), &verifier) {
+            panic!("the fixture record commits: {error}");
+        }
+    }
+    starts.push(file_len(&path));
+    (path, starts)
+}
+
+fn file_len(path: &std::path::Path) -> usize {
+    match std::fs::metadata(path) {
+        Ok(meta) => usize::try_from(meta.len()).unwrap_or(usize::MAX),
+        Err(error) => panic!("the journal is measurable: {error}"),
+    }
+}
+
 fn channel_journal(root: &std::path::Path) -> std::path::PathBuf {
     let Ok(entries) = std::fs::read_dir(root) else {
         panic!("the directory reads");

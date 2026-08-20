@@ -586,12 +586,37 @@ fn a_torn_tail_recovers_and_a_corrupt_frame_does_not() {
         );
     }
 
-    // A byte changed inside a complete frame. Nothing about this file is
-    // this endpoint's own writing, and no earlier state is invented
-    // from it.
+    // A byte changed inside the *last* frame is the same interruption
+    // wearing another shape: a page that never landed. Nothing follows
+    // it, nothing acknowledged it, and it goes the same way.
+    let mut torn = whole.clone();
+    let last = torn.len().saturating_sub(64);
+    if let Some(byte) = torn.get_mut(last) {
+        *byte ^= 0xff;
+    }
+    if let Err(error) = std::fs::write(&path, &torn) {
+        panic!("the torn journal writes: {error}");
+    }
+    let recovered = match SetupStore::open(
+        dir.path(),
+        network(),
+        bond_edge(),
+        Role::Provider,
+        &verifier,
+    ) {
+        Ok(store) => store,
+        Err(error) => panic!("a torn last frame recovers: {error}"),
+    };
+    assert!(recovered.recovered_torn_tail());
+    assert_eq!(recovered.state().revision(), Some(2));
+    drop(recovered);
+
+    // A byte changed in a frame with two more written after it. Those
+    // two say this one was whole when they were written, so what
+    // changed it was not a crash, and no earlier state is invented from
+    // it.
     let mut corrupt = whole;
-    let last = corrupt.len().saturating_sub(64);
-    if let Some(byte) = corrupt.get_mut(last) {
+    if let Some(byte) = corrupt.get_mut(header_len() + 8) {
         *byte ^= 0xff;
     }
     if let Err(error) = std::fs::write(&path, &corrupt) {
@@ -1098,8 +1123,13 @@ fn the_record_codec_is_exact() {
 ///
 /// Not by the reader's care: by the digest. A frame copied to another
 /// position, or lifted from another channel's journal, is not a record
-/// this journal ever wrote, and replay says so rather than replaying
-/// it.
+/// this journal ever wrote, and replay never replays it.
+///
+/// What replay *does* with it depends on what is after it, and that is
+/// the journal's crash rule rather than a second opinion about binding:
+/// a frame nothing follows is indistinguishable from an interrupted
+/// append, so it is dropped; a frame with records after it cannot be
+/// one, so the file is refused.
 #[test]
 fn a_frame_cannot_be_moved_duplicated_or_lifted() {
     let dir = temp();
@@ -1125,18 +1155,26 @@ fn a_frame_cannot_be_moved_duplicated_or_lifted() {
     if let Err(error) = std::fs::write(&path, &duplicated) {
         panic!("the duplicated journal writes: {error}");
     }
-    let error = SetupStore::open(
+    let recovered = match SetupStore::open(
         dir.path(),
         network(),
         bond_edge(),
         Role::Provider,
         &verifier,
-    )
-    .expect_err("a frame at another position is not a record");
+    ) {
+        Ok(store) => store,
+        Err(error) => panic!("the journal opens: {error}"),
+    };
     assert!(
-        matches!(error, WorkStoreError::Journal(JournalError::Corrupt { .. })),
-        "unexpected error: {error}"
+        recovered.recovered_torn_tail(),
+        "a frame at another position does not verify at it"
     );
+    assert_eq!(
+        recovered.len(),
+        3,
+        "the copy is not a fourth record, and the three real ones stand"
+    );
+    drop(recovered);
 
     // The same frames, under another channel's header.
     let elsewhere = EdgeId::from_bytes([0x88; EdgeId::LENGTH]);

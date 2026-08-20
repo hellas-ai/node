@@ -13,19 +13,35 @@
 //!
 //! # Crash story
 //!
-//! Before an append: `n` frames on disk. After it: `n + 1`. A crash
-//! between the two leaves either `n` frames, or `n` frames and a
-//! partial `n+1`th. Neither is an acknowledged write, so recovery
-//! treats both as `n`: a partial trailing frame is truncated at open,
-//! and the state it would have carried is the state the caller never
-//! got an `Ok` for.
+//! Before an append: `n` frames on disk. After it: `n + 1`. Interrupt
+//! it and the caller was never told it succeeded, so recovery's job is
+//! to get back to `n`.
 //!
-//! A *complete* frame whose digest does not verify is different. It is
-//! not an interrupted write, it is a file that is not the file this
-//! endpoint wrote, and recovery refuses to open it rather than
-//! reconstructing an earlier state that the endpoint may already have
-//! acted past. That is [`JournalError::Corrupt`], and it is deliberately
+//! What the interruption leaves depends on what died. A dead *process*
+//! leaves a short prefix of the frame: the kernel either took the whole
+//! `write_all` or took a prefix of it. A dead *machine* is not so
+//! orderly. The frame is not on the disk until `sync_all` returns, and
+//! until then it is pages in a cache that reach the platter in whatever
+//! order they like — while the file's length may already have grown.
+//! A record here runs to [`MAX_RECORD_BYTES`], hundreds of pages, so
+//! the last frame can come back full-length with a hole in it, or with
+//! a length field that is not a length at all.
+//!
+//! So the rule is about *position*, not about shape: a frame that does
+//! not verify and has nothing after it is the interrupted append, in
+//! whichever of those shapes, and recovery truncates it. A frame that
+//! does not verify with bytes after it is not an interrupted append —
+//! those bytes were written later, so this one was complete once. That
+//! is a file that is not the file this endpoint wrote, and recovery
+//! refuses it rather than reconstructing an earlier state the endpoint
+//! may already have acted past: [`JournalError::Corrupt`], deliberately
 //! terminal.
+//!
+//! The cost of that rule is named: media rot in the *last* frame is
+//! silently truncated rather than refused. It is the trade this file
+//! chooses, because the alternative wedges a channel permanently on the
+//! failure it is most likely to meet, and because the record it drops
+//! is one whose writer was never given an `Ok`.
 //!
 //! # What it is not
 //!
@@ -35,6 +51,15 @@
 //! journal — but anyone who can write the file can also write a whole
 //! consistent journal, and this module makes no claim otherwise. Its
 //! threat is a crash, not a forger.
+//!
+//! It is not a filesystem. Recovery finds the frames by following the
+//! length fields, so a length that is not a length says the file ends
+//! inside that frame, and nothing after it can be found to say
+//! otherwise. Such a frame is truncated as the tear it almost always
+//! is — and if it were instead damage in the middle of the file, the
+//! records after it go with it. That is the one place this module can
+//! lose a write it acknowledged, and it is named rather than papered
+//! over.
 //!
 //! It is not a database. There is one writer, holding an exclusive
 //! `flock` taken before anything is replayed, and a second process
@@ -200,11 +225,13 @@ pub enum JournalError {
 pub struct Replay {
     /// Every complete frame, in the order it was appended.
     pub records: Vec<Vec<u8>>,
-    /// Whether a partial trailing frame was truncated.
+    /// Whether an interrupted write was removed to get here.
     ///
-    /// True means the process crashed inside an append whose caller was
-    /// never told it succeeded. It is reported rather than hidden
-    /// because an operator reading a clean shutdown should not see it.
+    /// True means the file ended inside an append — or inside the
+    /// header — whose caller was never told it succeeded, and those
+    /// bytes are gone. A clean shutdown does not produce it, which is
+    /// why the stores carry it out to their callers rather than
+    /// swallowing it.
     pub truncated_tail: bool,
 }
 
@@ -271,6 +298,22 @@ impl Journal {
 
         let expected = id.header_bytes();
         if !bytes.starts_with(&expected) {
+            // A file that is a strict prefix of the header this journal
+            // would write is the creation that was interrupted. No frame
+            // can have been recorded under it — there is not even a
+            // whole header yet — so it is written again rather than
+            // refused as somebody else's file.
+            if expected.starts_with(&bytes) {
+                journal.file.set_len(0)?;
+                journal.write_header(&id)?;
+                return Ok((
+                    journal,
+                    Replay {
+                        records: Vec::new(),
+                        truncated_tail: true,
+                    },
+                ));
+            }
             return Err(JournalError::HeaderMismatch {
                 path: journal.path,
                 kind: id.kind,
@@ -307,19 +350,37 @@ impl Journal {
             let mut len_bytes = [0_u8; 4];
             len_bytes.copy_from_slice(prefix);
             let len = u32::from_be_bytes(len_bytes) as usize;
-            if len > MAX_RECORD_BYTES {
-                return Err(JournalError::RecordTooLarge { len });
-            }
-            let Some(frame) = rest.get(..FRAME_OVERHEAD + len) else {
+            // The extent first, and the length's plausibility second: a
+            // frame that runs past the end of the file is an append the
+            // file ends inside, whether its length field is a hundred
+            // bytes too many or four gigabytes too many. Only a length
+            // that fits inside the file could be a complete frame, and
+            // only there is an oversized one evidence of corruption
+            // rather than of a tear.
+            let Some(frame) = FRAME_OVERHEAD
+                .checked_add(len)
+                .and_then(|end| rest.get(..end))
+            else {
                 truncated_tail = true;
                 break;
             };
+            if len > MAX_RECORD_BYTES {
+                return Err(JournalError::RecordTooLarge { len });
+            }
             let (Some(payload), Some(stored)) = (frame.get(4..4 + len), frame.get(4 + len..))
             else {
                 truncated_tail = true;
                 break;
             };
             if stored != frame_digest(self.header, self.next_seq, payload).as_bytes() {
+                // Nothing after it: the interrupted append, arrived out
+                // of order or short, and never acknowledged. Bytes after
+                // it: this frame was whole when they were written, so
+                // what changed it was not a crash.
+                if frame.len() == rest.len() {
+                    truncated_tail = true;
+                    break;
+                }
                 return Err(JournalError::Corrupt { seq: self.next_seq });
             }
             records.push(payload.to_vec());
@@ -359,9 +420,11 @@ impl Journal {
         frame.extend_from_slice(&len.to_be_bytes());
         frame.extend_from_slice(payload);
         frame.extend_from_slice(digest.as_bytes());
-        // One `write_all` of the whole frame, so the interrupted case is
-        // a short prefix of one frame rather than a length that does not
-        // match the payload beside it.
+        // One `write_all` of the whole frame: the most an interrupted
+        // *process* can leave behind is a short prefix of it, rather
+        // than a length and a payload from two different calls. It says
+        // nothing about an interrupted machine, whose pages land in
+        // their own order; that case is recovery's, above.
         self.file.write_all(&frame)?;
         self.file.sync_all()?;
         self.next_seq = self.next_seq.saturating_add(1);
@@ -378,12 +441,6 @@ impl Journal {
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.next_seq == 0
-    }
-
-    /// Returns the file this journal is stored in.
-    #[must_use]
-    pub fn path(&self) -> &Path {
-        &self.path
     }
 }
 
