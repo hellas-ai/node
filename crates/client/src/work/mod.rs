@@ -20,7 +20,9 @@
 //!    authorization both parties signed and is re-checked every time
 //!    the journal is opened.
 //! 3. **Record.** The verdict is fsynced. Only after that is the job in
-//!    a phase its own journal will issue an invoice from.
+//!    a phase its own journal will issue an invoice from — which is
+//!    [`invoice::pay_for_checked_result`], the step that turns the
+//!    checked answer into a signed payment.
 //!
 //! Reversed, the third step would be a claim about a check that had not
 //! finished, and the second would be a check of bytes nothing durable
@@ -45,6 +47,7 @@
 //! policy that owns a clock can be written over a signal rather than a
 //! guess.
 
+pub mod invoice;
 pub mod oracle;
 
 use hellas_rpc::protocol::artifacts::PreparedPaidInputV1;
@@ -58,9 +61,9 @@ use oracle::{OracleFault, Reexecution};
 
 /// One job's answer, checked and durably recorded as checked.
 ///
-/// What P7 will build an invoice request from. The transcript rides with
-/// it because it is the answer the user asked for; the result is what
-/// the payment chain names.
+/// What [`invoice::pay_for_checked_result`] is called for. The
+/// transcript rides with it because it is the answer the user asked
+/// for; the result is what the payment chain names.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheckedResult {
     /// The provider's signed result.

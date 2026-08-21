@@ -1,6 +1,6 @@
 //! One paid job, end to end, from the client's side: proposed,
-//! computed by a real provider endpoint, delivered, and then checked by
-//! an engine that never speaks to the provider.
+//! computed by a real provider endpoint, delivered, checked by an
+//! engine that never speaks to the provider, and paid for.
 //!
 //! Both endpoints are real and hold real journals, and the exchange runs
 //! over a real multiplexed transport, framed and routed by method id.
@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::Bytes;
+use hellas_client::work::invoice::pay_for_checked_result;
 use hellas_client::work::oracle::{OracleFault, Reexecuted, Reexecution, ReexecutionRequest};
 use hellas_client::work::{CheckedResult, CollectError, CollectOutcome, collect_checked_result};
 use hellas_kernel::{
@@ -638,6 +639,176 @@ async fn a_checked_answer_is_the_only_thing_that_reaches_the_verified_phase() {
     };
     assert_eq!(job.phase(), JobPhase::Verified);
     assert_eq!(job.result().map(|(result, _)| *result), Some(result));
+}
+
+/// The whole of the client's side: a checked answer becomes a payment
+/// the provider has admitted.
+///
+/// What each side ends holding is asserted from its own journal, and
+/// the client's is asserted from a reopened file — a process that saw
+/// none of this and knows only what reached the disk.
+#[tokio::test]
+async fn a_checked_answer_becomes_a_payment_the_provider_admitted() {
+    let client_root = temp();
+    let provider_root = temp();
+    let ready = ready();
+    let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR);
+    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
+    let (id, _) = accept(
+        &execution_policy(),
+        &mut [&mut client_store, &mut provider_store],
+        1,
+    );
+    let Ok(provider_endpoint) = ProviderEndpoint::new(ready.clone(), provider_store, provider())
+    else {
+        panic!("the provider endpoint binds");
+    };
+    let service = WorkService::new(provider_endpoint);
+    let Ok(mut endpoint) = ClientEndpoint::new(ready.clone(), client_store, client()) else {
+        panic!("the client endpoint binds");
+    };
+    let engine = FixedEngine::agreeing();
+    run_to_result(&service, &ready, id).await;
+
+    let (transport, server) = transport_pair();
+    let serving = serve(server, service.clone());
+    let collected = collect_checked_result(transport, &mut endpoint, &ready, &engine, id).await;
+    serving.abort();
+    assert!(
+        matches!(collected, Ok(CollectOutcome::Checked(_))),
+        "the answer is checked: {collected:?}",
+    );
+
+    let (transport, server) = transport_pair();
+    let serving = serve(server, service.clone());
+    let credited = pay_for_checked_result(transport, &mut endpoint, id).await;
+    serving.abort();
+    let Ok(credited) = credited else {
+        panic!("the checked answer is paid for: {credited:?}");
+    };
+    assert_eq!(credited, PRICE, "one job at its authorized price");
+
+    // The provider has the certificate and has let the job's credit go,
+    // in that order and in one record.
+    {
+        let Ok(provider) = service.endpoint() else {
+            panic!("the endpoint is reachable");
+        };
+        let state = provider.state();
+        assert_eq!(state.ledger().credited_invoice_high_water(), PRICE);
+        assert_eq!(state.max_executable_certificate(), PRICE);
+        assert_eq!(state.compute_outstanding(), 0);
+        assert_eq!(state.delivery_outstanding(), 0);
+        assert!(state.job().is_none(), "the job is closed by its payment");
+    }
+
+    drop(endpoint);
+    drop(service);
+    let recovered = store_at(client_root.path(), &ready, Role::Client, CURSOR);
+    let state = recovered.state();
+    assert!(state.job().is_none());
+    assert_eq!(state.ledger().credited_invoice_high_water(), PRICE);
+    assert_eq!(state.ledger().next_invoice_seq(), 2);
+    let Some(payment) = state.last_payment() else {
+        panic!("the payment is on the disk");
+    };
+    assert_eq!(payment.work_id, id);
+    assert_eq!(payment.certificate.earned_cumulative(), PRICE);
+}
+
+/// An unchecked answer is not paid for, and asking to pay for one
+/// signs nothing.
+///
+/// The verdict is the only thing varied: the same delivered result,
+/// refused before it and paid after it.
+#[tokio::test]
+async fn an_unchecked_answer_is_not_paid_for() {
+    let client_root = temp();
+    let provider_root = temp();
+    let ready = ready();
+    let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR);
+    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
+    let (id, _) = accept(
+        &execution_policy(),
+        &mut [&mut client_store, &mut provider_store],
+        1,
+    );
+    let Ok(provider_endpoint) = ProviderEndpoint::new(ready.clone(), provider_store, provider())
+    else {
+        panic!("the provider endpoint binds");
+    };
+    let service = WorkService::new(provider_endpoint);
+    let Ok(mut endpoint) = ClientEndpoint::new(ready.clone(), client_store, client()) else {
+        panic!("the client endpoint binds");
+    };
+    run_to_result(&service, &ready, id).await;
+
+    // The result is fetched and journaled, and no oracle has run.
+    let (transport, server) = transport_pair();
+    let serving = serve(server, service.clone());
+    // One token of the provider's answer, changed: the engine's verdict
+    // is the only thing this test varies.
+    let mut other = ANSWER;
+    other[2] = 999;
+    let refuted = collect_checked_result(
+        transport,
+        &mut endpoint,
+        &ready,
+        &FixedEngine::answering(&other),
+        id,
+    )
+    .await;
+    serving.abort();
+    assert!(
+        matches!(refuted, Err(CollectError::Refuted(_))),
+        "the engine refuses the answer: {refuted:?}",
+    );
+    assert_eq!(
+        endpoint.state().job().map(JobState::phase),
+        Some(JobPhase::Ready),
+        "and the job is not in a phase an invoice may be asked from",
+    );
+
+    let (transport, server) = transport_pair();
+    let serving = serve(server, service.clone());
+    let paid = pay_for_checked_result(transport, &mut endpoint, id).await;
+    serving.abort();
+    assert!(
+        paid.is_err(),
+        "an unchecked answer is not paid for: {paid:?}"
+    );
+    assert!(
+        endpoint.state().last_payment().is_none(),
+        "and nothing was signed",
+    );
+    {
+        let Ok(provider) = service.endpoint() else {
+            panic!("the endpoint is reachable");
+        };
+        assert_eq!(provider.state().ledger().credited_invoice_high_water(), 0);
+    }
+
+    // The control: the same delivered result, checked, is paid for.
+    let (transport, server) = transport_pair();
+    let serving = serve(server, service.clone());
+    let checked = collect_checked_result(
+        transport,
+        &mut endpoint,
+        &ready,
+        &FixedEngine::agreeing(),
+        id,
+    )
+    .await;
+    serving.abort();
+    assert!(
+        matches!(checked, Ok(CollectOutcome::Checked(_))),
+        "the same answer, checked: {checked:?}",
+    );
+    let (transport, server) = transport_pair();
+    let serving = serve(server, service.clone());
+    let credited = pay_for_checked_result(transport, &mut endpoint, id).await;
+    serving.abort();
+    assert_eq!(credited.ok(), Some(PRICE));
 }
 
 /// An answer the client's own engine does not reproduce is refused, and
