@@ -2337,6 +2337,18 @@ fn a_corrupt_channel_journal_is_not_replayed_as_an_earlier_state() {
         panic!("the journal reads");
     };
 
+    // The undamaged file first, because a store that always reported a
+    // tear would satisfy every assertion below: an operator told this
+    // after a clean shutdown learns to ignore it, and then it is worth
+    // nothing on the day it is true.
+    let clean = open(dir.path(), Role::Provider);
+    assert!(
+        !clean.recovered_torn_tail(),
+        "nothing was interrupted, and the whole sequence is here"
+    );
+    assert_eq!(clean.len(), provider_sequence(&channel, &job).len() as u64);
+    drop(clean);
+
     // Interrupted inside the payment record: the payment never
     // happened, and the invoice is still open.
     if let Err(error) = std::fs::write(&path, &whole[..whole.len() - 40]) {

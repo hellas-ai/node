@@ -1119,6 +1119,45 @@ fn the_record_codec_is_exact() {
     assert_eq!(origin_parent, [0x02; 32]);
 }
 
+/// Every ending this handshake can reach survives the journal, under
+/// the code it has always had.
+///
+/// All seven are reachable — `decide` returns each of them from the
+/// chain state it observes — so none of this is a test of dead surface.
+/// The codes are pinned rather than only round-tripped, because a
+/// round-trip is a conversation between an encoder and a decoder that
+/// renumber together, and it is the *disk* that has to agree: a store
+/// that reads yesterday's `Ended` as a different ending resumes a
+/// handshake that ended for another reason.
+#[test]
+fn every_setup_ending_round_trips_under_its_own_code() {
+    // The tag `4` and the seven codes, written out here rather than
+    // read from the module that assigns them.
+    let endings: [(SetupEnd, u8); 7] = [
+        (SetupEnd::Complete, 0),
+        (SetupEnd::Aborted(SetupAbort::BondOpenExpired), 1),
+        (SetupEnd::Aborted(SetupAbort::PaymentFundingSpent), 2),
+        (SetupEnd::Faulted(SetupFault::BondFundingSpent), 3),
+        (SetupEnd::Faulted(SetupFault::LeaseMalformed), 4),
+        (SetupEnd::Faulted(SetupFault::LeasedElsewhere), 5),
+        (SetupEnd::Faulted(SetupFault::UnexplainedState), 6),
+    ];
+    for (outcome, code) in endings {
+        let bytes = SetupRecord::Ended { outcome }.encode();
+        assert_eq!(bytes, [4, code], "the bytes of {outcome:?}");
+        assert_eq!(
+            SetupRecord::decode(&bytes),
+            Ok(SetupRecord::Ended { outcome }),
+            "{outcome:?} reads back as itself"
+        );
+    }
+    // Seven codes, and nothing beyond them is an ending.
+    assert_eq!(
+        SetupRecord::decode(&[4, 7]),
+        Err(SetupStateError::Malformed)
+    );
+}
+
 /// A frame is bound to its journal and to its position in it.
 ///
 /// Not by the reader's care: by the digest. A frame copied to another
@@ -1139,6 +1178,20 @@ fn a_frame_cannot_be_moved_duplicated_or_lifted() {
     let Ok(whole) = std::fs::read(&path) else {
         panic!("the journal reads");
     };
+
+    // The undamaged file first. A store that reported a tear whatever
+    // it read would satisfy every assertion below, and an operator who
+    // is told this after a clean shutdown stops believing it.
+    match SetupStore::open(
+        dir.path(),
+        network(),
+        bond_edge(),
+        Role::Provider,
+        &verifier,
+    ) {
+        Ok(clean) => assert!(!clean.recovered_torn_tail(), "nothing was interrupted"),
+        Err(error) => panic!("the clean journal opens: {error}"),
+    }
 
     // The last frame, appended a second time. Its digest is the one for
     // the position it came from.
