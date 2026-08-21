@@ -6,11 +6,11 @@
 //! **The state that authorises a signature is on the disk before the
 //! signature leaves the process.** Everything here is an instance of
 //! that. A setup revision is fsynced before its signature is exported.
-//! A nonce is fsynced before the authorization carrying it is built. A
-//! result is fsynced before the plaintext goes out. An allocation is
-//! fsynced before the certificate that pays for it is sent — and the
-//! provider's copy is fsynced before it acknowledges payment or lets
-//! any credit go.
+//! An authorization is fsynced before its signature is sent. A result is
+//! fsynced before the plaintext goes out. A payment — the certificate
+//! and the binding that says what it bought, in one record — is fsynced
+//! before it is sent, and the provider's copy is fsynced before it
+//! acknowledges payment or lets any credit go.
 //!
 //! Reversing any one of those pairs is the same defect: the peer holds
 //! a signature the endpoint has no record of, and after the crash the
@@ -20,7 +20,7 @@
 //! commit returns only after `fsync`; a record the rules refuse writes
 //! nothing at all; and the records themselves are ordered, so a result
 //! cannot be journaled before the marker that says the backend was
-//! called, nor a certificate before the invoice it pays. What they
+//! called, nor a payment before the result it pays for. What they
 //! cannot see is a caller that sends first and commits afterwards.
 //! Nothing in a store can catch that, and no doc sentence here should
 //! be read as claiming it does.
@@ -31,8 +31,8 @@
 //!   revisions, and the recovery decision that resumes it. Keyed by
 //!   `(network, bond edge)`, because the bond edge is the first thing
 //!   both parties can name.
-//! - [`channel::ChannelStore`] — one channel's nonces, its one job, its
-//!   credit ledgers, and its certificates. Keyed by the channel id,
+//! - [`channel::ChannelStore`] — one channel's one job, its credit
+//!   ledgers, and its certificates. Keyed by the channel id,
 //!   which binds the network, both edges, and both terms bodies.
 //! - [`channel::CounterpartyLoss`] — what one client owes across every
 //!   channel it has had. Keyed by `(network, client key)`, so a fresh

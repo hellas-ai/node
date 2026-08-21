@@ -10,7 +10,7 @@
 
 use hellas_kernel::{
     BlockHeight, EarnedCertificate, EdgeId, EdgeValues, Encode as _, Fees, List, MAX_EDGE_OUTPUTS,
-    NetworkId, Parties, PayloadHash, Payout, Secp256k1Signer, Secp256k1Verifier, Sig,
+    NetworkId, Parties, PayloadHash, Payout, Secp256k1Signer, Secp256k1Verifier, Sig, TermsHash,
     WorkPaymentSettlement, WorkPaymentTerms, WorkStakeBondTerms, work_payment_settlement,
 };
 use hellas_rpc::evaluate::{
@@ -22,10 +22,10 @@ use hellas_rpc::protocol::artifacts::{
     TextArtifact, TextExecution, TextPolicy, TokenIds,
 };
 use hellas_rpc::protocol::work::{
-    CertificateAllocationV1, InvoiceEntryV1, PaidChannel, PaidChannelPolicyV1,
-    PaidJobAuthorizationV1, PaidJobResultV1, PaidWorkError, PrivateRecord as _, allocation_digest,
-    decode_transcript, encode_transcript, invoice_digest, invoice_entries_root, next_invoice_entry,
-    prepared_input_digest, private_policy_commitment, result_digest, terminal_result, work_id,
+    CreditLedger, PaidChannel, PaidChannelPolicyV1, PaidJobAuthorizationV1, PaidJobResultV1,
+    PaidWorkError, PaymentBindingV1, PrivateRecord as _, decode_transcript, encode_transcript,
+    next_payment, payment_binding_digest, prepared_input_digest, private_policy_commitment,
+    result_digest, terminal_result, work_id,
 };
 use hellas_rpc::protocol::{ContentId, Digest};
 use hellas_rpc::work_store::journal::{Journal, JournalError, JournalId, JournalKind};
@@ -277,12 +277,11 @@ struct Job {
     work_id: Digest,
     result: PaidJobResultV1,
     transcript: Vec<OutputEventEnvelope>,
-    entry: InvoiceEntryV1,
-    allocation: CertificateAllocationV1,
+    binding: PaymentBindingV1,
     certificate: EarnedCertificate,
 }
 
-fn job_at(channel: &PaidChannel, nonce: u64, seq: u64, before: u64) -> Job {
+fn job_at(channel: &PaidChannel, nonce: u64, credited: u64) -> Job {
     let authorization = authorization_for(channel, nonce);
     let work_id = work_id(channel, &authorization);
     // The result is derived from a real transcript rather than made up:
@@ -293,33 +292,17 @@ fn job_at(channel: &PaidChannel, nonce: u64, seq: u64, before: u64) -> Job {
         Ok(result) => result,
         Err(error) => panic!("the fixture transcript is a terminal: {error}"),
     };
-    let entry =
-        match next_invoice_entry(channel, &authorization, &result, seq, before, settlement()) {
-            Ok(entry) => entry,
-            Err(error) => panic!("the fixture entry builds: {error}"),
+    let (certificate, binding) =
+        match next_payment(channel, &authorization, &result, credited, settlement()) {
+            Ok(payment) => payment,
+            Err(error) => panic!("the fixture payment builds: {error}"),
         };
-    let certificate = EarnedCertificate::new(
-        channel.payment_edge(),
-        channel.payment_terms_hash(),
-        entry.cumulative_after,
-    );
-    let Ok(root) = invoice_entries_root(channel, &[entry]) else {
-        panic!("one entry has a root");
-    };
-    let allocation = CertificateAllocationV1 {
-        channel_id: channel.id(),
-        certificate_digest: certificate.digest(channel.network()),
-        first_invoice_seq: entry.invoice_seq,
-        last_invoice_seq: entry.invoice_seq,
-        invoice_entries_root: root,
-    };
     Job {
         authorization,
         work_id,
         result,
         transcript,
-        entry,
-        allocation,
+        binding,
         certificate,
     }
 }
@@ -370,19 +353,12 @@ impl Job {
         }
     }
 
-    fn invoice(&self, channel: &PaidChannel) -> ChannelRecord {
-        ChannelRecord::InvoiceIssued {
-            entry: self.entry,
-            provider_signature: provider().sign(payload(invoice_digest(channel, &self.entry))),
-        }
-    }
-
     fn paid(&self, channel: &PaidChannel) -> ChannelRecord {
-        ChannelRecord::CertificatePaid {
+        ChannelRecord::CertificateAdmitted {
             certificate: self.certificate,
-            allocation: self.allocation,
-            allocation_signature: client()
-                .sign(payload(allocation_digest(channel, &self.allocation))),
+            binding: self.binding,
+            binding_signature: client()
+                .sign(payload(payment_binding_digest(channel, &self.binding))),
             certificate_signature: client().sign(self.certificate.digest(channel.network())),
         }
     }
@@ -396,7 +372,6 @@ fn provider_sequence(channel: &PaidChannel, job: &Job) -> Vec<ChannelRecord> {
         ChannelRecord::JobRunning,
         job.result_record(channel),
         ChannelRecord::PlaintextReleased,
-        job.invoice(channel),
         job.paid(channel),
     ]
 }
@@ -409,14 +384,10 @@ fn provider_sequence(channel: &PaidChannel, job: &Job) -> Vec<ChannelRecord> {
 fn client_sequence(channel: &PaidChannel, job: &Job) -> Vec<ChannelRecord> {
     vec![
         cursor_at(RECEIPT_HEIGHT),
-        ChannelRecord::NonceReserved {
-            nonce: job.authorization.proposal_nonce,
-        },
         job.proposed(),
         job.accepted(),
         job.result_record(channel),
         ChannelRecord::ResultVerified,
-        job.invoice(channel),
         job.paid(channel),
     ]
 }
@@ -471,15 +442,18 @@ fn commit_all(store: &mut ChannelStore, records: &[ChannelRecord]) {
 fn one_paid_job_moves_every_ledger_once() {
     let dir = temp();
     let channel = channel();
-    let job = job_at(&channel, 1, 1, 0);
+    let job = job_at(&channel, 1, 0);
     let mut store = open(dir.path(), Role::Provider);
 
     commit_all(&mut store, &provider_sequence(&channel, &job));
 
     let state = store.state();
     assert!(state.job().is_none(), "a paid job is closed");
-    assert_eq!(state.ledger().next_invoice_seq(), 2);
-    assert_eq!(state.ledger().credited_invoice_high_water(), PRICE);
+    assert_eq!(state.ledger().credited_cumulative(), PRICE);
+    assert!(
+        state.ledger().has_paid_for(job.work_id),
+        "and it is on the ledger's paid list, forever",
+    );
     assert_eq!(state.max_executable_certificate(), PRICE);
     assert_eq!(
         state.compute_outstanding(),
@@ -489,16 +463,15 @@ fn one_paid_job_moves_every_ledger_once() {
     assert_eq!(state.delivery_outstanding(), 0);
     assert_eq!(store.loss().compute, 0, "a paid job is not a loss");
     assert_eq!(store.loss().delivery, 0);
-    assert!(state.unallocated_gap().is_none());
 }
 
 /// The same sequence on the client, which has a nonce to spend and no
 /// credit ledgers of its own.
 #[test]
-fn the_client_credits_the_same_allocation_it_signed() {
+fn the_client_credits_the_same_payment_it_signed() {
     let dir = temp();
     let channel = channel();
-    let job = job_at(&channel, 1, 1, 0);
+    let job = job_at(&channel, 1, 0);
     let mut store = open(dir.path(), Role::Client);
 
     assert_eq!(store.state().next_proposal_nonce(), 1);
@@ -506,7 +479,7 @@ fn the_client_credits_the_same_allocation_it_signed() {
 
     let state = store.state();
     assert_eq!(state.next_proposal_nonce(), 2, "the nonce is burnt");
-    assert_eq!(state.ledger().credited_invoice_high_water(), PRICE);
+    assert_eq!(state.ledger().credited_cumulative(), PRICE);
     assert!(state.job().is_none());
 }
 
@@ -524,7 +497,7 @@ fn a_result_must_be_the_transcript_it_is_stored_beside() {
     let dir = temp();
     let channel = channel();
     let verifier = Secp256k1Verifier::new();
-    let job = job_at(&channel, 1, 1, 0);
+    let job = job_at(&channel, 1, 0);
     let mut store = open(dir.path(), Role::Provider);
     commit_all(
         &mut store,
@@ -602,7 +575,7 @@ fn a_result_must_be_the_transcript_it_is_stored_beside() {
 fn a_restart_finds_the_transcript_the_result_was_derived_from() {
     let dir = temp();
     let channel = channel();
-    let job = job_at(&channel, 1, 1, 0);
+    let job = job_at(&channel, 1, 0);
     {
         let mut store = open(dir.path(), Role::Provider);
         commit_all(&mut store, &provider_sequence(&channel, &job)[..4]);
@@ -637,21 +610,14 @@ fn a_restart_finds_the_transcript_the_result_was_derived_from() {
 #[test]
 fn the_terminal_deadline_is_the_last_height_a_receipt_may_be_recorded_at() {
     let channel = channel();
-    let job = job_at(&channel, 1, 1, 0);
+    let job = job_at(&channel, 1, 0);
     let deadline = job.authorization.terminal_deadline;
     for (height, timely) in [(deadline, true), (deadline + 1, false)] {
         let dir = temp();
         let mut store = open(dir.path(), Role::Client);
         commit_all(
             &mut store,
-            &[
-                cursor_at(height),
-                ChannelRecord::NonceReserved {
-                    nonce: job.authorization.proposal_nonce,
-                },
-                job.proposed(),
-                job.accepted(),
-            ],
+            &[cursor_at(height), job.proposed(), job.accepted()],
         );
         let recorded = store.commit(job.result_record(&channel), &Secp256k1Verifier::new());
         if timely {
@@ -686,16 +652,16 @@ fn the_terminal_deadline_is_the_last_height_a_receipt_may_be_recorded_at() {
 #[test]
 fn the_payment_deadline_is_the_last_height_a_payment_may_be_signed_at() {
     let channel = channel();
-    let job = job_at(&channel, 1, 1, 0);
+    let job = job_at(&channel, 1, 0);
     let deadline = job.authorization.payment_deadline;
     for (height, timely) in [(deadline, true), (deadline + 1, false)] {
         let dir = temp();
         let mut store = open(dir.path(), Role::Client);
         let sequence = client_sequence(&channel, &job);
-        commit_all(&mut store, &sequence[..7]);
+        commit_all(&mut store, &sequence[..5]);
         assert_eq!(
             store.state().job().map(JobState::phase),
-            Some(JobPhase::Invoiced),
+            Some(JobPhase::Verified),
         );
         advance(&mut store, height);
 
@@ -704,7 +670,7 @@ fn the_payment_deadline_is_the_last_height_a_payment_may_be_signed_at() {
             if let Err(error) = paid {
                 panic!("a payment at {height} is timely: {error}");
             }
-            assert_eq!(store.state().ledger().credited_invoice_high_water(), PRICE);
+            assert_eq!(store.state().ledger().credited_cumulative(), PRICE);
             continue;
         }
         let Err(error) = paid else {
@@ -721,7 +687,7 @@ fn the_payment_deadline_is_the_last_height_a_payment_may_be_signed_at() {
             "unexpected error: {error}"
         );
         assert_eq!(
-            store.state().ledger().credited_invoice_high_water(),
+            store.state().ledger().credited_cumulative(),
             0,
             "a refused payment credits nothing",
         );
@@ -733,18 +699,9 @@ fn the_payment_deadline_is_the_last_height_a_payment_may_be_signed_at() {
 fn a_client_that_has_processed_no_block_records_no_receipt() {
     let dir = temp();
     let channel = channel();
-    let job = job_at(&channel, 1, 1, 0);
+    let job = job_at(&channel, 1, 0);
     let mut store = open(dir.path(), Role::Client);
-    commit_all(
-        &mut store,
-        &[
-            ChannelRecord::NonceReserved {
-                nonce: job.authorization.proposal_nonce,
-            },
-            job.proposed(),
-            job.accepted(),
-        ],
-    );
+    commit_all(&mut store, &[job.proposed(), job.accepted()]);
     let error = store
         .commit(job.result_record(&channel), &Secp256k1Verifier::new())
         .expect_err("a receipt needs a height to be timely at");
@@ -759,119 +716,33 @@ fn a_client_that_has_processed_no_block_records_no_receipt() {
     );
 }
 
-/// A client invoices what its oracle checked, not what merely arrived.
-///
-/// The verdict is the only thing varied: the same delivered result, the
-/// same signed entry, refused before it and taken after it.
-#[test]
-fn an_unverified_result_is_not_invoiced() {
-    let dir = temp();
-    let channel = channel();
-    let verifier = Secp256k1Verifier::new();
-    let job = job_at(&channel, 1, 1, 0);
-    let mut store = open(dir.path(), Role::Client);
-    let sequence = client_sequence(&channel, &job);
-    commit_all(&mut store, &sequence[..5]);
-    assert_eq!(
-        store.state().job().map(JobState::phase),
-        Some(JobPhase::Ready)
-    );
-
-    // MUTATION: the invoice offered with the verdict step skipped.
-    let error = store
-        .commit(job.invoice(&channel), &verifier)
-        .expect_err("a result nobody checked is not payable");
-    assert!(
-        matches!(
-            error,
-            WorkStoreError::Channel(ChannelStateError::WrongPhase {
-                step: "issuing an invoice",
-                phase: "ready"
-            })
-        ),
-        "unexpected error: {error}"
-    );
-
-    // The control: with the verdict recorded, the same entry is taken.
-    commit_all(&mut store, &[ChannelRecord::ResultVerified]);
-    assert_eq!(
-        store.state().job().map(JobState::phase),
-        Some(JobPhase::Verified)
-    );
-    if let Err(error) = store.commit(job.invoice(&channel), &verifier) {
-        panic!("a checked result is invoiced: {error}");
-    }
-}
-
-/// A verdict is the client's step, and it needs a result to be about.
-#[test]
-fn a_verdict_belongs_to_a_client_holding_a_result() {
-    let dir = temp();
-    let channel = channel();
-    let verifier = Secp256k1Verifier::new();
-    let job = job_at(&channel, 1, 1, 0);
-
-    // MUTATION: the provider's journal, which has no oracle.
-    let mut provider_store = open(dir.path(), Role::Provider);
-    commit_all(&mut provider_store, &provider_sequence(&channel, &job)[..4]);
-    let error = provider_store
-        .commit(ChannelRecord::ResultVerified, &verifier)
-        .expect_err("a provider does not check its own answer");
-    assert!(
-        matches!(
-            error,
-            WorkStoreError::Channel(ChannelStateError::WrongRole {
-                step: "recording an oracle verdict",
-                expected: "client"
-            })
-        ),
-        "unexpected error: {error}"
-    );
-
-    // MUTATION: a client's journal, one step before the result.
-    let other = temp();
-    let mut store = open(other.path(), Role::Client);
-    let sequence = client_sequence(&channel, &job);
-    commit_all(&mut store, &sequence[..4]);
-    let error = store
-        .commit(ChannelRecord::ResultVerified, &verifier)
-        .expect_err("there is nothing yet to have checked");
-    assert!(
-        matches!(
-            error,
-            WorkStoreError::Channel(ChannelStateError::WrongPhase {
-                step: "recording an oracle verdict",
-                phase: "accepted"
-            })
-        ),
-        "unexpected error: {error}"
-    );
-
-    // The control: with the result recorded, the same step is taken —
-    // and taken again is redundant rather than a second verdict.
-    commit_all(&mut store, &sequence[4..6]);
-    if let Err(error) = store.commit(ChannelRecord::ResultVerified, &verifier) {
-        panic!("a repeated verdict is the same verdict: {error}");
-    }
-    assert_eq!(
-        store.state().job().map(JobState::phase),
-        Some(JobPhase::Verified)
-    );
-}
-
 // ── The defect this phase exists to prevent ───────────────────────────
 
-/// A job paid for before the crash is not paid for again after it.
+/// One job is paid for once: live, and after a restart.
 ///
-/// This is the whole of P3 in one test. The endpoint keeps no ledger in
-/// memory across the restart; what stops the second payment is the
-/// journal, and nothing else.
+/// This is the whole of P3, and it is the construction a review used to
+/// break the invoice stack that stood here before: a *truthful* second
+/// payment for a job already paid for. Nothing about it is malformed.
+/// The work id is the same because the job is the same; the result is
+/// the same because the provider signed one; the certificate is the one
+/// this ledger's own arithmetic produces at the next cumulative. Read
+/// alone it is indistinguishable from a second job, and the only thing
+/// that can tell them apart is the record of what has been paid for.
+///
+/// The refusal is taken twice from the same rule and from two
+/// different ledgers: one held in memory since the first payment, and
+/// one no process kept — rebuilt by replaying the file a crashed
+/// endpoint left behind. Neither of them is asked whether a job is open,
+/// which is the point: the nonce rule and the phase rules would also
+/// refuse this, and both are facts about the journal rather than about
+/// the money. Those are checked below too, as the second and third
+/// lines they are.
 #[test]
-fn a_paid_job_is_not_billed_again_after_a_restart() {
+fn one_job_is_paid_for_once_live_and_after_a_restart() {
     let dir = temp();
     let channel = channel();
     let verifier = Secp256k1Verifier::new();
-    let first = job_at(&channel, 1, 1, 0);
+    let first = job_at(&channel, 1, 0);
 
     {
         let mut store = open(dir.path(), Role::Provider);
@@ -879,67 +750,98 @@ fn a_paid_job_is_not_billed_again_after_a_restart() {
     }
 
     let mut recovered = open(dir.path(), Role::Provider);
+    assert_eq!(recovered.state().ledger().credited_cumulative(), PRICE);
+
+    // The second payment: the same job, the same result, at this
+    // ledger's own next cumulative.
+    let second = job_at(&channel, 1, PRICE);
     assert_eq!(
-        recovered.state().ledger().credited_invoice_high_water(),
-        PRICE
+        second.binding.work_id, first.binding.work_id,
+        "the same job, which is what makes this a second payment",
+    );
+    assert_eq!(second.binding.result_digest, first.binding.result_digest);
+    assert_ne!(
+        second.certificate, first.certificate,
+        "and a fresh certificate, so nothing here is a replay of bytes",
+    );
+    assert_eq!(second.certificate.earned_cumulative(), 2 * PRICE);
+
+    // Once live, from the ledger this process has held since the first
+    // payment.
+    let mut live = CreditLedger::new();
+    if let Err(error) = live.credit_payment(
+        &channel,
+        &first.authorization,
+        &first.result,
+        &first.binding,
+        &first.certificate,
+        settlement(),
+    ) {
+        panic!("the first payment credits: {error}");
+    }
+    assert_eq!(live.credited_cumulative(), PRICE);
+    assert!(live.has_paid_for(first.work_id));
+    let refused = live.credit_payment(
+        &channel,
+        &second.authorization,
+        &second.result,
+        &second.binding,
+        &second.certificate,
+        settlement(),
+    );
+    assert_eq!(
+        refused,
+        Err(PaidWorkError::Duplicate { field: "work_id" }),
+        "a job is paid for at most once",
+    );
+    assert_eq!(
+        live.credited_cumulative(),
+        PRICE,
+        "and the refusal moved nothing",
     );
 
-    // The provider re-runs the same job at a fresh sequence: a second
-    // invoice for the same `work_id`, a second certificate, a second
-    // allocation. Every one of them is internally consistent, and the
-    // ledger refuses it because it has already paid this job.
-    let again = Job {
-        entry: match next_invoice_entry(
-            &channel,
-            &first.authorization,
-            &first.result,
-            2,
-            PRICE,
-            settlement(),
-        ) {
-            Ok(entry) => entry,
-            Err(error) => panic!("a second entry builds: {error}"),
-        },
-        ..job_at(&channel, 1, 2, PRICE)
-    };
-    let certificate = EarnedCertificate::new(
-        channel.payment_edge(),
-        channel.payment_terms_hash(),
-        again.entry.cumulative_after,
+    // And once from a ledger nothing kept: this one exists only because
+    // replaying the file rebuilt it.
+    let mut reopened = recovered.state().ledger().clone();
+    assert!(
+        reopened.has_paid_for(first.work_id),
+        "the paid job survives the crash",
     );
-    let Ok(root) = invoice_entries_root(&channel, &[again.entry]) else {
-        panic!("one entry has a root");
-    };
-    let replayed = Job {
-        allocation: CertificateAllocationV1 {
-            channel_id: channel.id(),
-            certificate_digest: certificate.digest(network()),
-            first_invoice_seq: 2,
-            last_invoice_seq: 2,
-            invoice_entries_root: root,
-        },
-        certificate,
-        ..again
-    };
+    let refused = reopened.credit_payment(
+        &channel,
+        &second.authorization,
+        &second.result,
+        &second.binding,
+        &second.certificate,
+        settlement(),
+    );
+    assert_eq!(
+        refused,
+        Err(PaidWorkError::Duplicate { field: "work_id" }),
+        "across a restart as well",
+    );
+    assert_eq!(reopened.credited_cumulative(), PRICE);
 
-    // It cannot even re-open the job: the nonce is burnt.
+    // The second line: the journal will not even re-open the job, since
+    // the nonce that names it is spent.
     let error = recovered
-        .commit(replayed.proposed(), &verifier)
+        .commit(second.proposed(), &verifier)
         .expect_err("this nonce was already spent");
     assert!(
         matches!(
             error,
-            WorkStoreError::Channel(ChannelStateError::Conflict { .. })
+            WorkStoreError::Channel(ChannelStateError::Nonce { .. })
         ),
         "unexpected error: {error}"
     );
 
-    // And with a fresh nonce — a genuinely new job, offered the paid
-    // job's own signed result and the transcript that produced it — the
-    // reproduction rule refuses it before any ledger is asked. Those
-    // events answer the first job's request commitment, so no result at
-    // all can be rebuilt from them against this authorization.
-    let fresh = job_at(&channel, 2, 2, PRICE);
+    // The third line: with a fresh nonce — a genuinely new job, offered
+    // the paid job's own signed result and the transcript that produced
+    // it — the reproduction rule refuses it before any ledger is asked.
+    // Those events answer the first job's request commitment, so no
+    // result at all can be rebuilt from them against this
+    // authorization.
+    let fresh = job_at(&channel, 2, PRICE);
     commit_all(
         &mut recovered,
         &[
@@ -963,10 +865,7 @@ fn a_paid_job_is_not_billed_again_after_a_restart() {
         ),
         "unexpected error: {error}"
     );
-    assert_eq!(
-        recovered.state().ledger().credited_invoice_high_water(),
-        PRICE
-    );
+    assert_eq!(recovered.state().ledger().credited_cumulative(), PRICE);
 
     // The control: this job's own result and transcript are taken, so
     // what was refused above is the pairing and not the step.
@@ -981,7 +880,7 @@ fn a_paid_job_is_not_billed_again_after_a_restart() {
 fn re_sending_a_retained_payment_is_idempotent() {
     let dir = temp();
     let channel = channel();
-    let job = job_at(&channel, 1, 1, 0);
+    let job = job_at(&channel, 1, 0);
     {
         let mut store = open(dir.path(), Role::Client);
         commit_all(&mut store, &client_sequence(&channel, &job));
@@ -992,7 +891,7 @@ fn re_sending_a_retained_payment_is_idempotent() {
         panic!("the payment is retained for re-sending");
     };
     assert_eq!(retained.certificate, job.certificate);
-    assert_eq!(retained.allocation, job.allocation);
+    assert_eq!(retained.binding, job.binding);
     // The job it paid for, kept beside the bytes: the payment closed
     // that job, so nothing else on this state can still name it.
     assert_eq!(retained.work_id, job.work_id);
@@ -1002,11 +901,7 @@ fn re_sending_a_retained_payment_is_idempotent() {
         panic!("re-sending the retained payment: {error}");
     }
     assert_eq!(recovered.len(), before, "nothing is written twice");
-    assert_eq!(
-        recovered.state().ledger().credited_invoice_high_water(),
-        PRICE
-    );
-    assert_eq!(recovered.state().ledger().next_invoice_seq(), 2);
+    assert_eq!(recovered.state().ledger().credited_cumulative(), PRICE);
 }
 
 // ── Crash points ──────────────────────────────────────────────────────
@@ -1019,7 +914,7 @@ fn re_sending_a_retained_payment_is_idempotent() {
 #[test]
 fn every_provider_write_boundary_recovers_to_one_state() {
     let channel = channel();
-    let job = job_at(&channel, 1, 1, 0);
+    let job = job_at(&channel, 1, 0);
     let sequence = provider_sequence(&channel, &job);
 
     let expected: Vec<(Option<JobPhase>, u64, u64, u64)> = vec![
@@ -1029,7 +924,6 @@ fn every_provider_write_boundary_recovers_to_one_state() {
         (Some(JobPhase::Running), PRICE, 0, 0),
         (Some(JobPhase::Ready), PRICE, 0, 0),
         (Some(JobPhase::Delivered), PRICE, PRICE, 0),
-        (Some(JobPhase::Invoiced), PRICE, PRICE, 0),
         (None, 0, 0, PRICE),
     ];
 
@@ -1060,7 +954,7 @@ fn every_provider_write_boundary_recovers_to_one_state() {
             index + 1
         );
         assert_eq!(
-            state.ledger().credited_invoice_high_water(),
+            state.ledger().credited_cumulative(),
             credited,
             "credited after {} records",
             index + 1
@@ -1075,7 +969,7 @@ fn every_provider_write_boundary_recovers_to_one_state() {
 fn a_half_signed_job_keeps_its_reservation_and_its_bytes() {
     let dir = temp();
     let channel = channel();
-    let job = job_at(&channel, 1, 1, 0);
+    let job = job_at(&channel, 1, 0);
     {
         let mut store = open(dir.path(), Role::Provider);
         commit_all(&mut store, &[job.proposed()]);
@@ -1131,7 +1025,7 @@ fn a_half_signed_job_keeps_its_reservation_and_its_bytes() {
 fn an_interrupted_invocation_stays_indeterminate() {
     let dir = temp();
     let channel = channel();
-    let job = job_at(&channel, 1, 1, 0);
+    let job = job_at(&channel, 1, 0);
     let verifier = Secp256k1Verifier::new();
     {
         let mut store = open(dir.path(), Role::Provider);
@@ -1200,7 +1094,7 @@ fn a_provider_fault_is_not_the_clients_debt() {
         } else {
             JobEnd::Indeterminate
         };
-        let job = job_at(&channel, nonce, 1, 0);
+        let job = job_at(&channel, nonce, 0);
         commit_all(&mut store, &provider_sequence(&channel, &job)[..4]);
         assert_eq!(
             store.state().job().map(JobState::phase),
@@ -1217,7 +1111,7 @@ fn a_provider_fault_is_not_the_clients_debt() {
     // The control: the same phase, ended as the client's own silence, is
     // the client's debt — and it is the whole of what this channel then
     // has left.
-    let expired = job_at(&channel, 5, 1, 0);
+    let expired = job_at(&channel, 5, 0);
     commit_all(&mut store, &provider_sequence(&channel, &expired)[..4]);
     if let Err(error) = store.commit(
         ChannelRecord::JobEnded {
@@ -1243,7 +1137,7 @@ fn a_provider_fault_is_not_the_clients_debt() {
 fn a_job_that_expired_before_its_result_is_not_the_clients_debt() {
     let dir = temp();
     let channel = channel();
-    let job = job_at(&channel, 1, 1, 0);
+    let job = job_at(&channel, 1, 0);
     let mut store = open(dir.path(), Role::Provider);
     commit_all(
         &mut store,
@@ -1266,7 +1160,7 @@ fn a_job_that_expired_before_its_result_is_not_the_clients_debt() {
 fn an_expired_half_signed_job_releases_its_reservation_without_loss() {
     let dir = temp();
     let channel = channel();
-    let job = job_at(&channel, 1, 1, 0);
+    let job = job_at(&channel, 1, 0);
     let verifier = Secp256k1Verifier::new();
     let mut store = open(dir.path(), Role::Provider);
     commit_all(&mut store, &[job.proposed()]);
@@ -1284,14 +1178,14 @@ fn an_expired_half_signed_job_releases_its_reservation_without_loss() {
     assert_eq!(store.loss().compute, 0, "no compute was spent");
 
     // The nonce it burnt is not returned with the reservation.
-    let same = job_at(&channel, 1, 1, 0);
+    let same = job_at(&channel, 1, 0);
     let error = store
         .commit(same.proposed(), &verifier)
         .expect_err("an expired job's nonce stays burnt");
     assert!(
         matches!(
             error,
-            WorkStoreError::Channel(ChannelStateError::Conflict { .. })
+            WorkStoreError::Channel(ChannelStateError::Nonce { .. })
         ),
         "unexpected error: {error}"
     );
@@ -1303,7 +1197,7 @@ fn an_expired_half_signed_job_releases_its_reservation_without_loss() {
 fn a_delivered_unpaid_job_is_loss_in_both_currencies() {
     let dir = temp();
     let channel = channel();
-    let job = job_at(&channel, 1, 1, 0);
+    let job = job_at(&channel, 1, 0);
     let mut store = open(dir.path(), Role::Provider);
     commit_all(
         &mut store,
@@ -1335,7 +1229,7 @@ fn compute_credit_bounds_what_may_be_co_signed() {
 
     // Two jobs fit inside 25; the third does not.
     for nonce in 1..=2 {
-        let job = job_at(&channel, nonce, 1, 0);
+        let job = job_at(&channel, nonce, 0);
         commit_all(&mut store, &[job.proposed()]);
         if let Err(error) = store.commit(
             ChannelRecord::JobEnded {
@@ -1354,7 +1248,7 @@ fn compute_credit_bounds_what_may_be_co_signed() {
     // Now spend the credit for real: two jobs whose results were signed
     // and whose deadlines then passed unpaid.
     for nonce in 3..=4 {
-        let job = job_at(&channel, nonce, 1, 0);
+        let job = job_at(&channel, nonce, 0);
         commit_all(&mut store, &provider_sequence(&channel, &job)[..4]);
         if let Err(error) = store.commit(
             ChannelRecord::JobEnded {
@@ -1368,7 +1262,7 @@ fn compute_credit_bounds_what_may_be_co_signed() {
     assert_eq!(store.loss().compute, 2 * PRICE);
 
     // 20 lost plus 10 more is 30, over the 25 this channel allows.
-    let over = job_at(&channel, 5, 1, 0);
+    let over = job_at(&channel, 5, 0);
     let error = store
         .commit(over.proposed(), &verifier)
         .expect_err("this client has spent its compute credit");
@@ -1407,7 +1301,7 @@ fn delivery_credit_bounds_what_may_be_released() {
     // Two delivered-and-unpaid jobs: 20 of the 25 delivery credit gone,
     // while compute has spent 20 of 1000.
     for nonce in 1..=2 {
-        let job = job_at(&channel, nonce, 1, 0);
+        let job = job_at(&channel, nonce, 0);
         commit_all(&mut store, &provider_sequence(&channel, &job)[..5]);
         if let Err(error) = store.commit(
             ChannelRecord::JobEnded {
@@ -1423,7 +1317,7 @@ fn delivery_credit_bounds_what_may_be_released() {
 
     // The third job is accepted — compute has room — and runs. Only the
     // plaintext is refused.
-    let third = job_at(&channel, 3, 1, 0);
+    let third = job_at(&channel, 3, 0);
     commit_all(&mut store, &provider_sequence(&channel, &third)[..4]);
     let error = store
         .commit(ChannelRecord::PlaintextReleased, &verifier)
@@ -1454,7 +1348,7 @@ fn delivery_credit_bounds_what_may_be_released() {
     let other = temp();
     let mut store = open_on(other.path(), roomy.clone(), Role::Provider);
     for nonce in 1..=2 {
-        let job = job_at(&roomy, nonce, 1, 0);
+        let job = job_at(&roomy, nonce, 0);
         commit_all(&mut store, &provider_sequence(&roomy, &job)[..5]);
         if let Err(error) = store.commit(
             ChannelRecord::JobEnded {
@@ -1465,7 +1359,7 @@ fn delivery_credit_bounds_what_may_be_released() {
             panic!("the ending commits: {error}");
         }
     }
-    let third = job_at(&roomy, 3, 1, 0);
+    let third = job_at(&roomy, 3, 0);
     commit_all(&mut store, &provider_sequence(&roomy, &third)[..5]);
     assert_eq!(store.state().delivery_outstanding(), PRICE);
 }
@@ -1480,7 +1374,7 @@ fn loss_outlives_the_channel_it_was_lost_on() {
     {
         let mut store = open_on(dir.path(), first.clone(), Role::Provider);
         for nonce in 1..=2 {
-            let job = job_at(&first, nonce, 1, 0);
+            let job = job_at(&first, nonce, 0);
             commit_all(&mut store, &provider_sequence(&first, &job)[..4]);
             if let Err(error) = store.commit(
                 ChannelRecord::JobEnded {
@@ -1516,9 +1410,9 @@ fn loss_outlives_the_channel_it_was_lost_on() {
         2 * PRICE,
         "a new channel does not reset what this client owes"
     );
-    assert_eq!(store.state().ledger().credited_invoice_high_water(), 0);
+    assert_eq!(store.state().ledger().credited_cumulative(), 0);
 
-    let job = job_at(&second, 1, 1, 0);
+    let job = job_at(&second, 1, 0);
     let error = store
         .commit(job.proposed(), &verifier)
         .expect_err("this client's credit was spent on another channel");
@@ -1545,8 +1439,8 @@ fn loss_outlives_the_channel_it_was_lost_on() {
 fn a_journal_accepted_a_record_at_a_time_reopens_whole() {
     let channel = channel_with(EdgeId::from_bytes([0xe5; 32]), limits(2 * PRICE, 2 * PRICE));
     let verifier = Secp256k1Verifier::new();
-    let first = job_at(&channel, 1, 1, 0);
-    let second = job_at(&channel, 2, 1, 0);
+    let first = job_at(&channel, 1, 0);
+    let second = job_at(&channel, 2, 0);
     let sequence = vec![
         first.proposed(),
         first.accepted(),
@@ -1578,8 +1472,8 @@ fn a_journal_accepted_a_record_at_a_time_reopens_whole() {
         EdgeId::from_bytes([0xea; 32]),
         limits(20 * PRICE, 2 * PRICE),
     );
-    let third = job_at(&delivering, 1, 1, 0);
-    let fourth = job_at(&delivering, 2, 1, 0);
+    let third = job_at(&delivering, 1, 0);
+    let fourth = job_at(&delivering, 2, 0);
     let mut delivered = Vec::new();
     for job in [&third, &fourth] {
         delivered.extend(provider_sequence(&delivering, job)[..5].to_vec());
@@ -1599,7 +1493,7 @@ fn a_journal_accepted_a_record_at_a_time_reopens_whole() {
     }
     let mut recovered = open_on(dir.path(), channel.clone(), Role::Provider);
     assert_eq!(recovered.loss().compute, 2 * PRICE, "the limit, exactly");
-    let next = job_at(&channel, 3, 1, 0);
+    let next = job_at(&channel, 3, 0);
     let error = recovered
         .commit(next.proposed(), &verifier)
         .expect_err("this client has spent its compute credit");
@@ -1691,7 +1585,7 @@ fn a_journal_reopens_when_the_clients_loss_has_passed_this_channels_limit() {
 
     // One whole job on the narrow channel, done and paid for while this
     // client owed nothing.
-    let paid = job_at(&narrow, 1, 1, 0);
+    let paid = job_at(&narrow, 1, 0);
     let live = {
         let mut store = open_on(dir.path(), narrow.clone(), Role::Provider);
         commit_all(&mut store, &provider_sequence(&narrow, &paid));
@@ -1705,7 +1599,7 @@ fn a_journal_reopens_when_the_clients_loss_has_passed_this_channels_limit() {
     {
         let mut store = open_on(dir.path(), roomy.clone(), Role::Provider);
         for nonce in 1..=3 {
-            let job = job_at(&roomy, nonce, 1, 0);
+            let job = job_at(&roomy, nonce, 0);
             commit_all(&mut store, &provider_sequence(&roomy, &job)[..4]);
             if let Err(error) = store.commit(
                 ChannelRecord::JobEnded {
@@ -1745,13 +1639,12 @@ fn a_journal_reopens_when_the_clients_loss_has_passed_this_channels_limit() {
     assert_eq!(state.compute_outstanding(), live.compute_outstanding());
     assert_eq!(state.delivery_outstanding(), live.delivery_outstanding());
     assert_eq!(state.next_proposal_nonce(), live.next_proposal_nonce());
-    assert_eq!(state.unallocated_gap(), live.unallocated_gap());
     assert_eq!(state.cursor(), live.cursor());
     assert!(!state.is_indeterminate());
 
     // And the credit rule the replay stopped applying to history still
     // applies to the next job.
-    let next = job_at(&narrow, 2, 2, PRICE);
+    let next = job_at(&narrow, 2, PRICE);
     let error = recovered
         .commit(next.proposed(), &verifier)
         .expect_err("this client's credit was spent on another channel");
@@ -1777,7 +1670,7 @@ fn replay_refuses_a_reservation_this_journals_own_losses_forbid() {
     {
         let mut store = open_on(dir.path(), channel.clone(), Role::Provider);
         for nonce in 1..=2 {
-            let job = job_at(&channel, nonce, 1, 0);
+            let job = job_at(&channel, nonce, 0);
             commit_all(&mut store, &provider_sequence(&channel, &job)[..4]);
             if let Err(error) = store.commit(
                 ChannelRecord::JobEnded {
@@ -1794,7 +1687,7 @@ fn replay_refuses_a_reservation_this_journals_own_losses_forbid() {
     // A third proposal, correct in every other way — the client's real
     // signature, this channel's fields, a nonce nothing has spent —
     // written behind the store's back, because no store would take it.
-    let third = job_at(&channel, 3, 1, 0);
+    let third = job_at(&channel, 3, 0);
     {
         let (mut journal, replay) = match Journal::open(
             channel_journal(dir.path()),
@@ -1872,14 +1765,14 @@ fn a_job_whose_loss_is_recorded_takes_no_step_but_its_ending() {
     let verifier = Secp256k1Verifier::new();
 
     // Both crash points where a loss is already owed: after the result,
-    // and after the invoice. The record offered next is the one the
+    // and after the release. The record offered next is the one the
     // interrupted process would have gone on to write.
     let cases: Vec<(&str, usize, u64, u64)> =
-        vec![("ready", 4, PRICE, 0), ("invoiced", 6, PRICE, PRICE)];
+        vec![("ready", 4, PRICE, 0), ("delivered", 5, PRICE, PRICE)];
 
     for (label, prefix, compute, delivery) in cases {
         let dir = temp();
-        let job = job_at(&channel, 1, 1, 0);
+        let job = job_at(&channel, 1, 0);
         {
             let mut store = open(dir.path(), Role::Provider);
             commit_all(&mut store, &provider_sequence(&channel, &job)[..prefix]);
@@ -1937,96 +1830,11 @@ fn a_job_whose_loss_is_recorded_takes_no_step_but_its_ending() {
         assert_eq!(recovered.loss().compute, compute, "case {label}");
         assert_eq!(recovered.loss().delivery, delivery, "case {label}");
         assert_eq!(
-            recovered.state().ledger().credited_invoice_high_water(),
+            recovered.state().ledger().credited_cumulative(),
             0,
             "case {label}: nothing was paid for"
         );
     }
-}
-
-// ── The unallocated gap ───────────────────────────────────────────────
-
-/// A certificate the invoice prefix cannot account for stops new work,
-/// and only its own allocation clears it.
-#[test]
-fn an_unallocated_certificate_quarantines_the_channel() {
-    let dir = temp();
-    let channel = channel();
-    let verifier = Secp256k1Verifier::new();
-    let mut store = open(dir.path(), Role::Provider);
-    let job = job_at(&channel, 1, 1, 0);
-
-    // The provider is handed a valid certificate with no allocation:
-    // executable evidence, and no invoice paid.
-    let gift = ChannelRecord::CertificateGift {
-        certificate: job.certificate,
-        certificate_signature: client().sign(job.certificate.digest(network())),
-    };
-    if let Err(error) = store.commit(gift.clone(), &verifier) {
-        panic!("the gift commits: {error}");
-    }
-    assert_eq!(store.state().max_executable_certificate(), PRICE);
-    assert_eq!(
-        store.state().ledger().credited_invoice_high_water(),
-        0,
-        "a gift marks no invoice paid"
-    );
-    assert_eq!(store.state().unallocated_gap(), Some(PRICE));
-
-    // While the gap is open, no new work.
-    let error = store
-        .commit(job.proposed(), &verifier)
-        .expect_err("the channel is quarantined");
-    assert!(
-        matches!(
-            error,
-            WorkStoreError::Channel(ChannelStateError::UnallocatedGap { .. })
-        ),
-        "unexpected error: {error}"
-    );
-
-    // The same certificate again is not news.
-    let before = store.len();
-    if let Err(error) = store.commit(gift, &verifier) {
-        panic!("a repeated gift commits: {error}");
-    }
-    assert_eq!(store.len(), before);
-    assert_eq!(store.state().unallocated_gap(), Some(PRICE));
-}
-
-/// The reconcilable case: the allocation that was lost, retried
-/// byte-identically, closes the gap and retires the credit once.
-#[test]
-fn the_lost_allocation_can_be_retried_and_closes_the_gap() {
-    let dir = temp();
-    let channel = channel();
-    let verifier = Secp256k1Verifier::new();
-    let job = job_at(&channel, 1, 1, 0);
-
-    // The provider crashed after the invoice; the client's certificate
-    // arrived without its allocation.
-    let mut store = open(dir.path(), Role::Provider);
-    commit_all(&mut store, &provider_sequence(&channel, &job)[..6]);
-    if let Err(error) = store.commit(
-        ChannelRecord::CertificateGift {
-            certificate: job.certificate,
-            certificate_signature: client().sign(job.certificate.digest(network())),
-        },
-        &verifier,
-    ) {
-        panic!("the gift commits: {error}");
-    }
-    assert_eq!(store.state().unallocated_gap(), Some(PRICE));
-
-    // The client re-sends the allocation it signed. It names exactly
-    // the invoice this job produced, so it reconciles.
-    if let Err(error) = store.commit(job.paid(&channel), &verifier) {
-        panic!("the retried allocation commits: {error}");
-    }
-    assert_eq!(store.state().unallocated_gap(), None);
-    assert_eq!(store.state().ledger().credited_invoice_high_water(), PRICE);
-    assert_eq!(store.state().compute_outstanding(), 0);
-    assert_eq!(store.state().delivery_outstanding(), 0);
 }
 
 // ── What the store refuses ────────────────────────────────────────────
@@ -2038,7 +1846,7 @@ fn a_signature_from_the_wrong_party_is_not_evidence() {
     let dir = temp();
     let channel = channel();
     let verifier = Secp256k1Verifier::new();
-    let job = job_at(&channel, 1, 1, 0);
+    let job = job_at(&channel, 1, 0);
 
     let cases: Vec<(&str, Vec<ChannelRecord>, ChannelRecord)> = vec![
         (
@@ -2067,21 +1875,23 @@ fn a_signature_from_the_wrong_party_is_not_evidence() {
             },
         ),
         (
-            "an invoice signed over another digest",
+            "a binding signed over another digest",
             provider_sequence(&channel, &job)[..5].to_vec(),
-            ChannelRecord::InvoiceIssued {
-                entry: job.entry,
-                provider_signature: provider().sign(payload(result_digest(&channel, &job.result))),
+            ChannelRecord::CertificateAdmitted {
+                certificate: job.certificate,
+                binding: job.binding,
+                binding_signature: client().sign(payload(job.work_id)),
+                certificate_signature: client().sign(job.certificate.digest(network())),
             },
         ),
         (
             "a certificate the client did not sign",
-            provider_sequence(&channel, &job)[..6].to_vec(),
-            ChannelRecord::CertificatePaid {
+            provider_sequence(&channel, &job)[..5].to_vec(),
+            ChannelRecord::CertificateAdmitted {
                 certificate: job.certificate,
-                allocation: job.allocation,
-                allocation_signature: client()
-                    .sign(payload(allocation_digest(&channel, &job.allocation))),
+                binding: job.binding,
+                binding_signature: client()
+                    .sign(payload(payment_binding_digest(&channel, &job.binding))),
                 certificate_signature: provider().sign(job.certificate.digest(network())),
             },
         ),
@@ -2107,70 +1917,130 @@ fn a_signature_from_the_wrong_party_is_not_evidence() {
     drop(dir);
 }
 
-/// An invoice is the one entry this ledger position admits, or it is
-/// not journaled at all.
+/// A payment is the one this ledger position admits, or it is not
+/// journaled at all.
+///
+/// Each case moves exactly one field of the honest payment and re-signs
+/// whatever the move invalidated, so what refuses it is the arithmetic
+/// and not a stale signature. The refusals name the field, which is
+/// what makes this six checks rather than one that six inputs happen to
+/// trip.
 #[test]
-fn an_invoice_must_be_the_entry_this_position_admits() {
-    let dir = temp();
+fn a_payment_must_be_the_one_this_position_admits() {
     let channel = channel();
     let verifier = Secp256k1Verifier::new();
-    let job = job_at(&channel, 1, 1, 0);
+    let job = job_at(&channel, 1, 0);
+    let elsewhere = Digest::from_bytes([0x5e; 32]);
+    let other_edge = EdgeId::from_bytes([0x77; 32]);
+    let other_terms = TermsHash::from_bytes([0x88; 32]);
 
-    let mutations: Vec<(&str, InvoiceEntryV1)> = vec![
+    let bindings: Vec<(&str, &str, PaymentBindingV1)> = vec![
         (
-            "a sequence that skips one",
-            InvoiceEntryV1 {
-                invoice_seq: 2,
-                ..job.entry
+            "a work id this journal never opened",
+            "binding work_id",
+            PaymentBindingV1 {
+                work_id: elsewhere,
+                ..job.binding
             },
         ),
         (
-            "a cumulative that starts above the credited amount",
-            InvoiceEntryV1 {
-                cumulative_before: 1,
-                cumulative_after: 1 + PRICE,
-                ..job.entry
+            "a result this provider never signed",
+            "binding result_digest",
+            PaymentBindingV1 {
+                result_digest: elsewhere,
+                ..job.binding
             },
         ),
         (
-            "a price the authorization did not fix",
-            InvoiceEntryV1 {
-                price: PRICE + 1,
-                cumulative_after: PRICE + 1,
-                ..job.entry
-            },
-        ),
-        (
-            "another channel's entry",
-            InvoiceEntryV1 {
-                channel_id: Digest::from_bytes([0x00; 32]),
-                ..job.entry
+            "a binding that names some other certificate",
+            "binding certificate_digest",
+            PaymentBindingV1 {
+                certificate_digest: PayloadHash::from_bytes([0x5e; 32]),
+                ..job.binding
             },
         ),
     ];
-
-    for (label, entry) in mutations {
+    for (label, field, binding) in bindings {
         let dir = temp();
         let mut store = open(dir.path(), Role::Provider);
         commit_all(&mut store, &provider_sequence(&channel, &job)[..5]);
         let error = store
             .commit(
-                ChannelRecord::InvoiceIssued {
-                    entry,
-                    provider_signature: provider().sign(payload(invoice_digest(&channel, &entry))),
+                ChannelRecord::CertificateAdmitted {
+                    certificate: job.certificate,
+                    binding,
+                    binding_signature: client()
+                        .sign(payload(payment_binding_digest(&channel, &binding))),
+                    certificate_signature: client().sign(job.certificate.digest(network())),
                 },
                 &verifier,
             )
-            .expect_err("this is not the entry the position admits");
+            .expect_err("this is not the payment the position admits");
         assert!(
             matches!(
                 error,
-                WorkStoreError::Channel(ChannelStateError::WrongChannel { .. })
+                WorkStoreError::Channel(ChannelStateError::Record(PaidWorkError::Mismatch {
+                    field: found
+                })) if found == field
             ),
             "case {label}: unexpected error: {error}"
         );
     }
-    drop(dir);
+
+    let certificates: Vec<(&str, &str, EarnedCertificate)> = vec![
+        (
+            "an amount this ledger did not arrive at",
+            "certificate earned_cumulative",
+            EarnedCertificate::new(
+                channel.payment_edge(),
+                channel.payment_terms_hash(),
+                PRICE + 1,
+            ),
+        ),
+        (
+            "another edge",
+            "certificate payment_edge",
+            EarnedCertificate::new(other_edge, channel.payment_terms_hash(), PRICE),
+        ),
+        (
+            "another terms body",
+            "certificate payment_terms_hash",
+            EarnedCertificate::new(channel.payment_edge(), other_terms, PRICE),
+        ),
+    ];
+    for (label, field, certificate) in certificates {
+        let dir = temp();
+        let mut store = open(dir.path(), Role::Provider);
+        commit_all(&mut store, &provider_sequence(&channel, &job)[..5]);
+        // Re-bound as well as re-signed: the binding names whichever
+        // certificate is being offered, so the refusal below is the
+        // ledger's arithmetic and not the binding check in front of it.
+        let binding = PaymentBindingV1 {
+            certificate_digest: certificate.digest(network()),
+            ..job.binding
+        };
+        let error = store
+            .commit(
+                ChannelRecord::CertificateAdmitted {
+                    certificate,
+                    binding,
+                    binding_signature: client()
+                        .sign(payload(payment_binding_digest(&channel, &binding))),
+                    certificate_signature: client().sign(certificate.digest(network())),
+                },
+                &verifier,
+            )
+            .expect_err("this is not the payment the position admits");
+        assert!(
+            matches!(
+                error,
+                WorkStoreError::Channel(ChannelStateError::Record(PaidWorkError::Mismatch {
+                    field: found
+                })) if found == field
+            ),
+            "case {label}: unexpected error: {error}"
+        );
+    }
 }
 
 /// A record for another channel is not this channel's, whatever it is
@@ -2182,29 +2052,10 @@ fn a_record_for_another_channel_is_refused() {
     let verifier = Secp256k1Verifier::new();
     let mut store = open(dir.path(), Role::Provider);
 
-    let elsewhere = job_at(&other, 1, 1, 0);
+    let elsewhere = job_at(&other, 1, 0);
     let error = store
         .commit(elsewhere.proposed(), &verifier)
         .expect_err("that authorization names another channel");
-    assert!(
-        matches!(
-            error,
-            WorkStoreError::Channel(ChannelStateError::WrongChannel { .. })
-        ),
-        "unexpected error: {error}"
-    );
-
-    // And a certificate against another edge.
-    let foreign = EarnedCertificate::new(other.payment_edge(), other.payment_terms_hash(), PRICE);
-    let error = store
-        .commit(
-            ChannelRecord::CertificateGift {
-                certificate: foreign,
-                certificate_signature: client().sign(foreign.digest(network())),
-            },
-            &verifier,
-        )
-        .expect_err("that certificate settles another edge");
     assert!(
         matches!(
             error,
@@ -2220,17 +2071,10 @@ fn role_scoped_steps_belong_to_one_role() {
     let dir = temp();
     let channel = channel();
     let verifier = Secp256k1Verifier::new();
-    let job = job_at(&channel, 1, 1, 0);
+    let job = job_at(&channel, 1, 0);
 
     let mut client_store = open(dir.path(), Role::Client);
-    commit_all(
-        &mut client_store,
-        &[
-            ChannelRecord::NonceReserved { nonce: 1 },
-            job.proposed(),
-            job.accepted(),
-        ],
-    );
+    commit_all(&mut client_store, &[job.proposed(), job.accepted()]);
     for record in [ChannelRecord::JobRunning, ChannelRecord::PlaintextReleased] {
         let error = client_store
             .commit(record, &verifier)
@@ -2243,52 +2087,34 @@ fn role_scoped_steps_belong_to_one_role() {
             "unexpected error: {error}"
         );
     }
-
-    let other = temp();
-    let mut provider_store = open(other.path(), Role::Provider);
-    let error = provider_store
-        .commit(ChannelRecord::NonceReserved { nonce: 1 }, &verifier)
-        .expect_err("that is a client's step");
-    assert!(
-        matches!(
-            error,
-            WorkStoreError::Channel(ChannelStateError::WrongRole { .. })
-        ),
-        "unexpected error: {error}"
-    );
 }
 
-/// A client spends nonce 1, then nonce 2, and never nonce 1 again.
+/// A channel spends nonce 1, then nonce 2, and never nonce 1 again.
+///
+/// One rule, run by both roles: the nonce a proposal carries must be
+/// one this journal has not reached, and recording the proposal moves
+/// the mark past it. It is the second half of what makes one `work_id`
+/// open at most one job in this journal's life.
 #[test]
-fn a_client_nonce_is_consumed_once_and_burnt_forever() {
+fn a_proposal_nonce_is_spent_once_and_burnt_forever() {
     let dir = temp();
     let channel = channel();
     let verifier = Secp256k1Verifier::new();
     let mut store = open(dir.path(), Role::Client);
+    assert_eq!(store.state().next_proposal_nonce(), 1);
 
-    // Out of order: nonce 2 before nonce 1 is not the next reservation.
-    let error = store
-        .commit(ChannelRecord::NonceReserved { nonce: 2 }, &verifier)
-        .expect_err("the first nonce is one");
-    assert!(
-        matches!(
-            error,
-            WorkStoreError::Channel(ChannelStateError::Nonce { .. })
-        ),
-        "unexpected error: {error}"
-    );
-
-    commit_all(&mut store, &[ChannelRecord::NonceReserved { nonce: 1 }]);
+    // Nonce 1, spent by the proposal that carries it.
+    let first = job_at(&channel, 1, 0);
+    commit_all(&mut store, &[first.proposed()]);
     assert_eq!(store.state().next_proposal_nonce(), 2);
 
-    // The reservation is idempotent while it is unspent.
+    // The identical proposal is the retry after a lost send, and costs
+    // nothing.
     let before = store.len();
-    commit_all(&mut store, &[ChannelRecord::NonceReserved { nonce: 1 }]);
-    assert_eq!(store.len(), before);
+    commit_all(&mut store, &[first.proposed()]);
+    assert_eq!(store.len(), before, "an exact repeat writes nothing");
 
     // The half-signed job expires; the nonce does not come back.
-    let job = job_at(&channel, 1, 1, 0);
-    commit_all(&mut store, &[job.proposed()]);
     if let Err(error) = store.commit(
         ChannelRecord::JobEnded {
             reason: JobEnd::Expired,
@@ -2298,37 +2124,53 @@ fn a_client_nonce_is_consumed_once_and_burnt_forever() {
         panic!("the ending commits: {error}");
     }
     let error = store
-        .commit(ChannelRecord::NonceReserved { nonce: 1 }, &verifier)
-        .expect_err("a spent nonce is not reserved again");
+        .commit(first.proposed(), &verifier)
+        .expect_err("a spent nonce is not spent again");
     assert!(
         matches!(
             error,
-            WorkStoreError::Channel(ChannelStateError::Nonce { .. })
+            WorkStoreError::Channel(ChannelStateError::Nonce {
+                expected: 2,
+                actual: 1
+            })
         ),
         "unexpected error: {error}"
     );
 
     // The next job uses nonce 2.
-    commit_all(&mut store, &[ChannelRecord::NonceReserved { nonce: 2 }]);
-    let second = job_at(&channel, 2, 1, 0);
+    let second = job_at(&channel, 2, 0);
     commit_all(&mut store, &[second.proposed()]);
     let Some(open_job) = store.state().job() else {
         panic!("the second job is open");
     };
     assert_eq!(open_job.authorization().proposal_nonce, 2);
 
-    // A proposal whose nonce is not the reserved one is refused.
-    let dir = temp();
-    let mut fresh = open(dir.path(), Role::Client);
-    commit_all(&mut fresh, &[ChannelRecord::NonceReserved { nonce: 1 }]);
-    let mismatched = job_at(&channel, 7, 1, 0);
-    let error = fresh
-        .commit(mismatched.proposed(), &verifier)
-        .expect_err("that nonce was never reserved");
+    // The same rule on the provider's side, which never chose a nonce
+    // and only ever sees the one a client's signature carries. A
+    // forward jump is admitted; the number it jumped past is not.
+    let other = temp();
+    let mut provider_store = open(other.path(), Role::Provider);
+    let seventh = job_at(&channel, 7, 0);
+    commit_all(&mut provider_store, &[seventh.proposed()]);
+    assert_eq!(provider_store.state().next_proposal_nonce(), 8);
+    if let Err(error) = provider_store.commit(
+        ChannelRecord::JobEnded {
+            reason: JobEnd::Expired,
+        },
+        &verifier,
+    ) {
+        panic!("the ending commits: {error}");
+    }
+    let error = provider_store
+        .commit(job_at(&channel, 3, 0).proposed(), &verifier)
+        .expect_err("a nonce this journal has passed is not admitted");
     assert!(
         matches!(
             error,
-            WorkStoreError::Channel(ChannelStateError::Nonce { .. })
+            WorkStoreError::Channel(ChannelStateError::Nonce {
+                expected: 8,
+                actual: 3
+            })
         ),
         "unexpected error: {error}"
     );
@@ -2432,7 +2274,7 @@ fn a_second_process_cannot_hold_the_same_channel() {
 fn a_corrupt_channel_journal_is_not_replayed_as_an_earlier_state() {
     let dir = temp();
     let channel = channel();
-    let job = job_at(&channel, 1, 1, 0);
+    let job = job_at(&channel, 1, 0);
     {
         let mut store = open(dir.path(), Role::Provider);
         commit_all(&mut store, &provider_sequence(&channel, &job));
@@ -2455,18 +2297,18 @@ fn a_corrupt_channel_journal_is_not_replayed_as_an_earlier_state() {
     drop(clean);
 
     // Interrupted inside the payment record: the payment never
-    // happened, and the invoice is still open.
+    // happened, and the delivered job is still unpaid.
     if let Err(error) = std::fs::write(&path, &whole[..whole.len() - 40]) {
         panic!("the truncated journal writes: {error}");
     }
     let recovered = open(dir.path(), Role::Provider);
-    assert_eq!(recovered.state().ledger().credited_invoice_high_water(), 0);
+    assert_eq!(recovered.state().ledger().credited_cumulative(), 0);
     assert_eq!(
         recovered
             .state()
             .job()
             .map(hellas_rpc::work_store::JobState::phase),
-        Some(JobPhase::Invoiced)
+        Some(JobPhase::Delivered)
     );
     drop(recovered);
 
@@ -2505,7 +2347,7 @@ fn a_corrupt_channel_journal_is_not_replayed_as_an_earlier_state() {
 #[test]
 fn an_interrupted_final_frame_is_removed_rather_than_refused() {
     let channel = channel();
-    let job = job_at(&channel, 1, 1, 0);
+    let job = job_at(&channel, 1, 0);
     let sequence = provider_sequence(&channel, &job);
 
     let mut damage = verifiable_damage();
@@ -2545,11 +2387,11 @@ fn an_interrupted_final_frame_is_removed_rather_than_refused() {
                 .state()
                 .job()
                 .map(hellas_rpc::work_store::JobState::phase),
-            Some(JobPhase::Invoiced),
+            Some(JobPhase::Delivered),
             "case {label}"
         );
         assert_eq!(
-            recovered.state().ledger().credited_invoice_high_water(),
+            recovered.state().ledger().credited_cumulative(),
             0,
             "case {label}"
         );
@@ -2578,7 +2420,7 @@ fn an_interrupted_final_frame_is_removed_rather_than_refused() {
 #[test]
 fn damage_with_a_frame_after_it_is_not_treated_as_a_tear() {
     let channel = channel();
-    let job = job_at(&channel, 1, 1, 0);
+    let job = job_at(&channel, 1, 0);
     let sequence = provider_sequence(&channel, &job);
     // The result record: three frames still follow it.
     let wounded = 3;
@@ -2636,7 +2478,7 @@ fn damage_with_a_frame_after_it_is_not_treated_as_a_tear() {
 fn a_journal_torn_inside_its_header_is_written_again() {
     let dir = temp();
     let channel = channel();
-    let job = job_at(&channel, 1, 1, 0);
+    let job = job_at(&channel, 1, 0);
     {
         let mut store = open(dir.path(), Role::Provider);
         commit_all(&mut store, &[job.proposed()]);
@@ -2789,7 +2631,7 @@ fn one_jobs_loss_is_counted_once() {
 #[test]
 fn the_record_codec_is_exact_and_ordered() {
     let channel = channel();
-    let job = job_at(&channel, 1, 1, 0);
+    let job = job_at(&channel, 1, 0);
 
     let cursor = ChannelRecord::CursorAdvanced {
         height: 0x0102_0304_0506_0708,
@@ -2822,7 +2664,7 @@ fn the_record_codec_is_exact_and_ordered() {
     // tag || the kernel's own encoding of the start, and nothing else:
     // the journal holds the bytes consensus will read, not a second
     // spelling of them.
-    let mut expected = vec![12_u8];
+    let mut expected = vec![9_u8];
     let mut body = vec![0_u8; start.encoded_size()];
     let written = start.write_to(&mut body);
     body.truncate(written);
@@ -2834,7 +2676,7 @@ fn the_record_codec_is_exact_and_ordered() {
         start_id: hellas_kernel::StartId::from_bytes([0xcd; 32]),
     };
     let bytes = opened.encode();
-    let mut expected = vec![13_u8];
+    let mut expected = vec![10_u8];
     expected.extend_from_slice(&[0xcd; 32]);
     assert_eq!(bytes, expected);
     assert_eq!(ChannelRecord::decode(&bytes), Ok(opened));
@@ -2848,7 +2690,7 @@ fn the_record_codec_is_exact_and_ordered() {
     // tag || height || payload || provider payout. Two big-endian
     // `u64`s around one digest: a round trip would pass with them
     // exchanged, and these bytes would not.
-    let mut expected = vec![14_u8];
+    let mut expected = vec![11_u8];
     expected.extend_from_slice(&0x1112_1314_1516_1718_u64.to_be_bytes());
     expected.extend_from_slice(&[0xef; 32]);
     expected.extend_from_slice(&0x2122_2324_2526_2728_u64.to_be_bytes());
@@ -2859,7 +2701,7 @@ fn the_record_codec_is_exact_and_ordered() {
     // the record names them.
     let proposed = job.proposed();
     let bytes = proposed.encode();
-    let mut expected = vec![2_u8];
+    let mut expected = vec![1_u8];
     expected.extend_from_slice(&job.authorization.encode());
     expected.extend_from_slice(client().sign(payload(job.work_id)).as_bytes());
     expected.extend_from_slice(&bundle_bytes(1));
@@ -2870,7 +2712,7 @@ fn the_record_codec_is_exact_and_ordered() {
     // the whole of the rest.
     let recorded = job.result_record(&channel);
     let bytes = recorded.encode();
-    let mut expected = vec![5_u8];
+    let mut expected = vec![4_u8];
     expected.extend_from_slice(&job.result.encode());
     expected.extend_from_slice(
         provider()
@@ -2883,31 +2725,49 @@ fn the_record_codec_is_exact_and_ordered() {
 
     // The two records with no body at all are one byte each, and they
     // are not each other's.
-    assert_eq!(ChannelRecord::PlaintextReleased.encode(), vec![6_u8]);
-    assert_eq!(ChannelRecord::ResultVerified.encode(), vec![11_u8]);
+    assert_eq!(ChannelRecord::JobRunning.encode(), vec![3_u8]);
+    assert_eq!(ChannelRecord::PlaintextReleased.encode(), vec![5_u8]);
+    assert_eq!(ChannelRecord::ResultVerified.encode(), vec![6_u8]);
+    assert_eq!(ChannelRecord::decode(&[3]), Ok(ChannelRecord::JobRunning));
     assert_eq!(
-        ChannelRecord::decode(&[11]),
+        ChannelRecord::decode(&[5]),
+        Ok(ChannelRecord::PlaintextReleased)
+    );
+    assert_eq!(
+        ChannelRecord::decode(&[6]),
         Ok(ChannelRecord::ResultVerified)
     );
 
     let paid = job.paid(&channel);
     let bytes = paid.encode();
+    let mut expected = vec![7_u8];
+    let mut certificate = vec![0_u8; job.certificate.encoded_size()];
+    let written = job.certificate.write_to(&mut certificate);
+    certificate.truncate(written);
+    expected.extend_from_slice(&certificate);
+    expected.extend_from_slice(&job.binding.encode());
+    expected.extend_from_slice(
+        client()
+            .sign(payload(payment_binding_digest(&channel, &job.binding)))
+            .as_bytes(),
+    );
+    expected.extend_from_slice(client().sign(job.certificate.digest(network())).as_bytes());
+    assert_eq!(bytes, expected);
     assert_eq!(
         bytes.len(),
-        1 + EarnedCertificate::ENCODED_SIZE
-            + CertificateAllocationV1::ENCODED_SIZE
-            + 2 * Sig::LENGTH
+        1 + EarnedCertificate::ENCODED_SIZE + PaymentBindingV1::ENCODED_SIZE + 2 * Sig::LENGTH
     );
     assert_eq!(ChannelRecord::decode(&bytes), Ok(paid));
 
     // Swapping the two client signatures is a different record, and a
     // reader that agreed with the layout only by round-tripping could
     // not see it.
-    let swapped = ChannelRecord::CertificatePaid {
+    let swapped = ChannelRecord::CertificateAdmitted {
         certificate: job.certificate,
-        allocation: job.allocation,
-        allocation_signature: client().sign(job.certificate.digest(network())),
-        certificate_signature: client().sign(payload(allocation_digest(&channel, &job.allocation))),
+        binding: job.binding,
+        binding_signature: client().sign(job.certificate.digest(network())),
+        certificate_signature: client()
+            .sign(payload(payment_binding_digest(&channel, &job.binding))),
     };
     assert_ne!(swapped.encode(), bytes);
 
@@ -2932,49 +2792,50 @@ fn the_record_codec_is_exact_and_ordered() {
     );
 }
 
-/// The credited position survives the restart, and the next invoice is
-/// the next one.
+/// The credited position survives the restart, and the next payment
+/// starts from it.
 ///
 /// The certificate that paid for job one is not a certificate that pays
 /// for job two, and the ledger the journal rebuilt is what says so.
 #[test]
-fn the_next_invoice_after_a_restart_is_the_next_one() {
+fn the_next_payment_after_a_restart_starts_from_the_credited_total() {
     let dir = temp();
     let channel = channel();
     let verifier = Secp256k1Verifier::new();
-    let first = job_at(&channel, 1, 1, 0);
+    let first = job_at(&channel, 1, 0);
     {
         let mut store = open(dir.path(), Role::Provider);
         commit_all(&mut store, &provider_sequence(&channel, &first));
     }
 
     let mut recovered = open(dir.path(), Role::Provider);
-    let second = job_at(&channel, 2, 2, PRICE);
+    let second = job_at(&channel, 2, PRICE);
     commit_all(&mut recovered, &provider_sequence(&channel, &second)[..5]);
 
-    // The invoice this position admits is the second one, and the first
-    // one's entry — already paid — is not it.
+    // A payment for this job at the *old* credited position — the one
+    // the first job's certificate settled — is refused on the amount.
+    // The first job's own bytes are not offered here: those are the
+    // retained payment, and re-sending them is idempotent by design.
+    let stale = job_at(&channel, 2, 0);
+    assert_eq!(stale.certificate.earned_cumulative(), PRICE);
     let error = recovered
-        .commit(first.invoice(&channel), &verifier)
-        .expect_err("that invoice was already credited");
+        .commit(stale.paid(&channel), &verifier)
+        .expect_err("that amount was already credited");
     assert!(
         matches!(
             error,
-            WorkStoreError::Channel(ChannelStateError::WrongChannel { .. })
+            WorkStoreError::Channel(ChannelStateError::Record(PaidWorkError::Mismatch {
+                field: "certificate earned_cumulative"
+            }))
         ),
         "unexpected error: {error}"
     );
 
-    commit_all(
-        &mut recovered,
-        &[second.invoice(&channel), second.paid(&channel)],
-    );
-    assert_eq!(recovered.state().ledger().next_invoice_seq(), 3);
-    assert_eq!(
-        recovered.state().ledger().credited_invoice_high_water(),
-        2 * PRICE
-    );
+    commit_all(&mut recovered, &[second.paid(&channel)]);
+    assert_eq!(recovered.state().ledger().credited_cumulative(), 2 * PRICE);
     assert_eq!(recovered.state().max_executable_certificate(), 2 * PRICE);
+    assert!(recovered.state().ledger().has_paid_for(first.work_id));
+    assert!(recovered.state().ledger().has_paid_for(second.work_id));
 }
 
 /// Signatures are checked when the journal is read back, not only when
@@ -2983,7 +2844,7 @@ fn the_next_invoice_after_a_restart_is_the_next_one() {
 fn replay_checks_the_signatures_again() {
     let dir = temp();
     let channel = channel();
-    let job = job_at(&channel, 1, 1, 0);
+    let job = job_at(&channel, 1, 0);
     let forged = ChannelRecord::JobProposed {
         authorization: job.authorization,
         client_signature: provider().sign(payload(job.work_id)),
@@ -3040,7 +2901,7 @@ impl hellas_kernel::SigVerifier for AcceptAll {
 fn a_result_needs_the_marker_that_says_the_backend_was_called() {
     let dir = temp();
     let channel = channel();
-    let job = job_at(&channel, 1, 1, 0);
+    let job = job_at(&channel, 1, 0);
     let mut store = open(dir.path(), Role::Provider);
     commit_all(&mut store, &[job.proposed(), job.accepted()]);
 
@@ -3073,7 +2934,7 @@ fn a_result_needs_the_marker_that_says_the_backend_was_called() {
 fn the_retained_dispatch_input_is_the_one_the_authorization_commits_to() {
     let dir = temp();
     let channel = channel();
-    let job = job_at(&channel, 1, 1, 0);
+    let job = job_at(&channel, 1, 0);
     {
         let mut store = open(dir.path(), Role::Provider);
         commit_all(&mut store, &[job.proposed(), job.accepted()]);
@@ -3138,7 +2999,7 @@ fn the_retained_dispatch_input_is_the_one_the_authorization_commits_to() {
 #[test]
 fn inputs_swapped_on_the_disk_are_not_a_job_to_execute() {
     let channel = channel();
-    let job = job_at(&channel, 1, 1, 0);
+    let job = job_at(&channel, 1, 0);
 
     // Two journals written the same way, behind the store's back
     // because no store would take the second: the same authorization,
@@ -3233,38 +3094,32 @@ fn channel_key_bytes(path: &std::path::Path) -> [u8; 32] {
 
 // ── The close cutoff ──────────────────────────────────────────────────
 
-/// A retained close start shuts the channel to certificates it cannot
-/// carry.
+/// A retained close start shuts the channel to new work.
 ///
-/// The certificate offered afterwards is the same certificate the same
-/// journal took a moment earlier — same edge, same terms, same client
-/// signature, larger amount — so what refuses the second one is the
-/// cutoff and nothing else. A close is built from what is held when it
-/// is signed, and a certificate admitted after that is money it leaves
-/// out.
+/// A close is built from what is held when it is signed, so a job
+/// admitted afterwards is a job whose payment that close could not
+/// carry. There is no separate rule for certificates: a payment credits
+/// the open job, and a close start is refused while there is one, so
+/// the two are excluded by the same fact.
 #[test]
-fn a_retained_close_start_admits_no_further_certificate() {
+fn a_retained_close_start_admits_no_further_work() {
     let dir = temp();
     let channel = channel();
     let verifier = Secp256k1Verifier::new();
     let mut store = open(dir.path(), Role::Provider);
     commit_all(&mut store, &[cursor_at(RECEIPT_HEIGHT)]);
 
-    let held = EarnedCertificate::new(channel.payment_edge(), channel.payment_terms_hash(), PRICE);
-    commit_all(
-        &mut store,
-        &[ChannelRecord::CertificateGift {
-            certificate: held,
-            certificate_signature: client().sign(held.digest(network())),
-        }],
-    );
+    // One paid job, which is the only way this journal comes to hold a
+    // certificate at all.
+    let paid = job_at(&channel, 1, 0);
+    commit_all(&mut store, &provider_sequence(&channel, &paid));
     assert_eq!(store.state().max_executable_certificate(), PRICE);
 
     let Ok(start) = hellas_rpc::work_close::close_start(
         &channel,
         hellas_kernel::Party::Taker,
         RECEIPT_HEIGHT,
-        store.state().executable_certificate().copied(),
+        store.state().executable_certificate(),
         &provider(),
     ) else {
         panic!("a channel with a certificate builds a close start");
@@ -3277,24 +3132,16 @@ fn a_retained_close_start_admits_no_further_certificate() {
     );
     assert!(store.state().is_closing());
 
-    let later = EarnedCertificate::new(
-        channel.payment_edge(),
-        channel.payment_terms_hash(),
-        PRICE + 1,
-    );
+    let next = job_at(&channel, 2, PRICE);
     let error = store
-        .commit(
-            ChannelRecord::CertificateGift {
-                certificate: later,
-                certificate_signature: client().sign(later.digest(network())),
-            },
-            &verifier,
-        )
-        .expect_err("a certificate after the cutoff is refused");
+        .commit(next.proposed(), &verifier)
+        .expect_err("a job after the cutoff is refused");
     assert!(
         matches!(
             error,
-            WorkStoreError::Channel(ChannelStateError::Closing { .. })
+            WorkStoreError::Channel(ChannelStateError::Closing {
+                step: "proposing a job"
+            })
         ),
         "unexpected error: {error}"
     );
@@ -3303,4 +3150,5 @@ fn a_retained_close_start_admits_no_further_certificate() {
         PRICE,
         "and it moves nothing",
     );
+    assert!(store.state().job().is_none());
 }

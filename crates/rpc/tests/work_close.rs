@@ -2,7 +2,7 @@
 //! something, and the close that turns one signed scalar into coins.
 //!
 //! The job at the top of every fixture here is a real one — proposed,
-//! co-signed, computed by a backend, delivered, checked, invoiced and
+//! co-signed, computed by a backend, delivered, checked and
 //! paid over a live transport — because a close built from a
 //! certificate this file invented would prove only that the arithmetic
 //! composes. What it settles has to be what the earlier phases produced.
@@ -39,8 +39,8 @@ use hellas_rpc::protocol::artifacts::{
     SourceRef, TextArtifact, TextExecution, TextPolicy, TokenIds,
 };
 use hellas_rpc::protocol::work::{
-    InvoiceEntryV1, JobDeadlines, PaidChannelPolicyV1, PaidExecutionPolicyV1,
-    PaidJobAuthorizationV1, PrivateRecord as _, generation_policy_digest, identity_source_digest,
+    JobDeadlines, PaidChannelPolicyV1, PaidExecutionPolicyV1, PaidJobAuthorizationV1,
+    PrivateRecord as _, generation_policy_digest, identity_source_digest,
     private_policy_commitment, propose_authorization, signing_hash, work_id,
 };
 use hellas_rpc::protocol::work_setup::{
@@ -50,7 +50,7 @@ use hellas_rpc::protocol::{ContentId, Digest};
 use hellas_rpc::services::work::{WorkClientImpl, WorkServer};
 use hellas_rpc::work::{
     BackendFault, ClientEndpoint, PaidEvaluateBackend, PaymentError, ProviderEndpoint, RunOutcome,
-    WorkService, admit_payment, fetch_result, request_invoice, run_accepted_work,
+    WorkService, admit_payment, fetch_result, run_accepted_work,
 };
 use hellas_rpc::work_close::{
     BlockSourceError, CatchUpError, CloseError, FinalizedBlocks, FinalizedWork, close_start,
@@ -387,14 +387,6 @@ fn accept(stores: &mut [&mut ChannelStore]) -> Digest {
         panic!("the fixture bundle encodes");
     };
     for store in stores {
-        if store.state().role() == Role::Client {
-            commit(
-                store,
-                ChannelRecord::NonceReserved {
-                    nonce: NONCE.into(),
-                },
-            );
-        }
         commit(
             store,
             ChannelRecord::JobProposed {
@@ -681,7 +673,7 @@ async fn checked_job() -> Checked {
     }
     // The oracle is `hellas-client`'s; what this file needs is the
     // durable verdict it records, which is the only phase an honest
-    // client's journal will invoice from.
+    // client's journal signs a certificate from.
     if let Err(error) = client.verified(id) {
         panic!("the fixture verdict records: {error}");
     }
@@ -696,19 +688,6 @@ async fn checked_job() -> Checked {
 }
 
 // ── Driving the two calls ─────────────────────────────────────────────
-
-/// One `RequestInvoice` over a live transport, journaled on both sides.
-async fn invoice_over_wire(
-    service: &WorkService,
-    client: &mut ClientEndpoint,
-    id: Digest,
-) -> Result<InvoiceEntryV1, PaymentError> {
-    let (transport, server) = transport_pair();
-    let serving = serve(server, service.clone());
-    let outcome = request_invoice(&WorkClientImpl::new(transport), client, id).await;
-    stop(serving).await;
-    outcome
-}
 
 /// One `AdmitCertificate` over a live transport: signed, journaled,
 /// sent, and acknowledged.
@@ -726,7 +705,7 @@ async fn pay_over_wire(
 
 // ── The state this phase begins from ──────────────────────────────────
 
-/// One job, all the way through: checked, invoiced, and paid for.
+/// One job, all the way through: checked and paid for.
 ///
 /// The provider's journal ends holding one client-signed
 /// [`EarnedCertificate`] at `PRICE`, and that certificate is the only
@@ -734,9 +713,6 @@ async fn pay_over_wire(
 async fn paid_job() -> Checked {
     let mut fixture = checked_job().await;
     let id = fixture.id;
-    if let Err(error) = invoice_over_wire(&fixture.service, &mut fixture.client, id).await {
-        panic!("the fixture job is invoiced: {error}");
-    }
     if let Err(error) = pay_over_wire(&fixture.service, &mut fixture.client, id).await {
         panic!("the fixture job is paid: {error}");
     }

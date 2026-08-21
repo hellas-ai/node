@@ -391,14 +391,6 @@ fn accept(
         panic!("the fixture bundle encodes");
     };
     for store in stores {
-        if store.state().role() == Role::Client {
-            commit(
-                store,
-                ChannelRecord::NonceReserved {
-                    nonce: nonce.into(),
-                },
-            );
-        }
         commit(
             store,
             ChannelRecord::JobProposed {
@@ -633,13 +625,10 @@ async fn one_answer_crosses_the_wire_and_is_debited_once() {
     );
     drop(provider);
 
-    // The verdict is the client's own step, and it moves the phase.
-    if let Err(error) = endpoint.verified(id) {
-        panic!("the client records its verdict: {error}");
-    }
     assert_eq!(
         endpoint.state().job().map(JobState::phase),
-        Some(JobPhase::Verified)
+        Some(JobPhase::Ready),
+        "a received result is ready, and a client has no marker past it",
     );
 
     serving.abort();
@@ -653,7 +642,7 @@ async fn one_answer_crosses_the_wire_and_is_debited_once() {
     let Some(job) = recovered.state().job() else {
         panic!("the job is still open");
     };
-    assert_eq!(job.phase(), JobPhase::Verified);
+    assert_eq!(job.phase(), JobPhase::Ready);
     assert_eq!(
         job.result().map(|(result, _)| *result),
         Some(delivered.result)
@@ -1077,33 +1066,6 @@ async fn a_client_behind_its_readiness_records_no_receipt() {
     if let Err(error) = endpoint.receive(id, &ready, &delivered) {
         panic!("a caught-up client records the receipt: {error}");
     }
-}
-
-/// A verdict names the job the client holds, and nothing else.
-#[tokio::test]
-async fn a_verdict_names_the_job_the_client_holds() {
-    let client_root = temp();
-    let ready = ready();
-    let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR);
-    let (id, _) = accept(&execution_policy(), &mut [&mut client_store], 1);
-    let Ok(mut endpoint) = ClientEndpoint::new(ready.clone(), client_store, client()) else {
-        panic!("the client endpoint binds");
-    };
-
-    let other = work_id(ready.channel(), &authorization(&execution_policy(), 2));
-    assert_ne!(other, id);
-    assert!(
-        matches!(endpoint.verified(other), Err(DeliverError::NoSuchJob)),
-        "a verdict about another job is not this job's",
-    );
-
-    // And a verdict about a job with no result at all is refused by the
-    // journal rather than recorded.
-    let refused = endpoint.verified(id);
-    assert!(
-        matches!(refused, Err(DeliverError::Store(_))),
-        "unexpected answer: {refused:?}",
-    );
 }
 
 // ── Canonical chain objects, spelled out ──────────────────────────────

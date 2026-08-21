@@ -1299,35 +1299,6 @@ fn a_job_already_in_flight_declines_the_next_one() {
 }
 
 #[test]
-fn an_unallocated_certificate_declines_new_work() {
-    let root = temp();
-    let mut store = store_at_cursor(root.path(), Role::Provider);
-    // A valid client certificate larger than anything this ledger has
-    // credited: money the provider holds and cannot say what for.
-    let certificate = hellas_kernel::EarnedCertificate::new(
-        ready().channel().payment_edge(),
-        ready().channel().payment_terms_hash(),
-        1,
-    );
-    let signature = client().sign(certificate.digest(network()));
-    if let Err(error) = store.commit(
-        ChannelRecord::CertificateGift {
-            certificate,
-            certificate_signature: signature,
-        },
-        &Secp256k1Verifier::new(),
-    ) {
-        panic!("a gift is journaled: {error}");
-    }
-    let Ok(mut endpoint) = ProviderEndpoint::new(ready(), store, provider()) else {
-        panic!("the endpoint binds");
-    };
-    assert_eq!(endpoint.state().unallocated_gap(), Some(1));
-    let response = endpoint.accept(&signed_request(1, 1));
-    assert_eq!(refusal_code(&response), WorkRefusalCode::Declined);
-}
-
-#[test]
 fn a_nonce_this_channel_has_already_seen_is_a_conflict() {
     let root = temp();
     let mut endpoint = provider_endpoint(root.path());
@@ -1375,19 +1346,36 @@ fn a_poisoned_endpoint_is_unavailable() {
 
 // ── Binding an endpoint to its own half of its own channel ────────────
 
-/// A nonce spent by a process that did not come back is not spent again.
+/// A nonce spent on a job that ended is not spent again.
+///
+/// The nonce and the proposal that carries it reach the disk in one
+/// record, so there is no window in which a nonce is spent and no job
+/// exists. What this covers is the other end: ending a job releases its
+/// credit and its capacity, and never its number.
 #[test]
-fn a_nonce_burnt_by_a_crash_is_not_used_again() {
+fn a_nonce_spent_on_an_ended_job_is_not_used_again() {
     let root = temp();
-    // The client reserved nonce 1 and died before it built a proposal.
-    let mut store = store_at_cursor(root.path(), Role::Client);
-    if let Err(error) = store.commit(
-        ChannelRecord::NonceReserved { nonce: 1 },
+    let mut endpoint = client_endpoint(root.path());
+    let Ok(first) = endpoint.propose(&proposal(1)) else {
+        panic!("the first proposal is built");
+    };
+    let Ok(built) = PaidJobAuthorizationV1::decode(&first.authorization) else {
+        panic!("the request carries an authorization");
+    };
+    assert_eq!(built.proposal_nonce, 1, "a client's first nonce is one");
+    drop(endpoint);
+
+    // The job ends unpaid, and the process comes back.
+    let mut ending = store(root.path(), Role::Client);
+    if let Err(error) = ending.commit(
+        ChannelRecord::JobEnded {
+            reason: JobEnd::Failed,
+        },
         &Secp256k1Verifier::new(),
     ) {
-        panic!("a nonce is reserved: {error}");
+        panic!("the job ends: {error}");
     }
-    drop(store);
+    drop(ending);
 
     let mut endpoint = client_endpoint(root.path());
     let Ok(request) = endpoint.propose(&proposal(1)) else {
@@ -1398,7 +1386,7 @@ fn a_nonce_burnt_by_a_crash_is_not_used_again() {
     };
     assert_eq!(
         built.proposal_nonce, 2,
-        "the burnt nonce is not offered a second time",
+        "the spent nonce is not offered a second time",
     );
 }
 

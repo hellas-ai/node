@@ -23,13 +23,12 @@ use hellas_rpc::protocol::artifacts::{
     TextArtifact, TextExecution, TextExecutionId, TextPolicy, TextState, TokenIds, completed_text,
 };
 use hellas_rpc::protocol::work::{
-    CertificateAllocationV1, CreditLedger, InvoiceEntryV1, InvoicedJob, MAX_ALLOCATION_ENTRIES,
-    PaidChannel, PaidChannelPolicyV1, PaidExecutionPolicyV1, PaidJobAuthorizationV1,
-    PaidJobResultV1, PaidWorkError, PrivateRecord, allocation_digest, canonical_output_digest,
+    CreditLedger, PaidChannel, PaidChannelPolicyV1, PaidExecutionPolicyV1, PaidJobAuthorizationV1,
+    PaidJobResultV1, PaidWorkError, PaymentBindingV1, PrivateRecord, canonical_output_digest,
     check_authorization, check_execution_policy, check_prepared_input, check_result,
     decode_transcript, encode_transcript, execution_policy_digest, generation_policy_digest,
-    identity_source_digest, invoice_digest, invoice_empty_root, invoice_entries_root,
-    next_invoice_entry, prepared_input_digest, private_policy_commitment, result_digest, work_id,
+    identity_source_digest, next_payment, payment_binding_digest, prepared_input_digest,
+    private_policy_commitment, result_digest, work_id,
 };
 use hellas_rpc::{
     Assurance, ContentId, Digest, Evaluate, EvaluateProgramManifest, EvaluateRequest,
@@ -271,14 +270,6 @@ fn job_result(work_id: Digest) -> PaidJobResultV1 {
     }
 }
 
-fn earned(cumulative: u64) -> EarnedCertificate {
-    EarnedCertificate::new(
-        channel().payment_edge(),
-        channel().payment_terms_hash(),
-        cumulative,
-    )
-}
-
 // ── Golden encodings ──────────────────────────────────────────────────
 
 /// Every fixed body's exact bytes, decoded field by field.
@@ -295,10 +286,8 @@ fn golden_record_encodings_are_pinned() {
     assert_eq!(PaidJobAuthorizationV1::ENCODED_SIZE, 330);
     assert_eq!(PaidJobResultV1::BODY_SIZE, 96);
     assert_eq!(PaidJobResultV1::ENCODED_SIZE, 98);
-    assert_eq!(InvoiceEntryV1::BODY_SIZE, 128);
-    assert_eq!(InvoiceEntryV1::ENCODED_SIZE, 130);
-    assert_eq!(CertificateAllocationV1::BODY_SIZE, 112);
-    assert_eq!(CertificateAllocationV1::ENCODED_SIZE, 114);
+    assert_eq!(PaymentBindingV1::BODY_SIZE, 96);
+    assert_eq!(PaymentBindingV1::ENCODED_SIZE, 98);
 
     assert_eq!(
         hex(&channel_policy().encode()),
@@ -321,49 +310,26 @@ fn golden_record_encodings_are_pinned() {
         )
     );
 
-    let entry = InvoiceEntryV1 {
-        channel_id: Digest::from_bytes([0xc0; 32]),
-        invoice_seq: 1,
+    // The one new canonical encoding in this profile, hand-decoded. Its
+    // three fields are all 32 bytes, so a round trip agrees with any
+    // permutation of them and only these bytes do not: `a1` is the job,
+    // `a2` the result, `d0` the certificate, in that order.
+    let binding = PaymentBindingV1 {
         work_id: Digest::from_bytes([0xa1; 32]),
         result_digest: Digest::from_bytes([0xa2; 32]),
-        price: 250,
-        cumulative_before: 0,
-        cumulative_after: 250,
+        certificate_digest: hellas_kernel::PayloadHash::from_bytes([0xd0; 32]),
     };
     assert_eq!(
-        hex(&entry.encode()),
+        hex(&binding.encode()),
         concat!(
             "01",
-            "04", // format version 1, tag 4 = PRIVATE_INVOICE
-            "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0", // channel_id
-            "0000000000000001", // invoice_seq
+            "04", // format version 1, tag 4 = PAYMENT_BINDING
             "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1", // work_id
             "a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2", // result_digest
-            "00000000000000fa", // price = 250
-            "0000000000000000", // cumulative_before
-            "00000000000000fa", // cumulative_after
-        )
-    );
-
-    let allocation = CertificateAllocationV1 {
-        channel_id: Digest::from_bytes([0xc0; 32]),
-        certificate_digest: hellas_kernel::PayloadHash::from_bytes([0xd0; 32]),
-        first_invoice_seq: 1,
-        last_invoice_seq: 3,
-        invoice_entries_root: Digest::from_bytes([0xd1; 32]),
-    };
-    assert_eq!(
-        hex(&allocation.encode()),
-        concat!(
-            "01",
-            "05", // format version 1, tag 5 = CERTIFICATE_ALLOCATION
-            "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0", // channel_id
             "d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0", // certificate
-            "0000000000000001", // first_invoice_seq
-            "0000000000000003", // last_invoice_seq
-            "d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1", // root
         )
     );
+    assert_eq!(PaymentBindingV1::decode(&binding.encode()), Ok(binding));
 
     let policy = PaidExecutionPolicyV1 {
         allowed_environment: ContentId::from_bytes([0x40; 32]),
@@ -445,19 +411,21 @@ fn golden_record_encodings_are_pinned() {
 /// Maximum-value bodies still encode to their fixed width.
 #[test]
 fn maximum_value_bodies_stay_fixed_width() {
-    let entry = InvoiceEntryV1 {
-        channel_id: Digest::from_bytes([0xff; 32]),
-        invoice_seq: u64::MAX,
-        work_id: Digest::from_bytes([0xff; 32]),
-        result_digest: Digest::from_bytes([0xff; 32]),
-        price: u64::MAX,
-        cumulative_before: u64::MAX,
-        cumulative_after: u64::MAX,
-    };
-    let bytes = entry.encode();
-    assert_eq!(bytes.len(), InvoiceEntryV1::ENCODED_SIZE);
-    assert_eq!(InvoiceEntryV1::decode(&bytes), Ok(entry));
-    assert_eq!(hex(&bytes[2..10]), "ffffffffffffffff");
+    let mut authorization = authorization();
+    authorization.proposal_nonce = u64::MAX;
+    authorization.acceptance_deadline = u64::MAX;
+    authorization.price = u64::MAX;
+    authorization.terminal_deadline = u64::MAX;
+    authorization.payment_deadline = u64::MAX;
+    let bytes = authorization.encode();
+    assert_eq!(bytes.len(), PaidJobAuthorizationV1::ENCODED_SIZE);
+    assert_eq!(PaidJobAuthorizationV1::decode(&bytes), Ok(authorization));
+    // The five `u64`s, all `ff`, at the offsets the layout puts them.
+    assert_eq!(hex(&bytes[226..242]), "ffffffffffffffffffffffffffffffff");
+    assert_eq!(
+        hex(&bytes[306..330]),
+        "ffffffffffffffffffffffffffffffffffffffffffffffff"
+    );
 }
 
 /// Wrong tag, wrong version, truncation, and a trailing byte all reject.
@@ -466,7 +434,7 @@ fn envelope_and_length_mutations_reject() {
     let bytes = job_result(Digest::from_bytes([0x30; 32])).encode();
     assert!(PaidJobResultV1::decode(&bytes).is_ok());
 
-    // MUTATION: a result body presented under the invoice tag.
+    // MUTATION: a result body presented under the binding tag.
     let mut wrong_tag = bytes.clone();
     wrong_tag[1] = 4;
     assert_eq!(
@@ -479,12 +447,12 @@ fn envelope_and_length_mutations_reject() {
 
     // MUTATION: an unassigned tag.
     let mut unknown_tag = bytes.clone();
-    unknown_tag[1] = 6;
+    unknown_tag[1] = 5;
     assert_eq!(
         PaidJobResultV1::decode(&unknown_tag),
         Err(PaidWorkError::WrongRecordTag {
             expected: 3,
-            actual: 6
+            actual: 5
         })
     );
 
@@ -520,27 +488,60 @@ fn envelope_and_length_mutations_reject() {
 
 /// A paid-work body must not decode as another paid-work record.
 ///
-/// No two of the six records share a length — asserted here, because it
-/// is what this test rests on — so a body relabelled as another record
-/// never reaches the tag rule: the length refuses it first, whether or
-/// not the tag byte was changed with it. The tag rule is exercised where
-/// a record's own length is intact, in
-/// `envelope_and_length_mutations_reject`.
+/// Two rules do this between them, and which one fires depends on the
+/// pair. Four of the five records have lengths no other record shares,
+/// so a body offered as one of those never reaches the tag rule: the
+/// length refuses it first, whether or not the tag byte was changed with
+/// it. The fifth pair — a result and a payment binding, both three
+/// digests — is the same width, and there the envelope tag is the whole
+/// of what separates them.
+///
+/// Which means a result body whose tag byte is *rewritten* does decode
+/// as a binding, and that is asserted below rather than glossed. What
+/// stops it mattering is not the codec: the two are signed by different
+/// parties under different domains, and the ledger checks every field of
+/// a binding against the job it is offered for. A relabelled result
+/// carries a transcript commitment where a result digest belongs, which
+/// is not the digest of anything.
 #[test]
 fn a_body_cannot_be_reinterpreted_under_another_record() {
     let sizes = [
-        PaidChannelPolicyV1::ENCODED_SIZE,
-        PaidExecutionPolicyV1::ENCODED_SIZE,
-        PaidJobAuthorizationV1::ENCODED_SIZE,
-        PaidJobResultV1::ENCODED_SIZE,
-        InvoiceEntryV1::ENCODED_SIZE,
-        CertificateAllocationV1::ENCODED_SIZE,
+        ("channel policy", PaidChannelPolicyV1::ENCODED_SIZE),
+        ("execution policy", PaidExecutionPolicyV1::ENCODED_SIZE),
+        ("authorization", PaidJobAuthorizationV1::ENCODED_SIZE),
+        ("result", PaidJobResultV1::ENCODED_SIZE),
+        ("payment binding", PaymentBindingV1::ENCODED_SIZE),
     ];
-    for (index, size) in sizes.iter().enumerate() {
-        for other in sizes.iter().skip(index + 1) {
-            assert_ne!(size, other, "two records share a length");
-        }
-    }
+    let collisions: Vec<(&str, &str)> = sizes
+        .iter()
+        .enumerate()
+        .flat_map(|(index, (name, size))| {
+            sizes
+                .iter()
+                .skip(index + 1)
+                .filter(move |(_, other)| other == size)
+                .map(move |(other, _)| (*name, *other))
+        })
+        .collect();
+    assert_eq!(
+        collisions,
+        vec![("result", "payment binding")],
+        "the set of same-width pairs is exactly the one the tag rule covers",
+    );
+
+    // The pair the length cannot separate: relabelled, and refused by
+    // the tag it now carries.
+    let result = job_result(Digest::from_bytes([0x30; 32])).encode();
+    let mut relabelled = result.clone();
+    relabelled[1] = 4;
+    assert!(PaymentBindingV1::decode(&relabelled).is_ok());
+    assert_eq!(
+        PaymentBindingV1::decode(&result),
+        Err(PaidWorkError::WrongRecordTag {
+            expected: 4,
+            actual: 3
+        })
+    );
 
     let policy = execution_policy().encode();
     assert_eq!(
@@ -617,16 +618,8 @@ fn records_do_not_cross_channels() {
     );
     let authorization = authorization();
     let result = job_result(work_id(&here, &authorization));
-    let entry = InvoiceEntryV1 {
-        channel_id: here.id(),
-        invoice_seq: 1,
-        work_id: result.work_id,
-        result_digest: result_digest(&here, &result),
-        price: 250,
-        cumulative_before: 0,
-        cumulative_after: 250,
-    };
-    let allocation = allocation_over(&[entry], &earned(250));
+    let (_, binding) =
+        next_payment(&here, &authorization, &result, 0, capacity()).expect("a legal payment");
 
     assert_ne!(here.id(), sibling.id());
     for (label, other) in [("sibling", &sibling), ("elsewhere", &elsewhere)] {
@@ -641,14 +634,9 @@ fn records_do_not_cross_channels() {
             "{label} shares this channel's result digest"
         );
         assert_ne!(
-            invoice_digest(&here, &entry),
-            invoice_digest(other, &entry),
-            "{label} shares this channel's invoice digest"
-        );
-        assert_ne!(
-            allocation_digest(&here, &allocation),
-            allocation_digest(other, &allocation),
-            "{label} shares this channel's allocation digest"
+            payment_binding_digest(&here, &binding),
+            payment_binding_digest(other, &binding),
+            "{label} shares this channel's payment binding digest"
         );
         assert_ne!(
             execution_policy_digest(&here, &execution_policy()),
@@ -904,8 +892,7 @@ fn widest_fixed_preimage_is_measured() {
         PaidChannelPolicyV1::ENCODED_SIZE,
         PaidExecutionPolicyV1::ENCODED_SIZE,
         PaidJobResultV1::ENCODED_SIZE,
-        InvoiceEntryV1::ENCODED_SIZE,
-        CertificateAllocationV1::ENCODED_SIZE,
+        PaymentBindingV1::ENCODED_SIZE,
     ] {
         assert!(
             size <= PaidJobAuthorizationV1::ENCODED_SIZE,
@@ -914,45 +901,35 @@ fn widest_fixed_preimage_is_measured() {
     }
     for domain in [
         "hellas.work.channel.v2",
-        "hellas.work.paid-channel-policy.v1",
         "hellas.work.generation-policy.v1",
         "hellas.work.identity-source.v1",
         "hellas.work.execution-policy.v1",
         "hellas.work.prepared-input.v1",
         "hellas.work.paid-job-authorize.v1",
         "hellas.work.paid-job-result.v1",
-        "hellas.work.private-invoice.v1",
-        "hellas.work.private-invoice-empty.v1",
-        "hellas.work.private-invoice-leaf.v1",
-        "hellas.work.private-invoice-node.v1",
+        "hellas.work.payment-binding.v1",
         "hellas.work.evaluate-output.v1",
     ] {
         assert!(
-            domain.len() <= "hellas.work.private-certificate-allocation.v1".len(),
+            domain.len() <= "hellas.work.paid-channel-policy.v1".len(),
             "{domain} is longer than the domain the bound is taken over"
         );
     }
-    let widest = "hellas.work.private-certificate-allocation.v1".len()
+    let widest = "hellas.work.paid-channel-policy.v1".len()
         + encoded_network
         + 32
         + PaidJobAuthorizationV1::ENCODED_SIZE;
-    assert_eq!(widest, 45 + 64 + 32 + 330);
-    assert_eq!(widest, 471);
+    assert_eq!(widest, 34 + 64 + 32 + 330);
+    assert_eq!(widest, 460);
     assert!(widest < hellas_xet::MIN_CHUNK_SIZE);
 
-    // The four shapes that are not record-shaped are bounded too: the
-    // channel id, which has no channel field, and the invoice tree's
-    // three nodes, which carry neither network nor channel.
+    // The one shape that is not record-shaped is bounded too: the
+    // channel id, which is derived before a channel id exists and so
+    // carries no channel field.
     assert_eq!(
         "hellas.work.channel.v2".len() + encoded_network + 4 * 32,
         214
     );
-    assert_eq!("hellas.work.private-invoice-leaf.v1".len() + 8 + 32, 75);
-    assert_eq!(
-        "hellas.work.private-invoice-node.v1".len() + 8 + 2 + 2 + 64,
-        111
-    );
-    assert_eq!("hellas.work.private-invoice-empty.v1".len() + 1, 37);
 
     // The widest preimage is also a preimage that must hash rather than
     // panic, so it is actually hashed here.
@@ -1959,10 +1936,10 @@ fn only_the_identity_artifact_may_start_a_paid_job() {
     );
 }
 
-// ── Result, invoice, allocation ───────────────────────────────────────
+// ── Result, binding, payment ──────────────────────────────────────────
 
 /// A result answers one job. Swapping two provider-signed results
-/// between two authorizations rejects both invoice transitions.
+/// between two authorizations rejects both payments.
 #[test]
 fn results_cannot_be_swapped_between_jobs() {
     let channel = channel();
@@ -1977,23 +1954,23 @@ fn results_cannot_be_swapped_between_jobs() {
     let first_result = job_result(first_id);
     let second_result = job_result(second_id);
 
-    assert!(next_invoice_entry(&channel, &first, &first_result, 1, 0, capacity()).is_ok());
-    assert!(next_invoice_entry(&channel, &second, &second_result, 1, 0, capacity()).is_ok());
+    assert!(next_payment(&channel, &first, &first_result, 0, capacity()).is_ok());
+    assert!(next_payment(&channel, &second, &second_result, 0, capacity()).is_ok());
 
     // MUTATION: pay the first job with the second job's result.
     assert_eq!(
-        next_invoice_entry(&channel, &first, &second_result, 1, 0, capacity()),
+        next_payment(&channel, &first, &second_result, 0, capacity()),
         Err(PaidWorkError::Mismatch { field: "work_id" })
     );
     assert_eq!(
-        next_invoice_entry(&channel, &second, &first_result, 1, 0, capacity()),
+        next_payment(&channel, &second, &first_result, 0, capacity()),
         Err(PaidWorkError::Mismatch { field: "work_id" })
     );
 }
 
 /// The result digest binds the output and the transcript, so re-signing
 /// mutated output bytes produces a different digest and a different
-/// invoice.
+/// binding.
 #[test]
 fn result_output_mutations_move_the_result_digest() {
     let channel = channel();
@@ -2002,7 +1979,7 @@ fn result_output_mutations_move_the_result_digest() {
     let pinned = check_result(&channel, id, &base).expect("a legal result");
 
     // MUTATION: different output bytes, honestly re-signed by the
-    // provider. The digest moves, so the invoice that named the old one
+    // provider. The digest moves, so the binding that named the old one
     // no longer describes this result.
     let mut different_output = base;
     different_output.canonical_output_digest = Digest::from_bytes([0x33; 32]);
@@ -2015,28 +1992,31 @@ fn result_output_mutations_move_the_result_digest() {
     assert_ne!(result_digest(&channel, &different_transcript), pinned);
 }
 
-/// A new channel starts at sequence 1 and cumulative 0, and the
-/// transition is checked arithmetic against the edge's capacity.
+/// A new channel starts at cumulative 0, and the transition is checked
+/// arithmetic against the edge's capacity.
 #[test]
-fn invoice_transition_is_checked_arithmetic() {
+fn the_payment_transition_is_checked_arithmetic() {
     let channel = channel();
     let authorization = authorization();
     let result = job_result(work_id(&channel, &authorization));
 
-    let first = next_invoice_entry(&channel, &authorization, &result, 1, 0, capacity())
-        .expect("a legal first invoice");
-    assert_eq!(first.invoice_seq, 1);
-    assert_eq!(first.cumulative_before, 0);
-    assert_eq!(first.cumulative_after, 250);
-
-    // MUTATION: zero-based sequence numbering.
+    let (certificate, binding) = next_payment(&channel, &authorization, &result, 0, capacity())
+        .expect("a legal first payment");
+    assert_eq!(certificate.earned_cumulative(), 250);
+    assert_eq!(certificate.payment_edge(), channel.payment_edge());
     assert_eq!(
-        next_invoice_entry(&channel, &authorization, &result, 0, 0, capacity()),
-        Err(PaidWorkError::InvoiceSequence {
-            expected: 1,
-            actual: 0
-        })
+        certificate.payment_terms_hash(),
+        channel.payment_terms_hash()
     );
+    assert_eq!(binding.work_id, work_id(&channel, &authorization));
+    assert_eq!(binding.result_digest, result_digest(&channel, &result));
+    assert_eq!(binding.certificate_digest, certificate.digest(network()));
+
+    // The second payment continues the first: nothing here restates the
+    // price, so the only way the cumulative moves is by adding it.
+    let (second, _) = next_payment(&channel, &authorization, &result, 250, capacity())
+        .expect("a legal second payment");
+    assert_eq!(second.earned_cumulative(), 500);
 
     // MUTATION: a transition that would exceed the edge's capacity.
     let Some(thin) = work_payment_settlement(EdgeValues::new(400, 0, Fees::ZERO), 100) else {
@@ -2044,7 +2024,7 @@ fn invoice_transition_is_checked_arithmetic() {
     };
     assert_eq!(thin.capacity(), 300);
     assert_eq!(
-        next_invoice_entry(&channel, &authorization, &result, 2, 100, thin),
+        next_payment(&channel, &authorization, &result, 100, thin),
         Err(PaidWorkError::OverCapacity {
             cumulative: 350,
             capacity: 300
@@ -2056,655 +2036,390 @@ fn invoice_transition_is_checked_arithmetic() {
         panic!("the largest edge is representable");
     };
     assert_eq!(
-        next_invoice_entry(&channel, &authorization, &result, 2, u64::MAX, widest),
+        next_payment(&channel, &authorization, &result, u64::MAX, widest),
         Err(PaidWorkError::Overflow {
-            field: "cumulative_after"
+            field: "earned cumulative"
         })
     );
 }
 
-fn allocation_over(
-    entries: &[InvoiceEntryV1],
-    certificate: &EarnedCertificate,
-) -> CertificateAllocationV1 {
+/// One job's whole payment, as the ledger credits it.
+///
+/// Returns the four values `credit_payment` takes beside the channel, so
+/// a mutation below can move exactly one of them.
+fn payment_at(
+    credited: u64,
+    nonce: u64,
+) -> (
+    PaidJobAuthorizationV1,
+    PaidJobResultV1,
+    EarnedCertificate,
+    PaymentBindingV1,
+) {
     let channel = channel();
-    CertificateAllocationV1 {
-        channel_id: channel.id(),
-        certificate_digest: certificate.digest(channel.network()),
-        first_invoice_seq: entries.first().expect("nonempty").invoice_seq,
-        last_invoice_seq: entries.last().expect("nonempty").invoice_seq,
-        invoice_entries_root: invoice_entries_root(&channel, entries).expect("legal allocation"),
-    }
+    let mut authorization = authorization();
+    authorization.proposal_nonce = nonce;
+    let result = job_result(work_id(&channel, &authorization));
+    let (certificate, binding) =
+        next_payment(&channel, &authorization, &result, credited, capacity())
+            .expect("a legal payment");
+    (authorization, result, certificate, binding)
 }
 
-/// Three distinct jobs, invoiced at sequences 1, 2 and 3.
-fn three_jobs() -> Vec<InvoicedJob> {
+/// The ledger credits exactly the payment this position produces.
+///
+/// Every mutation below moves one field and leaves the rest of the
+/// payment intact, and every one of them is refused by name. A rule that
+/// answered them all with one message would be a rule six inputs happen
+/// to trip rather than six checks.
+#[test]
+fn the_ledger_credits_only_the_payment_this_position_produces() {
     let channel = channel();
-    let mut jobs = Vec::new();
-    let mut cumulative = 0;
-    for index in 0..3_u64 {
-        let mut authorization = authorization();
-        authorization.proposal_nonce = index;
-        let result = job_result(work_id(&channel, &authorization));
-        let entry = next_invoice_entry(
+    let (authorization, result, certificate, binding) = payment_at(0, 1);
+
+    CreditLedger::new()
+        .credit_payment(
             &channel,
             &authorization,
             &result,
-            index + 1,
-            cumulative,
-            capacity(),
-        )
-        .expect("a legal invoice");
-        cumulative = entry.cumulative_after;
-        jobs.push(InvoicedJob {
-            authorization,
-            result,
-            entry,
-        });
-    }
-    jobs
-}
-
-fn entries_of(jobs: &[InvoicedJob]) -> Vec<InvoiceEntryV1> {
-    jobs.iter().map(|job| job.entry).collect()
-}
-
-fn three_entries() -> Vec<InvoiceEntryV1> {
-    entries_of(&three_jobs())
-}
-
-fn allocation_of(jobs: &[InvoicedJob], certificate: &EarnedCertificate) -> CertificateAllocationV1 {
-    allocation_over(&entries_of(jobs), certificate)
-}
-
-/// The allocation binds one certificate to exactly one contiguous
-/// invoice prefix.
-#[test]
-fn allocation_binds_the_certificate_to_its_prefix() {
-    let channel = channel();
-    let jobs = three_jobs();
-    let certificate = earned(750);
-    let allocation = allocation_of(&jobs, &certificate);
-
-    CreditLedger::new()
-        .credit_allocation(&channel, &allocation, &jobs, &certificate)
-        .expect("a legal allocation");
-
-    // MUTATION: a certificate for a different total.
-    let short = earned(500);
-    let mut short_allocation = allocation;
-    short_allocation.certificate_digest = short.digest(channel.network());
-    assert_eq!(
-        CreditLedger::new().credit_allocation(&channel, &short_allocation, &jobs, &short),
-        Err(PaidWorkError::Mismatch {
-            field: "certificate earned_cumulative"
-        })
-    );
-
-    // MUTATION: the right total under the wrong allocation digest.
-    let mut wrong_digest = allocation;
-    wrong_digest.certificate_digest = hellas_kernel::PayloadHash::from_bytes([0; 32]);
-    assert_eq!(
-        CreditLedger::new().credit_allocation(&channel, &wrong_digest, &jobs, &certificate),
-        Err(PaidWorkError::Mismatch {
-            field: "certificate_digest"
-        })
-    );
-
-    // MUTATION: a root over a different prefix with the same entry
-    // count. The tree binds absolute sequence numbers, so this cannot
-    // pass by having the right shape.
-    let mut later = three_entries();
-    for entry in &mut later {
-        entry.invoice_seq += 3;
-    }
-    let mut swapped_root = allocation;
-    swapped_root.invoice_entries_root =
-        invoice_entries_root(&channel, &later).expect("legal allocation");
-    assert_eq!(
-        CreditLedger::new().credit_allocation(&channel, &swapped_root, &jobs, &certificate),
-        Err(PaidWorkError::Mismatch {
-            field: "invoice_entries_root"
-        })
-    );
-
-    // MUTATION: a gap in the sequence.
-    let mut gapped = jobs.clone();
-    gapped[2].entry.invoice_seq = 4;
-    let gapped_allocation = allocation_of(&gapped, &certificate);
-    assert_eq!(
-        CreditLedger::new().credit_allocation(&channel, &gapped_allocation, &gapped, &certificate),
-        Err(PaidWorkError::InvoiceSequence {
-            expected: 3,
-            actual: 4
-        })
-    );
-
-    // MUTATION: a cumulative that does not continue its predecessor's.
-    let mut skipped = jobs.clone();
-    skipped[1].entry.cumulative_before += 1;
-    skipped[1].entry.cumulative_after += 1;
-    skipped[2].entry.cumulative_before += 1;
-    skipped[2].entry.cumulative_after += 1;
-    let skipped_allocation = allocation_of(&skipped, &earned(751));
-    assert_eq!(
-        CreditLedger::new().credit_allocation(
-            &channel,
-            &skipped_allocation,
-            &skipped,
-            &earned(751)
-        ),
-        Err(PaidWorkError::Mismatch {
-            field: "cumulative_before"
-        })
-    );
-
-    // MUTATION: a transition that is not its own two endpoints. The
-    // price still matches the authorization, so only the arithmetic can
-    // refuse it.
-    let mut widened = jobs.clone();
-    widened[1].entry.cumulative_after += 1;
-    widened[2].entry.cumulative_before += 1;
-    widened[2].entry.cumulative_after += 1;
-    let widened_allocation = allocation_of(&widened, &earned(751));
-    assert_eq!(
-        CreditLedger::new().credit_allocation(
-            &channel,
-            &widened_allocation,
-            &widened,
-            &earned(751)
-        ),
-        Err(PaidWorkError::Mismatch {
-            field: "cumulative_after"
-        })
-    );
-
-    // MUTATION: the same job invoiced twice inside one allocation.
-    let mut duplicated = jobs.clone();
-    duplicated[2].authorization = duplicated[0].authorization;
-    duplicated[2].result = duplicated[0].result;
-    duplicated[2].entry.work_id = duplicated[0].entry.work_id;
-    duplicated[2].entry.result_digest = duplicated[0].entry.result_digest;
-    let duplicated_allocation = allocation_of(&duplicated, &certificate);
-    assert_eq!(
-        CreditLedger::new().credit_allocation(
-            &channel,
-            &duplicated_allocation,
-            &duplicated,
-            &certificate
-        ),
-        Err(PaidWorkError::Duplicate { field: "work_id" })
-    );
-
-    // MUTATION: an allocation over no entries at all.
-    assert_eq!(
-        CreditLedger::new().credit_allocation(&channel, &allocation, &[], &certificate),
-        Err(PaidWorkError::AllocationSize { count: 0 })
-    );
-}
-
-/// A job this ledger has already paid for cannot be billed again, at any
-/// later sequence.
-///
-/// The two entries are byte-identical in everything the invoice binds to
-/// the job — the same `work_id`, the same `result_digest`, the same
-/// price — and differ only in the sequence and the cumulative pair that
-/// an honest second job would also have moved. A prefix rule alone
-/// accepts the second one, because it *is* the next prefix; only a
-/// ledger that remembers the first refuses it.
-#[test]
-fn a_credited_job_cannot_be_billed_again_at_a_fresh_sequence() {
-    let channel = channel();
-    let authorization = authorization();
-    let result = job_result(work_id(&channel, &authorization));
-
-    let first = next_invoice_entry(&channel, &authorization, &result, 1, 0, capacity())
-        .expect("a legal invoice");
-    let again = next_invoice_entry(&channel, &authorization, &result, 2, 250, capacity())
-        .expect("the builder recomputes one job's identifiers");
-    assert_eq!(first.work_id, again.work_id);
-    assert_eq!(first.result_digest, again.result_digest);
-
-    let paid = InvoicedJob {
-        authorization,
-        result,
-        entry: first,
-    };
-    let rebilled = InvoicedJob {
-        authorization,
-        result,
-        entry: again,
-    };
-
-    let mut ledger = CreditLedger::new();
-    ledger
-        .credit_allocation(
-            &channel,
-            &allocation_of(&[paid], &earned(250)),
-            &[paid],
-            &earned(250),
-        )
-        .expect("a legal allocation");
-    assert_eq!(ledger.next_invoice_seq(), 2);
-    assert_eq!(ledger.credited_invoice_high_water(), 250);
-
-    // MUTATION: the same job, re-invoiced at the sequence the ledger is
-    // now waiting for, at the cumulative it is now waiting for.
-    assert_eq!(
-        ledger.credit_allocation(
-            &channel,
-            &allocation_of(&[rebilled], &earned(500)),
-            &[rebilled],
-            &earned(500),
-        ),
-        Err(PaidWorkError::Duplicate { field: "work_id" })
-    );
-    // The refusal credited nothing.
-    assert_eq!(ledger.next_invoice_seq(), 2);
-    assert_eq!(ledger.credited_invoice_high_water(), 250);
-}
-
-/// One allocation continues the last one; it does not start wherever it
-/// likes.
-///
-/// Seeding the expected sequence from the allocation's own first entry
-/// makes every allocation a prefix of itself, which is no rule at all.
-#[test]
-fn an_allocation_must_continue_the_credited_prefix() {
-    let channel = channel();
-    let jobs = three_jobs();
-    let certificate = earned(750);
-    let mut ledger = CreditLedger::new();
-    ledger
-        .credit_allocation(
-            &channel,
-            &allocation_of(&jobs, &certificate),
-            &jobs,
+            &binding,
             &certificate,
-        )
-        .expect("a legal allocation");
-    assert_eq!(ledger.next_invoice_seq(), 4);
-
-    // MUTATION: a second allocation that begins nowhere near sequence 4,
-    // and is internally contiguous and internally correct.
-    let mut far = three_jobs();
-    let mut cumulative = 750;
-    for (index, job) in far.iter_mut().enumerate() {
-        job.authorization.proposal_nonce = 0xf0 + index as u64;
-        job.result = job_result(work_id(&channel, &job.authorization));
-        job.entry = next_invoice_entry(
-            &channel,
-            &job.authorization,
-            &job.result,
-            900_000 + index as u64,
-            cumulative,
             capacity(),
         )
-        .expect("a legal invoice");
-        cumulative = job.entry.cumulative_after;
-    }
-    let far_certificate = earned(1_500);
-    assert_eq!(
-        ledger.credit_allocation(
-            &channel,
-            &allocation_of(&far, &far_certificate),
-            &far,
-            &far_certificate
-        ),
-        Err(PaidWorkError::InvoiceSequence {
-            expected: 4,
-            actual: 900_000
-        })
-    );
+        .expect("a legal payment");
 
-    // MUTATION: the right sequence, the wrong cumulative — an allocation
-    // that skips the amount the ledger has already credited.
-    let mut restated = three_jobs();
-    cumulative = 0;
-    for (index, job) in restated.iter_mut().enumerate() {
-        job.authorization.proposal_nonce = 0xe0 + index as u64;
-        job.result = job_result(work_id(&channel, &job.authorization));
-        job.entry = next_invoice_entry(
+    let elsewhere = Digest::from_bytes([0x7a; 32]);
+    let bindings: Vec<(&str, PaymentBindingV1)> = vec![
+        (
+            "binding work_id",
+            PaymentBindingV1 {
+                work_id: elsewhere,
+                ..binding
+            },
+        ),
+        (
+            "binding result_digest",
+            PaymentBindingV1 {
+                result_digest: elsewhere,
+                ..binding
+            },
+        ),
+        (
+            "binding certificate_digest",
+            PaymentBindingV1 {
+                certificate_digest: hellas_kernel::PayloadHash::from_bytes([0x7b; 32]),
+                ..binding
+            },
+        ),
+    ];
+    for (field, mutated) in bindings {
+        assert_ne!(mutated, binding, "{field} is the one thing varied");
+        assert_eq!(
+            CreditLedger::new().credit_payment(
+                &channel,
+                &authorization,
+                &result,
+                &mutated,
+                &certificate,
+                capacity(),
+            ),
+            Err(PaidWorkError::Mismatch { field })
+        );
+    }
+
+    let certificates: Vec<(&str, EarnedCertificate)> = vec![
+        (
+            "certificate earned_cumulative",
+            EarnedCertificate::new(channel.payment_edge(), channel.payment_terms_hash(), 500),
+        ),
+        (
+            "certificate payment_edge",
+            EarnedCertificate::new(
+                EdgeId::from_bytes([0; 32]),
+                channel.payment_terms_hash(),
+                250,
+            ),
+        ),
+        (
+            "certificate payment_terms_hash",
+            EarnedCertificate::new(
+                channel.payment_edge(),
+                TermsHash::from_bytes([0x9c; 32]),
+                250,
+            ),
+        ),
+    ];
+    for (field, mutated) in certificates {
+        assert_ne!(mutated, certificate, "{field} is the one thing varied");
+        // The binding is re-pointed at whichever certificate is offered,
+        // so what refuses each case is the certificate rule and not the
+        // binding check in front of it.
+        let rebound = PaymentBindingV1 {
+            certificate_digest: mutated.digest(network()),
+            ..binding
+        };
+        assert_eq!(
+            CreditLedger::new().credit_payment(
+                &channel,
+                &authorization,
+                &result,
+                &rebound,
+                &mutated,
+                capacity(),
+            ),
+            Err(PaidWorkError::Mismatch { field })
+        );
+    }
+
+    // MUTATION: a result for another job entirely. The binding and the
+    // certificate are both rebuilt around it, so the refusal is the
+    // result↔authorization rule rather than a stale digest.
+    let (_, other_result, ..) = payment_at(0, 9);
+    assert_ne!(other_result, result);
+    let (other_certificate, other_binding) =
+        next_payment(&channel, &authorization, &result, 0, capacity()).expect("a legal payment");
+    assert_eq!(
+        CreditLedger::new().credit_payment(
             &channel,
-            &job.authorization,
-            &job.result,
-            4 + index as u64,
-            cumulative,
+            &authorization,
+            &other_result,
+            &other_binding,
+            &other_certificate,
             capacity(),
-        )
-        .expect("a legal invoice");
-        cumulative = job.entry.cumulative_after;
-    }
-    assert_eq!(
-        ledger.credit_allocation(
-            &channel,
-            &allocation_of(&restated, &certificate),
-            &restated,
-            &certificate
-        ),
-        Err(PaidWorkError::Mismatch {
-            field: "cumulative_before"
-        })
-    );
-}
-
-/// An entry is checked against the job it claims to bill, not merely
-/// against the entry before it.
-///
-/// Arithmetic alone accepts an honest `work_id` at ten times its price,
-/// because the price↔authorization binding lives in the builder, and a
-/// rule that holds only on the honest path holds only for honest
-/// providers.
-#[test]
-fn an_entry_must_name_the_job_and_the_price_it_was_authorized_for() {
-    let channel = channel();
-    let jobs = three_jobs();
-    let certificate = earned(750);
-
-    // MUTATION: an honest job at ten times its authorized price, with
-    // every cumulative and the certificate moved to agree.
-    let mut dear = jobs.clone();
-    dear[1].entry.price = 2_500;
-    dear[1].entry.cumulative_after = dear[1].entry.cumulative_before + 2_500;
-    dear[2].entry.cumulative_before = dear[1].entry.cumulative_after;
-    dear[2].entry.cumulative_after = dear[2].entry.cumulative_before + 250;
-    let dear_certificate = earned(3_000);
-    assert_eq!(
-        CreditLedger::new().credit_allocation(
-            &channel,
-            &allocation_of(&dear, &dear_certificate),
-            &dear,
-            &dear_certificate
-        ),
-        Err(PaidWorkError::Mismatch {
-            field: "invoice price"
-        })
-    );
-
-    // MUTATION: an entry naming a job this endpoint never authorized.
-    let mut foreign = jobs.clone();
-    foreign[1].entry.work_id = Digest::from_bytes([0x7a; 32]);
-    assert_eq!(
-        CreditLedger::new().credit_allocation(
-            &channel,
-            &allocation_of(&foreign, &certificate),
-            &foreign,
-            &certificate
-        ),
-        Err(PaidWorkError::Mismatch {
-            field: "invoice work_id"
-        })
-    );
-
-    // MUTATION: an entry billing a result the provider never signed for
-    // this job. The result body still answers the job, so only the
-    // entry's own copy of the digest is wrong.
-    let mut unsigned = jobs.clone();
-    unsigned[1].entry.result_digest = Digest::from_bytes([0x7b; 32]);
-    assert_eq!(
-        CreditLedger::new().credit_allocation(
-            &channel,
-            &allocation_of(&unsigned, &certificate),
-            &unsigned,
-            &certificate
-        ),
-        Err(PaidWorkError::Mismatch {
-            field: "invoice result_digest"
-        })
-    );
-
-    // MUTATION: a result for another job entirely.
-    let mut swapped = jobs.clone();
-    swapped[1].result = swapped[0].result;
-    assert_eq!(
-        CreditLedger::new().credit_allocation(
-            &channel,
-            &allocation_of(&swapped, &certificate),
-            &swapped,
-            &certificate
         ),
         Err(PaidWorkError::Mismatch { field: "work_id" })
     );
 }
 
-/// An entry from another channel is refused, however well it agrees with
-/// everything around it.
+/// A payment is not portable between channels, and the binding's lack
+/// of a channel field is not what makes it portable.
 ///
-/// The entry's own `channel_id` is the only field that says which
-/// channel it belongs to: the tree recomputes over whatever entries it
-/// is given, and the work id, result digest and price all come from an
-/// authorization that this channel did accept.
+/// Two things scope a payment, and neither is a channel id inside the
+/// binding. The certificate names an edge and a terms body, which the
+/// ledger checks; and the binding is signed as a digest that binds the
+/// network and the channel, so a client signature made on one channel
+/// does not verify on another. Both are asserted, because a reader who
+/// noticed only the missing field would conclude the wrong thing.
 #[test]
-fn an_entry_from_another_channel_is_refused() {
+fn a_payment_does_not_cross_channels() {
     let channel = channel();
     let sibling = channel_on(network(), EdgeId::from_bytes([0xe2; 32]));
     assert_ne!(channel.id(), sibling.id());
 
-    let mut jobs = three_jobs();
-    jobs[1].entry.channel_id = sibling.id();
-    let certificate = earned(750);
-    assert_eq!(
-        CreditLedger::new().credit_allocation(
-            &channel,
-            &allocation_of(&jobs, &certificate),
-            &jobs,
-            &certificate
-        ),
-        Err(PaidWorkError::Mismatch {
-            field: "invoice channel_id"
-        })
-    );
-}
+    let authorization = authorization();
+    let result = job_result(work_id(&channel, &authorization));
+    let (certificate, binding) =
+        next_payment(&channel, &authorization, &result, 0, capacity()).expect("a legal payment");
 
-/// The certificate must name this channel's edge, and its terms.
-///
-/// The terms hash is the sole discriminator between two certificates on
-/// one edge under two different terms: the edge matches, the amount
-/// matches, and the allocation digest is over the certificate offered.
-#[test]
-fn allocation_rejects_a_certificate_from_another_edge_or_other_terms() {
-    let channel = channel();
-    let jobs = three_jobs();
-
-    let other_edge = EarnedCertificate::new(
-        EdgeId::from_bytes([0; 32]),
+    // MUTATION: the same job, paid on the sibling's edge. The binding is
+    // re-pointed at that certificate, so the refusal is the edge check.
+    let foreign = EarnedCertificate::new(
+        sibling.payment_edge(),
         channel.payment_terms_hash(),
-        750,
+        certificate.earned_cumulative(),
     );
-    let allocation = CertificateAllocationV1 {
-        certificate_digest: other_edge.digest(channel.network()),
-        ..allocation_of(&jobs, &earned(750))
+    let rebound = PaymentBindingV1 {
+        certificate_digest: foreign.digest(network()),
+        ..binding
     };
     assert_eq!(
-        CreditLedger::new().credit_allocation(&channel, &allocation, &jobs, &other_edge),
+        CreditLedger::new().credit_payment(
+            &channel,
+            &authorization,
+            &result,
+            &rebound,
+            &foreign,
+            capacity(),
+        ),
         Err(PaidWorkError::Mismatch {
             field: "certificate payment_edge"
         })
     );
 
-    // MUTATION: this channel's edge under terms it never agreed to.
-    let other_terms = EarnedCertificate::new(
-        channel.payment_edge(),
-        TermsHash::from_bytes([0x9c; 32]),
-        750,
-    );
-    assert_ne!(
-        other_terms.payment_terms_hash(),
-        channel.payment_terms_hash()
-    );
-    let allocation = CertificateAllocationV1 {
-        certificate_digest: other_terms.digest(channel.network()),
-        ..allocation_of(&jobs, &earned(750))
-    };
+    // And the binding digest is a different digest in the two channels,
+    // so the client signature beside it does not travel either.
+    let here = payment_binding_digest(&channel, &binding);
+    let there = payment_binding_digest(&sibling, &binding);
+    assert_ne!(here, there);
+    let payload = hellas_kernel::PayloadHash::from_bytes(here.into_bytes());
+    let signature = client().sign(payload);
+    assert!(!Secp256k1Verifier.verify_sig(
+        signature,
+        channel.client_key(),
+        hellas_kernel::PayloadHash::from_bytes(there.into_bytes()),
+    ));
+}
+
+/// A job this ledger has already paid for cannot be paid for again, at
+/// any later cumulative.
+///
+/// The second payment is truthful in every field the records bind to the
+/// job — the same `work_id`, the same `result_digest`, the same price
+/// implied by the same authorization — and differs only in the
+/// cumulative, which an honest second *job* would also have moved.
+/// Arithmetic alone accepts it, because it *is* the next legal
+/// transition; only a ledger that remembers the first refuses it.
+#[test]
+fn a_credited_job_cannot_be_paid_for_again_at_a_fresh_cumulative() {
+    let channel = channel();
+    let authorization = authorization();
+    let result = job_result(work_id(&channel, &authorization));
+
+    let (first, first_binding) =
+        next_payment(&channel, &authorization, &result, 0, capacity()).expect("a legal payment");
+    let (again, again_binding) = next_payment(&channel, &authorization, &result, 250, capacity())
+        .expect("the builder recomputes one job's identifiers");
+    assert_eq!(first_binding.work_id, again_binding.work_id);
+    assert_eq!(first_binding.result_digest, again_binding.result_digest);
+    assert_eq!(first.earned_cumulative(), 250);
+    assert_eq!(again.earned_cumulative(), 500);
+
+    let mut ledger = CreditLedger::new();
+    ledger
+        .credit_payment(
+            &channel,
+            &authorization,
+            &result,
+            &first_binding,
+            &first,
+            capacity(),
+        )
+        .expect("a legal payment");
+    assert_eq!(ledger.credited_cumulative(), 250);
+    assert!(ledger.has_paid_for(first_binding.work_id));
+
+    // MUTATION: the same job, paid again at the cumulative the ledger is
+    // now waiting for.
     assert_eq!(
-        CreditLedger::new().credit_allocation(&channel, &allocation, &jobs, &other_terms),
+        ledger.credit_payment(
+            &channel,
+            &authorization,
+            &result,
+            &again_binding,
+            &again,
+            capacity(),
+        ),
+        Err(PaidWorkError::Duplicate { field: "work_id" })
+    );
+    // The refusal credited nothing.
+    assert_eq!(ledger.credited_cumulative(), 250);
+}
+
+/// One payment continues the last one; it does not start wherever it
+/// likes.
+///
+/// Three distinct jobs in order, and then a fourth that restates a
+/// cumulative the ledger has already passed.
+#[test]
+fn a_payment_must_continue_the_credited_total() {
+    let channel = channel();
+    let mut ledger = CreditLedger::new();
+    let mut credited = 0;
+    for nonce in 0..3_u64 {
+        let (authorization, result, certificate, binding) = payment_at(credited, nonce);
+        ledger
+            .credit_payment(
+                &channel,
+                &authorization,
+                &result,
+                &binding,
+                &certificate,
+                capacity(),
+            )
+            .expect("a legal payment");
+        credited += 250;
+        assert_eq!(ledger.credited_cumulative(), credited);
+    }
+    assert_eq!(credited, 750);
+
+    // MUTATION: a fresh job whose payment was built at cumulative zero —
+    // internally consistent, and a restatement of an amount this ledger
+    // has already credited.
+    let (authorization, result, certificate, binding) = payment_at(0, 7);
+    assert_eq!(certificate.earned_cumulative(), 250);
+    assert_eq!(
+        ledger.credit_payment(
+            &channel,
+            &authorization,
+            &result,
+            &binding,
+            &certificate,
+            capacity(),
+        ),
         Err(PaidWorkError::Mismatch {
-            field: "certificate payment_terms_hash"
+            field: "certificate earned_cumulative"
         })
     );
+    assert_eq!(ledger.credited_cumulative(), 750);
+
+    // The control: the same job at this ledger's own position.
+    let (authorization, result, certificate, binding) = payment_at(750, 7);
+    ledger
+        .credit_payment(
+            &channel,
+            &authorization,
+            &result,
+            &binding,
+            &certificate,
+            capacity(),
+        )
+        .expect("the position this ledger is at");
+    assert_eq!(ledger.credited_cumulative(), 1_000);
 }
 
-/// Every invoice-entry field is inside the leaf, so the root moves when
-/// any of them does.
+/// The binding digest is what the client signs, and every field of the
+/// binding is inside it.
 #[test]
-fn every_invoice_field_moves_the_root() {
+fn payment_binding_digest_binds_every_field() {
     let channel = channel();
-    let entries = three_entries();
-    let root = invoice_entries_root(&channel, &entries).expect("legal allocation");
+    let (.., base) = payment_at(0, 1);
+    let pinned = payment_binding_digest(&channel, &base);
 
-    for index in 0..3 {
-        for mutate in [
-            (|e: &mut InvoiceEntryV1| e.invoice_seq += 100) as fn(&mut InvoiceEntryV1),
-            |e: &mut InvoiceEntryV1| e.price += 1,
-            |e: &mut InvoiceEntryV1| e.cumulative_before += 1,
-            |e: &mut InvoiceEntryV1| e.cumulative_after += 1,
-            |e: &mut InvoiceEntryV1| e.work_id = Digest::from_bytes([0; 32]),
-            |e: &mut InvoiceEntryV1| e.result_digest = Digest::from_bytes([0; 32]),
-            |e: &mut InvoiceEntryV1| e.channel_id = Digest::from_bytes([0; 32]),
-        ] {
-            let mut mutated = entries.clone();
-            mutate(&mut mutated[index]);
-            assert_ne!(
-                invoice_entries_root(&channel, &mutated).expect("legal allocation"),
-                root
-            );
-        }
-    }
-}
-
-/// The invoice tree's shape is pinned: widths, absolute starts, and the
-/// empty root.
-#[test]
-fn invoice_tree_shape_is_pinned() {
-    let channel = channel();
-    let entries = three_entries();
-
-    let single = invoice_entries_root(&channel, &entries[..1]).expect("legal allocation");
-    let pair = invoice_entries_root(&channel, &entries[..2]).expect("legal allocation");
-    let triple = invoice_entries_root(&channel, &entries).expect("legal allocation");
-    assert_ne!(single, pair);
-    assert_ne!(pair, triple);
-    // A prefix is not the whole: the node binds `n`.
-    assert_ne!(
-        triple,
-        invoice_entries_root(&channel, &entries[..2]).expect("legal")
-    );
-
-    // The empty root exists, and is not any real allocation's root.
-    let empty = invoice_empty_root();
-    assert_ne!(empty, single);
-    assert_eq!(
-        invoice_entries_root(&channel, &[]),
-        Err(PaidWorkError::AllocationSize { count: 0 })
-    );
-
-    // A leaf is the digest of its entry under its absolute sequence.
-    assert_ne!(single, invoice_digest(&channel, &entries[0]));
-
-    // The tree admits its stated maximum and nothing above it.
-    let mut wide = Vec::new();
-    for index in 0..MAX_ALLOCATION_ENTRIES + 1 {
-        let mut entry = entries[0];
-        entry.invoice_seq = index as u64 + 1;
-        wide.push(entry);
-    }
-    assert!(invoice_entries_root(&channel, &wide[..MAX_ALLOCATION_ENTRIES]).is_ok());
-    assert_eq!(
-        invoice_entries_root(&channel, &wide),
-        Err(PaidWorkError::AllocationSize { count: 257 })
-    );
-}
-
-/// The allocation digest is what the client signs, and every field of
-/// the allocation is inside it.
-#[test]
-fn allocation_digest_binds_every_field() {
-    let channel = channel();
-    let entries = three_entries();
-    let certificate = earned(750);
-    let base = allocation_over(&entries, &certificate);
-    let pinned = allocation_digest(&channel, &base);
-
-    let mutations: Vec<(&str, CertificateAllocationV1)> = vec![
-        ("channel_id", {
-            let mut m = base;
-            m.channel_id = Digest::from_bytes([0; 32]);
-            m
-        }),
-        ("certificate_digest", {
-            let mut m = base;
-            m.certificate_digest = hellas_kernel::PayloadHash::from_bytes([0; 32]);
-            m
-        }),
-        ("first_invoice_seq", {
-            let mut m = base;
-            m.first_invoice_seq += 1;
-            m
-        }),
-        ("last_invoice_seq", {
-            let mut m = base;
-            m.last_invoice_seq += 1;
-            m
-        }),
-        ("invoice_entries_root", {
-            let mut m = base;
-            m.invoice_entries_root = Digest::from_bytes([0; 32]);
-            m
-        }),
+    let mutations: Vec<(&str, PaymentBindingV1)> = vec![
+        (
+            "work_id",
+            PaymentBindingV1 {
+                work_id: Digest::from_bytes([0; 32]),
+                ..base
+            },
+        ),
+        (
+            "result_digest",
+            PaymentBindingV1 {
+                result_digest: Digest::from_bytes([0; 32]),
+                ..base
+            },
+        ),
+        (
+            "certificate_digest",
+            PaymentBindingV1 {
+                certificate_digest: hellas_kernel::PayloadHash::from_bytes([0; 32]),
+                ..base
+            },
+        ),
     ];
-    assert_eq!(mutations.len(), 5);
+    assert_eq!(mutations.len(), 3);
     for (field, mutated) in mutations {
-        assert_ne!(allocation_digest(&channel, &mutated), pinned, "{field}");
+        assert_ne!(
+            payment_binding_digest(&channel, &mutated),
+            pinned,
+            "{field}"
+        );
     }
 
-    // The signature is over the digest, so a mutated allocation is not
-    // the one the client signed.
+    // The signature is over the digest, so a mutated binding is not the
+    // one the client signed.
     let payload = hellas_kernel::PayloadHash::from_bytes(pinned.into_bytes());
     let signature = client().sign(payload);
     assert!(Secp256k1Verifier.verify_sig(signature, channel.client_key(), payload));
-    let mut moved = base;
-    moved.last_invoice_seq += 1;
-    let moved_payload =
-        hellas_kernel::PayloadHash::from_bytes(allocation_digest(&channel, &moved).into_bytes());
-    assert!(!Secp256k1Verifier.verify_sig(signature, channel.client_key(), moved_payload));
-}
-
-/// The invoice tree's leaf and node preimages, rebuilt by hand.
-///
-/// The width `n` is why this test exists. An honest builder derives `k`
-/// from `n` and both subtrees from the entries, so no pair of legal
-/// allocations differs in `n` alone — dropping it from the preimage
-/// changes no root any other test computes. It is pinned here instead,
-/// because the field is what a later inclusion proof would be checked
-/// against, and a preimage nothing can fail is a preimage nothing keeps.
-#[test]
-fn invoice_tree_preimages_are_reproducible_by_hand() {
-    let channel = channel();
-    let entries = three_entries();
-    let pair = &entries[..2];
-
-    let leaf = |seq: u64, entry: &InvoiceEntryV1| {
-        let mut preimage = b"hellas.work.private-invoice-leaf.v1".to_vec();
-        preimage.extend_from_slice(&seq.to_be_bytes());
-        preimage.extend_from_slice(invoice_digest(&channel, entry).as_bytes());
-        Digest::hash(&preimage)
+    let moved = PaymentBindingV1 {
+        work_id: Digest::from_bytes([0x5f; 32]),
+        ..base
     };
-
-    let mut preimage = b"hellas.work.private-invoice-node.v1".to_vec();
-    preimage.extend_from_slice(&1_u64.to_be_bytes()); // start
-    preimage.extend_from_slice(&2_u16.to_be_bytes()); // n
-    preimage.extend_from_slice(&1_u16.to_be_bytes()); // k
-    preimage.extend_from_slice(leaf(1, &pair[0]).as_bytes());
-    preimage.extend_from_slice(leaf(2, &pair[1]).as_bytes());
-    assert_eq!(preimage.len(), 35 + 8 + 2 + 2 + 64);
-    assert_eq!(
-        Digest::hash(&preimage),
-        invoice_entries_root(&channel, pair).expect("legal allocation")
+    let moved_payload = hellas_kernel::PayloadHash::from_bytes(
+        payment_binding_digest(&channel, &moved).into_bytes(),
     );
-
-    let mut empty = b"hellas.work.private-invoice-empty.v1".to_vec();
-    empty.push(0);
-    assert_eq!(Digest::hash(&empty), invoice_empty_root());
+    assert!(!Secp256k1Verifier.verify_sig(signature, channel.client_key(), moved_payload));
 }
 
 // ── Canonical output ──────────────────────────────────────────────────
@@ -2780,16 +2495,19 @@ fn canonical_output_digest_normalizes_chunking() {
 
 // ── Independent preimage reproduction ─────────────────────────────────
 
-/// Rebuilds two complete preimages by hand and hashes them through the
+/// Rebuilds three complete preimages by hand and hashes them through the
 /// crate's *other* hashing entry point.
 ///
 /// [`Digest::hash`] chunks its input and takes a Merkle file hash;
 /// `work.rs` streams into the allocation-free single-chunk hasher. If the
 /// domain, the network's length prefix, the channel argument, or the
 /// envelope-plus-body order in this file disagreed with the module's, the
-/// two would not meet here. The same two preimages were also hashed
+/// two would not meet here. The first two preimages were also hashed
 /// outside this workspace with `b3sum --keyed`, twice: once under the Xet
-/// DATA key and once under the zero key.
+/// DATA key and once under the zero key. The third — the payment binding,
+/// which this profile added — was not; its pinned value is this
+/// workspace's own, and what it catches is a later change to the layout
+/// rather than a disagreement with an outside implementation.
 #[test]
 fn digest_preimages_are_reproducible_by_hand() {
     let channel = channel();
@@ -2819,6 +2537,32 @@ fn digest_preimages_are_reproducible_by_hand() {
     assert_eq!(
         hex(&Digest::hash(&preimage).into_bytes()),
         "53a140ae47ca3abd2a848238aca5bbcb958f48f0c087c2966d66ea1b5e350590"
+    );
+
+    // The payment binding, whose three fields are all 32 bytes: a round
+    // trip agrees with any permutation of them, and this does not.
+    let binding = PaymentBindingV1 {
+        work_id: Digest::from_bytes([0xa1; 32]),
+        result_digest: Digest::from_bytes([0xa2; 32]),
+        certificate_digest: hellas_kernel::PayloadHash::from_bytes([0xd0; 32]),
+    };
+    let mut preimage = b"hellas.work.payment-binding.v1".to_vec();
+    preimage.push(NETWORK.len() as u8);
+    preimage.extend_from_slice(NETWORK.as_bytes());
+    preimage.extend_from_slice(channel.id().as_bytes());
+    preimage.push(1);
+    preimage.push(4);
+    preimage.extend_from_slice(&[0xa1; 32]);
+    preimage.extend_from_slice(&[0xa2; 32]);
+    preimage.extend_from_slice(&[0xd0; 32]);
+    assert_eq!(preimage.len(), 30 + 16 + 32 + 98);
+    assert_eq!(
+        Digest::hash(&preimage),
+        payment_binding_digest(&channel, &binding)
+    );
+    assert_eq!(
+        hex(&payment_binding_digest(&channel, &binding).into_bytes()),
+        "5a4a09be82eeeb121ca16ce6cefa64a8318af45d37c522c9141eaff96851940b"
     );
 }
 

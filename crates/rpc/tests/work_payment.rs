@@ -1,18 +1,18 @@
-//! Invoicing one checked job and paying for it: what each endpoint
-//! prices for itself, what is on the disk before either of them speaks,
-//! and what a certificate the ledger cannot explain does.
+//! Paying for one checked job: the amount each endpoint derives for
+//! itself, what is on the disk before either of them speaks, and what a
+//! certificate the ledger cannot explain does.
 //!
-//! Both calls run over a real multiplexed transport, so the requests are
+//! One call, over a real multiplexed transport, so the request is
 //! framed, routed by method id, decoded and answered rather than handed
 //! to a function. Every crash is a real one: the endpoints are dropped
 //! and their stores reopened over their own files.
 //!
 //! What is not re-proved here. The transition rules themselves belong to
-//! the journal and are pinned in `work_store_channel.rs` — that a client
-//! invoices only what its oracle checked, that a payment past its
-//! deadline is refused, that a paid job is not billed again after a
-//! restart. The record arithmetic belongs to `paid_work_vectors.rs`.
-//! These tests are about the two endpoints and the wire between them.
+//! the journal and are pinned in `work_store_channel.rs` — that a
+//! payment past its deadline is refused, that a paid job is not paid for
+//! again after a restart. The record arithmetic belongs to
+//! `paid_work_vectors.rs`. These tests are about the two endpoints and
+//! the wire between them.
 
 #![cfg(feature = "work")]
 
@@ -31,19 +31,18 @@ use hellas_rpc::evaluate::{
     input_commitment,
 };
 use hellas_rpc::pb::work::{
-    AdmitCertificateRequest, AdmitCertificateResponse, RequestInvoiceRequest, WorkInvoiced,
-    WorkPaid, WorkRefusalCode, admit_certificate_response::Outcome as AdmitOutcome,
-    request_invoice_response::Outcome as InvoiceOutcome,
+    AdmitCertificateRequest, AdmitCertificateResponse, WorkPaid, WorkRefusalCode,
+    admit_certificate_response::Outcome as AdmitOutcome,
 };
 use hellas_rpc::protocol::artifacts::{
     BoundTermId, Canonical as _, InputAddressed as _, OutputAddressed as _, PreparedPaidInputV1,
     SourceRef, TextArtifact, TextExecution, TextPolicy, TokenIds,
 };
 use hellas_rpc::protocol::work::{
-    CertificateAllocationV1, InvoiceEntryV1, JobDeadlines, PaidChannel, PaidChannelPolicyV1,
-    PaidExecutionPolicyV1, PaidJobAuthorizationV1, PrivateRecord as _, allocation_digest,
-    generation_policy_digest, identity_source_digest, invoice_digest, invoice_entries_root,
-    private_policy_commitment, propose_authorization, signing_hash, work_id,
+    JobDeadlines, PaidChannelPolicyV1, PaidExecutionPolicyV1, PaidJobAuthorizationV1,
+    PaymentBindingV1, PrivateRecord as _, generation_policy_digest, identity_source_digest,
+    payment_binding_digest, private_policy_commitment, propose_authorization, signing_hash,
+    work_id,
 };
 use hellas_rpc::protocol::work_setup::{
     ObservedChannel, ReadyChannel, WorkChannelConfig, WorkChannelDescriptor, payment_terms_hash,
@@ -52,14 +51,10 @@ use hellas_rpc::protocol::{ContentId, Digest};
 use hellas_rpc::services::work::{WorkClientImpl, WorkServer};
 use hellas_rpc::work::{
     BackendFault, ClientEndpoint, PaidEvaluateBackend, PaymentError, ProviderEndpoint, RunError,
-    RunOutcome, WorkRefusal, WorkService, admit_payment, fetch_result, request_invoice,
-    run_accepted_work,
+    RunOutcome, WorkRefusal, WorkService, admit_payment, fetch_result, run_accepted_work,
 };
 use hellas_rpc::work_close::{FinalizedWork, observe};
-use hellas_rpc::work_store::{
-    ChannelRecord, ChannelStateError, ChannelStore, JobEnd, JobPhase, JobState, Role,
-    WorkStoreError,
-};
+use hellas_rpc::work_store::{ChannelRecord, ChannelStore, JobEnd, JobPhase, JobState, Role};
 use hellas_rpc::{
     Assurance, EvaluateProgramManifest, EvaluateRequest, OutputEventEnvelope, ProducerSigningKey,
     ProgramManifest, PublicKey,
@@ -388,14 +383,6 @@ fn accept(stores: &mut [&mut ChannelStore]) -> Digest {
         panic!("the fixture bundle encodes");
     };
     for store in stores {
-        if store.state().role() == Role::Client {
-            commit(
-                store,
-                ChannelRecord::NonceReserved {
-                    nonce: NONCE.into(),
-                },
-            );
-        }
         commit(
             store,
             ChannelRecord::JobProposed {
@@ -643,7 +630,7 @@ fn lease_over(bond: EdgeId, payment: EdgeId) -> LeaseSlots {
 
 /// One job, accepted, computed, delivered and independently checked.
 ///
-/// Everything before the invoice, driven exactly as the earlier phases
+/// Everything before the payment, driven exactly as the earlier phases
 /// drive it, because a payment for a job that reached this state any
 /// other way would be a payment for something these tests invented.
 struct Checked {
@@ -682,7 +669,7 @@ async fn checked_job() -> Checked {
     }
     // The oracle is `hellas-client`'s; what this file needs is the
     // durable verdict it records, which is the only phase an honest
-    // client's journal will invoice from.
+    // client's journal signs a certificate from.
     if let Err(error) = client.verified(id) {
         panic!("the fixture verdict records: {error}");
     }
@@ -696,20 +683,7 @@ async fn checked_job() -> Checked {
     }
 }
 
-// ── Driving the two calls ─────────────────────────────────────────────
-
-/// One `RequestInvoice` over a live transport, journaled on both sides.
-async fn invoice_over_wire(
-    service: &WorkService,
-    client: &mut ClientEndpoint,
-    id: Digest,
-) -> Result<InvoiceEntryV1, PaymentError> {
-    let (transport, server) = transport_pair();
-    let serving = serve(server, service.clone());
-    let outcome = request_invoice(&WorkClientImpl::new(transport), client, id).await;
-    stop(serving).await;
-    outcome
-}
+// ── Driving the call ──────────────────────────────────────────────────
 
 /// One `AdmitCertificate` over a live transport: signed, journaled,
 /// sent, and acknowledged.
@@ -723,23 +697,6 @@ async fn pay_over_wire(
     let outcome = admit_payment(&WorkClientImpl::new(transport), client, id).await;
     stop(serving).await;
     outcome
-}
-
-/// The provider's invoice for one job, taken off the wire and not
-/// recorded by any client.
-async fn invoice_response(service: &WorkService, id: Digest) -> WorkInvoiced {
-    let (transport, server) = transport_pair();
-    let serving = serve(server, service.clone());
-    let response = WorkClientImpl::new(transport)
-        .request_invoice(RequestInvoiceRequest {
-            work_id: id.as_bytes().to_vec(),
-        })
-        .await;
-    stop(serving).await;
-    match response.map(|response| response.outcome) {
-        Ok(Some(InvoiceOutcome::Invoiced(invoiced))) => invoiced,
-        other => panic!("expected an invoice, got {other:?}"),
-    }
 }
 
 /// The provider's answer to one payment, whatever it is.
@@ -769,18 +726,6 @@ fn refusal_of(response: &AdmitCertificateResponse) -> WorkRefusalCode {
     }
 }
 
-/// One invoice entry as a provider would offer it, signed by `signer`.
-fn offered(
-    channel: &PaidChannel,
-    entry: &InvoiceEntryV1,
-    signer: &Secp256k1Signer,
-) -> WorkInvoiced {
-    WorkInvoiced {
-        entry: entry.encode(),
-        provider_signature: signature_over(signer, signing_hash(invoice_digest(channel, entry))),
-    }
-}
-
 fn signature_over(signer: &Secp256k1Signer, hash: hellas_kernel::PayloadHash) -> Vec<u8> {
     signer.sign(hash).as_bytes().to_vec()
 }
@@ -792,60 +737,44 @@ fn certificate_bytes(certificate: &EarnedCertificate) -> Vec<u8> {
     buf
 }
 
-// ── One job, invoiced and paid ────────────────────────────────────────
+// ── One job, paid for ─────────────────────────────────────────────────
 
-/// One checked answer becomes one invoice and one certificate, and both
-/// endpoints end at the same number.
+/// One checked answer becomes one certificate, and both endpoints end
+/// at the same number.
 ///
 /// The record counts at the end are what say nothing was written twice:
-/// the calls were each made a second time, and the journals a process
-/// that saw none of it reopens are the same length as before.
+/// the call was made a second time, and the journals a process that saw
+/// none of it reopens are the same length as before.
 #[tokio::test]
-async fn one_invoice_and_one_certificate_pay_for_one_job() {
+async fn one_certificate_pays_for_one_job() {
     let mut fixture = checked_job().await;
     let id = fixture.id;
 
-    let entry = match invoice_over_wire(&fixture.service, &mut fixture.client, id).await {
-        Ok(entry) => entry,
-        Err(error) => panic!("the checked job is invoiced: {error}"),
-    };
-    assert_eq!(entry.invoice_seq, 1, "the first invoice is sequence one");
-    assert_eq!(entry.work_id, id);
-    assert_eq!(entry.price, PRICE);
-    assert_eq!(entry.cumulative_before, 0);
-    assert_eq!(entry.cumulative_after, PRICE);
-    assert_eq!(
-        fixture.client.state().job().map(JobState::phase),
-        Some(JobPhase::Invoiced),
-    );
-
-    // One job has one invoice: asking again is the lost-response retry,
-    // and it returns the same entry rather than a second sequence.
-    match invoice_over_wire(&fixture.service, &mut fixture.client, id).await {
-        Ok(again) => assert_eq!(again, entry),
-        Err(error) => panic!("a repeated invoice is the same invoice: {error}"),
-    }
-
     let credited = match pay_over_wire(&fixture.service, &mut fixture.client, id).await {
         Ok(credited) => credited,
-        Err(error) => panic!("the invoiced job is paid: {error}"),
+        Err(error) => panic!("the checked job is paid: {error}"),
     };
     assert_eq!(credited, PRICE);
 
     let state = fixture.client.state();
     assert!(state.job().is_none(), "the payment closes the job");
-    assert_eq!(state.ledger().credited_invoice_high_water(), PRICE);
-    assert_eq!(state.ledger().next_invoice_seq(), 2);
+    assert_eq!(state.ledger().credited_cumulative(), PRICE);
     let Some(payment) = state.last_payment() else {
         panic!("the payment is retained for re-sending");
     };
     assert_eq!(payment.work_id, id);
+    assert_eq!(payment.certificate.earned_cumulative(), PRICE);
     assert_eq!(
-        payment.certificate.earned_cumulative(),
-        entry.cumulative_after
+        payment.binding.work_id, id,
+        "the binding names the job it paid for",
     );
-    assert_eq!(payment.allocation.first_invoice_seq, entry.invoice_seq);
-    assert_eq!(payment.allocation.last_invoice_seq, entry.invoice_seq);
+    assert_eq!(
+        payment.binding.certificate_digest,
+        payment
+            .certificate
+            .digest(fixture.ready.channel().network()),
+        "and the certificate it paid with",
+    );
 
     {
         let Ok(provider) = fixture.service.endpoint() else {
@@ -853,7 +782,7 @@ async fn one_invoice_and_one_certificate_pay_for_one_job() {
         };
         let state = provider.state();
         assert!(state.job().is_none());
-        assert_eq!(state.ledger().credited_invoice_high_water(), PRICE);
+        assert_eq!(state.ledger().credited_cumulative(), PRICE);
         assert_eq!(state.max_executable_certificate(), PRICE);
         assert_eq!(
             state.compute_outstanding(),
@@ -893,15 +822,21 @@ async fn one_invoice_and_one_certificate_pay_for_one_job() {
         Role::Provider,
         CURSOR,
     );
-    // Client: cursor, nonce, proposal, acceptance, result, verdict,
-    // invoice, payment. Provider: cursor, proposal, acceptance, running
-    // marker, result, release, invoice, payment.
-    for (store, role) in [(&client_store, "client"), (&provider_store, "provider")] {
-        assert_eq!(store.len(), 8, "the {role} journal wrote each step once");
+    // Client: cursor, proposal, acceptance, result, verdict, payment.
+    // Provider: cursor, proposal, acceptance, running marker, result,
+    // release, payment.
+    for (store, role, records) in [
+        (&client_store, "client", 6),
+        (&provider_store, "provider", 7),
+    ] {
+        assert_eq!(
+            store.len(),
+            records,
+            "the {role} journal wrote each step once",
+        );
         let state = store.state();
         assert!(state.job().is_none(), "the {role} job is closed");
-        assert_eq!(state.ledger().credited_invoice_high_water(), PRICE);
-        assert_eq!(state.ledger().next_invoice_seq(), 2);
+        assert_eq!(state.ledger().credited_cumulative(), PRICE);
         assert_eq!(state.max_executable_certificate(), PRICE);
     }
     assert_eq!(provider_store.state().compute_outstanding(), 0);
@@ -912,120 +847,191 @@ async fn one_invoice_and_one_certificate_pay_for_one_job() {
     );
 }
 
-// ── What the client will be billed ────────────────────────────────────
+// ── What the provider will be paid ────────────────────────────────────
 
-/// A client pays the entry its own ledger arrives at, and no other.
+/// A provider credits the payment its own ledger arrives at, and no
+/// other.
 ///
-/// Each offer below moves exactly one field of the honest entry and is
-/// re-signed by the provider, so what refuses it is the arithmetic and
-/// not the signature — and the last one moves no field and changes only
-/// the signer, so the signature rule is shown to be there too.
+/// Each request below moves exactly one field of the honest payment and
+/// is re-signed by the client, so what refuses it is the arithmetic and
+/// not the signature — and the last two move no field and change only
+/// the signer, so both signature rules are shown to be there too.
+///
+/// Nothing is banked on any of them. A certificate whose binding this
+/// ledger cannot explain is not money that was earned and mis-labelled;
+/// both halves of an honest payment come out of one derivation.
 #[tokio::test]
-async fn the_client_prices_the_invoice_itself() {
+async fn the_provider_prices_the_payment_itself() {
     let mut fixture = checked_job().await;
     let id = fixture.id;
     let channel = fixture.ready.channel().clone();
-    let honest = invoice_response(&fixture.service, id).await;
-    let Ok(entry) = InvoiceEntryV1::decode(&honest.entry) else {
-        panic!("the provider's own entry decodes");
+    let honest = match fixture.client.pay(id) {
+        Ok(request) => request,
+        Err(error) => panic!("the client signs its payment: {error}"),
     };
+    let Ok(binding) = PaymentBindingV1::decode(&honest.binding) else {
+        panic!("the client's own binding decodes");
+    };
+    let Ok(certificate) = EarnedCertificate::decode(&honest.certificate) else {
+        panic!("the client's own certificate decodes");
+    };
+    let certificate = certificate.0;
 
     let elsewhere = Digest::from_bytes([0x5e; 32]);
-    let mutations = [
-        (
-            "price",
-            InvoiceEntryV1 {
-                price: PRICE + 1,
-                ..entry
-            },
-        ),
-        (
-            "invoice_seq",
-            InvoiceEntryV1 {
-                invoice_seq: 2,
-                ..entry
-            },
-        ),
-        (
-            "cumulative_before",
-            InvoiceEntryV1 {
-                cumulative_before: 1,
-                ..entry
-            },
-        ),
-        (
-            "cumulative_after",
-            InvoiceEntryV1 {
-                cumulative_after: PRICE + 1,
-                ..entry
-            },
-        ),
+    let bindings = [
         (
             "work_id",
-            InvoiceEntryV1 {
+            PaymentBindingV1 {
                 work_id: elsewhere,
-                ..entry
+                ..binding
             },
         ),
         (
             "result_digest",
-            InvoiceEntryV1 {
+            PaymentBindingV1 {
                 result_digest: elsewhere,
-                ..entry
+                ..binding
             },
         ),
         (
-            "channel_id",
-            InvoiceEntryV1 {
-                channel_id: elsewhere,
-                ..entry
+            "certificate_digest",
+            PaymentBindingV1 {
+                certificate_digest: hellas_kernel::PayloadHash::from_bytes([0x5e; 32]),
+                ..binding
             },
         ),
     ];
-    for (field, mutated) in mutations {
-        assert_ne!(mutated, entry, "{field} is the one thing varied");
-        let refused = fixture
-            .client
-            .invoiced(id, &offered(&channel, &mutated, &provider()));
-        let Err(PaymentError::Store(WorkStoreError::Channel(error))) = refused else {
-            panic!("an entry whose {field} this client did not arrive at: {refused:?}");
-        };
-        assert!(
-            matches!(
-                error,
-                ChannelStateError::WrongChannel {
-                    field: "invoice entry"
-                }
+    for (field, mutated) in bindings {
+        assert_ne!(mutated, binding, "{field} is the one thing varied");
+        let request = AdmitCertificateRequest {
+            binding: mutated.encode(),
+            binding_signature: signature_over(
+                &client(),
+                signing_hash(payment_binding_digest(&channel, &mutated)),
             ),
-            "unexpected error for {field}: {error}",
-        );
+            ..honest.clone()
+        };
+        let response = admit_response(&fixture.service, request).await;
         assert_eq!(
-            fixture.client.state().job().map(JobState::phase),
-            Some(JobPhase::Verified),
-            "a refused invoice records nothing",
+            refusal_of(&response),
+            WorkRefusalCode::Invalid,
+            "a binding whose {field} this provider did not arrive at",
         );
+        assert_nothing_credited(&fixture.service, field).await;
     }
 
-    // The honest entry, signed by the wrong party.
-    let refused = fixture
-        .client
-        .invoiced(id, &offered(&channel, &entry, &client()));
-    let Err(PaymentError::Store(WorkStoreError::Channel(ChannelStateError::BadSignature {
-        slot: "invoice",
-        party: "the provider",
-    }))) = refused
-    else {
-        panic!("an entry the provider did not sign: {refused:?}");
+    // The certificate's own three fields, each re-bound and re-signed so
+    // the refusal is the ledger's rather than a stale digest's.
+    let other_edge = EdgeId::from_bytes([0x77; EdgeId::LENGTH]);
+    let other_terms = TermsHash::from_bytes([0x88; 32]);
+    let certificates = [
+        (
+            "earned_cumulative",
+            EarnedCertificate::new(
+                channel.payment_edge(),
+                channel.payment_terms_hash(),
+                PRICE + 1,
+            ),
+        ),
+        (
+            "payment_edge",
+            EarnedCertificate::new(other_edge, channel.payment_terms_hash(), PRICE),
+        ),
+        (
+            "payment_terms_hash",
+            EarnedCertificate::new(channel.payment_edge(), other_terms, PRICE),
+        ),
+    ];
+    for (field, mutated) in certificates {
+        assert_ne!(mutated, certificate, "{field} is the one thing varied");
+        let rebound = PaymentBindingV1 {
+            certificate_digest: mutated.digest(channel.network()),
+            ..binding
+        };
+        let request = AdmitCertificateRequest {
+            certificate: certificate_bytes(&mutated),
+            binding: rebound.encode(),
+            binding_signature: signature_over(
+                &client(),
+                signing_hash(payment_binding_digest(&channel, &rebound)),
+            ),
+            certificate_signature: signature_over(&client(), mutated.digest(channel.network())),
+        };
+        let response = admit_response(&fixture.service, request).await;
+        assert_eq!(
+            refusal_of(&response),
+            WorkRefusalCode::Invalid,
+            "a certificate whose {field} this provider did not arrive at",
+        );
+        assert_nothing_credited(&fixture.service, field).await;
+    }
+
+    // The honest bytes, signed by the wrong party — once for each
+    // signature the record carries.
+    for (slot, request) in [
+        (
+            "binding",
+            AdmitCertificateRequest {
+                binding_signature: signature_over(
+                    &provider(),
+                    signing_hash(payment_binding_digest(&channel, &binding)),
+                ),
+                ..honest.clone()
+            },
+        ),
+        (
+            "certificate",
+            AdmitCertificateRequest {
+                certificate_signature: signature_over(
+                    &provider(),
+                    certificate.digest(channel.network()),
+                ),
+                ..honest.clone()
+            },
+        ),
+    ] {
+        let response = admit_response(&fixture.service, request).await;
+        assert_eq!(
+            refusal_of(&response),
+            WorkRefusalCode::Invalid,
+            "a {slot} the client did not sign",
+        );
+        assert_nothing_credited(&fixture.service, slot).await;
+    }
+
+    // The control: the client's own bytes, credited.
+    let response = admit_response(&fixture.service, honest).await;
+    assert!(
+        matches!(response.outcome, Some(AdmitOutcome::Paid(_))),
+        "the client's own payment is credited: {response:?}",
+    );
+}
+
+/// Asserts that a refused payment moved no money at all.
+async fn assert_nothing_credited(service: &WorkService, what: &str) {
+    let Ok(provider) = service.endpoint() else {
+        panic!("the endpoint is reachable");
     };
-
-    // The control: the provider's own bytes, taken.
-    match fixture.client.invoiced(id, &honest) {
-        Ok(taken) => assert_eq!(taken, entry),
-        Err(error) => panic!("the provider's own invoice is taken: {error}"),
-    }
+    let state = provider.state();
     assert_eq!(
-        fixture.client.state().job().map(JobState::phase),
-        Some(JobPhase::Invoiced),
+        state.ledger().credited_cumulative(),
+        0,
+        "{what} credits nothing",
+    );
+    assert_eq!(
+        state.max_executable_certificate(),
+        0,
+        "{what} is not banked either",
+    );
+    assert_eq!(
+        state.delivery_outstanding(),
+        PRICE,
+        "{what} retires no credit",
+    );
+    assert_eq!(
+        state.job().map(JobState::phase),
+        Some(JobPhase::Delivered),
+        "{what} leaves the job unpaid",
     );
 }
 
@@ -1038,12 +1044,9 @@ async fn the_client_prices_the_invoice_itself() {
 async fn an_acknowledgement_must_name_the_amount_that_was_signed() {
     let mut fixture = checked_job().await;
     let id = fixture.id;
-    if let Err(error) = invoice_over_wire(&fixture.service, &mut fixture.client, id).await {
-        panic!("the checked job is invoiced: {error}");
-    }
     match pay_over_wire(&fixture.service, &mut fixture.client, id).await {
         Ok(credited) => assert_eq!(credited, PRICE),
-        Err(error) => panic!("the invoiced job is paid: {error}"),
+        Err(error) => panic!("the checked job is paid: {error}"),
     }
 
     for credited_cumulative in [PRICE - 1, PRICE, PRICE + 1] {
@@ -1065,227 +1068,74 @@ async fn an_acknowledgement_must_name_the_amount_that_was_signed() {
     }
 }
 
-/// A job with no result yet has no invoice, and the provider says so
-/// as a wait rather than a refusal.
+/// A job with no result yet has nothing to pay for: the client signs
+/// nothing, and the provider credits nothing.
 ///
-/// The control is `one_invoice_and_one_certificate_pay_for_one_job`:
-/// the same call, on the same channel, once a result has been computed
-/// and released.
+/// The control is `one_certificate_pays_for_one_job`: the same call, on
+/// the same channel, once a result has been computed and delivered.
 #[tokio::test]
-async fn an_uncomputed_job_has_no_invoice_yet() {
+async fn an_uncomputed_job_is_not_paid_for() {
+    let client_root = temp();
     let provider_root = temp();
     let ready = ready();
+    let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR);
     let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
-    let id = accept(&mut [&mut provider_store]);
-    let Ok(endpoint) = ProviderEndpoint::new(ready.clone(), provider_store, provider()) else {
+    let id = accept(&mut [&mut client_store, &mut provider_store]);
+    let Ok(mut endpoint) = ClientEndpoint::new(ready.clone(), client_store, client()) else {
+        panic!("the client endpoint binds");
+    };
+    let Ok(provider_endpoint) = ProviderEndpoint::new(ready.clone(), provider_store, provider())
+    else {
         panic!("the provider endpoint binds");
     };
-    let service = WorkService::new(endpoint);
+    let service = WorkService::new(provider_endpoint);
 
-    let (transport, server) = transport_pair();
-    let serving = serve(server, service.clone());
-    let response = WorkClientImpl::new(transport)
-        .request_invoice(RequestInvoiceRequest {
-            work_id: id.as_bytes().to_vec(),
-        })
-        .await;
-    stop(serving).await;
-    let Ok(response) = response else {
-        panic!("the call completes: {response:?}");
+    let paid = endpoint.pay(id);
+    let Err(PaymentError::NotPayable { phase }) = paid else {
+        panic!("an accepted job with no result: {paid:?}");
     };
-    match response.outcome {
-        Some(InvoiceOutcome::Refused(refused)) => assert_eq!(
-            WorkRefusalCode::try_from(refused.code),
-            Ok(WorkRefusalCode::NotReady),
-        ),
-        other => panic!("expected a wait, got {other:?}"),
-    }
+    assert_eq!(phase, JobPhase::Accepted);
+    assert!(
+        endpoint.state().last_payment().is_none(),
+        "and nothing was signed",
+    );
+
+    // And a well-formed, correctly signed payment for that same job is
+    // refused by the provider, whose journal has no result to price
+    // either.
+    let channel = ready.channel();
+    let certificate =
+        EarnedCertificate::new(channel.payment_edge(), channel.payment_terms_hash(), PRICE);
+    let binding = PaymentBindingV1 {
+        work_id: id,
+        result_digest: Digest::from_bytes([0x22; 32]),
+        certificate_digest: certificate.digest(channel.network()),
+    };
+    let response = admit_response(
+        &service,
+        AdmitCertificateRequest {
+            certificate: certificate_bytes(&certificate),
+            binding: binding.encode(),
+            binding_signature: signature_over(
+                &client(),
+                signing_hash(payment_binding_digest(channel, &binding)),
+            ),
+            certificate_signature: signature_over(&client(), certificate.digest(channel.network())),
+        },
+    )
+    .await;
+    assert_eq!(refusal_of(&response), WorkRefusalCode::Declined);
     let Ok(provider) = service.endpoint() else {
         panic!("the endpoint is reachable");
     };
-    assert_eq!(
-        provider.state().job().map(JobState::phase),
-        Some(JobPhase::Accepted),
-        "and nothing was invoiced",
-    );
-}
-
-/// A job nobody has invoiced has nothing to pay for.
-#[tokio::test]
-async fn an_uninvoiced_job_is_not_paid() {
-    let mut fixture = checked_job().await;
-    let paid = fixture.client.pay(fixture.id);
-    let Err(PaymentError::Unbilled { phase }) = paid else {
-        panic!("a checked job with no invoice: {paid:?}");
-    };
-    assert_eq!(phase, JobPhase::Verified);
-    assert!(
-        fixture.client.state().last_payment().is_none(),
-        "and nothing was signed",
-    );
-}
-
-// ── Money the ledger cannot explain ───────────────────────────────────
-
-/// A certificate whose allocation is wrong is kept and credits nothing,
-/// and the allocation that is right still closes the gap afterwards.
-///
-/// Only the private evidence is varied: the same certificate bytes, the
-/// same client signature over them, and an allocation naming a sequence
-/// this channel never invoiced — signed by the client, so what refuses
-/// it is the ledger and not the signature.
-#[tokio::test]
-async fn a_certificate_its_allocation_cannot_explain_is_kept_as_evidence() {
-    let mut fixture = checked_job().await;
-    let id = fixture.id;
-    let channel = fixture.ready.channel().clone();
-    if let Err(error) = invoice_over_wire(&fixture.service, &mut fixture.client, id).await {
-        panic!("the checked job is invoiced: {error}");
-    }
-    let honest = match fixture.client.pay(id) {
-        Ok(request) => request,
-        Err(error) => panic!("the client signs its payment: {error}"),
-    };
-
-    let Ok(allocation) = CertificateAllocationV1::decode(&honest.allocation) else {
-        panic!("the client's own allocation decodes");
-    };
-    let corrupted = CertificateAllocationV1 {
-        first_invoice_seq: 2,
-        last_invoice_seq: 2,
-        ..allocation
-    };
-    let response = admit_response(
-        &fixture.service,
-        AdmitCertificateRequest {
-            allocation: corrupted.encode(),
-            allocation_signature: signature_over(
-                &client(),
-                signing_hash(allocation_digest(&channel, &corrupted)),
-            ),
-            ..honest.clone()
-        },
-    )
-    .await;
-    assert_eq!(refusal_of(&response), WorkRefusalCode::Invalid);
-    {
-        let Ok(provider) = fixture.service.endpoint() else {
-            panic!("the endpoint is reachable");
-        };
-        let state = provider.state();
-        assert_eq!(
-            state.max_executable_certificate(),
-            PRICE,
-            "the money the client signed for is kept",
-        );
-        assert_eq!(
-            state.ledger().credited_invoice_high_water(),
-            0,
-            "and it buys nothing",
-        );
-        assert_eq!(
-            state.delivery_outstanding(),
-            PRICE,
-            "so no credit is retired",
-        );
-        assert_eq!(state.unallocated_gap(), Some(PRICE));
-        assert_eq!(
-            state.job().map(JobState::phase),
-            Some(JobPhase::Invoiced),
-            "and the job is still unpaid",
-        );
-    }
-
-    // The same certificate with the allocation the client actually
-    // signed: credited once, and the credit retired once.
-    match pay_over_wire(&fixture.service, &mut fixture.client, id).await {
-        Ok(credited) => assert_eq!(credited, PRICE),
-        Err(error) => panic!("the durable allocation reconciles: {error}"),
-    }
-    let Ok(provider) = fixture.service.endpoint() else {
-        panic!("the endpoint is reachable");
-    };
     let state = provider.state();
-    assert_eq!(state.ledger().credited_invoice_high_water(), PRICE);
-    assert_eq!(state.unallocated_gap(), None);
-    assert_eq!(state.compute_outstanding(), 0);
-    assert_eq!(state.delivery_outstanding(), 0);
-}
-
-/// A certificate above the invoiced prefix is close evidence and
-/// nothing else: no job is marked paid, and no credit is released.
-#[tokio::test]
-async fn a_certificate_above_the_invoiced_prefix_pays_no_job() {
-    let mut fixture = checked_job().await;
-    let id = fixture.id;
-    let channel = fixture.ready.channel().clone();
-    let entry = match invoice_over_wire(&fixture.service, &mut fixture.client, id).await {
-        Ok(entry) => entry,
-        Err(error) => panic!("the checked job is invoiced: {error}"),
-    };
-
-    // Correctly signed, and for one more than this channel has ever
-    // invoiced. The amount is the only thing varied.
-    let larger = EarnedCertificate::new(
-        channel.payment_edge(),
-        channel.payment_terms_hash(),
-        entry.cumulative_after + 1,
+    assert_eq!(state.ledger().credited_cumulative(), 0);
+    assert_eq!(state.max_executable_certificate(), 0);
+    assert_eq!(
+        state.job().map(JobState::phase),
+        Some(JobPhase::Accepted),
+        "and nothing moved",
     );
-    let Ok(invoice_entries_root) = invoice_entries_root(&channel, &[entry]) else {
-        panic!("one entry has a root");
-    };
-    let allocation = CertificateAllocationV1 {
-        channel_id: channel.id(),
-        certificate_digest: larger.digest(channel.network()),
-        first_invoice_seq: entry.invoice_seq,
-        last_invoice_seq: entry.invoice_seq,
-        invoice_entries_root,
-    };
-    let response = admit_response(
-        &fixture.service,
-        AdmitCertificateRequest {
-            certificate: certificate_bytes(&larger),
-            allocation: allocation.encode(),
-            allocation_signature: signature_over(
-                &client(),
-                signing_hash(allocation_digest(&channel, &allocation)),
-            ),
-            certificate_signature: signature_over(&client(), larger.digest(channel.network())),
-        },
-    )
-    .await;
-    assert_eq!(refusal_of(&response), WorkRefusalCode::Invalid);
-    {
-        let Ok(provider) = fixture.service.endpoint() else {
-            panic!("the endpoint is reachable");
-        };
-        let state = provider.state();
-        assert_eq!(
-            state.max_executable_certificate(),
-            PRICE + 1,
-            "a close may name it",
-        );
-        assert_eq!(state.ledger().credited_invoice_high_water(), 0);
-        assert_eq!(
-            state.delivery_outstanding(),
-            PRICE,
-            "and it releases nothing"
-        );
-        assert_eq!(state.job().map(JobState::phase), Some(JobPhase::Invoiced));
-    }
-
-    // The job's own payment still credits its own prefix. What the
-    // client signed above it stays unexplained, and while it does this
-    // channel takes no new work.
-    match pay_over_wire(&fixture.service, &mut fixture.client, id).await {
-        Ok(credited) => assert_eq!(credited, PRICE),
-        Err(error) => panic!("the invoiced prefix is still paid: {error}"),
-    }
-    let Ok(provider) = fixture.service.endpoint() else {
-        panic!("the endpoint is reachable");
-    };
-    assert_eq!(provider.state().max_executable_certificate(), PRICE + 1);
-    assert_eq!(provider.state().unallocated_gap(), Some(1));
 }
 
 /// A payment is exactly the bytes the service defines, and no other
@@ -1293,14 +1143,11 @@ async fn a_certificate_above_the_invoiced_prefix_pays_no_job() {
 ///
 /// Each request below is the honest one with one field mis-encoded, and
 /// none of the three reaches a rule about money: nothing is credited,
-/// and nothing is kept as evidence either.
+/// and nothing is banked either.
 #[tokio::test]
 async fn a_payment_is_exactly_the_bytes_the_service_defines() {
     let mut fixture = checked_job().await;
     let id = fixture.id;
-    if let Err(error) = invoice_over_wire(&fixture.service, &mut fixture.client, id).await {
-        panic!("the checked job is invoiced: {error}");
-    }
     let honest = match fixture.client.pay(id) {
         Ok(request) => request,
         Err(error) => panic!("the client signs its payment: {error}"),
@@ -1308,9 +1155,9 @@ async fn a_payment_is_exactly_the_bytes_the_service_defines() {
 
     let mut trailing = honest.certificate.clone();
     trailing.push(0);
-    let mut truncated = honest.allocation.clone();
+    let mut truncated = honest.binding.clone();
     truncated.pop();
-    let mut short = honest.allocation_signature.clone();
+    let mut short = honest.binding_signature.clone();
     short.pop();
     let mutations = [
         (
@@ -1321,16 +1168,16 @@ async fn a_payment_is_exactly_the_bytes_the_service_defines() {
             },
         ),
         (
-            "a truncated allocation",
+            "a truncated binding",
             AdmitCertificateRequest {
-                allocation: truncated,
+                binding: truncated,
                 ..honest.clone()
             },
         ),
         (
-            "a 63-byte allocation signature",
+            "a 63-byte binding signature",
             AdmitCertificateRequest {
-                allocation_signature: short,
+                binding_signature: short,
                 ..honest.clone()
             },
         ),
@@ -1338,20 +1185,7 @@ async fn a_payment_is_exactly_the_bytes_the_service_defines() {
     for (what, request) in mutations {
         let response = admit_response(&fixture.service, request).await;
         assert_eq!(refusal_of(&response), WorkRefusalCode::Invalid, "{what}");
-        let Ok(provider) = fixture.service.endpoint() else {
-            panic!("the endpoint is reachable");
-        };
-        let state = provider.state();
-        assert_eq!(
-            state.ledger().credited_invoice_high_water(),
-            0,
-            "{what} credits nothing",
-        );
-        assert_eq!(
-            state.max_executable_certificate(),
-            0,
-            "{what} is not evidence either",
-        );
+        assert_nothing_credited(&fixture.service, what).await;
     }
 
     // The control: the same request, whole.
@@ -1378,9 +1212,6 @@ async fn a_payment_is_exactly_the_bytes_the_service_defines() {
 async fn a_defaulted_job_is_not_paid_for_as_well() {
     let mut fixture = checked_job().await;
     let id = fixture.id;
-    if let Err(error) = invoice_over_wire(&fixture.service, &mut fixture.client, id).await {
-        panic!("the checked job is invoiced: {error}");
-    }
     {
         let Ok(mut provider) = fixture.service.endpoint() else {
             panic!("the endpoint is reachable");
@@ -1402,7 +1233,7 @@ async fn a_defaulted_job_is_not_paid_for_as_well() {
             panic!("the endpoint is reachable");
         };
         let state = provider.state();
-        assert_eq!(state.ledger().credited_invoice_high_water(), 0);
+        assert_eq!(state.ledger().credited_cumulative(), 0);
         assert_eq!(
             state.max_executable_certificate(),
             0,
@@ -1411,11 +1242,7 @@ async fn a_defaulted_job_is_not_paid_for_as_well() {
         assert_eq!(state.loss().compute, PRICE, "and the write-off stands");
     }
     assert_eq!(
-        fixture
-            .client
-            .state()
-            .ledger()
-            .credited_invoice_high_water(),
+        fixture.client.state().ledger().credited_cumulative(),
         PRICE,
         "the client holds a payment no provider will take",
     );
@@ -1423,12 +1250,9 @@ async fn a_defaulted_job_is_not_paid_for_as_well() {
     // The other order.
     let mut fixture = checked_job().await;
     let id = fixture.id;
-    if let Err(error) = invoice_over_wire(&fixture.service, &mut fixture.client, id).await {
-        panic!("the checked job is invoiced: {error}");
-    }
     match pay_over_wire(&fixture.service, &mut fixture.client, id).await {
         Ok(credited) => assert_eq!(credited, PRICE),
-        Err(error) => panic!("the invoiced job is paid: {error}"),
+        Err(error) => panic!("the checked job is paid: {error}"),
     }
     let Ok(mut provider) = fixture.service.endpoint() else {
         panic!("the endpoint is reachable");
@@ -1439,8 +1263,5 @@ async fn a_defaulted_job_is_not_paid_for_as_well() {
         "a paid job is closed: {ended:?}",
     );
     assert_eq!(provider.state().loss().compute, 0, "and cost nothing");
-    assert_eq!(
-        provider.state().ledger().credited_invoice_high_water(),
-        PRICE
-    );
+    assert_eq!(provider.state().ledger().credited_cumulative(), PRICE);
 }

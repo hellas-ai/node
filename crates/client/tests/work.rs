@@ -16,8 +16,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::Bytes;
-use hellas_client::work::invoice::pay_for_checked_result;
 use hellas_client::work::oracle::{OracleFault, Reexecuted, Reexecution, ReexecutionRequest};
+use hellas_client::work::payment::pay_for_checked_result;
 use hellas_client::work::{CheckedResult, CollectError, CollectOutcome, collect_checked_result};
 use hellas_kernel::{
     BlockHeight, Decode as _, Edge, EdgeId, EdgeValues, Fees, Key, LeaseSlots, List,
@@ -42,10 +42,10 @@ use hellas_rpc::protocol::work_setup::{
     ObservedChannel, ReadyChannel, WorkChannelConfig, WorkChannelDescriptor, payment_terms_hash,
 };
 use hellas_rpc::protocol::{ContentId, Digest};
-use hellas_rpc::services::work::{WorkClientImpl, WorkServer};
+use hellas_rpc::services::work::WorkServer;
 use hellas_rpc::work::{
     BackendFault, ClientEndpoint, PaidEvaluateBackend, ProviderEndpoint, RunOutcome, WorkService,
-    request_invoice, run_accepted_work,
+    run_accepted_work,
 };
 use hellas_rpc::work_close::{FinalizedWork, observe};
 use hellas_rpc::work_store::{ChannelRecord, ChannelStore, JobPhase, JobState, Role};
@@ -381,14 +381,6 @@ fn accept(
         panic!("the fixture bundle encodes");
     };
     for store in stores {
-        if store.state().role() == Role::Client {
-            commit(
-                store,
-                ChannelRecord::NonceReserved {
-                    nonce: nonce.into(),
-                },
-            );
-        }
         commit(
             store,
             ChannelRecord::JobProposed {
@@ -721,7 +713,7 @@ async fn a_checked_answer_becomes_a_payment_the_provider_admitted() {
             panic!("the endpoint is reachable");
         };
         let state = provider.state();
-        assert_eq!(state.ledger().credited_invoice_high_water(), PRICE);
+        assert_eq!(state.ledger().credited_cumulative(), PRICE);
         assert_eq!(state.max_executable_certificate(), PRICE);
         assert_eq!(state.compute_outstanding(), 0);
         assert_eq!(state.delivery_outstanding(), 0);
@@ -733,8 +725,7 @@ async fn a_checked_answer_becomes_a_payment_the_provider_admitted() {
     let recovered = store_at(client_root.path(), &ready, Role::Client, CURSOR);
     let state = recovered.state();
     assert!(state.job().is_none());
-    assert_eq!(state.ledger().credited_invoice_high_water(), PRICE);
-    assert_eq!(state.ledger().next_invoice_seq(), 2);
+    assert_eq!(state.ledger().credited_cumulative(), PRICE);
     let Some(payment) = state.last_payment() else {
         panic!("the payment is on the disk");
     };
@@ -787,15 +778,8 @@ async fn a_payment_signed_before_a_crash_is_re_sent_after_it() {
         "the answer is checked: {collected:?}",
     );
 
-    // Invoiced and signed, and then the process is gone before a byte
-    // of the certificate leaves it.
-    let (transport, server) = transport_pair();
-    let serving = serve(server, service.clone());
-    let invoiced = request_invoice(&WorkClientImpl::new(transport), &mut endpoint, id).await;
-    serving.abort();
-    if let Err(error) = invoiced {
-        panic!("the checked job is invoiced: {error}");
-    }
+    // Signed, and then the process is gone before a byte of the
+    // certificate leaves it.
     let signed = endpoint.pay(id);
     assert!(signed.is_ok(), "the client signs its payment: {signed:?}");
     drop(endpoint);
@@ -804,7 +788,7 @@ async fn a_payment_signed_before_a_crash_is_re_sent_after_it() {
             panic!("the endpoint is reachable");
         };
         assert_eq!(
-            provider.state().ledger().credited_invoice_high_water(),
+            provider.state().ledger().credited_cumulative(),
             0,
             "and the provider has seen nothing",
         );
@@ -823,10 +807,7 @@ async fn a_payment_signed_before_a_crash_is_re_sent_after_it() {
     let Ok(provider) = service.endpoint() else {
         panic!("the endpoint is reachable");
     };
-    assert_eq!(
-        provider.state().ledger().credited_invoice_high_water(),
-        PRICE
-    );
+    assert_eq!(provider.state().ledger().credited_cumulative(), PRICE);
     assert_eq!(provider.state().compute_outstanding(), 0);
     assert_eq!(provider.state().delivery_outstanding(), 0);
 }
@@ -881,7 +862,7 @@ async fn an_unchecked_answer_is_not_paid_for() {
     assert_eq!(
         endpoint.state().job().map(JobState::phase),
         Some(JobPhase::Ready),
-        "and the job is not in a phase an invoice may be asked from",
+        "and the job is not in a phase a certificate may be signed from",
     );
 
     let (transport, server) = transport_pair();
@@ -900,7 +881,7 @@ async fn an_unchecked_answer_is_not_paid_for() {
         let Ok(provider) = service.endpoint() else {
             panic!("the endpoint is reachable");
         };
-        assert_eq!(provider.state().ledger().credited_invoice_high_water(), 0);
+        assert_eq!(provider.state().ledger().credited_cumulative(), 0);
     }
 
     // The control: the same delivered result, checked, is paid for.

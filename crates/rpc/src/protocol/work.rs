@@ -14,19 +14,25 @@
 //! both signatures
 //!   -> authorization digest / work_id
 //!   -> provider-signed result_digest
-//!   -> InvoiceEntryV1(price, before, after)
-//!   -> CertificateAllocationV1
-//!   -> client-signed EarnedCertificate(after)
+//!   -> client-signed PaymentBindingV1(work_id, result, certificate)
+//!   -> client-signed EarnedCertificate(credited + price)
 //!   -> kernel payout
 //! ```
 //!
+//! There is no provider signature between the result and the payment,
+//! and there is deliberately no room for one. The provider has already
+//! co-signed the authorization that fixes the price and signed the
+//! result that earns it; a third provider signature restating those two
+//! numbers would add no authority to either, and would be a second place
+//! for the price to be written down.
+//!
 //! A chain of digests is not by itself a ledger: every link above can be
 //! rebuilt truthfully for a job that was already paid for, at a fresh
-//! sequence and a fresh cumulative, and read alone it is indistinguishable
-//! from a second job. [`CreditLedger`] is what makes it a ledger. It holds
-//! the whole of the cross-call state — the next sequence, the credited
-//! amount, and the jobs already paid for — and it is the only thing here
-//! that says a job is paid for at most once.
+//! cumulative, and read alone it is indistinguishable from a second job.
+//! [`CreditLedger`] is what makes it a ledger. It holds the whole of the
+//! cross-call state — the credited amount and the jobs already paid for
+//! — and it is the only thing here that says a job is paid for at most
+//! once.
 //!
 //! None of it is consensus input, and none of it is on L1. It lives here,
 //! in the neutral protocol crate, so the provider and the client have one
@@ -50,21 +56,21 @@
 //! Every fixed record is hashed with [`SingleChunkHasher`], which
 //! *asserts* rather than errors once a preimage reaches
 //! [`hellas_xet::MIN_CHUNK_SIZE`]. Each body here is fixed-width, so each
-//! complete preimage has a compile-time maximum, and every preimage
-//! shape — record, channel id, invoice leaf, invoice node, empty tree —
-//! is asserted below. The four variable-length preimages — the
-//! generation policy, the identity artifact, the prepared input bundle,
-//! and the canonical output — use the streaming [`XetFileHasher`]
-//! instead, which has no such limit and which agrees with one-shot
-//! [`Digest::hash`] under every write segmentation.
+//! complete preimage has a compile-time maximum, and both preimage
+//! shapes — record and channel id — are asserted below. The four
+//! variable-length preimages — the generation policy, the identity
+//! artifact, the prepared input bundle, and the canonical output — use
+//! the streaming [`XetFileHasher`] instead, which has no such limit and
+//! which agrees with one-shot [`Digest::hash`] under every write
+//! segmentation.
 //!
 //! # Signatures
 //!
 //! Signatures ride beside these bodies, never inside them. The provider
-//! signs the result and each invoice entry; the client signs the
-//! authorization, the allocation, and the kernel's earned digest. Every
-//! digest below binds the network and the channel, so a body lifted from
-//! one channel is not a body in another.
+//! signs the authorization and the result; the client signs the
+//! authorization, the payment binding, and the kernel's earned digest.
+//! Every digest below binds the network and the channel, so a body
+//! lifted from one channel is not a body in another.
 
 use std::collections::BTreeSet;
 
@@ -108,17 +114,8 @@ const PREPARED_INPUT: &[u8] = b"hellas.work.prepared-input.v1";
 const PAID_JOB_AUTHORIZE: &[u8] = b"hellas.work.paid-job-authorize.v1";
 /// The provider's signed result.
 const PAID_JOB_RESULT: &[u8] = b"hellas.work.paid-job-result.v1";
-/// One private invoice entry.
-const PRIVATE_INVOICE: &[u8] = b"hellas.work.private-invoice.v1";
-/// The empty invoice tree. Defined for completeness; an allocation over
-/// no entries is not a valid allocation.
-const PRIVATE_INVOICE_EMPTY: &[u8] = b"hellas.work.private-invoice-empty.v1";
-/// One invoice-tree leaf.
-const PRIVATE_INVOICE_LEAF: &[u8] = b"hellas.work.private-invoice-leaf.v1";
-/// One invoice-tree interior node.
-const PRIVATE_INVOICE_NODE: &[u8] = b"hellas.work.private-invoice-node.v1";
-/// The client's allocation of a certificate to an invoice prefix.
-const PRIVATE_CERTIFICATE_ALLOCATION: &[u8] = b"hellas.work.private-certificate-allocation.v1";
+/// The client's binding of one certificate to one job's result.
+const PAYMENT_BINDING: &[u8] = b"hellas.work.payment-binding.v1";
 /// The normalized Evaluate answer the client's oracle compares.
 const EVALUATE_OUTPUT: &[u8] = b"hellas.work.evaluate-output.v1";
 
@@ -137,18 +134,11 @@ mod tag {
     pub(super) const PAID_EXECUTION_POLICY: u8 = 1;
     pub(super) const PAID_JOB_AUTHORIZATION: u8 = 2;
     pub(super) const PAID_JOB_RESULT: u8 = 3;
-    pub(super) const PRIVATE_INVOICE: u8 = 4;
-    pub(super) const CERTIFICATE_ALLOCATION: u8 = 5;
+    pub(super) const PAYMENT_BINDING: u8 = 4;
 }
 
 /// Bytes the envelope occupies: `format_version:u8 || record_tag:u8`.
 const ENVELOPE_SIZE: usize = 2;
-
-/// Largest number of entries one allocation may cover.
-///
-/// The invoice tree carries its width as a `u16`, and an endpoint that
-/// wanted to settle more than this many jobs at once can settle twice.
-pub const MAX_ALLOCATION_ENTRIES: usize = 256;
 
 // ── Errors ────────────────────────────────────────────────────────────
 
@@ -239,31 +229,16 @@ pub enum PaidWorkError {
         /// Which computation overflowed.
         field: &'static str,
     },
-    /// The invoice would settle more than the edge can pay.
+    /// The payment would settle more than the edge can pay.
     #[error("cumulative {cumulative} exceeds the payment edge capacity {capacity}")]
     OverCapacity {
-        /// Cumulative the invoice would reach.
+        /// Cumulative the payment would reach.
         cumulative: u64,
         /// Capacity the kernel will admit on this edge.
         capacity: u64,
     },
-    /// Invoice sequence numbers were not contiguous and increasing from
-    /// the expected next sequence.
-    #[error("invoice sequence {actual} is not the expected {expected}")]
-    InvoiceSequence {
-        /// Sequence the transition requires.
-        expected: u64,
-        /// Sequence the entry carried.
-        actual: u64,
-    },
-    /// An allocation covered no entries, or more than the tree admits.
-    #[error("allocation covers {count} entries; 1..={MAX_ALLOCATION_ENTRIES} required")]
-    AllocationSize {
-        /// Number of entries offered.
-        count: usize,
-    },
-    /// One accepted job was invoiced twice on this channel.
-    #[error("{field} appears in more than one credited invoice entry of this channel")]
+    /// One accepted job was paid for twice on this channel.
+    #[error("{field} has already been paid for on this channel")]
     Duplicate {
         /// Which identifier repeated.
         field: &'static str,
@@ -284,9 +259,9 @@ pub enum PaidWorkError {
 /// One fixed-width private record: an envelope and a body.
 ///
 /// The trait exists so the envelope, the exact-length rule, and the
-/// unknown-tag rejection are written once. Six copies of "check the
-/// version, check the tag, check the length" is six chances to write one
-/// of them differently.
+/// unknown-tag rejection are written once. Five copies of "check the
+/// version, check the tag, check the length" is five chances to write
+/// one of them differently.
 pub trait PrivateRecord: Sized {
     /// This record's tag byte.
     const TAG: u8;
@@ -347,7 +322,7 @@ pub trait PrivateRecord: Sized {
         // Unreachable while every `decode_body` reads exactly
         // `BODY_SIZE` bytes, which is what the length check above
         // already guaranteed it was handed. It is kept because that is a
-        // property of six separate implementations rather than of this
+        // property of five separate implementations rather than of this
         // one: a field dropped from a `decode_body` whose `BODY_SIZE`
         // was left alone leaves bytes here, and this is the only place
         // that would notice. No test isolates it, and none claims to.
@@ -602,96 +577,52 @@ impl PrivateRecord for PaidJobResultV1 {
     }
 }
 
-/// One line of the private ledger: this job, this result, this price,
-/// and the exact cumulative transition it causes.
+/// The client's statement of what one certificate paid for.
 ///
-/// The provider signs it. That binds what the provider claimed was
-/// payable; it does not let the provider forge the client's later
-/// certificate.
+/// This is the record that gives the scalar a meaning: it names the job,
+/// the exact result being paid for, and the exact certificate paying for
+/// it. The client signs it, and only the client: the price is fixed by
+/// the authorization both parties signed, and the result is already the
+/// provider's own signed statement, so a provider counter-signature here
+/// would restate two things it has already said.
+///
+/// It carries no price and no cumulative. Both are derivable — the price
+/// from the authorization the `work_id` is the digest of, the cumulative
+/// from the certificate — and a copy of a derivable number is a second
+/// place for it to disagree.
+///
+/// It carries no channel id either. The digest this record is signed as
+/// binds the network and the channel ([`payment_binding_digest`]), so a
+/// binding lifted into another channel is not a binding there.
+///
+/// It is private evidence: consensus never sees it, and it never alters
+/// settlement. It exists so a crash-recovered endpoint can prove to
+/// itself what a number bought.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct InvoiceEntryV1 {
-    /// Channel this entry belongs to.
-    pub channel_id: Digest,
-    /// Position in the channel's invoice sequence. The first is 1.
-    pub invoice_seq: u64,
-    /// The accepted job being billed.
+pub struct PaymentBindingV1 {
+    /// The accepted job being paid for.
     pub work_id: Digest,
-    /// The provider-signed result being billed.
+    /// The provider-signed result being paid for.
     pub result_digest: Digest,
-    /// Price of that result.
-    pub price: u64,
-    /// Cumulative earned before this entry.
-    pub cumulative_before: u64,
-    /// Cumulative earned after it: `cumulative_before + price`.
-    pub cumulative_after: u64,
-}
-
-impl PrivateRecord for InvoiceEntryV1 {
-    const TAG: u8 = tag::PRIVATE_INVOICE;
-    const BODY_SIZE: usize = 3 * 32 + 4 * 8;
-
-    fn encode_body(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(self.channel_id.as_bytes());
-        put_u64(out, self.invoice_seq);
-        out.extend_from_slice(self.work_id.as_bytes());
-        out.extend_from_slice(self.result_digest.as_bytes());
-        put_u64(out, self.price);
-        put_u64(out, self.cumulative_before);
-        put_u64(out, self.cumulative_after);
-    }
-
-    fn decode_body(reader: &mut BodyReader<'_>) -> Result<Self, PaidWorkError> {
-        Ok(Self {
-            channel_id: Digest::from_bytes(reader.bytes32()?),
-            invoice_seq: reader.u64()?,
-            work_id: Digest::from_bytes(reader.bytes32()?),
-            result_digest: Digest::from_bytes(reader.bytes32()?),
-            price: reader.u64()?,
-            cumulative_before: reader.u64()?,
-            cumulative_after: reader.u64()?,
-        })
-    }
-}
-
-/// The client's statement of which invoice prefix one certificate paid.
-///
-/// This is the record that gives the scalar a meaning. It is private
-/// evidence: consensus never sees it, and it never alters settlement. It
-/// exists so a crash-recovered endpoint can prove to itself what a
-/// number bought.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CertificateAllocationV1 {
-    /// Channel this allocation belongs to.
-    pub channel_id: Digest,
     /// Digest of the exact certificate the client signed.
     pub certificate_digest: PayloadHash,
-    /// First invoice sequence this certificate pays.
-    pub first_invoice_seq: u64,
-    /// Last invoice sequence this certificate pays.
-    pub last_invoice_seq: u64,
-    /// Root over exactly those invoice entries.
-    pub invoice_entries_root: Digest,
 }
 
-impl PrivateRecord for CertificateAllocationV1 {
-    const TAG: u8 = tag::CERTIFICATE_ALLOCATION;
-    const BODY_SIZE: usize = 3 * 32 + 2 * 8;
+impl PrivateRecord for PaymentBindingV1 {
+    const TAG: u8 = tag::PAYMENT_BINDING;
+    const BODY_SIZE: usize = 3 * 32;
 
     fn encode_body(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(self.channel_id.as_bytes());
+        out.extend_from_slice(self.work_id.as_bytes());
+        out.extend_from_slice(self.result_digest.as_bytes());
         out.extend_from_slice(self.certificate_digest.as_bytes());
-        put_u64(out, self.first_invoice_seq);
-        put_u64(out, self.last_invoice_seq);
-        out.extend_from_slice(self.invoice_entries_root.as_bytes());
     }
 
     fn decode_body(reader: &mut BodyReader<'_>) -> Result<Self, PaidWorkError> {
         Ok(Self {
-            channel_id: Digest::from_bytes(reader.bytes32()?),
+            work_id: Digest::from_bytes(reader.bytes32()?),
+            result_digest: Digest::from_bytes(reader.bytes32()?),
             certificate_digest: PayloadHash::from_bytes(reader.bytes32()?),
-            first_invoice_seq: reader.u64()?,
-            last_invoice_seq: reader.u64()?,
-            invoice_entries_root: Digest::from_bytes(reader.bytes32()?),
         })
     }
 }
@@ -819,35 +750,38 @@ const fn wider(a: usize, b: usize) -> usize {
     if a > b { a } else { b }
 }
 
-/// Widest of the six records, taken rather than named.
+/// Widest of the five records, taken rather than named.
 const WIDEST_RECORD: usize = wider(
     wider(
-        wider(
-            PaidChannelPolicyV1::ENCODED_SIZE,
-            PaidExecutionPolicyV1::ENCODED_SIZE,
-        ),
+        PaidChannelPolicyV1::ENCODED_SIZE,
+        PaidExecutionPolicyV1::ENCODED_SIZE,
+    ),
+    wider(
         wider(
             PaidJobAuthorizationV1::ENCODED_SIZE,
             PaidJobResultV1::ENCODED_SIZE,
         ),
-    ),
-    wider(
-        InvoiceEntryV1::ENCODED_SIZE,
-        CertificateAllocationV1::ENCODED_SIZE,
+        PaymentBindingV1::ENCODED_SIZE,
     ),
 );
-/// Longest of the domain strings, likewise taken rather than named.
-const LONGEST_DOMAIN: usize = PRIVATE_CERTIFICATE_ALLOCATION.len();
+/// Longest of the record domains, likewise taken rather than named.
+const LONGEST_DOMAIN: usize = wider(
+    wider(PAID_CHANNEL_POLICY.len(), EXECUTION_POLICY.len()),
+    wider(
+        wider(PAID_JOB_AUTHORIZE.len(), PAID_JOB_RESULT.len()),
+        PAYMENT_BINDING.len(),
+    ),
+);
 const ENCODED_NETWORK: usize = <NetworkId as Encode>::MAX_ENCODED_SIZE;
 
 /// Largest complete `XH` preimage this module can produce.
 ///
-/// Every `XH` preimage has one of five shapes, and every one of the five
-/// is bounded below rather than assumed to be covered by another. The
-/// record-shaped preimages — `domain || network || channel_id || record`
-/// — take the widest record and the longest domain from the sets above,
-/// so a seventh record, or one that grew, cannot invalidate this bound
-/// by being overlooked.
+/// Every `XH` preimage has one of two shapes, and both are bounded below
+/// rather than assumed to be covered by the other. The record-shaped
+/// preimages — `domain || network || channel_id || record` — take the
+/// widest record and the longest domain from the sets above, so a sixth
+/// record, or one that grew, cannot invalidate this bound by being
+/// overlooked.
 const WIDEST_XH_PREIMAGE: usize = LONGEST_DOMAIN + ENCODED_NETWORK + 32 + WIDEST_RECORD;
 
 const _: () = assert!(
@@ -860,20 +794,6 @@ const _: () = assert!(
 const _: () = assert!(
     CHANNEL.len() + ENCODED_NETWORK + 4 * 32 < MIN_CHUNK_SIZE,
     "channel id preimage must stay under MIN_CHUNK_SIZE"
-);
-// The invoice tree's three shapes. They carry no network and no channel:
-// their entries' own digests already do.
-const _: () = assert!(
-    PRIVATE_INVOICE_LEAF.len() + 8 + 32 < MIN_CHUNK_SIZE,
-    "invoice leaf preimage must stay under MIN_CHUNK_SIZE"
-);
-const _: () = assert!(
-    PRIVATE_INVOICE_NODE.len() + 8 + 2 + 2 + 32 + 32 < MIN_CHUNK_SIZE,
-    "invoice node preimage must stay under MIN_CHUNK_SIZE"
-);
-const _: () = assert!(
-    PRIVATE_INVOICE_EMPTY.len() + 1 < MIN_CHUNK_SIZE,
-    "empty invoice root preimage must stay under MIN_CHUNK_SIZE"
 );
 
 // ── The channel ───────────────────────────────────────────────────────
@@ -1119,123 +1039,17 @@ pub fn result_digest(channel: &PaidChannel, result: &PaidJobResultV1) -> Digest 
     )
 }
 
-/// Returns the digest the provider signs for one invoice entry.
-pub fn invoice_digest(channel: &PaidChannel, entry: &InvoiceEntryV1) -> Digest {
-    let network_bytes = channel.network_bytes();
-    xh(
-        PRIVATE_INVOICE,
-        &[
-            network_bytes.as_slice(),
-            channel.id.as_bytes(),
-            &entry.encode(),
-        ],
-    )
-}
-
 /// Returns the digest the client signs beside its certificate.
-pub fn allocation_digest(channel: &PaidChannel, allocation: &CertificateAllocationV1) -> Digest {
+pub fn payment_binding_digest(channel: &PaidChannel, binding: &PaymentBindingV1) -> Digest {
     let network_bytes = channel.network_bytes();
     xh(
-        PRIVATE_CERTIFICATE_ALLOCATION,
+        PAYMENT_BINDING,
         &[
             network_bytes.as_slice(),
             channel.id.as_bytes(),
-            &allocation.encode(),
+            &binding.encode(),
         ],
     )
-}
-
-/// Returns the digest of the empty invoice tree.
-///
-/// Defined for completeness of the tree's definition, and never a valid
-/// allocation root: an allocation that pays for nothing is not an
-/// allocation.
-pub fn invoice_empty_root() -> Digest {
-    xh(PRIVATE_INVOICE_EMPTY, &[&[0_u8]])
-}
-
-fn invoice_leaf(seq: u64, digest: Digest) -> Digest {
-    xh(
-        PRIVATE_INVOICE_LEAF,
-        &[&seq.to_be_bytes(), digest.as_bytes()],
-    )
-}
-
-fn invoice_node(start: u64, n: u16, k: u16, left: Digest, right: Digest) -> Digest {
-    xh(
-        PRIVATE_INVOICE_NODE,
-        &[
-            &start.to_be_bytes(),
-            &n.to_be_bytes(),
-            &k.to_be_bytes(),
-            left.as_bytes(),
-            right.as_bytes(),
-        ],
-    )
-}
-
-/// Returns the root over one allocation's invoice entries.
-///
-/// The tree binds each entry's absolute sequence number, not its
-/// position in a list, and every node binds the width beneath it. A
-/// prefix of a longer allocation therefore has a different root than the
-/// same entries allocated alone.
-pub fn invoice_entries_root(
-    channel: &PaidChannel,
-    entries: &[InvoiceEntryV1],
-) -> Result<Digest, PaidWorkError> {
-    if entries.is_empty() || entries.len() > MAX_ALLOCATION_ENTRIES {
-        return Err(PaidWorkError::AllocationSize {
-            count: entries.len(),
-        });
-    }
-    let first = entries.first().ok_or(PaidWorkError::AllocationSize {
-        count: entries.len(),
-    })?;
-    subtree(channel, entries, first.invoice_seq)
-}
-
-fn subtree(
-    channel: &PaidChannel,
-    entries: &[InvoiceEntryV1],
-    start: u64,
-) -> Result<Digest, PaidWorkError> {
-    let n = u16::try_from(entries.len()).map_err(|_| PaidWorkError::AllocationSize {
-        count: entries.len(),
-    })?;
-    match entries {
-        // Unreachable: `invoice_entries_root` refuses an empty
-        // allocation, and every split below leaves both halves
-        // non-empty. It is written anyway because it states the tree's
-        // own definition — the empty tree is the empty root — and
-        // because the alternative is not a smaller function but a slice
-        // split that would panic on the input it cannot receive. No test
-        // isolates it, and none claims to.
-        [] => Ok(invoice_empty_root()),
-        [entry] => Ok(invoice_leaf(start, invoice_digest(channel, entry))),
-        _ => {
-            let k = largest_power_of_two_below(n);
-            let (left, right) = entries.split_at(usize::from(k));
-            let right_start = start
-                .checked_add(u64::from(k))
-                .ok_or(PaidWorkError::Overflow {
-                    field: "invoice subtree start",
-                })?;
-            Ok(invoice_node(
-                start,
-                n,
-                k,
-                subtree(channel, left, start)?,
-                subtree(channel, right, right_start)?,
-            ))
-        }
-    }
-}
-
-/// Returns the largest power of two strictly below `n`, for `n >= 2`.
-fn largest_power_of_two_below(n: u16) -> u16 {
-    let bits = u16::BITS - n.saturating_sub(1).leading_zeros();
-    1_u16 << bits.saturating_sub(1)
 }
 
 /// Returns the digest of the normalized Evaluate answer.
@@ -1836,18 +1650,28 @@ pub fn check_result(
     Ok(result_digest(channel, result))
 }
 
-/// Builds the one invoice entry a delivered result may produce.
+/// Builds the one payment a delivered result may be settled by: the
+/// certificate consensus will see, and the private binding that says
+/// what it bought.
 ///
-/// This is the only way an entry is made: the provider builds the entry
-/// it signs, and a rule enforced by construction cannot be enforced
-/// differently by the two endpoints.
+/// This is the only way either is made, and the two are made together
+/// because neither is checkable without the other. A certificate alone
+/// is a number, and a binding alone names a certificate that need not
+/// exist. Both endpoints call this — the client to build what it signs,
+/// [`CreditLedger::credit_payment`] to rebuild what it is handed — so
+/// a rule enforced by construction here cannot be enforced differently
+/// by the two of them.
 ///
-/// It builds an entry for whatever sequence and cumulative it is given,
-/// and will therefore build a second entry for a job that already has
-/// one — the identifiers it recomputes are a function of the job alone.
+/// Nothing it produces is a function of anything but the channel, the
+/// job, and `credited`. In particular there is no price argument: the
+/// price is the one the authorization both parties signed fixes, and a
+/// caller that could pass another would be a caller that could set it.
+///
+/// It builds a payment for whatever `credited` it is given, and will
+/// therefore build a second payment for a job that already has one.
 /// Nothing here can tell the two apart, and nothing here tries:
-/// [`CreditLedger::credit_allocation`] is where a job is paid for at
-/// most once.
+/// [`CreditLedger::credit_payment`] is where a job is paid for at most
+/// once.
 ///
 /// The capacity bound is the kernel's own [`WorkPaymentSettlement`], not
 /// a number this module derives. A certificate above the smaller of the
@@ -1855,275 +1679,179 @@ pub fn check_result(
 /// and `EdgeState.value` is not that bound. Taking the settlement rather
 /// than a bare integer is what stops an endpoint from supplying its own
 /// arithmetic here.
-pub fn next_invoice_entry(
+///
+/// # Errors
+///
+/// [`PaidWorkError::Mismatch`] when the result does not answer this
+/// authorization, [`PaidWorkError::Overflow`] when the cumulative would
+/// wrap, and [`PaidWorkError::OverCapacity`] when it would exceed what
+/// this edge can settle.
+pub fn next_payment(
     channel: &PaidChannel,
     authorization: &PaidJobAuthorizationV1,
     result: &PaidJobResultV1,
-    next_invoice_seq: u64,
-    cumulative_before: u64,
+    credited: u64,
     settlement: WorkPaymentSettlement,
-) -> Result<InvoiceEntryV1, PaidWorkError> {
-    if next_invoice_seq == 0 {
-        return Err(PaidWorkError::InvoiceSequence {
-            expected: 1,
-            actual: 0,
-        });
-    }
+) -> Result<(EarnedCertificate, PaymentBindingV1), PaidWorkError> {
     let work_id = work_id(channel, authorization);
     let result_digest = check_result(channel, work_id, result)?;
-    let cumulative_after =
-        cumulative_before
-            .checked_add(authorization.price)
-            .ok_or(PaidWorkError::Overflow {
-                field: "cumulative_after",
-            })?;
-    if cumulative_after > settlement.capacity() {
+    let cumulative = credited
+        .checked_add(authorization.price)
+        .ok_or(PaidWorkError::Overflow {
+            field: "earned cumulative",
+        })?;
+    if cumulative > settlement.capacity() {
         return Err(PaidWorkError::OverCapacity {
-            cumulative: cumulative_after,
+            cumulative,
             capacity: settlement.capacity(),
         });
     }
-    Ok(InvoiceEntryV1 {
-        channel_id: channel.id,
-        invoice_seq: next_invoice_seq,
+    let certificate =
+        EarnedCertificate::new(channel.payment_edge, channel.payment_terms_hash, cumulative);
+    let binding = PaymentBindingV1 {
         work_id,
         result_digest,
-        price: authorization.price,
-        cumulative_before,
-        cumulative_after,
-    })
+        certificate_digest: certificate.digest(channel.network),
+    };
+    Ok((certificate, binding))
 }
 
-/// One invoiced job as the endpoint crediting it holds it.
+/// What one endpoint has already paid for on one channel.
 ///
-/// The three travel together because the only thing that makes an entry
-/// evidence is its agreement with the other two: an entry names a job
-/// this client authorized, a result the provider signed for exactly that
-/// job, and the price that authorization fixed. An entry alone is three
-/// numbers and two digests that nothing local can contradict.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct InvoicedJob {
-    /// The authorization both parties signed.
-    pub authorization: PaidJobAuthorizationV1,
-    /// The result the provider signed for it.
-    pub result: PaidJobResultV1,
-    /// The invoice entry the provider signed for that pair.
-    pub entry: InvoiceEntryV1,
-}
-
-/// What one endpoint has already credited on one channel.
+/// Two values that only ever move together: the cumulative amount
+/// already credited, and the jobs already paid for. They are one value
+/// rather than two arguments because they are the whole of the
+/// cross-call state, and an endpoint that advanced one and forgot the
+/// other is an endpoint that pays for a job twice. Nothing but
+/// [`Self::credit_payment`] moves them, and it moves them only over a
+/// payment it has just accepted.
 ///
-/// Three values that only ever move together: the sequence the next
-/// invoice must carry, the cumulative amount already credited, and the
-/// jobs already paid for. They are one value rather than three arguments
-/// because they are the whole of the cross-call state, and an endpoint
-/// that advanced two of them and forgot the third is an endpoint that
-/// pays for a job twice. Nothing but [`Self::credit_allocation`] moves
-/// them, and it moves them only over an allocation it has just accepted.
+/// The cumulative alone would not do it. It is a high-water mark, and a
+/// second payment for a job already paid for is a perfectly monotone
+/// step: same price, next cumulative, a certificate the arithmetic
+/// accepts. What refuses it is the set below, and only the set below.
+/// That the job is closed by its own payment, that its proposal nonce
+/// can never be offered again — those are true, and they are facts
+/// about the journal and the nonce rule rather than about the money.
+/// This is the rule that is about the money.
 ///
-/// The set of credited jobs grows by one digest per paid job, and a
-/// channel admits at most `capacity / price` of those, so it is bounded
-/// by the same edge that bounds the money.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// The set grows by one digest per paid job, and a channel admits at
+/// most `capacity / price` of those, so it is bounded by the same edge
+/// that bounds the money.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CreditLedger {
-    next_invoice_seq: u64,
-    credited_invoice_high_water: u64,
-    credited_work_ids: BTreeSet<Digest>,
-}
-
-impl Default for CreditLedger {
-    /// The default ledger is a new channel's, not a zeroed struct: a
-    /// derived `Default` would start at sequence 0, which is the one
-    /// sequence no invoice may carry.
-    fn default() -> Self {
-        Self::new()
-    }
+    credited_cumulative: u64,
+    paid_work_ids: BTreeSet<Digest>,
 }
 
 impl CreditLedger {
     /// A channel that has credited nothing.
-    ///
-    /// Its first invoice therefore carries `invoice_seq = 1` and
-    /// `cumulative_before = 0`; no endpoint may choose zero-based
-    /// sequence numbering from local convention.
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            next_invoice_seq: 1,
-            credited_invoice_high_water: 0,
-            credited_work_ids: BTreeSet::new(),
-        }
-    }
-
-    /// Returns the sequence the next invoice entry must carry.
-    pub const fn next_invoice_seq(&self) -> u64 {
-        self.next_invoice_seq
+        Self::default()
     }
 
     /// Returns the cumulative amount already credited.
-    pub const fn credited_invoice_high_water(&self) -> u64 {
-        self.credited_invoice_high_water
+    pub const fn credited_cumulative(&self) -> u64 {
+        self.credited_cumulative
     }
 
-    /// Checks that a certificate and its allocation pay for exactly
-    /// these invoiced jobs, and credits them if they do.
+    /// Returns whether this channel has already paid for `work_id`.
+    #[must_use]
+    pub fn has_paid_for(&self, work_id: Digest) -> bool {
+        self.paid_work_ids.contains(&work_id)
+    }
+
+    /// Checks that a certificate and its binding pay for exactly this
+    /// job, and credits it if they do.
     ///
-    /// This is the join between the private ledger and the one number
+    /// This is the join between the private evidence and the one number
     /// consensus sees, and it is the only place the two meet. It
-    /// establishes that the certificate the client is about to sign
-    /// settles the next contiguous run of this channel's invoices, at
-    /// the prices those jobs' own authorizations fix, for results the
-    /// provider signed against exactly those jobs, and for no job this
-    /// ledger has already paid for.
-    ///
-    /// The prefix is contiguous *across calls*, not merely within one:
-    /// the first entry must carry [`Self::next_invoice_seq`] and the
-    /// first `cumulative_before` must equal
-    /// [`Self::credited_invoice_high_water`], so a second allocation
-    /// cannot start wherever it likes. That alone does not stop a job
-    /// from being billed again at a fresh sequence, which is what the
-    /// credited-job set is for.
+    /// establishes that the certificate the client is about to sign —
+    /// or that a provider is about to bank — settles this channel's
+    /// credited total plus exactly one job's authorized price, for a
+    /// result the provider signed against exactly that job, and for a
+    /// job this ledger has not already paid for.
     ///
     /// What the caller still owns: keeping this ledger — one per
-    /// channel, across restarts — and verifying the provider's
-    /// signatures over each entry and each result. This function reads
+    /// channel, across restarts — and verifying the client's signatures
+    /// over the binding and over the certificate. This function reads
     /// bodies, never signatures.
-    pub fn credit_allocation(
+    ///
+    /// # Errors
+    ///
+    /// [`PaidWorkError::Duplicate`] when this job has been paid for
+    /// before, [`PaidWorkError::Mismatch`] when the binding or the
+    /// certificate is not the one this job at this ledger position
+    /// produces, and whatever [`next_payment`] refuses about the job
+    /// itself.
+    pub fn credit_payment(
         &mut self,
         channel: &PaidChannel,
-        allocation: &CertificateAllocationV1,
-        jobs: &[InvoicedJob],
+        authorization: &PaidJobAuthorizationV1,
+        result: &PaidJobResultV1,
+        binding: &PaymentBindingV1,
         certificate: &EarnedCertificate,
+        settlement: WorkPaymentSettlement,
     ) -> Result<(), PaidWorkError> {
-        let count = jobs.len();
-        if count == 0 || count > MAX_ALLOCATION_ENTRIES {
-            return Err(PaidWorkError::AllocationSize { count });
+        let (expected_certificate, expected_binding) = next_payment(
+            channel,
+            authorization,
+            result,
+            self.credited_cumulative,
+            settlement,
+        )?;
+
+        // One work id is one payment, here and in every earlier one. The
+        // result digest needs no rule of its own: the result body
+        // carries its work id, so two payments sharing a result digest
+        // share a work id and are refused by this one.
+        if self.paid_work_ids.contains(&expected_binding.work_id) {
+            return Err(PaidWorkError::Duplicate { field: "work_id" });
         }
 
-        let mut expected_seq = self.next_invoice_seq;
-        let mut expected_before = self.credited_invoice_high_water;
-        let mut credited = BTreeSet::new();
-        let mut entries = Vec::with_capacity(count);
-        for job in jobs {
-            let entry = &job.entry;
-            if entry.channel_id.as_bytes() != channel.id.as_bytes() {
-                return Err(PaidWorkError::Mismatch {
-                    field: "invoice channel_id",
-                });
-            }
-
-            // What the entry says it billed, against what this endpoint
-            // authorized and was delivered. Without these three an entry
-            // may name an honest job at any price it likes.
-            let work_id = work_id(channel, &job.authorization);
-            if entry.work_id.as_bytes() != work_id.as_bytes() {
-                return Err(PaidWorkError::Mismatch {
-                    field: "invoice work_id",
-                });
-            }
-            let result_digest = check_result(channel, work_id, &job.result)?;
-            if entry.result_digest.as_bytes() != result_digest.as_bytes() {
-                return Err(PaidWorkError::Mismatch {
-                    field: "invoice result_digest",
-                });
-            }
-            if entry.price != job.authorization.price {
-                return Err(PaidWorkError::Mismatch {
-                    field: "invoice price",
-                });
-            }
-
-            // One work id is one payment, here and in every earlier
-            // allocation. The result digest needs no rule of its own:
-            // the result body carries its work id, so two entries
-            // sharing a result digest share a work id and are refused
-            // by this one.
-            if self.credited_work_ids.contains(&work_id) || !credited.insert(work_id) {
-                return Err(PaidWorkError::Duplicate { field: "work_id" });
-            }
-
-            if entry.invoice_seq != expected_seq {
-                return Err(PaidWorkError::InvoiceSequence {
-                    expected: expected_seq,
-                    actual: entry.invoice_seq,
-                });
-            }
-            if entry.cumulative_before != expected_before {
-                return Err(PaidWorkError::Mismatch {
-                    field: "cumulative_before",
-                });
-            }
-            let after = entry.cumulative_before.checked_add(entry.price).ok_or(
-                PaidWorkError::Overflow {
-                    field: "cumulative_after",
-                },
-            )?;
-            if entry.cumulative_after != after {
-                return Err(PaidWorkError::Mismatch {
-                    field: "cumulative_after",
-                });
-            }
-            expected_seq = entry.invoice_seq.checked_add(1).ok_or({
-                PaidWorkError::Overflow {
-                    field: "invoice_seq",
-                }
-            })?;
-            expected_before = entry.cumulative_after;
-            entries.push(*entry);
-        }
-
-        let first = entries
-            .first()
-            .ok_or(PaidWorkError::AllocationSize { count })?;
-        let last = entries
-            .last()
-            .ok_or(PaidWorkError::AllocationSize { count })?;
-        let bindings = [
-            (
-                "allocation channel_id",
-                allocation.channel_id.as_bytes() == channel.id.as_bytes(),
-            ),
-            (
-                "first_invoice_seq",
-                allocation.first_invoice_seq == first.invoice_seq,
-            ),
-            (
-                "last_invoice_seq",
-                allocation.last_invoice_seq == last.invoice_seq,
-            ),
-            (
-                "invoice_entries_root",
-                allocation.invoice_entries_root.as_bytes()
-                    == invoice_entries_root(channel, &entries)?.as_bytes(),
-            ),
-            (
-                "certificate_digest",
-                allocation.certificate_digest.as_bytes()
-                    == certificate.digest(channel.network).as_bytes(),
-            ),
+        // The certificate's three fields, each against what this channel
+        // and this ledger position fix. All three together are the whole
+        // of an `EarnedCertificate`, which is what makes the binding
+        // check below a statement about *this* certificate rather than
+        // about some certificate with the same digest field.
+        let expected = [
             (
                 "certificate payment_edge",
-                certificate.payment_edge().as_bytes() == channel.payment_edge.as_bytes(),
+                certificate.payment_edge().as_bytes()
+                    == expected_certificate.payment_edge().as_bytes(),
             ),
             (
                 "certificate payment_terms_hash",
                 certificate.payment_terms_hash().as_bytes()
-                    == channel.payment_terms_hash.as_bytes(),
+                    == expected_certificate.payment_terms_hash().as_bytes(),
             ),
             (
                 "certificate earned_cumulative",
-                certificate.earned_cumulative() == last.cumulative_after,
+                certificate.earned_cumulative() == expected_certificate.earned_cumulative(),
+            ),
+            (
+                "binding work_id",
+                binding.work_id.as_bytes() == expected_binding.work_id.as_bytes(),
+            ),
+            (
+                "binding result_digest",
+                binding.result_digest.as_bytes() == expected_binding.result_digest.as_bytes(),
+            ),
+            (
+                "binding certificate_digest",
+                binding.certificate_digest.as_bytes()
+                    == expected_binding.certificate_digest.as_bytes(),
             ),
         ];
-        for (field, holds) in bindings {
+        for (field, holds) in expected {
             if !holds {
                 return Err(PaidWorkError::Mismatch { field });
             }
         }
 
-        self.next_invoice_seq = expected_seq;
-        self.credited_invoice_high_water = last.cumulative_after;
-        self.credited_work_ids.append(&mut credited);
+        self.credited_cumulative = expected_certificate.earned_cumulative();
+        self.paid_work_ids.insert(expected_binding.work_id);
         Ok(())
     }
 }
