@@ -1262,6 +1262,80 @@ async fn a_certificate_above_the_invoiced_prefix_pays_no_job() {
     assert_eq!(provider.state().unallocated_gap(), Some(1));
 }
 
+/// A payment is exactly the bytes the service defines, and no other
+/// spelling of them.
+///
+/// Each request below is the honest one with one field mis-encoded, and
+/// none of the three reaches a rule about money: nothing is credited,
+/// and nothing is kept as evidence either.
+#[tokio::test]
+async fn a_payment_is_exactly_the_bytes_the_service_defines() {
+    let mut fixture = checked_job().await;
+    let id = fixture.id;
+    if let Err(error) = invoice_over_wire(&fixture.service, &mut fixture.client, id).await {
+        panic!("the checked job is invoiced: {error}");
+    }
+    let honest = match fixture.client.pay(id) {
+        Ok(request) => request,
+        Err(error) => panic!("the client signs its payment: {error}"),
+    };
+
+    let mut trailing = honest.certificate.clone();
+    trailing.push(0);
+    let mut truncated = honest.allocation.clone();
+    truncated.pop();
+    let mut short = honest.allocation_signature.clone();
+    short.pop();
+    let mutations = [
+        (
+            "a trailing byte on the certificate",
+            AdmitCertificateRequest {
+                certificate: trailing,
+                ..honest.clone()
+            },
+        ),
+        (
+            "a truncated allocation",
+            AdmitCertificateRequest {
+                allocation: truncated,
+                ..honest.clone()
+            },
+        ),
+        (
+            "a 63-byte allocation signature",
+            AdmitCertificateRequest {
+                allocation_signature: short,
+                ..honest.clone()
+            },
+        ),
+    ];
+    for (what, request) in mutations {
+        let response = admit_response(&fixture.service, request).await;
+        assert_eq!(refusal_of(&response), WorkRefusalCode::Invalid, "{what}");
+        let Ok(provider) = fixture.service.endpoint() else {
+            panic!("the endpoint is reachable");
+        };
+        let state = provider.state();
+        assert_eq!(
+            state.ledger().credited_invoice_high_water(),
+            0,
+            "{what} credits nothing",
+        );
+        assert_eq!(
+            state.max_executable_certificate(),
+            0,
+            "{what} is not evidence either",
+        );
+    }
+
+    // The control: the same request, whole.
+    let response = admit_response(&fixture.service, honest).await;
+    assert!(
+        matches!(response.outcome, Some(AdmitOutcome::Paid(_))),
+        "the whole request is paid: {response:?}",
+    );
+}
+
 // ── Payment against default ───────────────────────────────────────────
 
 /// A job written off and a job paid for are the same job, and exactly
