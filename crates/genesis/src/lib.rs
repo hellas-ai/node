@@ -288,6 +288,33 @@ mod tests {
         }
     }
 
+    /// The shipped documents are pinned by their bytes, not by the
+    /// facts a parser can be talked into agreeing with. `include_str!`
+    /// takes a path, and a path is a thing that can be re-pointed by a
+    /// move, a symlink, or a directory rename — after which every
+    /// assertion above still passes while the committee has changed.
+    /// Two networks differing in one hex digit are two networks, and a
+    /// node that joined the wrong one has forked.
+    #[test]
+    fn shipped_documents_hash_to_the_bytes_that_were_reviewed() {
+        use sha2::{Digest as _, Sha256};
+
+        for (json, expected) in [
+            (
+                HELLAS_DEVNET_1_JSON,
+                "caab04a9350edbe0d50aa9375dcee2742145cf5c24c57f42c844ebf4f27aa4b6",
+            ),
+            (
+                HELLAS_TESTNET_1_JSON,
+                "2c845c34455dc96e818ce40f4200edac79e6fb43f3e68a24e522d2030c3d8680",
+            ),
+        ] {
+            let digest = Sha256::digest(json.as_bytes());
+            let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+            assert_eq!(hex, expected);
+        }
+    }
+
     #[test]
     fn canonical_devnet_genesis_is_valid_and_matches_its_id_constant() {
         let genesis: Genesis = serde_json::from_str(HELLAS_DEVNET_1_JSON).unwrap();
