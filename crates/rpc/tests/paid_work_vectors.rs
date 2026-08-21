@@ -2151,19 +2151,18 @@ fn the_ledger_credits_only_the_payment_this_position_produces() {
     ];
     for (field, mutated) in certificates {
         assert_ne!(mutated, certificate, "{field} is the one thing varied");
-        // The binding is re-pointed at whichever certificate is offered,
-        // so what refuses each case is the certificate rule and not the
-        // binding check in front of it.
-        let rebound = PaymentBindingV1 {
-            certificate_digest: mutated.digest(network()),
-            ..binding
-        };
+        // The binding is left alone, so it is the binding this ledger
+        // position expects and the check in front passes. What refuses
+        // each case is therefore the certificate's own field and not its
+        // neighbour — which also covers the case the neighbour cannot
+        // see: an offered certificate that is not the one the binding
+        // names.
         assert_eq!(
             CreditLedger::new().credit_payment(
                 &channel,
                 &authorization,
                 &result,
-                &rebound,
+                &binding,
                 &mutated,
                 capacity(),
             ),
@@ -2212,22 +2211,19 @@ fn a_payment_does_not_cross_channels() {
         next_payment(&channel, &authorization, &result, 0, capacity()).expect("a legal payment");
 
     // MUTATION: the same job, paid on the sibling's edge. The binding is
-    // re-pointed at that certificate, so the refusal is the edge check.
+    // the one this position expects, so the check in front of the
+    // certificate passes and the edge check is what refuses it.
     let foreign = EarnedCertificate::new(
         sibling.payment_edge(),
         channel.payment_terms_hash(),
         certificate.earned_cumulative(),
     );
-    let rebound = PaymentBindingV1 {
-        certificate_digest: foreign.digest(network()),
-        ..binding
-    };
     assert_eq!(
         CreditLedger::new().credit_payment(
             &channel,
             &authorization,
             &result,
-            &rebound,
+            &binding,
             &foreign,
             capacity(),
         ),

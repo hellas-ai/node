@@ -920,8 +920,8 @@ async fn the_provider_prices_the_payment_itself() {
         assert_nothing_credited(&fixture.service, field).await;
     }
 
-    // The certificate's own three fields, each re-bound and re-signed so
-    // the refusal is the ledger's rather than a stale digest's.
+    // The certificate's own three fields, each re-signed so the refusal
+    // is the ledger's rather than a signature's.
     let other_edge = EdgeId::from_bytes([0x77; EdgeId::LENGTH]);
     let other_terms = TermsHash::from_bytes([0x88; 32]);
     let certificates = [
@@ -944,18 +944,13 @@ async fn the_provider_prices_the_payment_itself() {
     ];
     for (field, mutated) in certificates {
         assert_ne!(mutated, certificate, "{field} is the one thing varied");
-        let rebound = PaymentBindingV1 {
-            certificate_digest: mutated.digest(channel.network()),
-            ..binding
-        };
+        // The binding is left alone, so the check in front of the
+        // certificate passes and the certificate's own field is what
+        // refuses each case.
         let request = AdmitCertificateRequest {
             certificate: certificate_bytes(&mutated),
-            binding: rebound.encode(),
-            binding_signature: signature_over(
-                &client(),
-                signing_hash(payment_binding_digest(&channel, &rebound)),
-            ),
             certificate_signature: signature_over(&client(), mutated.digest(channel.network())),
+            ..honest.clone()
         };
         let response = admit_response(&fixture.service, request).await;
         assert_eq!(

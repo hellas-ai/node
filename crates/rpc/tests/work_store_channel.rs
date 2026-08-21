@@ -716,6 +716,116 @@ fn a_client_that_has_processed_no_block_records_no_receipt() {
     );
 }
 
+/// A verdict is the client's step, and it needs a result to be about.
+///
+/// This is what keeps [`ChannelRecord::ResultVerified`] worth its tag.
+/// Without the phase rule below, a client could record a verdict about
+/// an answer that had not arrived, and the payment gate that reads it
+/// would be gating on nothing.
+#[test]
+fn a_verdict_belongs_to_a_client_holding_a_result() {
+    let dir = temp();
+    let channel = channel();
+    let verifier = Secp256k1Verifier::new();
+    let job = job_at(&channel, 1, 0);
+
+    // MUTATION: the provider's journal, which has no oracle.
+    let mut provider_store = open(dir.path(), Role::Provider);
+    commit_all(&mut provider_store, &provider_sequence(&channel, &job)[..4]);
+    let error = provider_store
+        .commit(ChannelRecord::ResultVerified, &verifier)
+        .expect_err("a provider does not check its own answer");
+    assert!(
+        matches!(
+            error,
+            WorkStoreError::Channel(ChannelStateError::WrongRole {
+                step: "recording an oracle verdict",
+                expected: "client"
+            })
+        ),
+        "unexpected error: {error}"
+    );
+
+    // MUTATION: a client's journal, one step before the result.
+    let other = temp();
+    let mut store = open(other.path(), Role::Client);
+    let sequence = client_sequence(&channel, &job);
+    commit_all(&mut store, &sequence[..3]);
+    assert_eq!(
+        store.state().job().map(JobState::phase),
+        Some(JobPhase::Accepted)
+    );
+    let error = store
+        .commit(ChannelRecord::ResultVerified, &verifier)
+        .expect_err("there is nothing yet to have checked");
+    assert!(
+        matches!(
+            error,
+            WorkStoreError::Channel(ChannelStateError::WrongPhase {
+                step: "recording an oracle verdict",
+                phase: "accepted"
+            })
+        ),
+        "unexpected error: {error}"
+    );
+
+    // The control: with the result recorded, the same step is taken —
+    // and taken again is redundant rather than a second verdict.
+    commit_all(&mut store, &sequence[3..5]);
+    let before = store.len();
+    if let Err(error) = store.commit(ChannelRecord::ResultVerified, &verifier) {
+        panic!("a repeated verdict is the same verdict: {error}");
+    }
+    assert_eq!(store.len(), before, "and it is not written twice");
+    assert_eq!(
+        store.state().job().map(JobState::phase),
+        Some(JobPhase::Verified)
+    );
+}
+
+/// An unverified result is not paid for, whichever half of the channel
+/// is asked.
+///
+/// The verdict is the only thing varied: the same delivered result, the
+/// same signed payment, refused before it and taken after it.
+#[test]
+fn an_unverified_result_is_not_paid_for() {
+    let dir = temp();
+    let channel = channel();
+    let verifier = Secp256k1Verifier::new();
+    let job = job_at(&channel, 1, 0);
+    let mut store = open(dir.path(), Role::Client);
+    let sequence = client_sequence(&channel, &job);
+    commit_all(&mut store, &sequence[..4]);
+    assert_eq!(
+        store.state().job().map(JobState::phase),
+        Some(JobPhase::Ready)
+    );
+
+    // MUTATION: the payment offered with the verdict step skipped.
+    let error = store
+        .commit(job.paid(&channel), &verifier)
+        .expect_err("a result nobody checked is not payable");
+    assert!(
+        matches!(
+            error,
+            WorkStoreError::Channel(ChannelStateError::WrongPhase {
+                step: "crediting a payment",
+                phase: "ready"
+            })
+        ),
+        "unexpected error: {error}"
+    );
+    assert_eq!(store.state().ledger().credited_cumulative(), 0);
+
+    // The control: with the verdict recorded, the same payment is taken.
+    commit_all(&mut store, &[ChannelRecord::ResultVerified]);
+    if let Err(error) = store.commit(job.paid(&channel), &verifier) {
+        panic!("a checked result is paid for: {error}");
+    }
+    assert_eq!(store.state().ledger().credited_cumulative(), PRICE);
+}
+
 // ── The defect this phase exists to prevent ───────────────────────────
 
 /// One job is paid for once: live, and after a restart.
@@ -2012,20 +2122,18 @@ fn a_payment_must_be_the_one_this_position_admits() {
         let dir = temp();
         let mut store = open(dir.path(), Role::Provider);
         commit_all(&mut store, &provider_sequence(&channel, &job)[..5]);
-        // Re-bound as well as re-signed: the binding names whichever
-        // certificate is being offered, so the refusal below is the
-        // ledger's arithmetic and not the binding check in front of it.
-        let binding = PaymentBindingV1 {
-            certificate_digest: certificate.digest(network()),
-            ..job.binding
-        };
+        // The binding is left as the one this position expects, so the
+        // check in front of the certificate passes and what refuses each
+        // case is the certificate's own field. It is also the case that
+        // check cannot see: an offered certificate that is not the one
+        // the binding names.
         let error = store
             .commit(
                 ChannelRecord::CertificateAdmitted {
                     certificate,
-                    binding,
+                    binding: job.binding,
                     binding_signature: client()
-                        .sign(payload(payment_binding_digest(&channel, &binding))),
+                        .sign(payload(payment_binding_digest(&channel, &job.binding))),
                     certificate_signature: client().sign(certificate.digest(network())),
                 },
                 &verifier,
