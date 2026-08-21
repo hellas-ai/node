@@ -1791,3 +1791,118 @@ async fn a_start_signed_before_a_crash_is_the_start_that_is_resubmitted() {
     }
     assert_eq!(watcher.provider.state().close_prepared(), Some(&signed));
 }
+
+// ── Answering a contest opened below what is held ─────────────────────
+
+/// The provider answers a client that opened below what it has already
+/// signed for, and answers exactly once.
+///
+/// Each refusal below differs from the admissible answer in one thing:
+/// the contest is another, the answer already landed, the read is at
+/// the deadline rather than a block before it, or the provider holds
+/// nothing more than the contest already settles. The last is not a
+/// fault — it is the case where the one answer the window admits would
+/// buy nothing.
+#[tokio::test]
+async fn the_provider_answers_an_understated_contest_exactly_once() {
+    let fixture = paid_job().await;
+    let ready = fixture.ready.clone();
+    let inclusion = CURSOR + 1;
+    let bond = bond_object();
+    let payment_edge_object = payment_object();
+
+    // The client opens at nothing, having a certificate for PRICE.
+    let Ok(understated) = close_start(
+        ready.channel(),
+        hellas_kernel::Party::Maker,
+        CURSOR,
+        None,
+        &client(),
+    ) else {
+        panic!("a client opens a close");
+    };
+    let id = contest_id(&ready, &understated, inclusion);
+
+    let Ok(mut provider) = fixture.service.endpoint() else {
+        panic!("the endpoint is reachable");
+    };
+    if let Err(error) = provider.observe_finalized(&block(
+        inclusion,
+        vec![hellas_kernel::Tx::move_action(
+            hellas_kernel::Move::StartPaymentClose(understated),
+        )],
+    )) {
+        panic!("the block applies: {error}");
+    }
+    assert_eq!(provider.state().close_opened(), Some(id));
+
+    let deadline = inclusion + payment_terms().omit_response_blocks;
+    let open = Contest::opened(id, deadline, 0);
+    let read_at = |height: u64, record: &Contest| ObservedChannel {
+        height,
+        bond: Some(&bond),
+        payment: Some(&payment_edge_object),
+        lease: lease_over(bond_edge(), payment_edge()),
+        pending: pending_slot(record),
+    };
+
+    // One block before the deadline, the answer is the client's own
+    // larger certificate.
+    let answered = match provider.respond_to_close(&read_at(deadline - 1, &open)) {
+        Ok(answer) => answer,
+        Err(error) => panic!("an understated contest is answered: {error}"),
+    };
+    let hellas_kernel::Tx::Move {
+        action: hellas_kernel::Move::RespondPaymentClose(response),
+    } = &answered
+    else {
+        panic!("an answer is a response move");
+    };
+    assert_eq!(response.start_id(), id);
+    assert_eq!(response.responder_role(), hellas_kernel::Party::Taker);
+    assert_eq!(response.certificate().earned_cumulative(), PRICE);
+
+    // At the deadline the kernel calls it late, and so does this.
+    assert!(
+        matches!(
+            provider.respond_to_close(&read_at(deadline, &open)),
+            Err(CloseError::ResponseWindowClosed { height, deadline: owed })
+                if height == deadline && owed == deadline
+        ),
+        "an answer at the deadline is late",
+    );
+
+    // The one answer, already landed.
+    let mut settled = Contest::opened(id, deadline, 0);
+    settled.final_cumulative = PRICE;
+    settled.responded = true;
+    settled.penalty_due = true;
+    assert!(
+        matches!(
+            provider.respond_to_close(&read_at(deadline - 1, &settled)),
+            Err(CloseError::AlreadyResponded)
+        ),
+        "there is one answer",
+    );
+
+    // A contest already at this endpoint's own high-water: nothing to
+    // add, and the window is not spent saying so.
+    let level = Contest::opened(id, deadline, PRICE);
+    assert!(
+        matches!(
+            provider.respond_to_close(&read_at(deadline - 1, &level)),
+            Err(CloseError::NothingToAdd { held, settled }) if held == PRICE && settled == PRICE
+        ),
+        "an equal high-water has no legal answer",
+    );
+
+    // Another contest in the slot.
+    let elsewhere = Contest::opened(hellas_kernel::StartId::from_bytes([0x77; 32]), deadline, 0);
+    assert!(
+        matches!(
+            provider.respond_to_close(&read_at(deadline - 1, &elsewhere)),
+            Err(CloseError::OtherContest)
+        ),
+        "another contest is not this endpoint's to answer",
+    );
+}

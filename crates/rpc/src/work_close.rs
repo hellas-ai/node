@@ -72,9 +72,9 @@
 //! and a place to put the other.
 
 use hellas_kernel::{
-    EarnedCertificate, List, MAX_EDGE_OUTPUTS, Party, PayloadHash, PaymentCloseStart, Payout,
-    PendingPaymentClose, Proof, Secp256k1Signer, Sig, SigVerifier, Terms, Tx,
-    WorkPaymentSettlement, adjudicated_payouts, no_earned_digest,
+    EarnedCertificate, List, MAX_EDGE_OUTPUTS, Party, PayloadHash, PaymentCloseResponse,
+    PaymentCloseStart, Payout, PendingPaymentClose, Proof, Secp256k1Signer, Sig, SigVerifier,
+    StartId, Terms, Tx, WorkPaymentSettlement, adjudicated_payouts, no_earned_digest,
 };
 
 use crate::protocol::work::PaidChannel;
@@ -173,6 +173,31 @@ pub enum CloseError {
         height: u64,
         /// Height at which the window shuts.
         deadline: u64,
+    },
+    /// The contest has already been answered, and there is one answer.
+    #[error("this contest has already been answered")]
+    AlreadyResponded,
+    /// The response window has shut, so consensus would refuse an
+    /// answer.
+    #[error("the response window shut at height {deadline}, and the read is at {height}")]
+    ResponseWindowClosed {
+        /// Finalized height the read was taken at.
+        height: u64,
+        /// Height at which the window shut.
+        deadline: u64,
+    },
+    /// This endpoint holds nothing the contest does not already settle.
+    ///
+    /// Not a fault. An answer has to strictly advance the amount, so a
+    /// contest already at this endpoint's own high-water is one there
+    /// is nothing to say about — and saying it would spend the one
+    /// answer the window admits.
+    #[error("the contest already settles {settled}, and this endpoint holds {held}")]
+    NothingToAdd {
+        /// Largest certificate this endpoint holds.
+        held: u64,
+        /// Amount the contest currently settles at.
+        settled: u64,
     },
     /// The payouts this contest settles do not fit what the edge
     /// distributes.
@@ -282,6 +307,40 @@ pub fn close_start(
         unsigned.certificate().copied(),
         action_sig,
     ))
+}
+
+/// Builds the provider's one answer to a contest opened below what it
+/// holds.
+///
+/// The certificate is the client's own, already on this endpoint's disk
+/// — an answer reveals no new evidence, it spends evidence the client
+/// signed and the opener left out. That is why nothing is journaled
+/// before it: the write-ahead step this answer needs is the watcher's
+/// [`ChannelRecord::CloseOpened`], which is on the disk before anything
+/// can be built from it and is what shuts this channel to new work.
+#[must_use]
+pub fn close_response(
+    channel: &PaidChannel,
+    start_id: StartId,
+    certificate: (EarnedCertificate, Sig),
+    signer: &Secp256k1Signer,
+) -> PaymentCloseResponse {
+    let earned = certificate.0.digest(channel.network());
+    let digest = hellas_kernel::response_digest(
+        channel.network(),
+        channel.payment_edge(),
+        channel.payment_terms_hash(),
+        start_id,
+        Party::Taker,
+        earned,
+    );
+    PaymentCloseResponse::new(
+        channel.payment_edge(),
+        start_id,
+        Party::Taker,
+        certificate,
+        signer.sign(digest),
+    )
 }
 
 /// Builds the close that pays out whatever the contest ended on.

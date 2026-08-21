@@ -114,7 +114,7 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use hellas_kernel::{
-    Decode as _, EarnedCertificate, Party, PaymentCloseStart, PendingSlot, Secp256k1Signer,
+    Decode as _, EarnedCertificate, Move, Party, PaymentCloseStart, PendingSlot, Secp256k1Signer,
     Secp256k1Verifier, Sig, Tx,
 };
 use hellas_wire::{StreamTransport, WireStatus};
@@ -142,7 +142,7 @@ use crate::protocol::work_setup::{ObservedChannel, ReadyChannel, WorkSetupError}
 use crate::services::work::{WorkClientImpl, WorkHandler};
 use crate::work_close::{
     CatchUpError, CloseError, FinalizedBlocks, FinalizedWork, adjudicated_close, catch_up,
-    close_start, observe,
+    close_response, close_start, observe,
 };
 use crate::work_store::channel::encode_kernel;
 use crate::work_store::journal::MAX_RECORD_BYTES;
@@ -1080,6 +1080,64 @@ impl ProviderEndpoint {
             });
         }
         adjudicated_close(self.ready.channel(), self.ready.settlement(), &record)
+    }
+
+    /// Builds the one answer to a contest opened below what this
+    /// provider holds.
+    ///
+    /// The contest may be either side's — this is the answer to a
+    /// *client* that opened at less than it has already signed for, and
+    /// it is the whole of what the funded omission bond deters. Only
+    /// the certificate's beneficiary may answer, which is why there is
+    /// no client counterpart to this.
+    ///
+    /// Nothing durable is written. The certificate it spends is already
+    /// on this endpoint's disk, and the record that shut this channel
+    /// to new work — the watcher's `CloseOpened` — was fsynced before
+    /// anything here could be built from it.
+    ///
+    /// # Errors
+    ///
+    /// [`CloseError::NoContest`] and [`CloseError::OtherContest`] as
+    /// above, [`CloseError::AlreadyResponded`] once the one answer has
+    /// landed, [`CloseError::ResponseWindowClosed`] at or after the
+    /// deadline — the kernel refuses an answer exactly there — and
+    /// [`CloseError::NothingToAdd`] when this endpoint holds nothing
+    /// the contest does not already settle.
+    pub fn respond_to_close(&self, observed: &ObservedChannel<'_>) -> Result<Tx, CloseError> {
+        let held = self.state().close_opened().ok_or(CloseError::NoContest)?;
+        let PendingSlot::Present(record) = observed.pending else {
+            return Err(CloseError::NoContest);
+        };
+        if record.start_id() != held {
+            return Err(CloseError::OtherContest);
+        }
+        if record.responded() {
+            return Err(CloseError::AlreadyResponded);
+        }
+        // Strictly below the deadline, which is the kernel's own rule:
+        // an answer landing exactly at it is late.
+        if observed.height >= record.response_deadline() {
+            return Err(CloseError::ResponseWindowClosed {
+                height: observed.height,
+                deadline: record.response_deadline(),
+            });
+        }
+        let certificate = self
+            .state()
+            .executable_certificate()
+            .copied()
+            .filter(|(certificate, _)| certificate.earned_cumulative() > record.final_cumulative())
+            .ok_or(CloseError::NothingToAdd {
+                held: self.state().max_executable_certificate(),
+                settled: record.final_cumulative(),
+            })?;
+        Ok(Tx::move_action(Move::RespondPaymentClose(close_response(
+            self.ready.channel(),
+            held,
+            certificate,
+            &self.signer,
+        ))))
     }
 }
 
