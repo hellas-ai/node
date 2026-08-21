@@ -63,7 +63,9 @@ use hellas_wire::StreamTransport;
 /// it may call this again with the same `work_id`: the invoice is
 /// re-issued from the provider's retained bytes and taken as one, the
 /// certificate is signed at most once per job, and re-sending it
-/// credits nothing further.
+/// credits nothing further. A job this channel has already paid for is
+/// past having an invoice to ask about — the payment closed it — so
+/// that call goes straight to re-sending the bytes the journal holds.
 ///
 /// # Errors
 ///
@@ -82,6 +84,12 @@ where
     T::Stream: 'static,
 {
     let client = WorkClientImpl::new(transport);
-    request_invoice(&client, endpoint, work_id).await?;
+    let signed_already = endpoint
+        .state()
+        .last_payment()
+        .is_some_and(|payment| payment.work_id == work_id);
+    if !signed_already {
+        request_invoice(&client, endpoint, work_id).await?;
+    }
     admit_payment(&client, endpoint, work_id).await
 }

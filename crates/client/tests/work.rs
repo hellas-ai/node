@@ -42,10 +42,10 @@ use hellas_rpc::protocol::work_setup::{
     ObservedChannel, ReadyChannel, WorkChannelConfig, WorkChannelDescriptor, payment_terms_hash,
 };
 use hellas_rpc::protocol::{ContentId, Digest};
-use hellas_rpc::services::work::WorkServer;
+use hellas_rpc::services::work::{WorkClientImpl, WorkServer};
 use hellas_rpc::work::{
     BackendFault, ClientEndpoint, PaidEvaluateBackend, ProviderEndpoint, RunOutcome, WorkService,
-    run_accepted_work,
+    request_invoice, run_accepted_work,
 };
 use hellas_rpc::work_store::{ChannelRecord, ChannelStore, JobPhase, JobState, Role};
 use hellas_rpc::{
@@ -714,6 +714,95 @@ async fn a_checked_answer_becomes_a_payment_the_provider_admitted() {
     };
     assert_eq!(payment.work_id, id);
     assert_eq!(payment.certificate.earned_cumulative(), PRICE);
+}
+
+/// A payment signed before a crash is re-sent after it, and credited
+/// once.
+///
+/// The client dies between fsyncing its certificate and sending it —
+/// the one window where its journal holds a payment no provider has
+/// seen. What comes back is not a second signature: it is the same
+/// bytes, off the disk of a process that never made them.
+#[tokio::test]
+async fn a_payment_signed_before_a_crash_is_re_sent_after_it() {
+    let client_root = temp();
+    let provider_root = temp();
+    let ready = ready();
+    let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR);
+    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
+    let (id, _) = accept(
+        &execution_policy(),
+        &mut [&mut client_store, &mut provider_store],
+        1,
+    );
+    let Ok(provider_endpoint) = ProviderEndpoint::new(ready.clone(), provider_store, provider())
+    else {
+        panic!("the provider endpoint binds");
+    };
+    let service = WorkService::new(provider_endpoint);
+    let Ok(mut endpoint) = ClientEndpoint::new(ready.clone(), client_store, client()) else {
+        panic!("the client endpoint binds");
+    };
+    run_to_result(&service, &ready, id).await;
+
+    let (transport, server) = transport_pair();
+    let serving = serve(server, service.clone());
+    let collected = collect_checked_result(
+        transport,
+        &mut endpoint,
+        &ready,
+        &FixedEngine::agreeing(),
+        id,
+    )
+    .await;
+    serving.abort();
+    assert!(
+        matches!(collected, Ok(CollectOutcome::Checked(_))),
+        "the answer is checked: {collected:?}",
+    );
+
+    // Invoiced and signed, and then the process is gone before a byte
+    // of the certificate leaves it.
+    let (transport, server) = transport_pair();
+    let serving = serve(server, service.clone());
+    let invoiced = request_invoice(&WorkClientImpl::new(transport), &mut endpoint, id).await;
+    serving.abort();
+    if let Err(error) = invoiced {
+        panic!("the checked job is invoiced: {error}");
+    }
+    let signed = endpoint.pay(id);
+    assert!(signed.is_ok(), "the client signs its payment: {signed:?}");
+    drop(endpoint);
+    {
+        let Ok(provider) = service.endpoint() else {
+            panic!("the endpoint is reachable");
+        };
+        assert_eq!(
+            provider.state().ledger().credited_invoice_high_water(),
+            0,
+            "and the provider has seen nothing",
+        );
+    }
+
+    let recovered = store_at(client_root.path(), &ready, Role::Client, CURSOR);
+    let Ok(mut endpoint) = ClientEndpoint::new(ready.clone(), recovered, client()) else {
+        panic!("the client endpoint rebinds");
+    };
+    let (transport, server) = transport_pair();
+    let serving = serve(server, service.clone());
+    let credited = pay_for_checked_result(transport, &mut endpoint, id).await;
+    serving.abort();
+    assert_eq!(credited.ok(), Some(PRICE));
+
+    let Ok(provider) = service.endpoint() else {
+        panic!("the endpoint is reachable");
+    };
+    assert_eq!(
+        provider.state().ledger().credited_invoice_high_water(),
+        PRICE
+    );
+    assert_eq!(provider.state().compute_outstanding(), 0);
+    assert_eq!(provider.state().delivery_outstanding(), 0);
 }
 
 /// An unchecked answer is not paid for, and asking to pay for one
