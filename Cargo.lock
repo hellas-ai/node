@@ -3463,7 +3463,6 @@ dependencies = [
  "ciborium",
  "futures",
  "hellas-attestation",
- "hellas-compute-oracle",
  "hellas-kernel",
  "hellas-rpc",
  "hellas-wire",
@@ -3479,15 +3478,6 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
-]
-
-[[package]]
-name = "hellas-compute-oracle"
-version = "0.1.0"
-dependencies = [
- "hellas-kernel",
- "hellas-rpc",
- "thiserror 2.0.18",
 ]
 
 [[package]]

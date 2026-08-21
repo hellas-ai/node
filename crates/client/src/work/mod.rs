@@ -33,7 +33,7 @@
 //! tokens in the same order, stopping for the same reason, with the same
 //! output artifact and the same usage. It does not mean the provider
 //! computed rather than recalled that answer, and it is no stronger than
-//! the engine behind [`Reexecution`]. See `hellas_compute_oracle`.
+//! the engine behind [`Reexecution`]. See [`oracle`].
 //!
 //! # What is not here
 //!
@@ -45,13 +45,16 @@
 //! policy that owns a clock can be written over a signal rather than a
 //! guess.
 
-use hellas_compute_oracle::{OracleFault, Reexecution};
+pub mod oracle;
+
 use hellas_rpc::protocol::artifacts::PreparedPaidInputV1;
 use hellas_rpc::protocol::work::PaidJobResultV1;
 use hellas_rpc::protocol::work_setup::ReadyChannel;
 use hellas_rpc::work::{ClientEndpoint, DeliverError, fetch_result};
 use hellas_rpc::work_store::journal::MAX_RECORD_BYTES;
 use hellas_wire::StreamTransport;
+
+use oracle::{OracleFault, Reexecution};
 
 /// One job's answer, checked and durably recorded as checked.
 ///
@@ -158,7 +161,7 @@ where
         .map_err(|error| CollectError::Bundle(error.to_string()))?;
     let network = endpoint.state().channel().network();
 
-    match hellas_compute_oracle::verify(engine, network, work_id, &bundle, &delivery.result) {
+    match oracle::verify(engine, network, work_id, &bundle, &delivery.result) {
         Ok(()) => {}
         Err(fault @ OracleFault::Mismatch) => return Err(CollectError::Refuted(fault)),
         Err(fault) => return Err(CollectError::Unchecked(fault)),

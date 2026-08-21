@@ -16,8 +16,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::Bytes;
+use hellas_client::work::oracle::{OracleFault, Reexecuted, Reexecution, ReexecutionRequest};
 use hellas_client::work::{CheckedResult, CollectError, CollectOutcome, collect_checked_result};
-use hellas_compute_oracle::{OracleFault, Reexecuted, Reexecution, ReexecutionRequest};
 use hellas_kernel::{
     BlockHeight, Decode as _, Edge, EdgeId, EdgeValues, Fees, Key, LeaseSlots, List,
     MAX_EDGE_OUTPUTS, NetworkId, Parties, Payout, PendingSlot, RegistryChunk, RegistryNamespace,

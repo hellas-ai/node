@@ -7,7 +7,9 @@
 //! that drifted would show up as the oracle rejecting an honest result
 //! rather than as two wrongs agreeing.
 
-use hellas_compute_oracle::{
+#![cfg(feature = "work")]
+
+use hellas_client::work::oracle::{
     OracleFault, Reexecuted, Reexecution, ReexecutionRequest, plan, verify,
 };
 use hellas_kernel::{

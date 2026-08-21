@@ -1,15 +1,17 @@
 //! The client's independent check: does the answer this provider signed
 //! reproduce from the inputs both parties agreed to?
 //!
-//! # Why a crate of its own
+//! # Why it sits here
 //!
 //! Because the check must not be able to reach the provider. Everything
 //! here takes bytes and returns a verdict; nothing here opens a
 //! connection, reads a store, or consults a piece of provider metadata
 //! that is not inside the authorization the client itself signed. A
-//! module inside the executor could not credibly claim that, and a
-//! module inside the client would drag model weights into a crate that
-//! today has no model dependency at all.
+//! module inside the executor could not credibly claim that. This one
+//! can: the engine arrives through [`Reexecution`], never through a
+//! dependency, and `hellas-client`'s closure holds no `hellas-executor`
+//! and no model weights under any feature it has. The boundary that
+//! makes the check independent is the trait, not a crate.
 //!
 //! # What is checked, exactly
 //!
@@ -36,9 +38,9 @@
 //! # What it cannot do
 //!
 //! It cannot be more independent than its [`Reexecution`] engine is.
-//! The milestone this crate exists for wants a *second* deterministic
+//! The milestone this check exists for wants a *second* deterministic
 //! implementation of the same model, and there is not one in this
-//! repository: the executor has exactly one backend. So this crate
+//! repository: the executor has exactly one backend. So this module
 //! defines the seam and derives everything around it, and the
 //! independence of the answer itself is exactly the independence of
 //! whatever is plugged in. Running the provider's own implementation

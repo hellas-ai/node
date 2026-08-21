@@ -73,14 +73,14 @@ let
       mk "check-rpc-work"
         "cargo test -p hellas-rpc --features work && cargo clippy -p hellas-rpc --features work --all-targets -- -D warnings"
         (cargoEnv rustToolchain);
-    # The client's paid-work half and the oracle behind it. `work` is off
-    # by default on `hellas-client`, so `check-clippy` compiles neither
-    # the orchestrator nor its end-to-end test; and the oracle crate has
-    # no default-feature consumer at all, so its own suite — the one that
-    # says what a failed independent check does — runs only here.
+    # The client's paid-work half and the oracle inside it. `work` is off
+    # by default on `hellas-client`, so `check-clippy` compiles none of
+    # it: not the orchestrator, not its end-to-end test, and not the
+    # oracle's own suite — the one that says what a failed independent
+    # check does. All three run only here.
     client-work =
       mk "check-client-work"
-        "cargo test -p hellas-client --features work && cargo test -p hellas-compute-oracle && cargo clippy -p hellas-client --features work --all-targets -- -D warnings"
+        "cargo test -p hellas-client --features work && cargo clippy -p hellas-client --features work --all-targets -- -D warnings"
         (cargoEnv rustToolchain);
     # The chain service's wire-id pins compile only under `chain`, which
     # `work` does not pull in. `check-validator` links hellas-rpc with
