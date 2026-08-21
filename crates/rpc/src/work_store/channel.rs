@@ -184,7 +184,7 @@ pub enum ChannelStateError {
     ///
     /// Late plaintext earns nothing: the provider signed a terminal
     /// deadline, and a client that recorded a receipt past it would be
-    /// building the evidence for an invoice the same deadline refuses.
+    /// building the evidence for a payment the same deadline refuses.
     #[error(
         "a result received at finalized height {height} is past the terminal deadline {deadline}"
     )]
@@ -958,7 +958,7 @@ impl ChannelState {
     /// Fixed when the store was opened, from the finalized read that
     /// established the channel is live. An endpoint built over a
     /// readiness decision taken at other funding would bound its
-    /// invoices by a different number than this one.
+    /// payments by a different number than this one.
     #[must_use]
     pub const fn settlement(&self) -> WorkPaymentSettlement {
         self.settlement
@@ -977,7 +977,7 @@ impl ChannelState {
     }
 
     /// Returns the last certificate this channel credited, with the
-    /// allocation and the two signatures it was credited against.
+    /// binding and the two signatures it was credited against.
     ///
     /// What a recovered endpoint re-sends. The job it paid for is
     /// closed, so these bytes are the only remaining copy of what was
@@ -2080,7 +2080,7 @@ impl ChannelStore {
     /// `settlement` is what the funded payment edge can settle, taken
     /// from the finalized read that established the channel is live. It
     /// is a channel constant: a payment edge's value is fixed when it is
-    /// opened, and every invoice this store admits is bounded by it.
+    /// opened, and every payment this store admits is bounded by it.
     ///
     /// A job left in its running phase by the process that did not come
     /// back makes the state indeterminate. Opening does not resolve it,

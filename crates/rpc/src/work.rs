@@ -370,7 +370,7 @@ pub enum EndpointError {
     #[error("the store's channel is not the one this readiness decided")]
     WrongChannel,
     /// The journal was opened at other funding than the readiness read
-    /// found, so the two bound invoices differently.
+    /// found, so the two bound payments differently.
     #[error("the store's settlement is not the one this readiness read")]
     WrongSettlement,
     /// The journal is the other role's.
@@ -405,7 +405,7 @@ const fn role_name(role: Role) -> &'static str {
 ///
 /// All four disagreements are configuration mistakes rather than peer
 /// behaviour, and every one of them would otherwise surface much later
-/// as a signature nobody can verify or an invoice bounded by the wrong
+/// as a signature nobody can verify or a payment bounded by the wrong
 /// capacity.
 fn bind(
     ready: &ReadyChannel,

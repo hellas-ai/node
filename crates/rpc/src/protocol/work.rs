@@ -454,8 +454,8 @@ impl PrivateRecord for PaidExecutionPolicyV1 {
 /// One job, as both parties agreed to it before any work happened.
 ///
 /// Its digest is the `work_id`. Both parties sign that digest, and every
-/// later record names it, so a result, an invoice, or a payment can be
-/// traced back to exactly one accepted job or to nothing at all.
+/// later record names it, so a result or a payment can be traced back
+/// to exactly one accepted job or to nothing at all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PaidJobAuthorizationV1 {
     /// Channel this job belongs to.
