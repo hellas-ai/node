@@ -2,15 +2,15 @@ use crate::domain::{
     Address as UserAddress, PublicKey, SettlementKey as UserSettlementKey, SettlementKeyError,
     ThresholdPolynomial, ThresholdShare,
 };
+pub use crate::genesis::{
+    Genesis, GenesisAllocation as GenesisEntry, GenesisValidator, HELLAS_DEVNET_1_JSON,
+};
 use commonware_codec::{Decode, DecodeExt, Encode};
 use commonware_cryptography::bls12381::primitives::sharing::ModeVersion;
 use commonware_cryptography::{Signer, ed25519};
 use commonware_p2p::Address as P2pAddress;
 use commonware_runtime::{BufferPooler, buffer::paged::CacheRef};
 use commonware_utils::ordered::{Map, Set};
-pub use hellas_genesis::{
-    Genesis, GenesisAllocation as GenesisEntry, GenesisValidator, HELLAS_DEVNET_1_JSON,
-};
 use hellas_kernel::NetworkId;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -32,7 +32,7 @@ pub enum ConfigError {
     #[error("duplicate public keys in config")]
     DuplicatePublicKeys,
     #[error("invalid genesis document")]
-    Genesis(#[from] hellas_genesis::GenesisError),
+    Genesis(#[from] crate::genesis::GenesisError),
     #[error("validator identity is not in the genesis committee")]
     MissingLocalValidator,
     #[error("configured peer identities do not match the genesis committee")]
@@ -308,8 +308,8 @@ mod tests {
             metrics_port: None,
             relay_urls: Vec::new(),
             genesis: Genesis {
-                schema_version: hellas_genesis::GENESIS_SCHEMA_VERSION,
-                network_id: hellas_genesis::HELLAS_DEVNET_1_ID.to_string(),
+                schema_version: crate::genesis::GENESIS_SCHEMA_VERSION,
+                network_id: crate::genesis::HELLAS_DEVNET_1_ID.to_string(),
                 validators: vec![GenesisValidator {
                     public_key,
                     label: "validator-0".to_string(),

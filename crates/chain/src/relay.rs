@@ -1,10 +1,10 @@
 //! Outbound, authenticated light-client RPC serving for validators.
 
 use crate::domain::PrivateKey;
+use crate::genesis::Genesis;
 use crate::{LightClient, LightClientRpc, serve_light_client_transport};
 use commonware_codec::Encode;
 use commonware_cryptography::Signer;
-use hellas_genesis::Genesis;
 use hellas_wire::PeerIdentity;
 use hellas_wire::relay_auth::{
     NETWORK_HEADER, NONCE_BYTES, NONCE_HEADER, RelayAdmission, RelayAdmissionError,
@@ -17,7 +17,7 @@ use tokio_tungstenite::tungstenite::http::{HeaderValue, Request};
 #[derive(Debug, thiserror::Error)]
 pub enum RelayConnectError {
     #[error("invalid genesis document: {0}")]
-    Genesis(#[from] hellas_genesis::GenesisError),
+    Genesis(#[from] crate::genesis::GenesisError),
     #[error("validator identity is not in the genesis committee")]
     NotInCommittee,
     #[error("invalid relay URL: {0}")]
@@ -132,9 +132,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::genesis::{GENESIS_SCHEMA_VERSION, GenesisValidator};
     use commonware_cryptography::ed25519;
     use ed25519_dalek::Verifier as _;
-    use hellas_genesis::{GENESIS_SCHEMA_VERSION, GenesisValidator};
     use hellas_wire::relay_auth::{
         NETWORK_HEADER, NONCE_HEADER, SIGNATURE_HEADER, TIMESTAMP_HEADER, VALIDATOR_HEADER,
     };
@@ -142,7 +142,7 @@ mod tests {
     fn genesis(private_key: &ed25519::PrivateKey) -> Genesis {
         Genesis {
             schema_version: GENESIS_SCHEMA_VERSION,
-            network_id: hellas_genesis::HELLAS_DEVNET_1_ID.to_string(),
+            network_id: crate::genesis::HELLAS_DEVNET_1_ID.to_string(),
             validators: vec![GenesisValidator {
                 public_key: hex::encode(private_key.public_key().encode()),
                 label: "validator-a".to_string(),

@@ -15,8 +15,8 @@ domain = [
     "dep:commonware-codec",
     "dep:commonware-cryptography",
     "dep:hellas-kernel",
-    "dep:hellas-genesis",
     "dep:p256",
+    "dep:serde",
     "dep:serde_json",
     "dep:sha2",
     "dep:thiserror",
@@ -147,7 +147,6 @@ futures-util = { version = "0.3", optional = true, default-features = false, fea
     "sink",
 ] }
 hellas-kernel = { workspace = true, optional = true, default-features = false }
-hellas-genesis = { workspace = true, optional = true }
 hellas-rpc = { workspace = true, optional = true, features = ["chain"] }
 hellas-wire = { workspace = true, optional = true }
 hex = { workspace = true, optional = true }
@@ -190,3 +189,8 @@ proptest = "1.11"
 serde = { workspace = true, features = ["derive"] }
 tempfile = "3"
 test-log = { version = "0.2", features = ["trace"] }
+# `genesis`'s round-trip test reads the document back out of TOML, which
+# is the format a validator config embeds it in. As a runtime dependency
+# `toml` arrives only with `validator`; the module compiles from `domain`
+# up, so its own suite has to ask for it unconditionally.
+toml.workspace = true

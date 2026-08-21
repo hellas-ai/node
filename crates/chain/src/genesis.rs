@@ -1,9 +1,14 @@
 //! Portable network identity and genesis configuration.
 //!
-//! This crate intentionally contains no consensus engine, transport, or key
+//! This module intentionally contains no consensus engine, transport, or key
 //! implementation. It is the small document shared by validators, relays,
 //! indexers, browsers, and deployment tooling. Cryptographic consumers decode
 //! and validate the key strings at their own boundary.
+//!
+//! It sits under `domain`, the lowest feature that has a network at all, so
+//! everything above it — the light client, the server, the indexer, the
+//! validator — reads the same document type, and a `wasm-client` browser build
+//! carries the shipped documents exactly as it did when this was a crate.
 
 use std::collections::BTreeSet;
 
@@ -12,15 +17,13 @@ use serde::{Deserialize, Serialize};
 pub const GENESIS_SCHEMA_VERSION: u16 = 1;
 
 /// The in-tree development network's document.
-pub const HELLAS_DEVNET_1_JSON: &str =
-    include_str!("../../../networks/hellas-devnet-1/genesis.json");
+pub const HELLAS_DEVNET_1_JSON: &str = include_str!("../networks/hellas-devnet-1/genesis.json");
 
 /// The id that document names.
 pub const HELLAS_DEVNET_1_ID: &str = "hellas-devnet-1";
 
 /// The in-tree test network's document.
-pub const HELLAS_TESTNET_1_JSON: &str =
-    include_str!("../../../networks/hellas-testnet-1/genesis.json");
+pub const HELLAS_TESTNET_1_JSON: &str = include_str!("../networks/hellas-testnet-1/genesis.json");
 
 /// The id that document names.
 pub const HELLAS_TESTNET_1_ID: &str = "hellas-testnet-1";

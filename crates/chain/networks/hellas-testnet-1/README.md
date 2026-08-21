@@ -42,7 +42,7 @@ make the two networks needlessly easy to confuse in a terminal.
 
 ```
 hellas-cli chain validator config -n 6 -i 0 --seed 200 \
-    --genesis networks/hellas-testnet-1/genesis.json
+    --genesis crates/chain/networks/hellas-testnet-1/genesis.json
 ```
 
 The `--genesis` check refuses unless the identities `--seed 200`

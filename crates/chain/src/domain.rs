@@ -496,7 +496,7 @@ pub struct NetworkIdError(pub String);
 /// There is deliberately no compile-time default. A binary that
 /// carries one silently re-domains every signature in the tree the
 /// moment that constant moves, which is not hypothetical.
-pub fn network_id(genesis: &hellas_genesis::Genesis) -> Result<NetworkId, NetworkIdError> {
+pub fn network_id(genesis: &crate::genesis::Genesis) -> Result<NetworkId, NetworkIdError> {
     NetworkId::new(&genesis.network_id).ok_or_else(|| NetworkIdError(genesis.network_id.clone()))
 }
 
@@ -1775,10 +1775,10 @@ mod tests {
         }
 
         for (json, scalars) in [
-            (hellas_genesis::HELLAS_DEVNET_1_JSON, [1_u8, 2]),
-            (hellas_genesis::HELLAS_TESTNET_1_JSON, [3, 4]),
+            (crate::genesis::HELLAS_DEVNET_1_JSON, [1_u8, 2]),
+            (crate::genesis::HELLAS_TESTNET_1_JSON, [3, 4]),
         ] {
-            let genesis: hellas_genesis::Genesis =
+            let genesis: crate::genesis::Genesis =
                 serde_json::from_str(json).expect("shipped document parses");
             let funded: Vec<&str> = genesis
                 .allocations

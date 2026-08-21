@@ -314,7 +314,7 @@ fn generate_network(args: GenerateNetworkArgs) -> Result<(), ValidatorError> {
         signing_key
     });
     let genesis = Genesis {
-        schema_version: hellas_genesis::GENESIS_SCHEMA_VERSION,
+        schema_version: crate::genesis::GENESIS_SCHEMA_VERSION,
         network_id,
         validators: keys
             .iter()
@@ -487,8 +487,8 @@ fn setup(args: SetupArgs) -> Result<(), ValidatorError> {
             genesis
         }
         None => Genesis {
-            schema_version: hellas_genesis::GENESIS_SCHEMA_VERSION,
-            network_id: hellas_genesis::HELLAS_DEVNET_1_ID.to_string(),
+            schema_version: crate::genesis::GENESIS_SCHEMA_VERSION,
+            network_id: crate::genesis::HELLAS_DEVNET_1_ID.to_string(),
             validators: generated_validators,
             allocations: genesis_allocations
                 .iter()

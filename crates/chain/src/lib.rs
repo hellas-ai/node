@@ -12,14 +12,14 @@ pub mod config;
 mod consensus;
 #[cfg(feature = "domain")]
 pub mod domain;
-#[cfg(feature = "domain")]
-pub use hellas_genesis as genesis;
 #[cfg(any(feature = "indexer", feature = "validator"))]
 mod execution;
 #[cfg(feature = "validator")]
 pub mod faucet;
 #[cfg(feature = "indexer")]
 pub mod follower;
+#[cfg(feature = "domain")]
+pub mod genesis;
 #[cfg(any(feature = "indexer", feature = "validator"))]
 pub mod indexer;
 #[cfg(any(feature = "client-core", feature = "server"))]
