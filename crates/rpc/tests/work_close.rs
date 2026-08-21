@@ -53,8 +53,8 @@ use hellas_rpc::work::{
     WorkService, admit_payment, fetch_result, request_invoice, run_accepted_work,
 };
 use hellas_rpc::work_close::{
-    BlockSourceError, CatchUpError, CloseError, FinalizedBlocks, FinalizedWork, observe,
-    start_body_digest,
+    BlockSourceError, CatchUpError, CloseError, FinalizedBlocks, FinalizedWork, close_start,
+    observe, start_body_digest,
 };
 use hellas_rpc::work_store::{
     ChannelRecord, ChannelStore, CloseSettlement, JobPhase, JobState, Role,
@@ -1642,4 +1642,152 @@ async fn the_watcher_ends_a_job_its_payment_deadline_has_passed() {
         ),
         Err(error) => panic!("a channel whose job is over closes: {error}"),
     }
+}
+
+// ── The signed window ─────────────────────────────────────────────────
+
+/// The same channel under another start-validity span.
+fn channel_with_span(span: u64) -> hellas_rpc::protocol::work::PaidChannel {
+    let mut terms = payment_terms();
+    terms.start_validity_blocks = span;
+    match hellas_rpc::protocol::work::PaidChannel::new(
+        network(),
+        payment_edge(),
+        terms,
+        &SALT,
+        channel_policy(),
+    ) {
+        Ok(channel) => channel,
+        Err(error) => panic!("the fixture channel opens: {error}"),
+    }
+}
+
+/// The signed window starts at the next block and is exactly as wide as
+/// the terms say, and at the ceiling it refuses rather than wraps.
+///
+/// The span is inclusive at both ends, which is the kernel's own
+/// reading: a one-block window has span one. An endpoint that read the
+/// field as a duration would sign a window one block wider than the
+/// terms admit, and every signature it made would be refused for a span
+/// that is too wide.
+#[test]
+fn the_start_window_is_the_next_block_and_the_span_the_terms_fix() {
+    for (span, height, expected) in [(8_u64, 10_u64, (11_u64, 18_u64)), (1, 10, (11, 11))] {
+        let Ok(start) = close_start(
+            &channel_with_span(span),
+            hellas_kernel::Party::Taker,
+            height,
+            None,
+            &signer(0x22),
+        ) else {
+            panic!("a span of {span} at height {height} signs");
+        };
+        assert_eq!(
+            (start.valid_from_height(), start.valid_through_height()),
+            expected,
+        );
+    }
+
+    // A one-block window whose only live block is the last one there
+    // is.
+    let Ok(edge) = close_start(
+        &channel_with_span(1),
+        hellas_kernel::Party::Taker,
+        u64::MAX - 1,
+        None,
+        &signer(0x22),
+    ) else {
+        panic!("the last representable window signs");
+    };
+    assert_eq!(
+        (edge.valid_from_height(), edge.valid_through_height()),
+        (u64::MAX, u64::MAX),
+    );
+
+    // Past it, nothing is signed. Each of these differs from a case
+    // above in exactly one number.
+    assert!(
+        matches!(
+            close_start(
+                &channel_with_span(1),
+                hellas_kernel::Party::Taker,
+                u64::MAX,
+                None,
+                &signer(0x22),
+            ),
+            Err(CloseError::WindowOverflow { height }) if height == u64::MAX
+        ),
+        "there is no block after the last one",
+    );
+    assert!(
+        matches!(
+            close_start(
+                &channel_with_span(8),
+                hellas_kernel::Party::Taker,
+                u64::MAX - 1,
+                None,
+                &signer(0x22),
+            ),
+            Err(CloseError::WindowOverflow { .. })
+        ),
+        "an eight-block window does not fit before the ceiling",
+    );
+    assert!(
+        matches!(
+            close_start(
+                &channel_with_span(0),
+                hellas_kernel::Party::Taker,
+                10,
+                None,
+                &signer(0x22),
+            ),
+            Err(CloseError::NoValidityWindow)
+        ),
+        "a zero-block window is a signature no block could carry",
+    );
+}
+
+/// A start signed before a crash is the start that is resubmitted.
+///
+/// The endpoint is dropped and its journal reopened over its own files,
+/// so what comes back is replayed rather than remembered. Signing a
+/// second start here would be a second contest for one channel — and
+/// the first one may already be in a mempool.
+#[tokio::test]
+async fn a_start_signed_before_a_crash_is_the_start_that_is_resubmitted() {
+    let fixture = paid_job().await;
+    let signed = {
+        let Ok(mut provider) = fixture.service.endpoint() else {
+            panic!("the endpoint is reachable");
+        };
+        match provider.prepare_close() {
+            Ok(start) => start,
+            Err(error) => panic!("a paid channel closes: {error}"),
+        }
+    };
+
+    let mut watcher = restarted(fixture);
+    assert_eq!(
+        watcher.provider.state().close_prepared(),
+        Some(&signed),
+        "the reopened journal holds the exact bytes that were signed",
+    );
+
+    // One more finalized block, so a fresh signature would carry a
+    // different window. Without it the two are the same bytes — the
+    // signing is deterministic — and this would prove nothing.
+    if let Err(error) = watcher
+        .provider
+        .observe_finalized(&block(CURSOR + 1, Vec::new()))
+    {
+        panic!("the block applies: {error}");
+    }
+    match watcher.provider.prepare_close() {
+        Ok(again) => assert_eq!(
+            again, signed,
+            "the retained start is resubmitted, not replaced by a fresh one",
+        ),
+        Err(error) => panic!("the retained start is offered again: {error}"),
+    }
+    assert_eq!(watcher.provider.state().close_prepared(), Some(&signed));
 }

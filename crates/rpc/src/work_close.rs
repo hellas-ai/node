@@ -50,10 +50,10 @@
 //! - [`close_start`] builds and signs; [`crate::work::ProviderEndpoint`]
 //!   commits the exact bytes before they are handed to a chain. A crash
 //!   between signing and that commit loses a signature nobody has, and
-//!   the retry signs a fresh one at the new cursor height. A crash after
-//!   it leaves bytes that are re-sent verbatim, and the kernel admits at
-//!   most one contest per edge — so a resubmission is not a second
-//!   close, it is the same one.
+//!   the retry signs again at whatever height the cursor has reached. A
+//!   crash after it leaves bytes that are re-sent verbatim, and the
+//!   kernel admits at most one contest per edge — so a resubmission is
+//!   not a second close, it is the same one.
 //! - The certificate the start carries stays in the journal it was
 //!   admitted into. The start holds a copy; it never becomes the only
 //!   copy.
