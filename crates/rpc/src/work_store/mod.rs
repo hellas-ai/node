@@ -72,8 +72,8 @@ pub mod setup;
 mod cursor;
 
 pub use channel::{
-    ChannelRecord, ChannelState, ChannelStateError, ChannelStore, CounterpartyLoss, JobEnd,
-    JobPhase, JobState, LossTotals, PaidCertificate,
+    ChannelRecord, ChannelState, ChannelStateError, ChannelStore, CloseSettlement,
+    CounterpartyLoss, JobEnd, JobPhase, JobState, LossTotals, PaidCertificate,
 };
 pub use journal::{JournalError, Role};
 pub use setup::{

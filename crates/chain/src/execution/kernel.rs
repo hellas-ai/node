@@ -1978,6 +1978,239 @@ mod tests {
         });
     }
 
+    /// The bytes a provider endpoint builds are the bytes consensus
+    /// accepts, and the coins they pay are the coins the certificate
+    /// named.
+    ///
+    /// The test above hand-builds its start and its close. This one
+    /// calls the endpoint's own two builders — `close_start` and
+    /// `adjudicated_close` from `hellas_rpc::work_close` — and submits
+    /// what they return, so an endpoint that derived a window, a
+    /// contest identifier, a seal, or a split differently from the
+    /// kernel would fail here rather than at a demonstration.
+    ///
+    /// Nothing about the certificate's *provenance* is proved here: it
+    /// is signed by the fixture's client key. That it comes from a job
+    /// the client checked and invoiced is `hellas-rpc`'s
+    /// `a_paid_job_closes_at_exactly_what_it_earned`.
+    #[test]
+    fn an_endpoint_built_close_settles_on_a_real_chain() {
+        use hellas_kernel::{
+            Auth, BlockHeight as KernelHeight, EarnedCertificate, Funding, List, MAX_EDGE_OUTPUTS,
+            MAX_PARTY_INPUTS as INPUTS, Move, Parties, Party, Payout as KernelPayout, PendingSlot,
+            Secp256k1Signer, Terms as KernelTerms, WorkPaymentTerms, WorkStakeBondTerms,
+            adjudicated_payouts, parse_pending_close, pending_payment_close_slot,
+            work_payment_settlement,
+        };
+        use hellas_rpc::protocol::work::{
+            PaidChannel, PaidChannelPolicyV1, private_policy_commitment,
+        };
+        use hellas_rpc::work_close::{adjudicated_close, close_start, start_body_digest};
+
+        const FUNDING: u64 = 100;
+        const STAKE: u64 = 12;
+        const OMISSION_BOND: u64 = 2;
+        const WINDOW: u64 = hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS;
+        const START_VALIDITY: u64 = 8;
+        const HORIZON: u64 = 500;
+        /// What the client signed for its one job.
+        const EARNED: u64 = 60;
+        const SALT: [u8; 32] = [0x5a; 32];
+        /// The finalized height the endpoint has processed through when
+        /// it decides to close.
+        const CURSOR: u64 = 1;
+
+        let Ok(client) = Secp256k1Signer::from_secret_scalar([0x21; 32]) else {
+            panic!("client key");
+        };
+        let Ok(provider) = Secp256k1Signer::from_secret_scalar([0x22; 32]) else {
+            panic!("provider key");
+        };
+        let client_key = client.party_key();
+        let provider_key = provider.party_key();
+        let network = crate::domain::TEST_NETWORK;
+        let policy = PaidChannelPolicyV1 {
+            compute_credit_limit: 40,
+            delivery_credit_limit: 40,
+        };
+
+        let bond = WorkStakeBondTerms {
+            parties: Parties::new(provider_key, client_key),
+            timeout: KernelHeight::new(HORIZON),
+            timeout_outputs: List::take(
+                [KernelPayout::new(provider_key, STAKE); MAX_EDGE_OUTPUTS],
+                1,
+            ),
+            max_job_price: 4,
+        };
+        let bond_terms = KernelTerms::work_stake_bond(bond.clone());
+        let bond_funding = Funding::new(
+            List::take([CoinId::from_bytes(genesis_object_id(1).into()); INPUTS], 1),
+            List::take([CoinId::from_bytes([0; CoinId::LENGTH]); INPUTS], 0),
+        );
+        let bond_edge = KernelTx::edge_id_of(&bond_funding, &bond_terms);
+        let bond_open_hash = KernelTx::open_hash(network, &bond_funding, &bond_terms);
+        let bond_open = KernelTx::open(
+            bond_funding,
+            bond_terms,
+            Auth::native(provider.sign(bond_open_hash)),
+            Auth::native(client.sign(bond_open_hash)),
+        );
+
+        let payment = WorkPaymentTerms {
+            bond_edge,
+            bond_terms: bond,
+            private_policy_commitment: private_policy_commitment(network, &SALT, &policy),
+            omit_response_blocks: WINDOW,
+            start_validity_blocks: START_VALIDITY,
+            omission_bond: OMISSION_BOND,
+        };
+        let terms = KernelTerms::work_payment(payment.clone());
+        let funding = Funding::new(
+            List::take([CoinId::from_bytes(genesis_object_id(0).into()); INPUTS], 1),
+            List::take([CoinId::from_bytes([0; CoinId::LENGTH]); INPUTS], 0),
+        );
+        let edge = KernelTx::edge_id_of(&funding, &terms);
+        let open_hash = KernelTx::open_hash(network, &funding, &terms);
+        let open = KernelTx::open(
+            funding,
+            terms.clone(),
+            Auth::native(client.sign(open_hash)),
+            Auth::native(provider.sign(open_hash)),
+        );
+
+        // The endpoint's view of the same channel, derived from the same
+        // terms body the open commits to.
+        let Ok(channel) = PaidChannel::new(network, edge, payment.clone(), &SALT, policy) else {
+            panic!("the fixture channel opens");
+        };
+        assert_eq!(channel.payment_terms_hash(), terms.hash());
+
+        run_qmdb(|runtime| async move {
+            let database = database(runtime, "endpoint_built_close").await;
+            let allocations = vec![
+                (SettlementKey::from(client_key), FUNDING),
+                (SettlementKey::from(provider_key), STAKE),
+            ];
+            let slot = registry_chunk_object_id(pending_payment_close_slot(network, edge));
+
+            apply_and_finalize(
+                &database,
+                context(CURSOR),
+                &[Transaction::Kernel(bond_open), Transaction::Kernel(open)],
+                &allocations,
+            )
+            .await;
+
+            // What the funded edge can settle, read off the edge rather
+            // than off an expectation. Every amount below comes from it.
+            let Ok(Some(Object::Edge(live))) =
+                database.read().await.get(&edge_object_id(edge)).await
+            else {
+                panic!("the payment edge is live");
+            };
+            let Some(settlement) = work_payment_settlement(live.values(), OMISSION_BOND) else {
+                panic!("a funded edge prices both exits");
+            };
+            assert!(EARNED <= settlement.capacity());
+
+            // One client-signed certificate, and the start the endpoint
+            // builds from it at the height it has processed through.
+            let certificate = EarnedCertificate::new(edge, terms.hash(), EARNED);
+            let signature = client.sign(certificate.digest(network));
+            let Ok(start) = close_start(
+                &channel,
+                Party::Taker,
+                CURSOR,
+                Some((certificate, signature)),
+                &provider,
+            ) else {
+                panic!("a channel with a certificate builds a close start");
+            };
+            assert_eq!(
+                (start.valid_from_height(), start.valid_through_height()),
+                (CURSOR + 1, CURSOR + START_VALIDITY),
+                "the next block is the first one that can carry it",
+            );
+            let expected_id =
+                hellas_kernel::start_id(start_body_digest(&channel, &start), CURSOR + 1);
+
+            apply_and_finalize(
+                &database,
+                context(CURSOR + 1),
+                &[Transaction::Kernel(KernelTx::move_action(
+                    Move::StartPaymentClose(start),
+                ))],
+                &allocations,
+            )
+            .await;
+            let Ok(Some(Object::RegistryChunk(chunk))) = database.read().await.get(&slot).await
+            else {
+                panic!("the accepted start wrote its contest record");
+            };
+            let PendingSlot::Present(record) = parse_pending_close(Some(chunk), edge) else {
+                panic!("the stored record is this edge's");
+            };
+            assert_eq!(
+                record.start_id(),
+                expected_id,
+                "the endpoint derives the contest identifier the kernel did",
+            );
+            assert_eq!(record.start_cumulative(), EARNED);
+            assert!(!record.responded());
+            assert!(!record.penalty_due());
+            assert_eq!(record.response_deadline(), CURSOR + 1 + WINDOW);
+
+            // The client never answers. At the deadline the endpoint
+            // builds its close out of the record the chain holds.
+            let Ok(close) = adjudicated_close(&channel, settlement, &record) else {
+                panic!("a spent window closes");
+            };
+            let KernelTx::Close { outputs, .. } = &close else {
+                panic!("an adjudicated close is a close");
+            };
+            let Ok(expected_payouts) =
+                adjudicated_payouts(settlement, payment.parties(), EARNED, false)
+            else {
+                panic!("the settled amount fits the route");
+            };
+            assert_eq!(outputs.as_slice(), expected_payouts);
+            let payout_ids = KernelTx::close_output_ids(edge, outputs);
+
+            apply_and_finalize(
+                &database,
+                context(record.response_deadline()),
+                &[Transaction::Kernel(close.clone())],
+                &allocations,
+            )
+            .await;
+
+            let read = database.read().await;
+            assert_eq!(
+                read.get(&edge_object_id(edge)).await.expect("edge read"),
+                None,
+                "the close consumed the payment edge",
+            );
+            assert_eq!(
+                read.get(&slot).await.expect("contest slot read"),
+                None,
+                "and retired the contest in the same batch",
+            );
+            for (id, expected) in payout_ids.iter().zip([
+                (SettlementKey::from(provider_key), EARNED),
+                (
+                    SettlementKey::from(client_key),
+                    settlement.adjudicated_total() - EARNED,
+                ),
+            ]) {
+                let Ok(Some(Object::Coin(coin))) = read.get(&coin_object_id(*id)).await else {
+                    panic!("payout coin exists");
+                };
+                assert_eq!((coin.owner, coin.value), expected);
+            }
+        });
+    }
+
     #[test]
     fn timeout_not_reached_is_retained_but_proof_expired_is_dropped() {
         let input = EdgeId::from_bytes([0x55; EdgeId::LENGTH]);

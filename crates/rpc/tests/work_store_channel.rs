@@ -9,9 +9,9 @@
 #![cfg(feature = "work")]
 
 use hellas_kernel::{
-    BlockHeight, EarnedCertificate, EdgeId, EdgeValues, Fees, List, MAX_EDGE_OUTPUTS, NetworkId,
-    Parties, PayloadHash, Payout, Secp256k1Signer, Secp256k1Verifier, Sig, WorkPaymentSettlement,
-    WorkPaymentTerms, WorkStakeBondTerms, work_payment_settlement,
+    BlockHeight, EarnedCertificate, EdgeId, EdgeValues, Encode as _, Fees, List, MAX_EDGE_OUTPUTS,
+    NetworkId, Parties, PayloadHash, Payout, Secp256k1Signer, Secp256k1Verifier, Sig,
+    WorkPaymentSettlement, WorkPaymentTerms, WorkStakeBondTerms, work_payment_settlement,
 };
 use hellas_rpc::evaluate::{
     EvaluateOutputTranscriptBuilder, EvaluateStopReason, EvaluateTerminal, EvaluateUsage,
@@ -408,10 +408,7 @@ fn provider_sequence(channel: &PaidChannel, job: &Job) -> Vec<ChannelRecord> {
 /// late against, and a journal with no processed block cannot say.
 fn client_sequence(channel: &PaidChannel, job: &Job) -> Vec<ChannelRecord> {
     vec![
-        ChannelRecord::CursorAdvanced {
-            height: RECEIPT_HEIGHT,
-            payload: [0xc0; 32],
-        },
+        cursor_at(RECEIPT_HEIGHT),
         ChannelRecord::NonceReserved {
             nonce: job.authorization.proposal_nonce,
         },
@@ -426,6 +423,36 @@ fn client_sequence(channel: &PaidChannel, job: &Job) -> Vec<ChannelRecord> {
 
 /// A finalized height inside every fixture job's terminal deadline.
 const RECEIPT_HEIGHT: u64 = 150;
+
+/// The payload digest of the synthetic block at `height`.
+///
+/// A cursor is contiguous, so a fixture that moves it has to name a
+/// chain rather than repeat one digest: each block's parent is the last
+/// block's payload, and the journal refuses anything else.
+fn payload_at(height: u64) -> [u8; 32] {
+    let mut payload = [0xc0; 32];
+    for (slot, byte) in payload.iter_mut().zip(height.to_be_bytes()) {
+        *slot = byte;
+    }
+    payload
+}
+
+fn cursor_at(height: u64) -> ChannelRecord {
+    ChannelRecord::CursorAdvanced {
+        height,
+        parent: payload_at(height.saturating_sub(1)),
+        payload: payload_at(height),
+    }
+}
+
+/// Moves one store's cursor to `height`, one block at a time.
+fn advance(store: &mut ChannelStore, height: u64) {
+    let mut next = store.state().cursor().map_or(height, |(held, _)| held + 1);
+    while next <= height {
+        commit_all(store, &[cursor_at(next)]);
+        next += 1;
+    }
+}
 
 fn commit_all(store: &mut ChannelStore, records: &[ChannelRecord]) {
     let verifier = Secp256k1Verifier::new();
@@ -618,10 +645,7 @@ fn the_terminal_deadline_is_the_last_height_a_receipt_may_be_recorded_at() {
         commit_all(
             &mut store,
             &[
-                ChannelRecord::CursorAdvanced {
-                    height,
-                    payload: [0xc1; 32],
-                },
+                cursor_at(height),
                 ChannelRecord::NonceReserved {
                     nonce: job.authorization.proposal_nonce,
                 },
@@ -673,13 +697,7 @@ fn the_payment_deadline_is_the_last_height_a_payment_may_be_signed_at() {
             store.state().job().map(JobState::phase),
             Some(JobPhase::Invoiced),
         );
-        commit_all(
-            &mut store,
-            &[ChannelRecord::CursorAdvanced {
-                height,
-                payload: [0xc2; 32],
-            }],
-        );
+        advance(&mut store, height);
 
         let paid = store.commit(job.paid(&channel), &Secp256k1Verifier::new());
         if timely {
@@ -2316,48 +2334,74 @@ fn a_client_nonce_is_consumed_once_and_burnt_forever() {
     );
 }
 
-/// The finalized cursor only moves forward.
+/// The finalized cursor moves to the next block, or it does not move.
+///
+/// Two rules, varied one at a time against the same held block. A
+/// height that is not the next one is a block this endpoint never read;
+/// a parent that is not the held payload is a block from a history it
+/// never read. Either would let a watcher report progress it has not
+/// made, and every deadline in this crate is measured against that
+/// progress.
 #[test]
-fn the_cursor_only_advances() {
+fn the_cursor_only_moves_to_the_contiguous_next_block() {
     let dir = temp();
     let verifier = Secp256k1Verifier::new();
     let mut store = open(dir.path(), Role::Provider);
-    commit_all(
-        &mut store,
-        &[ChannelRecord::CursorAdvanced {
-            height: 7,
-            payload: [0x01; 32],
-        }],
-    );
-    assert_eq!(store.state().cursor(), Some((7, [0x01; 32])));
+    commit_all(&mut store, &[cursor_at(7)]);
+    assert_eq!(store.state().cursor(), Some((7, payload_at(7))));
 
-    for height in [7_u64, 6, 0] {
+    // Every height but the next one, with the parent left correct. The
+    // repeated height carries a different payload, so it is a second
+    // block at height seven rather than the retry answered below.
+    for height in [7_u64, 6, 0, 9, 20] {
         let error = store
             .commit(
                 ChannelRecord::CursorAdvanced {
                     height,
-                    payload: [0x02; 32],
+                    parent: payload_at(7),
+                    payload: [0x99; 32],
                 },
                 &verifier,
             )
-            .expect_err("the cursor does not move backwards");
+            .expect_err("only the next height moves the cursor");
         assert!(
             matches!(
                 error,
-                WorkStoreError::Channel(ChannelStateError::CursorNotAdvancing { .. })
+                WorkStoreError::Channel(ChannelStateError::CursorNotNext {
+                    held: 7,
+                    actual,
+                }) if actual == height
             ),
-            "unexpected error: {error}"
+            "unexpected error at {height}: {error}"
         );
     }
+
+    // The next height, and the only thing varied is the parent.
+    let error = store
+        .commit(
+            ChannelRecord::CursorAdvanced {
+                height: 8,
+                parent: payload_at(6),
+                payload: payload_at(8),
+            },
+            &verifier,
+        )
+        .expect_err("a block from another history does not extend this one");
+    assert!(
+        matches!(
+            error,
+            WorkStoreError::Channel(ChannelStateError::CursorNotContiguous { height: 8 })
+        ),
+        "unexpected error: {error}"
+    );
+
+    // The same two fields, correct: the cursor moves by exactly one.
+    commit_all(&mut store, &[cursor_at(8)]);
+    assert_eq!(store.state().cursor(), Some((8, payload_at(8))));
+
     // The same block again is the same fact.
     let before = store.len();
-    commit_all(
-        &mut store,
-        &[ChannelRecord::CursorAdvanced {
-            height: 7,
-            payload: [0x01; 32],
-        }],
-    );
+    commit_all(&mut store, &[cursor_at(8)]);
     assert_eq!(store.len(), before);
 }
 
@@ -2749,15 +2793,67 @@ fn the_record_codec_is_exact_and_ordered() {
 
     let cursor = ChannelRecord::CursorAdvanced {
         height: 0x0102_0304_0506_0708,
+        parent: [0xaa; 32],
         payload: [0xab; 32],
     };
     let bytes = cursor.encode();
-    // tag || height || payload — the height first, and big-endian.
+    // tag || height || parent || payload — the height first and
+    // big-endian, and the two digests in that order. A round trip would
+    // pass with them transposed; these bytes do not.
     let mut expected = vec![0_u8];
     expected.extend_from_slice(&0x0102_0304_0506_0708_u64.to_be_bytes());
+    expected.extend_from_slice(&[0xaa; 32]);
     expected.extend_from_slice(&[0xab; 32]);
     assert_eq!(bytes, expected);
     assert_eq!(ChannelRecord::decode(&bytes), Ok(cursor));
+
+    let start = hellas_kernel::PaymentCloseStart::new(
+        channel.payment_edge(),
+        hellas_kernel::Terms::work_payment(channel.payment_terms().clone()),
+        hellas_kernel::Party::Taker,
+        (11, 18),
+        None,
+        provider().sign(payload(job.work_id)),
+    );
+    let prepared = ChannelRecord::ClosePrepared {
+        start: Box::new(start.clone()),
+    };
+    let bytes = prepared.encode();
+    // tag || the kernel's own encoding of the start, and nothing else:
+    // the journal holds the bytes consensus will read, not a second
+    // spelling of them.
+    let mut expected = vec![12_u8];
+    let mut body = vec![0_u8; start.encoded_size()];
+    let written = start.write_to(&mut body);
+    body.truncate(written);
+    expected.extend_from_slice(&body);
+    assert_eq!(bytes, expected);
+    assert_eq!(ChannelRecord::decode(&bytes), Ok(prepared));
+
+    let opened = ChannelRecord::CloseOpened {
+        start_id: hellas_kernel::StartId::from_bytes([0xcd; 32]),
+    };
+    let bytes = opened.encode();
+    let mut expected = vec![13_u8];
+    expected.extend_from_slice(&[0xcd; 32]);
+    assert_eq!(bytes, expected);
+    assert_eq!(ChannelRecord::decode(&bytes), Ok(opened));
+
+    let settled = ChannelRecord::CloseSettled {
+        height: 0x1112_1314_1516_1718,
+        payload: [0xef; 32],
+        provider_payout: 0x2122_2324_2526_2728,
+    };
+    let bytes = settled.encode();
+    // tag || height || payload || provider payout. Two big-endian
+    // `u64`s around one digest: a round trip would pass with them
+    // exchanged, and these bytes would not.
+    let mut expected = vec![14_u8];
+    expected.extend_from_slice(&0x1112_1314_1516_1718_u64.to_be_bytes());
+    expected.extend_from_slice(&[0xef; 32]);
+    expected.extend_from_slice(&0x2122_2324_2526_2728_u64.to_be_bytes());
+    assert_eq!(bytes, expected);
+    assert_eq!(ChannelRecord::decode(&bytes), Ok(settled));
 
     // The nested bodies are their own canonical encodings, in the order
     // the record names them.
@@ -3133,4 +3229,78 @@ fn channel_key_bytes(path: &std::path::Path) -> [u8; 32] {
         }
     }
     key
+}
+
+// ── The close cutoff ──────────────────────────────────────────────────
+
+/// A retained close start shuts the channel to certificates it cannot
+/// carry.
+///
+/// The certificate offered afterwards is the same certificate the same
+/// journal took a moment earlier — same edge, same terms, same client
+/// signature, larger amount — so what refuses the second one is the
+/// cutoff and nothing else. A close is built from what is held when it
+/// is signed, and a certificate admitted after that is money it leaves
+/// out.
+#[test]
+fn a_retained_close_start_admits_no_further_certificate() {
+    let dir = temp();
+    let channel = channel();
+    let verifier = Secp256k1Verifier::new();
+    let mut store = open(dir.path(), Role::Provider);
+    commit_all(&mut store, &[cursor_at(RECEIPT_HEIGHT)]);
+
+    let held = EarnedCertificate::new(channel.payment_edge(), channel.payment_terms_hash(), PRICE);
+    commit_all(
+        &mut store,
+        &[ChannelRecord::CertificateGift {
+            certificate: held,
+            certificate_signature: client().sign(held.digest(network())),
+        }],
+    );
+    assert_eq!(store.state().max_executable_certificate(), PRICE);
+
+    let Ok(start) = hellas_rpc::work_close::close_start(
+        &channel,
+        hellas_kernel::Party::Taker,
+        RECEIPT_HEIGHT,
+        store.state().executable_certificate().copied(),
+        &provider(),
+    ) else {
+        panic!("a channel with a certificate builds a close start");
+    };
+    commit_all(
+        &mut store,
+        &[ChannelRecord::ClosePrepared {
+            start: Box::new(start),
+        }],
+    );
+    assert!(store.state().is_closing());
+
+    let later = EarnedCertificate::new(
+        channel.payment_edge(),
+        channel.payment_terms_hash(),
+        PRICE + 1,
+    );
+    let error = store
+        .commit(
+            ChannelRecord::CertificateGift {
+                certificate: later,
+                certificate_signature: client().sign(later.digest(network())),
+            },
+            &verifier,
+        )
+        .expect_err("a certificate after the cutoff is refused");
+    assert!(
+        matches!(
+            error,
+            WorkStoreError::Channel(ChannelStateError::Closing { .. })
+        ),
+        "unexpected error: {error}"
+    );
+    assert_eq!(
+        store.state().max_executable_certificate(),
+        PRICE,
+        "and it moves nothing",
+    );
 }

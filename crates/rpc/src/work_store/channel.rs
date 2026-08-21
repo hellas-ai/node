@@ -84,8 +84,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use hellas_kernel::{
-    Decode as _, EarnedCertificate, Encode as _, Key, NetworkId, Sig, SigVerifier,
-    WorkPaymentSettlement,
+    Decode, EarnedCertificate, Encode, Key, NetworkId, Party, PaymentCloseStart, Sig, SigVerifier,
+    StartId, WorkPaymentSettlement,
 };
 use hellas_xet::XetFileHasher;
 
@@ -214,13 +214,30 @@ pub enum ChannelStateError {
         /// Deadline the authorization carries.
         deadline: u64,
     },
-    /// The finalized cursor moved backwards or stood still.
-    #[error("cursor height {actual} does not advance past {held}")]
-    CursorNotAdvancing {
+    /// The finalized cursor did not move on by exactly one block.
+    ///
+    /// A skipped height is a block this endpoint never read, and every
+    /// close and every certificate it would have carried is a fact this
+    /// journal would then be missing.
+    #[error("cursor height {actual} is not the block after {held}")]
+    CursorNotNext {
         /// Height already recorded.
         held: u64,
         /// Height the record carried.
         actual: u64,
+    },
+    /// The next block does not name the block the cursor holds as its
+    /// parent.
+    #[error("the block at height {height} is not a child of the cursor's block")]
+    CursorNotContiguous {
+        /// Height the record carried.
+        height: u64,
+    },
+    /// A step needs a channel whose payment close has not begun.
+    #[error("{step} is refused: this channel's payment close has begun")]
+    Closing {
+        /// Step that was attempted.
+        step: &'static str,
     },
     /// The same step was recorded twice with different contents.
     #[error("{what} was already recorded with different contents")]
@@ -329,10 +346,18 @@ mod end_code {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ChannelRecord {
     /// Finalized blocks have been processed through this block.
+    ///
+    /// The parent rides with the payload because a cursor is only worth
+    /// something if it is contiguous: a height alone would let a
+    /// watcher skip from block 7 to block 20 and still report that it
+    /// had processed everything through 20. What it would have skipped
+    /// is every close and every deadline those thirteen blocks crossed.
     CursorAdvanced {
         /// Height processed through.
         height: u64,
-        /// That block's payload digest.
+        /// The payload digest that block names as its parent.
+        parent: [u8; 32],
+        /// That block's own payload digest.
         payload: [u8; 32],
     },
     /// The client has consumed one proposal nonce. Written before the
@@ -421,6 +446,42 @@ pub enum ChannelRecord {
         /// Why.
         reason: JobEnd,
     },
+    /// This endpoint has signed a close start, and these are its exact
+    /// bytes.
+    ///
+    /// Written before the signature leaves the process, like every
+    /// other signature here — and it is also the cutoff: from this
+    /// record on the channel admits no new job and credits no new
+    /// certificate, because a close that left out a certificate it was
+    /// still admitting would be a close below what was earned.
+    ClosePrepared {
+        /// The signed start, exactly as it will be submitted.
+        ///
+        /// Boxed because a start reveals the channel's complete terms
+        /// and is the widest thing this enum carries by a long way; the
+        /// other eleven records would otherwise each be as large as it.
+        start: Box<PaymentCloseStart>,
+    },
+    /// A close contest on this channel's payment edge was finalized.
+    ///
+    /// The contest identifier is the whole of what this adds, and it is
+    /// the one thing about a close that cannot be derived from a
+    /// retained signature: the kernel derives it from the start digest
+    /// *and the height that accepted it*, so only the block tells an
+    /// endpoint which contest its start became.
+    CloseOpened {
+        /// Contest a later response or close must name.
+        start_id: StartId,
+    },
+    /// A close consuming this channel's payment edge was finalized.
+    CloseSettled {
+        /// Height of the block that carried it.
+        height: u64,
+        /// That block's payload digest.
+        payload: [u8; 32],
+        /// What the close paid the provider.
+        provider_payout: u64,
+    },
 }
 
 mod tag {
@@ -436,6 +497,9 @@ mod tag {
     pub(super) const GIFT: u8 = 9;
     pub(super) const ENDED: u8 = 10;
     pub(super) const VERIFIED: u8 = 11;
+    pub(super) const CLOSE_PREPARED: u8 = 12;
+    pub(super) const CLOSE_OPENED: u8 = 13;
+    pub(super) const CLOSE_SETTLED: u8 = 14;
 }
 
 impl ChannelRecord {
@@ -448,9 +512,14 @@ impl ChannelRecord {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         match self {
-            Self::CursorAdvanced { height, payload } => {
+            Self::CursorAdvanced {
+                height,
+                parent,
+                payload,
+            } => {
                 out.push(tag::CURSOR);
                 put_u64(&mut out, *height);
+                out.extend_from_slice(parent);
                 out.extend_from_slice(payload);
             }
             Self::NonceReserved { nonce } => {
@@ -505,7 +574,7 @@ impl ChannelRecord {
                 certificate_signature,
             } => {
                 out.push(tag::PAID);
-                out.extend_from_slice(&encode_certificate(certificate));
+                out.extend_from_slice(&encode_kernel(certificate));
                 out.extend_from_slice(&allocation.encode());
                 out.extend_from_slice(allocation_signature.as_bytes());
                 out.extend_from_slice(certificate_signature.as_bytes());
@@ -515,7 +584,7 @@ impl ChannelRecord {
                 certificate_signature,
             } => {
                 out.push(tag::GIFT);
-                out.extend_from_slice(&encode_certificate(certificate));
+                out.extend_from_slice(&encode_kernel(certificate));
                 out.extend_from_slice(certificate_signature.as_bytes());
             }
             Self::JobEnded { reason } => {
@@ -525,6 +594,28 @@ impl ChannelRecord {
                     JobEnd::Failed => end_code::FAILED,
                     JobEnd::Indeterminate => end_code::INDETERMINATE,
                 });
+            }
+            Self::ClosePrepared { start } => {
+                out.push(tag::CLOSE_PREPARED);
+                // Last field, and the whole of the rest, for the reason
+                // `JobProposed`'s bundle is: a start is variable-width,
+                // and the journal frame already carries this record's
+                // length.
+                out.extend_from_slice(&encode_kernel(start.as_ref()));
+            }
+            Self::CloseOpened { start_id } => {
+                out.push(tag::CLOSE_OPENED);
+                out.extend_from_slice(&start_id.to_bytes());
+            }
+            Self::CloseSettled {
+                height,
+                payload,
+                provider_payout,
+            } => {
+                out.push(tag::CLOSE_SETTLED);
+                put_u64(&mut out, *height);
+                out.extend_from_slice(payload);
+                put_u64(&mut out, *provider_payout);
             }
         }
         out
@@ -562,6 +653,7 @@ impl ChannelRecord {
         let record = match cursor.byte().ok_or(ChannelStateError::Malformed)? {
             tag::CURSOR => Self::CursorAdvanced {
                 height: cursor.u64().ok_or(ChannelStateError::Malformed)?,
+                parent: cursor.array::<32>().ok_or(ChannelStateError::Malformed)?,
                 payload: cursor.array::<32>().ok_or(ChannelStateError::Malformed)?,
             },
             tag::NONCE => Self::NonceReserved {
@@ -605,6 +697,21 @@ impl ChannelRecord {
                     _ => return Err(ChannelStateError::Malformed),
                 },
             },
+            tag::CLOSE_PREPARED => Self::ClosePrepared {
+                start: Box::new(decode_kernel(cursor.rest())?),
+            },
+            tag::CLOSE_OPENED => Self::CloseOpened {
+                start_id: StartId::from_bytes(
+                    cursor
+                        .array::<{ StartId::LENGTH }>()
+                        .ok_or(ChannelStateError::Malformed)?,
+                ),
+            },
+            tag::CLOSE_SETTLED => Self::CloseSettled {
+                height: cursor.u64().ok_or(ChannelStateError::Malformed)?,
+                payload: cursor.array::<32>().ok_or(ChannelStateError::Malformed)?,
+                provider_payout: cursor.u64().ok_or(ChannelStateError::Malformed)?,
+            },
             _ => return Err(ChannelStateError::Malformed),
         };
         if cursor.is_empty() {
@@ -644,17 +751,21 @@ fn certificate(cursor: &mut Cursor<'_>) -> Result<EarnedCertificate, ChannelStat
     }
 }
 
-/// Returns the kernel's own canonical encoding of a certificate.
+/// Returns the kernel's own canonical encoding of a kernel value.
 ///
 /// The journal holds these bytes and the wire carries them, and both
 /// take them from here: the signature beside a certificate is over the
 /// digest of this encoding, so a second speller of it would be a second
 /// definition of what was signed.
-pub(crate) fn encode_certificate(certificate: &EarnedCertificate) -> Vec<u8> {
-    let mut buf = vec![0_u8; certificate.encoded_size()];
-    let written = certificate.write_to(&mut buf);
+pub(crate) fn encode_kernel<E: Encode>(value: &E) -> Vec<u8> {
+    let mut buf = vec![0_u8; value.encoded_size()];
+    let written = value.write_to(&mut buf);
     buf.truncate(written);
     buf
+}
+
+fn decode_kernel<D: Decode>(bytes: &[u8]) -> Result<D, ChannelStateError> {
+    D::decode_exact(bytes).map_err(|_| ChannelStateError::Malformed)
 }
 
 /// The one job a channel may have in flight.
@@ -837,6 +948,26 @@ pub struct ChannelState {
     delivery_outstanding: u64,
     cursor: Option<(u64, [u8; 32])>,
     indeterminate: bool,
+    close_prepared: Option<PaymentCloseStart>,
+    close_opened: Option<StartId>,
+    close_settled: Option<CloseSettlement>,
+}
+
+/// What a finalized close of this channel's payment edge paid, and
+/// where it was.
+///
+/// Retained because a payout is a coin, and a coin can be spent. The
+/// block that carried the close is the durable answer to "was this
+/// channel settled"; a later lookup that finds no coin is not evidence
+/// that it was not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CloseSettlement {
+    /// Height of the block that carried the close.
+    pub height: u64,
+    /// That block's payload digest.
+    pub payload: [u8; 32],
+    /// What the close paid the provider.
+    pub provider_payout: u64,
 }
 
 impl ChannelState {
@@ -868,6 +999,9 @@ impl ChannelState {
             delivery_outstanding: 0,
             cursor: None,
             indeterminate: false,
+            close_prepared: None,
+            close_opened: None,
+            close_settled: None,
         }
     }
 
@@ -970,9 +1104,82 @@ impl ChannelState {
     }
 
     /// Returns the finalized block this endpoint has processed through.
+    ///
+    /// Contiguous by construction: every block from the first one this
+    /// journal recorded to this one was read, in order, each naming the
+    /// last as its parent. That is what makes it usable as a clock — a
+    /// height reached by skipping is a height at which this endpoint
+    /// does not know what happened.
     #[must_use]
     pub const fn cursor(&self) -> Option<(u64, [u8; 32])> {
         self.cursor
+    }
+
+    /// Returns the close start this endpoint signed and retains.
+    ///
+    /// What a resubmission sends. It stays here until a finalized block
+    /// shows a contest opened, or until the cursor has passed the last
+    /// height the signature could have been included at.
+    #[must_use]
+    pub const fn close_prepared(&self) -> Option<&PaymentCloseStart> {
+        self.close_prepared.as_ref()
+    }
+
+    /// Returns the retained close start while `height` is still inside
+    /// the window it could be included in.
+    ///
+    /// The one predicate that decides both halves of a resubmission: it
+    /// is why an endpoint offers the retained bytes again instead of
+    /// signing, and it is why the journal refuses to replace them. A
+    /// second spelling of it would let the two disagree about which
+    /// start this channel is closing with.
+    #[must_use]
+    pub fn includable_close_start(&self, height: u64) -> Option<&PaymentCloseStart> {
+        self.close_prepared
+            .as_ref()
+            .filter(|start| height <= start.valid_through_height())
+    }
+
+    /// Returns the finalized contest on this channel's payment edge.
+    #[must_use]
+    pub const fn close_opened(&self) -> Option<StartId> {
+        self.close_opened
+    }
+
+    /// Returns the finalized close of this channel's payment edge.
+    #[must_use]
+    pub const fn close_settled(&self) -> Option<CloseSettlement> {
+        self.close_settled
+    }
+
+    /// Returns the largest certificate held, with the client signature
+    /// that makes it spendable.
+    ///
+    /// The pair rather than the amount, because a close carries both:
+    /// [`Self::max_executable_certificate`] answers "how much", and this
+    /// answers "with what".
+    #[must_use]
+    pub const fn executable_certificate(&self) -> Option<&(EarnedCertificate, Sig)> {
+        self.executable.as_ref()
+    }
+
+    /// Whether this channel has begun closing.
+    ///
+    /// True from the moment a close start of this endpoint's is on the
+    /// disk, or a contest is finalized on this edge, or the edge is
+    /// gone. It is the cutoff: past it no job is admitted and no
+    /// certificate is credited, because a close cannot carry what it
+    /// did not know about.
+    #[must_use]
+    pub const fn is_closing(&self) -> bool {
+        self.close_prepared.is_some() || self.close_opened.is_some() || self.close_settled.is_some()
+    }
+
+    fn refuse_if_closing(&self, step: &'static str) -> Result<(), ChannelStateError> {
+        if self.is_closing() {
+            return Err(ChannelStateError::Closing { step });
+        }
+        Ok(())
     }
 
     /// Returns the unallocated monetary gap, if there is one.
@@ -1037,9 +1244,11 @@ impl ChannelState {
         verifier: &V,
     ) -> Result<Applied, ChannelStateError> {
         match record {
-            ChannelRecord::CursorAdvanced { height, payload } => {
-                self.apply_cursor(*height, payload)
-            }
+            ChannelRecord::CursorAdvanced {
+                height,
+                parent,
+                payload,
+            } => self.apply_cursor(*height, parent, payload),
             ChannelRecord::NonceReserved { nonce } => self.apply_nonce(*nonce),
             ChannelRecord::JobProposed {
                 authorization,
@@ -1078,26 +1287,169 @@ impl ChannelState {
                 certificate_signature,
             } => self.apply_gift(certificate, *certificate_signature, verifier),
             ChannelRecord::JobEnded { reason } => self.apply_ended(*reason),
+            ChannelRecord::ClosePrepared { start } => self.apply_close_prepared(start),
+            ChannelRecord::CloseOpened { start_id } => self.apply_close_opened(*start_id),
+            ChannelRecord::CloseSettled {
+                height,
+                payload,
+                provider_payout,
+            } => self.apply_close_settled(CloseSettlement {
+                height: *height,
+                payload: *payload,
+                provider_payout: *provider_payout,
+            }),
         }
     }
 
+    /// Moves the cursor on by exactly one contiguous block.
+    ///
+    /// Two rules, and they are the whole of what a cursor means here.
+    /// The height must be the next one, so nothing is skipped; and the
+    /// block must name the held block as its parent, so the chain that
+    /// was read is one chain. A watcher that fetched heights alone
+    /// would accept a block from a history this endpoint never saw.
+    ///
+    /// The first record has neither to check against. It anchors the
+    /// scan, and its parent is checked against nothing — an endpoint
+    /// that starts watching at height 900 has read no block before 900
+    /// and this makes no claim that it has.
     fn apply_cursor(
         &mut self,
         height: u64,
+        parent: &[u8; 32],
         payload: &[u8; 32],
     ) -> Result<Applied, ChannelStateError> {
         if self.cursor == Some((height, *payload)) {
             return Ok(Applied::Redundant);
         }
-        if let Some((held, _)) = self.cursor
-            && height <= held
-        {
-            return Err(ChannelStateError::CursorNotAdvancing {
-                held,
-                actual: height,
-            });
+        if let Some((held_height, held_payload)) = self.cursor {
+            if height != held_height.saturating_add(1) {
+                return Err(ChannelStateError::CursorNotNext {
+                    held: held_height,
+                    actual: height,
+                });
+            }
+            if *parent != held_payload {
+                return Err(ChannelStateError::CursorNotContiguous { height });
+            }
         }
         self.cursor = Some((height, *payload));
+        Ok(Applied::Changed)
+    }
+
+    /// Retains this endpoint's own signed close start, and shuts the
+    /// channel.
+    ///
+    /// A start already held is returned as the retry it is. A
+    /// *different* start replaces it only when the cursor has passed
+    /// the last height the held one could have been included at — and
+    /// that is not an approximation of the three facts §12 asks a
+    /// snapshot for, it is those facts. The cursor is contiguous, so
+    /// every block up to it was read: had any contest opened on this
+    /// edge, [`ChannelRecord::CloseOpened`] would be on this disk, and
+    /// had the edge been closed, [`ChannelRecord::CloseSettled`] would
+    /// be. Both refuse below. What remains — the held signature can no
+    /// longer be included anywhere — is exactly what the cursor says.
+    fn apply_close_prepared(
+        &mut self,
+        start: &PaymentCloseStart,
+    ) -> Result<Applied, ChannelStateError> {
+        if self.close_prepared.as_ref() == Some(start) {
+            return Ok(Applied::Redundant);
+        }
+        if self.close_opened.is_some() || self.close_settled.is_some() {
+            return Err(ChannelStateError::Closing {
+                step: "signing a close start",
+            });
+        }
+        if let Some(job) = &self.job {
+            return Err(ChannelStateError::WrongPhase {
+                step: "signing a close start",
+                phase: job.phase.name(),
+            });
+        }
+        // The start is about this channel, and it is this endpoint's to
+        // sign. Only the beneficiary of a certificate can be the
+        // provider, so a journal signing in the other role would be
+        // building a close for the other party.
+        for (field, holds) in [
+            (
+                "close start payment_edge",
+                start.payment_edge() == self.channel.payment_edge(),
+            ),
+            (
+                "close start payment_terms_hash",
+                start.terms().hash() == self.channel.payment_terms_hash(),
+            ),
+            (
+                "close start opener_role",
+                start.opener_role()
+                    == match self.role {
+                        Role::Client => Party::Maker,
+                        Role::Provider => Party::Taker,
+                    },
+            ),
+            (
+                "close start certificate",
+                start.certificate() == self.executable.as_ref(),
+            ),
+        ] {
+            if !holds {
+                return Err(ChannelStateError::WrongChannel { field });
+            }
+        }
+        let Some((cursor_height, _)) = self.cursor else {
+            return Err(ChannelStateError::NoCursor {
+                step: "signing a close start",
+            });
+        };
+        if self.includable_close_start(cursor_height).is_some() {
+            return Err(ChannelStateError::Conflict {
+                what: "a close start that can still be included",
+            });
+        }
+        self.close_prepared = Some(start.clone());
+        Ok(Applied::Changed)
+    }
+
+    /// Records the contest a finalized start opened.
+    ///
+    /// Refused once the edge is gone, and that is the rule that makes
+    /// the watcher's ordering visible: a block carrying a start and the
+    /// close that ends it is one history read in the validator's order
+    /// and another read backwards, and only one of them is a history
+    /// this journal takes.
+    fn apply_close_opened(&mut self, start_id: StartId) -> Result<Applied, ChannelStateError> {
+        if self.close_opened == Some(start_id) {
+            return Ok(Applied::Redundant);
+        }
+        if self.close_settled.is_some() {
+            return Err(ChannelStateError::Closing {
+                step: "opening a close contest",
+            });
+        }
+        if self.close_opened.is_some() {
+            return Err(ChannelStateError::Conflict {
+                what: "this edge's close contest",
+            });
+        }
+        self.close_opened = Some(start_id);
+        Ok(Applied::Changed)
+    }
+
+    fn apply_close_settled(
+        &mut self,
+        settlement: CloseSettlement,
+    ) -> Result<Applied, ChannelStateError> {
+        if self.close_settled == Some(settlement) {
+            return Ok(Applied::Redundant);
+        }
+        if self.close_settled.is_some() {
+            return Err(ChannelStateError::Conflict {
+                what: "this edge's close",
+            });
+        }
+        self.close_settled = Some(settlement);
         Ok(Applied::Changed)
     }
 
@@ -1113,6 +1465,7 @@ impl ChannelState {
         if self.reserved_nonce == Some(nonce) {
             return Ok(Applied::Redundant);
         }
+        self.refuse_if_closing("reserving a proposal nonce")?;
         if nonce != self.next_proposal_nonce {
             return Err(ChannelStateError::Nonce {
                 expected: self.next_proposal_nonce,
@@ -1154,6 +1507,10 @@ impl ChannelState {
                 phase: job.phase.name(),
             });
         }
+        // A closing channel takes no new work. The close is built from
+        // what is held now, so a job admitted after it would be a job
+        // whose payment no close could carry.
+        self.refuse_if_closing("proposing a job")?;
 
         // The channel this endpoint is, against the channel the
         // authorization names. The rest of the authorization's rules —
@@ -1550,6 +1907,11 @@ impl ChannelState {
         }) {
             return Ok(Applied::Redundant);
         }
+        // No cutoff check here, and none is needed: a payment credits
+        // the open job, and a close start is refused while there is
+        // one. The two are excluded by the same fact, and a second
+        // spelling of it would be a second chance to spell it
+        // differently.
         let job = self.open_job("crediting an allocation")?;
         let (Some((result, _)), Some((entry, _))) = (job.result, job.entry) else {
             return Err(ChannelStateError::WrongPhase {
@@ -1644,6 +2006,11 @@ impl ChannelState {
         certificate_signature: Sig,
         verifier: &V,
     ) -> Result<Applied, ChannelStateError> {
+        // The cutoff, and the one path it is needed on. An unsolicited
+        // certificate needs no job, so nothing else excludes it — and a
+        // certificate held after the start was signed is money that
+        // start does not carry.
+        self.refuse_if_closing("holding an unsolicited certificate")?;
         if certificate.payment_edge() != self.channel.payment_edge() {
             return Err(ChannelStateError::WrongChannel {
                 field: "certificate payment_edge",

@@ -26,6 +26,10 @@ pub mod stream;
 /// the refusals they answer with.
 #[cfg(feature = "work")]
 pub mod work;
+/// Settling paid work on chain: the finalized cursor every deadline is
+/// measured against, and the close that spends a certificate.
+#[cfg(feature = "work")]
+pub mod work_close;
 /// Durable endpoint state for paid work: the setup journal, the channel
 /// journal, and the counterparty loss ledger.
 #[cfg(feature = "work")]

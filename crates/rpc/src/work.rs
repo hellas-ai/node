@@ -113,7 +113,10 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use hellas_kernel::{Decode as _, EarnedCertificate, Secp256k1Signer, Secp256k1Verifier, Sig};
+use hellas_kernel::{
+    Decode as _, EarnedCertificate, Party, PaymentCloseStart, PendingSlot, Secp256k1Signer,
+    Secp256k1Verifier, Sig, Tx,
+};
 use hellas_wire::{StreamTransport, WireStatus};
 
 use prost::Message as _;
@@ -135,9 +138,13 @@ use crate::protocol::work::{
     next_invoice_entry, propose_authorization, result_digest, signing_hash, terminal_result,
     work_id,
 };
-use crate::protocol::work_setup::{ReadyChannel, WorkSetupError};
+use crate::protocol::work_setup::{ObservedChannel, ReadyChannel, WorkSetupError};
 use crate::services::work::{WorkClientImpl, WorkHandler};
-use crate::work_store::channel::encode_certificate;
+use crate::work_close::{
+    CatchUpError, CloseError, FinalizedBlocks, FinalizedWork, adjudicated_close, catch_up,
+    close_start, observe,
+};
+use crate::work_store::channel::encode_kernel;
 use crate::work_store::journal::MAX_RECORD_BYTES;
 use crate::work_store::{
     ChannelRecord, ChannelState, ChannelStateError, ChannelStore, JobEnd, JobPhase, JobState,
@@ -341,6 +348,7 @@ const fn channel_refusal(error: &ChannelStateError) -> WorkRefusal {
         | ChannelStateError::OverCredit { .. }
         | ChannelStateError::UnallocatedGap { .. }
         | ChannelStateError::LossRecorded
+        | ChannelStateError::Closing { .. }
         | ChannelStateError::Indeterminate => WorkRefusal::Declined,
         ChannelStateError::NoCursor { .. } => WorkRefusal::NotReady,
         ChannelStateError::ReceiptLate { .. } | ChannelStateError::PaymentLate { .. } => {
@@ -350,7 +358,8 @@ const fn channel_refusal(error: &ChannelStateError) -> WorkRefusal {
         | ChannelStateError::BadSignature { .. }
         | ChannelStateError::WrongRole { .. }
         | ChannelStateError::WrongChannel { .. }
-        | ChannelStateError::CursorNotAdvancing { .. }
+        | ChannelStateError::CursorNotNext { .. }
+        | ChannelStateError::CursorNotContiguous { .. }
         | ChannelStateError::Malformed => WorkRefusal::Invalid,
     }
 }
@@ -962,6 +971,148 @@ impl ProviderEndpoint {
     }
 }
 
+// ── Settling on chain ─────────────────────────────────────────────────
+
+impl ProviderEndpoint {
+    /// Applies one finalized block: every transition it carries, then
+    /// the cursor that says it was read.
+    ///
+    /// # Errors
+    ///
+    /// [`WorkStoreError`] when the block is not the contiguous next one,
+    /// or a transition it carries is refused.
+    pub fn observe_finalized(
+        &mut self,
+        block: &FinalizedWork,
+    ) -> Result<&ChannelState, WorkStoreError> {
+        observe(&mut self.store, block, &Secp256k1Verifier::new())?;
+        Ok(self.store.state())
+    }
+
+    /// Reads every finalized block this endpoint has not seen.
+    ///
+    /// # Errors
+    ///
+    /// [`CatchUpError`] when the source fails, a block in range cannot
+    /// be read, or the journal refuses one.
+    pub async fn catch_up<S: FinalizedBlocks + ?Sized>(
+        &mut self,
+        source: &S,
+    ) -> Result<Option<u64>, CatchUpError> {
+        catch_up(source, &mut self.store, &Secp256k1Verifier::new()).await
+    }
+
+    /// Signs the close start that spends this channel's certificate,
+    /// and retains its exact bytes before returning them.
+    ///
+    /// This is the write-ahead cutoff. Committing first is what stops
+    /// the provider admitting a certificate it has just decided to
+    /// leave out; the caller gets the bytes only after the disk holds
+    /// them, so a crash before the chain sees them costs a
+    /// resubmission and nothing else.
+    ///
+    /// Called again it returns the retained start rather than signing a
+    /// second one — until the cursor has passed the last height that
+    /// signature could have been included at, when a start that can no
+    /// longer land is replaced by one that can.
+    ///
+    /// # Errors
+    ///
+    /// [`CloseError::NoCursor`] before any finalized block has been
+    /// processed, [`CloseError::Store`] when a job is still open, a
+    /// contest is already live, or the journal refuses the record, and
+    /// the window errors [`close_start`] raises.
+    pub fn prepare_close(&mut self) -> Result<PaymentCloseStart, CloseError> {
+        let Some((height, _)) = self.state().cursor() else {
+            return Err(CloseError::NoCursor);
+        };
+        if let Some(retained) = self.state().includable_close_start(height) {
+            return Ok(retained.clone());
+        }
+        let start = close_start(
+            self.ready.channel(),
+            Party::Taker,
+            height,
+            self.state().executable_certificate().copied(),
+            &self.signer,
+        )?;
+        self.store.commit(
+            ChannelRecord::ClosePrepared {
+                start: Box::new(start.clone()),
+            },
+            &Secp256k1Verifier::new(),
+        )?;
+        Ok(start)
+    }
+
+    /// Builds the close that ends this endpoint's contest.
+    ///
+    /// `observed` is one coherent finalized read; the contest record it
+    /// carries is what consensus itself holds, and the payouts are
+    /// derived from it. Nothing durable is written, because nothing
+    /// here is a decision: after any crash this is rebuilt from a fresh
+    /// read and is the same transaction.
+    ///
+    /// The contest must be the one this endpoint's own watcher saw
+    /// finalized. That is what makes a snapshot showing *some* contest
+    /// insufficient: until the cursor has read the block that opened
+    /// it, this endpoint does not know it is its own.
+    ///
+    /// # Errors
+    ///
+    /// [`CloseError::NoContest`] when no contest of this endpoint's is
+    /// live at that read, [`CloseError::OtherContest`] when the live
+    /// one is another, [`CloseError::ResponseWindowOpen`] when the
+    /// provider's window has not run out, and [`CloseError::Unpayable`]
+    /// when the settled total does not fit the route.
+    pub fn adjudicated_close(&self, observed: &ObservedChannel<'_>) -> Result<Tx, CloseError> {
+        let held = self.state().close_opened().ok_or(CloseError::NoContest)?;
+        let PendingSlot::Present(record) = observed.pending else {
+            return Err(CloseError::NoContest);
+        };
+        if record.start_id() != held {
+            return Err(CloseError::OtherContest);
+        }
+        if !record.responded() && observed.height < record.response_deadline() {
+            return Err(CloseError::ResponseWindowOpen {
+                height: observed.height,
+                deadline: record.response_deadline(),
+            });
+        }
+        adjudicated_close(self.ready.channel(), self.ready.settlement(), &record)
+    }
+}
+
+impl ClientEndpoint {
+    /// Applies one finalized block: every transition it carries, then
+    /// the cursor that says it was read.
+    ///
+    /// # Errors
+    ///
+    /// [`WorkStoreError`] when the block is not the contiguous next one,
+    /// or a transition it carries is refused.
+    pub fn observe_finalized(
+        &mut self,
+        block: &FinalizedWork,
+    ) -> Result<&ChannelState, WorkStoreError> {
+        observe(&mut self.store, block, &Secp256k1Verifier::new())?;
+        Ok(self.store.state())
+    }
+
+    /// Reads every finalized block this endpoint has not seen.
+    ///
+    /// # Errors
+    ///
+    /// [`CatchUpError`] when the source fails, a block in range cannot
+    /// be read, or the journal refuses one.
+    pub async fn catch_up<S: FinalizedBlocks + ?Sized>(
+        &mut self,
+        source: &S,
+    ) -> Result<Option<u64>, CatchUpError> {
+        catch_up(source, &mut self.store, &Secp256k1Verifier::new()).await
+    }
+}
+
 // ── Running an accepted job ───────────────────────────────────────────
 
 /// Why the local execution backend produced no transcript.
@@ -1358,7 +1509,7 @@ fn earned_certificate(bytes: &[u8]) -> Option<EarnedCertificate> {
 /// Returns the request that carries one retained payment.
 fn admit_request(payment: &PaidCertificate) -> AdmitCertificateRequest {
     AdmitCertificateRequest {
-        certificate: encode_certificate(&payment.certificate),
+        certificate: encode_kernel(&payment.certificate),
         allocation: payment.allocation.encode(),
         allocation_signature: payment.allocation_signature.as_bytes().to_vec(),
         certificate_signature: payment.certificate_signature.as_bytes().to_vec(),
@@ -2007,7 +2158,7 @@ impl ClientEndpoint {
             &Secp256k1Verifier::new(),
         )?;
         Ok(AdmitCertificateRequest {
-            certificate: encode_certificate(&certificate),
+            certificate: encode_kernel(&certificate),
             allocation: allocation.encode(),
             allocation_signature: allocation_signature.as_bytes().to_vec(),
             certificate_signature: certificate_signature.as_bytes().to_vec(),

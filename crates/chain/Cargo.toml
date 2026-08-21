@@ -120,6 +120,11 @@ validator = [
     "hellas-kernel/webauthn",
 ]
 wasm-client = ["client-core", "hellas-wire/ws-wasm"]
+# The block source a paid endpoint's settlement watcher reads. It is its
+# own feature because the work protocol is the only thing in `hellas-rpc`
+# that needs the consensus kernel's types, and a chain client that only
+# serves coins has no use for them.
+work-watcher = ["block-view", "hellas-rpc/work"]
 
 [dependencies]
 hellas-xet = { workspace = true }
@@ -183,6 +188,11 @@ url = { version = "2", optional = true }
 commonware-consensus = { workspace = true, features = ["mocks"] }
 commonware-cryptography = { workspace = true, features = ["mocks"] }
 hellas-kernel = { workspace = true, features = ["test-support"] }
+# The settlement test drives the endpoint's own close builders against a
+# real database, so the bytes a provider would submit are the bytes
+# consensus is asked to accept. As a runtime dependency `hellas-rpc`
+# arrives without the work protocol; the settlement suite needs it.
+hellas-rpc = { workspace = true, features = ["work"] }
 ed25519-dalek.workspace = true
 itf = "0.4"
 proptest = "1.11"

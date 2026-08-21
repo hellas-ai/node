@@ -104,6 +104,15 @@ let
       mk "check-chain-block-view"
         "cargo clippy -p hellas-chain --no-default-features --features block-view --all-targets -- -D warnings"
         (cargoEnv rustToolchain);
+    # The settlement watcher's block source: the codec above plus the
+    # paid endpoint's journal. It is the only dimension that compiles
+    # `hellas-chain` and `hellas-rpc/work` together, so it is the only
+    # one that fails when the two disagree about what a finalized block
+    # hands a watcher.
+    chain-work-watcher =
+      mk "check-chain-work-watcher"
+        "cargo clippy -p hellas-chain --no-default-features --features work-watcher --all-targets -- -D warnings"
+        (cargoEnv rustToolchain);
     sort = mk "check-sort" "cargo-sort --workspace --check --no-format" [ pkgs.cargo-sort ];
     taplo =
       mk "check-taplo" "taplo fmt --option 'indent_string=    ' --check '*.toml' 'crates/**/Cargo.toml'"

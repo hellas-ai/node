@@ -34,6 +34,8 @@ pub mod rpc;
 pub mod server;
 #[cfg(feature = "validator")]
 pub mod validator;
+#[cfg(feature = "work-watcher")]
+pub mod work_blocks;
 #[cfg(any(feature = "client-core", feature = "server"))]
 pub mod work_view;
 
@@ -69,5 +71,7 @@ pub use owner_index::{ApplyOutcome, OwnerCursor, OwnerIndex, OwnerIndexError};
 pub use server::{
     LightClientRpc, LightClientServerError, serve_light_client_transport, spawn_light_client_server,
 };
+#[cfg(feature = "work-watcher")]
+pub use work_blocks::WorkBlocks;
 #[cfg(any(feature = "client-core", feature = "server"))]
 pub use work_view::{FinalizedWorkView, WorkChannelQuery, WorkChannelSnapshot};

@@ -1,0 +1,464 @@
+//! Spending the certificate: the finalized cursor, and the two
+//! transactions that turn a signed scalar into coins.
+//!
+//! # Why the cursor is the load-bearing part
+//!
+//! Five rules elsewhere in this crate are decided against a height —
+//! whether a receipt is timely, whether a payment is timely, whether a
+//! job's deadlines are still reachable, whether plaintext released now
+//! can still arrive, and whether a readiness decision may be acted on.
+//! Every one of them reads
+//! [`ChannelState::cursor`](crate::work_store::ChannelState::cursor). Until this module
+//! there was no writer for it outside tests, and a cursor that never
+//! moves makes every one of those rules pass: a receipt three hundred
+//! blocks late reads as timely against a height that stopped.
+//!
+//! So the cursor is not the plumbing around the close. It is what makes
+//! the deadlines mean anything, and [`observe`] is the only thing that
+//! moves it.
+//!
+//! # Contiguous, or not at all
+//!
+//! [`observe`] takes one block and commits one
+//! [`ChannelRecord::CursorAdvanced`], and that record refuses anything
+//! but the next height whose parent is the block already held. A
+//! notification that the chain has reached height 900 is a wake-up; it
+//! is not evidence that this endpoint read 880 through 899, and the
+//! close and the deadline those blocks may have carried are exactly
+//! what it would be missing.
+//!
+//! [`catch_up`] is therefore a loop and not a jump. A block the source
+//! cannot supply stops it, and the cursor stays where it was — which
+//! makes every gate above fail closed rather than pass on a stale
+//! height.
+//!
+//! # What a watcher looks for
+//!
+//! Two things, both on this channel's own payment edge. An accepted
+//! [`Move::StartPaymentClose`](hellas_kernel::Move::StartPaymentClose) means a contest is live, and the height
+//! that accepted it is the only place the contest's identifier can come
+//! from — the kernel derives [`StartId`](hellas_kernel::StartId) from the start
+//! digest *and*
+//! the inclusion height, so no retained signature determines it. An
+//! accepted [`Tx::Close`] means the edge is gone, and what it paid is
+//! read out of the transaction consensus admitted.
+//!
+//! # Non-destructive broadcast
+//!
+//! Nothing here consumes evidence to produce a transaction.
+//!
+//! - [`close_start`] builds and signs; [`crate::work::ProviderEndpoint`]
+//!   commits the exact bytes before they are handed to a chain. A crash
+//!   between signing and that commit loses a signature nobody has, and
+//!   the retry signs a fresh one at the new cursor height. A crash after
+//!   it leaves bytes that are re-sent verbatim, and the kernel admits at
+//!   most one contest per edge — so a resubmission is not a second
+//!   close, it is the same one.
+//! - The certificate the start carries stays in the journal it was
+//!   admitted into. The start holds a copy; it never becomes the only
+//!   copy.
+//! - [`adjudicated_close`] is derived, not retained: its payouts come
+//!   from the contest record consensus itself holds, so it can be
+//!   rebuilt after any crash from a fresh finalized read. What cannot be
+//!   rebuilt after the edge is consumed is the exact close *bytes* — and
+//!   nothing needs them, because [`observe`] recognises settlement by
+//!   the edge being closed rather than by matching bytes it kept.
+//!
+//! # What this module does not do
+//!
+//! It signs no cooperative freeze. That exit needs both parties'
+//! signatures over one amount and no exchange in this crate negotiates
+//! them; a freeze built here would be a transaction with one signature
+//! and a place to put the other.
+
+use hellas_kernel::{
+    EarnedCertificate, List, MAX_EDGE_OUTPUTS, Party, PayloadHash, PaymentCloseStart, Payout,
+    PendingPaymentClose, Proof, Secp256k1Signer, Sig, SigVerifier, Terms, Tx,
+    WorkPaymentSettlement, adjudicated_payouts, no_earned_digest,
+};
+
+use crate::protocol::work::PaidChannel;
+use crate::work_store::{ChannelRecord, ChannelStore, JobEnd, Role, WorkStoreError};
+
+/// One finalized block, as a watcher must see it.
+///
+/// The transactions are this block's accepted kernel transactions in
+/// consensus order — the order `HellasBlock::txs()` exposes, not a set
+/// and not a key-sorted projection. Two transactions in one block can
+/// be a start and the close that ends it, and reversing them is two
+/// different histories.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FinalizedWork {
+    /// Finalized height of this block.
+    pub height: u64,
+    /// Payload digest this block names as its parent.
+    pub parent: [u8; 32],
+    /// This block's own payload digest.
+    pub payload: [u8; 32],
+    /// The kernel transactions this block accepted, in block order.
+    pub txs: Vec<Tx>,
+}
+
+/// Why a finalized block could not be read.
+///
+/// Opaque, like [`crate::work::BackendFault`]: a watcher does the same
+/// thing for every one of them, which is stop and leave the cursor
+/// where it was.
+#[derive(Clone, Debug, thiserror::Error)]
+#[error("the finalized block source failed: {0}")]
+pub struct BlockSourceError(String);
+
+impl BlockSourceError {
+    /// Reports a source failure.
+    #[must_use]
+    pub fn new(reason: impl Into<String>) -> Self {
+        Self(reason.into())
+    }
+}
+
+/// Where a watcher gets its finalized blocks.
+///
+/// Narrow on purpose, and in this crate rather than in the chain crate,
+/// because both endpoints need exactly this and neither needs a
+/// mempool, a coin query, or an activity stream to get it. It is also
+/// what lets the loop below be tested against a history a test writes
+/// down rather than a validator it runs.
+pub trait FinalizedBlocks {
+    /// Returns the highest finalized height, or `None` before anything
+    /// is finalized.
+    fn latest_height(
+        &self,
+    ) -> impl core::future::Future<Output = Result<Option<u64>, BlockSourceError>> + Send;
+
+    /// Returns the finalized block at `height`.
+    ///
+    /// `Ok(None)` means this source cannot supply that height — it is
+    /// not finalized, or it has been pruned. Both stop a scan; neither
+    /// is a reason to skip it.
+    fn block_at(
+        &self,
+        height: u64,
+    ) -> impl core::future::Future<Output = Result<Option<FinalizedWork>, BlockSourceError>> + Send;
+}
+
+/// Why a close could not be built.
+#[derive(Debug, thiserror::Error)]
+pub enum CloseError {
+    /// No finalized block has been processed, so there is no height to
+    /// anchor the signed validity window at.
+    #[error("a close start needs a finalized block, and none has been processed")]
+    NoCursor,
+    /// The terms fix a zero-block start window, so no signature could
+    /// ever be included.
+    #[error("the payment terms admit no start validity window")]
+    NoValidityWindow,
+    /// The window arithmetic left the representable range.
+    #[error("the start validity window overflows past height {height}")]
+    WindowOverflow {
+        /// Height the window was anchored at.
+        height: u64,
+    },
+    /// A contest is live on this edge and it is not the one this
+    /// endpoint opened.
+    #[error("the live contest is not the one this endpoint started")]
+    OtherContest,
+    /// No finalized contest is open for this endpoint's start.
+    #[error("no finalized contest is open on this payment edge")]
+    NoContest,
+    /// The provider's response window has not run out, so consensus
+    /// would refuse this close.
+    #[error("the response window is open until height {deadline}, and the cursor is at {height}")]
+    ResponseWindowOpen {
+        /// Finalized height the endpoint has reached.
+        height: u64,
+        /// Height at which the window shuts.
+        deadline: u64,
+    },
+    /// The payouts this contest settles do not fit what the edge
+    /// distributes.
+    #[error("the contest settles more than this edge's adjudicated route distributes")]
+    Unpayable,
+    /// The step could not be made durable, or the journal refused it.
+    #[error(transparent)]
+    Store(#[from] WorkStoreError),
+}
+
+/// Why a catch-up did not finish.
+#[derive(Debug, thiserror::Error)]
+pub enum CatchUpError {
+    /// The block source failed.
+    #[error(transparent)]
+    Source(#[from] BlockSourceError),
+    /// A block inside the range this endpoint must read is not
+    /// available. The cursor stays where it was.
+    #[error("finalized block {height} is not available, so the cursor stays behind")]
+    Missing {
+        /// Height that could not be read.
+        height: u64,
+    },
+    /// A block was refused by the journal.
+    #[error(transparent)]
+    Store(#[from] WorkStoreError),
+}
+
+/// Returns the digest a close opener signs for `start`.
+///
+/// One spelling on this side of the wire. The kernel builds the same
+/// digest from the *edge* it reads, so a start whose terms are not the
+/// edge's is refused there before any signature is checked; here the
+/// terms are the channel's own, and every start this is called on is
+/// one on this channel's payment edge.
+#[must_use]
+pub fn start_body_digest(channel: &PaidChannel, start: &PaymentCloseStart) -> PayloadHash {
+    let earned = match start.certificate() {
+        None => no_earned_digest(channel.payment_edge(), channel.payment_terms_hash()),
+        Some((certificate, _)) => certificate.digest(channel.network()),
+    };
+    hellas_kernel::start_digest(
+        channel.network(),
+        channel.payment_edge(),
+        channel.payment_terms_hash(),
+        start.opener_role(),
+        (start.valid_from_height(), start.valid_through_height()),
+        earned,
+    )
+}
+
+/// Builds and signs one close start at finalized height `height`.
+///
+/// The window is `[height + 1, height + start_validity_blocks]`, and
+/// the two ends are the kernel's own inclusive interpretation: the next
+/// block is the first one that can carry a signature made now, and the
+/// span of a one-block window is one. Both additions are checked, so a
+/// height within one window of the ceiling refuses to sign rather than
+/// wrapping into a window that has already shut.
+///
+/// A zero-amount certificate has no representation here and needs none:
+/// a journal only ever retains a certificate that exceeded what it
+/// already held, and nothing exceeds zero. An opener with nothing to
+/// claim passes `None`, which is the kernel's one spelling for it.
+///
+/// # Errors
+///
+/// [`CloseError::NoValidityWindow`] when the terms fix a zero-block
+/// window, and [`CloseError::WindowOverflow`] when either addition
+/// leaves the representable range.
+pub fn close_start(
+    channel: &PaidChannel,
+    opener_role: Party,
+    height: u64,
+    certificate: Option<(EarnedCertificate, Sig)>,
+    signer: &Secp256k1Signer,
+) -> Result<PaymentCloseStart, CloseError> {
+    let span = channel.payment_terms().start_validity_blocks;
+    if span == 0 {
+        return Err(CloseError::NoValidityWindow);
+    }
+    let valid_from = height
+        .checked_add(1)
+        .ok_or(CloseError::WindowOverflow { height })?;
+    let valid_through = valid_from
+        .checked_add(span - 1)
+        .ok_or(CloseError::WindowOverflow { height })?;
+
+    // Built once with a placeholder signature, so the digest is taken
+    // from exactly the body that will carry it. The action signature is
+    // not part of what it covers, which is what makes this safe rather
+    // than circular.
+    let unsigned = PaymentCloseStart::new(
+        channel.payment_edge(),
+        Terms::work_payment(channel.payment_terms().clone()),
+        opener_role,
+        (valid_from, valid_through),
+        certificate,
+        Sig::from_bytes([0_u8; Sig::LENGTH]),
+    );
+    let action_sig = signer.sign(start_body_digest(channel, &unsigned));
+    Ok(PaymentCloseStart::new(
+        channel.payment_edge(),
+        Terms::work_payment(channel.payment_terms().clone()),
+        opener_role,
+        (valid_from, valid_through),
+        unsigned.certificate().copied(),
+        action_sig,
+    ))
+}
+
+/// Builds the close that pays out whatever the contest ended on.
+///
+/// The amounts are not this endpoint's opinion: `pending` is the record
+/// consensus itself holds, and the two payouts come from the kernel's
+/// own [`adjudicated_payouts`]. That is why this needs no retained
+/// bytes — after any crash it is rebuilt from one finalized read, and
+/// it is the same transaction.
+///
+/// There is no signature on it at all. The amounts were authorized when
+/// the certificates behind them were signed, and the window has shut on
+/// any further evidence.
+///
+/// `settlement` is what the *funded* edge distributes, taken from the
+/// finalized read that established the channel is live. A close built
+/// against an expectation rather than that read would name a total the
+/// edge does not hold.
+///
+/// # Errors
+///
+/// [`CloseError::Unpayable`] when the settled total does not fit the
+/// adjudicated route.
+pub fn adjudicated_close(
+    channel: &PaidChannel,
+    settlement: WorkPaymentSettlement,
+    pending: &PendingPaymentClose,
+) -> Result<Tx, CloseError> {
+    let payouts = adjudicated_payouts(
+        settlement,
+        channel.payment_terms().parties(),
+        pending.final_cumulative(),
+        pending.penalty_due(),
+    )
+    .map_err(|_| CloseError::Unpayable)?;
+    let mut outputs = [Payout::default(); MAX_EDGE_OUTPUTS];
+    for (slot, payout) in outputs.iter_mut().zip(payouts) {
+        *slot = payout;
+    }
+    Ok(Tx::close(
+        channel.payment_edge(),
+        Proof::adjudicated(pending.contest_commitment(
+            channel.network(),
+            channel.payment_edge(),
+            channel.payment_terms_hash(),
+        )),
+        List::take(outputs, payouts.len()),
+    ))
+}
+
+/// Applies one finalized block to one channel's journal.
+///
+/// The order is the order a crash must be able to stop in. Everything
+/// the block *means* is committed before the cursor that says the block
+/// was read, so a process that dies between them re-reads the same
+/// block and re-commits the same records — which the journal answers as
+/// the retries they are. The other order would advance past a block
+/// whose close it had not recorded, and no later scan would go back for
+/// it.
+///
+/// # Errors
+///
+/// [`WorkStoreError`] when a record is refused or cannot be made
+/// durable. The cursor is the last thing written, so a refusal
+/// anywhere leaves this endpoint still behind this block.
+pub fn observe<V: SigVerifier>(
+    store: &mut ChannelStore,
+    block: &FinalizedWork,
+    verifier: &V,
+) -> Result<(), WorkStoreError> {
+    let channel = store.state().channel().clone();
+    let edge = channel.payment_edge();
+
+    // The one height-driven transition this milestone applies. Past the
+    // deadline the client signed to pay by, the job is over: its price
+    // moves once to this client's identity-wide loss — which is
+    // `loss_of`'s decision and only for a job that produced something
+    // payable — and the channel is free to close. Earlier deadlines are
+    // deliberately not applied here; missing them costs this provider a
+    // reservation it holds slightly too long, and costs the client
+    // nothing.
+    if store.state().role() == Role::Provider
+        && let Some(job) = store.state().job()
+        && block.height > job.authorization().payment_deadline
+    {
+        store.commit(
+            ChannelRecord::JobEnded {
+                reason: JobEnd::Expired,
+            },
+            verifier,
+        )?;
+    }
+
+    for tx in &block.txs {
+        match tx {
+            Tx::Move {
+                action: hellas_kernel::Move::StartPaymentClose(start),
+            } if start.payment_edge() == edge => {
+                store.commit(
+                    ChannelRecord::CloseOpened {
+                        start_id: hellas_kernel::start_id(
+                            start_body_digest(&channel, start),
+                            block.height,
+                        ),
+                    },
+                    verifier,
+                )?;
+            }
+            Tx::Close { input, outputs, .. } if *input == edge => {
+                let provider_payout = outputs
+                    .as_slice()
+                    .iter()
+                    .find(|payout| payout.owner() == channel.provider_key())
+                    .map_or(0, |payout| payout.value());
+                store.commit(
+                    ChannelRecord::CloseSettled {
+                        height: block.height,
+                        payload: block.payload,
+                        provider_payout,
+                    },
+                    verifier,
+                )?;
+            }
+            _ => {}
+        }
+    }
+
+    store.commit(
+        ChannelRecord::CursorAdvanced {
+            height: block.height,
+            parent: block.parent,
+            payload: block.payload,
+        },
+        verifier,
+    )?;
+    Ok(())
+}
+
+/// Reads every finalized block this journal has not seen, in order.
+///
+/// A journal with no cursor anchors at the latest finalized block. It
+/// makes no claim about anything earlier, and needs none: an endpoint
+/// only exists over a channel whose readiness read found no contest
+/// open, so the history this skips is history in which nothing had
+/// happened to this edge.
+///
+/// Returns the height the cursor reached, or `None` when the source has
+/// finalized nothing.
+///
+/// # Errors
+///
+/// [`CatchUpError::Missing`] when a block inside the range cannot be
+/// read — the scan stops there and the cursor keeps the last height it
+/// did read — plus the source's own failures and the journal's.
+pub async fn catch_up<S, V>(
+    source: &S,
+    store: &mut ChannelStore,
+    verifier: &V,
+) -> Result<Option<u64>, CatchUpError>
+where
+    S: FinalizedBlocks + ?Sized,
+    V: SigVerifier,
+{
+    let Some(latest) = source.latest_height().await? else {
+        return Ok(store.state().cursor().map(|(height, _)| height));
+    };
+    let mut next = match store.state().cursor() {
+        Some((height, _)) => height.saturating_add(1),
+        None => latest,
+    };
+    while next <= latest {
+        let block = source
+            .block_at(next)
+            .await?
+            .ok_or(CatchUpError::Missing { height: next })?;
+        observe(store, &block, verifier)?;
+        next = next.saturating_add(1);
+    }
+    Ok(store.state().cursor().map(|(height, _)| height))
+}

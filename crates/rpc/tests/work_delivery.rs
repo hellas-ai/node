@@ -45,6 +45,7 @@ use hellas_rpc::work::{
     BackendFault, ClientEndpoint, DeliverError, PaidEvaluateBackend, ProviderEndpoint, RunOutcome,
     WorkService, fetch_result, run_accepted_work,
 };
+use hellas_rpc::work_close::{FinalizedWork, observe};
 use hellas_rpc::work_store::{ChannelRecord, ChannelStore, JobPhase, JobState, Role};
 use hellas_rpc::{
     Assurance, EvaluateProgramManifest, EvaluateRequest, OutputEventEnvelope, ProducerSigningKey,
@@ -68,7 +69,6 @@ const Q: u64 = 999_000;
 const COST_CAP: u64 = 1;
 /// The finalized block both endpoints have processed through.
 const CURSOR: u64 = 10;
-const CURSOR_PAYLOAD: [u8; 32] = [0xc0; 32];
 /// The prompt this fixture's bundle carries, in tokens.
 const PROMPT_TOKENS: u64 = 4;
 /// A frame bound no legal delivery here comes close to.
@@ -256,31 +256,42 @@ fn store_at(root: &std::path::Path, ready: &ReadyChannel, role: Role, height: u6
         Ok(store) => store,
         Err(error) => panic!("the fixture store opens: {error}"),
     };
-    if store.state().cursor().is_none() {
-        commit(
-            &mut store,
-            ChannelRecord::CursorAdvanced {
-                height,
-                payload: CURSOR_PAYLOAD,
-            },
-        );
-    }
+    advance(&mut store, height);
     store
 }
 
-/// Moves one store's finalized cursor forward, as a running P8a
-/// catch-up will.
-fn advance(store: &mut ChannelStore, height: u64) {
-    if store.state().cursor() == Some((height, CURSOR_PAYLOAD)) {
-        return;
+/// The payload digest of the synthetic block at `height`.
+///
+/// A cursor is contiguous, so a fixture that moves it has to name a
+/// chain rather than repeat one digest: each block's parent is the last
+/// block's payload, and the watcher refuses anything else.
+fn payload_at(height: u64) -> [u8; 32] {
+    let mut payload = [0xc0; 32];
+    for (slot, byte) in payload.iter_mut().zip(height.to_be_bytes()) {
+        *slot = byte;
     }
-    commit(
-        store,
-        ChannelRecord::CursorAdvanced {
-            height,
-            payload: CURSOR_PAYLOAD,
-        },
-    );
+    payload
+}
+
+/// Runs the production watcher over one empty finalized block per
+/// height, up through `height`.
+///
+/// The same call the settlement loop makes, so a fixture cursor is a
+/// cursor this endpoint could have reached.
+fn advance(store: &mut ChannelStore, height: u64) {
+    let mut next = store.state().cursor().map_or(height, |(held, _)| held + 1);
+    while next <= height {
+        let block = FinalizedWork {
+            height: next,
+            parent: payload_at(next.saturating_sub(1)),
+            payload: payload_at(next),
+            txs: Vec::new(),
+        };
+        if let Err(error) = observe(store, &block, &Secp256k1Verifier::new()) {
+            panic!("the fixture block applies: {error}");
+        }
+        next = next.saturating_add(1);
+    }
 }
 
 fn commit(store: &mut ChannelStore, record: ChannelRecord) {
