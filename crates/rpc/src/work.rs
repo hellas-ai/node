@@ -84,38 +84,64 @@
 //! redundant step, so one job's plaintext is debited once however many
 //! times it is fetched.
 //!
+//! # Paying for it
+//!
+//! [`ProviderEndpoint::issue_invoice`] and [`ClientEndpoint::pay`] are
+//! the fourth and fifth exchanges, and they are where the private
+//! ledger meets the one number consensus settles.
+//!
+//! The client asks for an invoice only from the phase its own oracle
+//! verdict put the job in, so an honest client is billed for an answer
+//! it checked. The provider builds the entry from its own ledger and
+//! fsyncs it before it answers. The client rebuilds the same entry from
+//! *its* ledger, fsyncs the provider's signature over it, and only then
+//! signs the kernel certificate for exactly that entry's
+//! `cumulative_after` — after the ledger has agreed, and before the
+//! signature leaves.
+//!
+//! Then the provider fsyncs the certificate before it acknowledges
+//! anything, and that same record is what retires the job's compute and
+//! delivery credit. There is no moment at which this client is owed
+//! service for a payment the provider's disk does not hold.
+//!
 //! # What this phase does not carry
 //!
-//! Invoicing and certificate admission. Both need a producer that does
-//! not exist yet, and a message with nothing on either end of it is not
-//! a protocol. [`ClientEndpoint::verified`] is the step an invoice will
-//! be asked for from; nothing here asks.
+//! Closing. Nothing here builds a `PaymentCloseStart`, so nothing here
+//! spends the certificate on L1 or bounds admission by a close cutoff;
+//! [`ChannelState::max_executable_certificate`] is the value such a
+//! builder starts from, and it is P8's to use.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use hellas_kernel::{Secp256k1Signer, Secp256k1Verifier, Sig};
+use hellas_kernel::{Decode as _, EarnedCertificate, Secp256k1Signer, Secp256k1Verifier, Sig};
 use hellas_wire::{StreamTransport, WireStatus};
 
 use prost::Message as _;
 
 use crate::pb::work::{
-    AcceptWorkRequest, AcceptWorkResponse, DeliverResultRequest, DeliverResultResponse,
-    WorkAccepted, WorkDelivered, WorkRefusalCode, WorkRefused, accept_work_response::Outcome,
+    AcceptWorkRequest, AcceptWorkResponse, AdmitCertificateRequest, AdmitCertificateResponse,
+    DeliverResultRequest, DeliverResultResponse, RequestInvoiceRequest, RequestInvoiceResponse,
+    WorkAccepted, WorkDelivered, WorkInvoiced, WorkPaid, WorkRefusalCode, WorkRefused,
+    accept_work_response::Outcome, admit_certificate_response::Outcome as AdmitOutcome,
     deliver_result_response::Outcome as DeliverOutcome,
+    request_invoice_response::Outcome as InvoiceOutcome,
 };
 use crate::protocol::Digest;
 use crate::protocol::artifacts::PreparedPaidInputV1;
 use crate::protocol::work::{
-    JobDeadlines, PaidJobAuthorizationV1, PaidJobResultV1, PaidWorkError, PrivateRecord as _,
-    check_authorization, check_prepared_input, encode_transcript, propose_authorization,
-    result_digest, signing_hash, terminal_result, work_id,
+    CertificateAllocationV1, InvoiceEntryV1, JobDeadlines, PaidJobAuthorizationV1, PaidJobResultV1,
+    PaidWorkError, PrivateRecord as _, allocation_digest, check_authorization,
+    check_prepared_input, encode_transcript, invoice_digest, invoice_entries_root,
+    next_invoice_entry, propose_authorization, result_digest, signing_hash, terminal_result,
+    work_id,
 };
 use crate::protocol::work_setup::{ReadyChannel, WorkSetupError};
 use crate::services::work::{WorkClientImpl, WorkHandler};
+use crate::work_store::channel::encode_certificate;
 use crate::work_store::journal::MAX_RECORD_BYTES;
 use crate::work_store::{
-    ChannelRecord, ChannelState, ChannelStateError, ChannelStore, JobEnd, JobPhase, JobState, Role,
-    WorkStoreError,
+    ChannelRecord, ChannelState, ChannelStateError, ChannelStore, JobEnd, JobPhase, JobState,
+    PaidCertificate, Role, WorkStoreError,
 };
 use crate::{EvaluateRequest, OutputEventEnvelope};
 
@@ -317,7 +343,9 @@ const fn channel_refusal(error: &ChannelStateError) -> WorkRefusal {
         | ChannelStateError::LossRecorded
         | ChannelStateError::Indeterminate => WorkRefusal::Declined,
         ChannelStateError::NoCursor { .. } => WorkRefusal::NotReady,
-        ChannelStateError::ReceiptLate { .. } => WorkRefusal::Expired,
+        ChannelStateError::ReceiptLate { .. } | ChannelStateError::PaymentLate { .. } => {
+            WorkRefusal::Expired
+        }
         ChannelStateError::Record(_)
         | ChannelStateError::BadSignature { .. }
         | ChannelStateError::WrongRole { .. }
@@ -763,6 +791,155 @@ impl ProviderEndpoint {
         })
     }
 
+    /// Issues the one invoice entry this job may have, and returns it
+    /// only once it is on the disk.
+    ///
+    /// The entry is built by [`next_invoice_entry`] from this
+    /// endpoint's own ledger — its next sequence and its credited
+    /// high-water — and from the price the authorization both parties
+    /// signed. Nothing a caller supplies chooses any of those, and the
+    /// journal rebuilds the same entry before it takes the record, so
+    /// an entry that named another position could not be stored even if
+    /// one could be built.
+    ///
+    /// Order: the entry and its signature are fsynced before this
+    /// returns them. A crash before the commit costs the round trip and
+    /// leaves the job delivered-unpaid, which is what it already was; a
+    /// crash after it leaves a durable entry, and asking again returns
+    /// exactly those bytes rather than signing a second one.
+    ///
+    /// # Errors
+    ///
+    /// [`PaymentError::NoSuchJob`] when no open job carries this
+    /// `work_id`, [`PaymentError::NotInvoiceable`] before a result is
+    /// signed, [`PaymentError::Record`] when the entry would exceed
+    /// what this edge can settle, and [`PaymentError::Store`] when the
+    /// journal refuses the record — which is what it does for a job
+    /// whose plaintext has not been released.
+    pub fn issue_invoice(
+        &mut self,
+        work_id: Digest,
+    ) -> Result<(InvoiceEntryV1, Sig), PaymentError> {
+        let job = self.state().job().ok_or(PaymentError::NoSuchJob)?;
+        if job.work_id() != work_id {
+            return Err(PaymentError::NoSuchJob);
+        }
+        // One job has one invoice. A repeat is the lost-response retry,
+        // and it is answered with the retained bytes.
+        if let Some((entry, signature)) = job.entry() {
+            return Ok((*entry, *signature));
+        }
+        let Some((result, _)) = job.result() else {
+            return Err(PaymentError::NotInvoiceable { phase: job.phase() });
+        };
+        let (authorization, result) = (*job.authorization(), *result);
+        let ledger = self.state().ledger();
+        let (next_seq, credited) = (
+            ledger.next_invoice_seq(),
+            ledger.credited_invoice_high_water(),
+        );
+        let settlement = self.state().settlement();
+        let channel = self.ready.channel();
+        let entry = next_invoice_entry(
+            channel,
+            &authorization,
+            &result,
+            next_seq,
+            credited,
+            settlement,
+        )?;
+        let signature = self
+            .signer
+            .sign(signing_hash(invoice_digest(channel, &entry)));
+        self.store.commit(
+            ChannelRecord::InvoiceIssued {
+                entry,
+                provider_signature: signature,
+            },
+            &Secp256k1Verifier::new(),
+        )?;
+        Ok((entry, signature))
+    }
+
+    /// Admits one client certificate, and returns what it credited only
+    /// once that is on the disk.
+    ///
+    /// This is the provider's half of the contract's sixth point. The
+    /// record it commits is the one that retires this job's compute and
+    /// delivery credit, so the credit is released in the same fsync
+    /// that admits the certificate, and both happen before the caller
+    /// has an answer to acknowledge with. A crash before the commit
+    /// releases nothing and credits nothing: the client re-sends the
+    /// bytes its own journal retained. A crash after it leaves the
+    /// payment durable, and the re-send is recognised as the same
+    /// payment and answered with the same number.
+    ///
+    /// A certificate whose allocation the ledger will not credit is
+    /// still kept, when a job is open and it is valid on its own terms
+    /// and larger than anything held: it is money this client signed
+    /// for the job in flight, and forgetting it because the private
+    /// evidence beside it was wrong would be giving it back. It marks no
+    /// invoice paid and releases no credit, and the refusal below is
+    /// what the caller is told.
+    ///
+    /// With no job open, nothing is kept. This channel is owed nothing
+    /// at that moment, and the case that matters is the one where the
+    /// job was already written off: its price is on this client's loss
+    /// ledger, which nothing takes back, so banking the money as well
+    /// would charge the client twice for one job. A client that signed
+    /// a payment its provider had already defaulted therefore keeps a
+    /// certificate no provider holds: the cost of that race falls on
+    /// the endpoint that decided the default, and deciding it is a
+    /// caller's act ([`ProviderEndpoint::end_run`]) rather than
+    /// anything this module times. Zero-work gifts are not admitted
+    /// here at all, which is what this milestone says about them.
+    ///
+    /// # Errors
+    ///
+    /// [`PaymentError::Malformed`] when a field is not the record or
+    /// signature it must be, [`PaymentError::Record`] when the
+    /// certificate does not decode, and [`PaymentError::Store`] for
+    /// every rule the journal applies — the client's two signatures,
+    /// the allocation against the ledger, and the phase this job is in.
+    pub fn admit(&mut self, request: &AdmitCertificateRequest) -> Result<u64, PaymentError> {
+        let certificate = earned_certificate(&request.certificate)
+            .ok_or(PaymentError::Malformed("certificate"))?;
+        let allocation = CertificateAllocationV1::decode(&request.allocation)?;
+        let allocation_signature = signature(&request.allocation_signature)
+            .ok_or(PaymentError::Malformed("allocation signature"))?;
+        let certificate_signature = signature(&request.certificate_signature)
+            .ok_or(PaymentError::Malformed("certificate signature"))?;
+
+        let refusal = match self.store.commit(
+            ChannelRecord::CertificatePaid {
+                certificate,
+                allocation,
+                allocation_signature,
+                certificate_signature,
+            },
+            &Secp256k1Verifier::new(),
+        ) {
+            Ok(state) => return Ok(state.ledger().credited_invoice_high_water()),
+            Err(error) => error,
+        };
+        // The certificate on its own, as close evidence for the job in
+        // flight. It is refused in turn when it is not this channel's,
+        // is over capacity, is not the client's signature, or is no
+        // larger than what is already held. Either way the payment's own
+        // refusal is the answer: what was retained is a fact about this
+        // provider's disk, not another outcome the caller may act on.
+        if self.state().job().is_some() {
+            let _ = self.store.commit(
+                ChannelRecord::CertificateGift {
+                    certificate,
+                    certificate_signature,
+                },
+                &Secp256k1Verifier::new(),
+            );
+        }
+        Err(PaymentError::Store(refusal))
+    }
+
     /// Ends the open job, releasing what it still holds.
     ///
     /// What ending costs is the journal's to decide from how far the job
@@ -1087,6 +1264,107 @@ impl From<DeliverError> for Refusal {
     }
 }
 
+// ── Paying for the answer ─────────────────────────────────────────────
+
+/// Why one invoice or one payment did not happen.
+///
+/// Shared by both halves of the exchange, like [`DeliverError`], because
+/// the two endpoints run the same rules over the same records; the arms
+/// only one of them can raise are documented where they are mapped.
+#[derive(Debug, thiserror::Error)]
+pub enum PaymentError {
+    /// No open job on this channel carries this `work_id`.
+    #[error("no open job on this channel carries this work id")]
+    NoSuchJob,
+    /// The job has no signed result, so there is nothing to bill for.
+    #[error("a {phase} job has no result to invoice")]
+    NotInvoiceable {
+        /// How far the job has got.
+        phase: JobPhase,
+    },
+    /// The job has no invoice entry, so there is nothing to pay.
+    #[error("a {phase} job has no invoice to pay")]
+    Unbilled {
+        /// How far the job has got.
+        phase: JobPhase,
+    },
+    /// A private-record rule refused the bytes.
+    #[error(transparent)]
+    Record(#[from] PaidWorkError),
+    /// The journal refused the step, or could not take it.
+    #[error(transparent)]
+    Store(#[from] WorkStoreError),
+    /// The peer refused.
+    #[error("the provider refused as {refusal}: {reason}")]
+    Refused {
+        /// Which of the six answers came back.
+        refusal: WorkRefusal,
+        /// The provider's diagnostic text, unchecked and uncovered by
+        /// any digest.
+        reason: String,
+    },
+    /// The message was not one of the shapes the service defines.
+    #[error("the message has no readable {0}")]
+    Malformed(&'static str),
+    /// The provider acknowledged crediting an amount other than the one
+    /// this client signed for.
+    #[error("the provider acknowledged crediting {credited}, not the {signed} it was sent")]
+    Acknowledged {
+        /// Cumulative the client's certificate names.
+        signed: u64,
+        /// Cumulative the provider says it credited.
+        credited: u64,
+    },
+    /// The call did not complete.
+    #[error("the work call failed: {0}")]
+    Transport(#[from] WireStatus),
+}
+
+impl From<PaymentError> for Refusal {
+    /// What a provider says on the wire when it will not invoice or
+    /// will not credit.
+    ///
+    /// A job this channel does not have is `Declined`: no wait produces
+    /// one. A job with no result yet is `NotReady`, because that is the
+    /// one answer asking again can change. Everything else about these
+    /// two calls is a rule over bytes the caller sent, and the
+    /// journal's own mapping is what grades those.
+    ///
+    /// Four arms are a client's own and no provider builds them: a
+    /// refusal it read, a response it could not read, an
+    /// acknowledgement that did not match, and a job it had not
+    /// invoiced. They are mapped so the match is total, and no test
+    /// claims a provider reaches them.
+    fn from(error: PaymentError) -> Self {
+        let reason = error.to_string();
+        let code = match error {
+            PaymentError::NoSuchJob => WorkRefusal::Declined,
+            PaymentError::NotInvoiceable { .. } | PaymentError::Unbilled { .. } => {
+                WorkRefusal::NotReady
+            }
+            PaymentError::Store(store) => return Refusal::from(store),
+            _ => WorkRefusal::Invalid,
+        };
+        Self::new(code, reason)
+    }
+}
+
+/// Reads one kernel certificate from exactly its canonical bytes.
+fn earned_certificate(bytes: &[u8]) -> Option<EarnedCertificate> {
+    let (certificate, consumed) = EarnedCertificate::decode(bytes).ok()?;
+    (consumed == bytes.len()).then_some(certificate)
+}
+
+/// Returns the request that carries one retained payment.
+fn admit_request(payment: &PaidCertificate) -> AdmitCertificateRequest {
+    AdmitCertificateRequest {
+        certificate: encode_certificate(&payment.certificate),
+        allocation: payment.allocation.encode(),
+        allocation_signature: payment.allocation_signature.as_bytes().to_vec(),
+        certificate_signature: payment.certificate_signature.as_bytes().to_vec(),
+    }
+}
+
 /// Ends the job as failed, and returns `fault` if that ending was
 /// recorded.
 fn end_failed(service: &WorkService, work_id: Digest, fault: RunError) -> RunError {
@@ -1181,6 +1459,52 @@ impl WorkService {
             }),
         }
     }
+
+    /// Issues one job's invoice, or says why not.
+    fn invoice(&self, request: &RequestInvoiceRequest) -> RequestInvoiceResponse {
+        let outcome = match self.endpoint() {
+            Ok(mut endpoint) => match work_id_bytes(&request.work_id) {
+                Some(work_id) => endpoint.issue_invoice(work_id).map_err(Refusal::from),
+                None => Err(Refusal::invalid("the work id is not 32 bytes")),
+            },
+            Err(error) => Err(Refusal::new(WorkRefusal::Unavailable, error.to_string())),
+        };
+        RequestInvoiceResponse {
+            outcome: Some(match outcome {
+                Ok((entry, signature)) => InvoiceOutcome::Invoiced(WorkInvoiced {
+                    entry: entry.encode(),
+                    provider_signature: signature.as_bytes().to_vec(),
+                }),
+                Err(refusal) => InvoiceOutcome::Refused(WorkRefused {
+                    code: refusal.code.code() as i32,
+                    reason: refusal.reason,
+                }),
+            }),
+        }
+    }
+
+    /// Admits one payment, or says why not.
+    ///
+    /// The answer is produced after [`ProviderEndpoint::admit`] returns,
+    /// which is after its record is fsynced. Nothing on this path can
+    /// acknowledge a payment the disk does not hold.
+    fn credit(&self, request: &AdmitCertificateRequest) -> AdmitCertificateResponse {
+        let outcome = match self.endpoint() {
+            Ok(mut endpoint) => endpoint.admit(request).map_err(Refusal::from),
+            Err(error) => Err(Refusal::new(WorkRefusal::Unavailable, error.to_string())),
+        };
+        AdmitCertificateResponse {
+            outcome: Some(match outcome {
+                Ok(credited_cumulative) => AdmitOutcome::Paid(WorkPaid {
+                    credited_cumulative,
+                }),
+                Err(refusal) => AdmitOutcome::Refused(WorkRefused {
+                    code: refusal.code.code() as i32,
+                    reason: refusal.reason,
+                }),
+            }),
+        }
+    }
 }
 
 impl WorkHandler for WorkService {
@@ -1203,6 +1527,30 @@ impl WorkHandler for WorkService {
         >,
     > + Send {
         core::future::ready(Ok(self.release(&request)))
+    }
+
+    fn request_invoice(
+        &self,
+        request: RequestInvoiceRequest,
+    ) -> impl core::future::Future<
+        Output = Result<
+            impl Into<crate::call::WithTrailer<RequestInvoiceResponse>> + Send,
+            WireStatus,
+        >,
+    > + Send {
+        core::future::ready(Ok(self.invoice(&request)))
+    }
+
+    fn admit_certificate(
+        &self,
+        request: AdmitCertificateRequest,
+    ) -> impl core::future::Future<
+        Output = Result<
+            impl Into<crate::call::WithTrailer<AdmitCertificateResponse>> + Send,
+            WireStatus,
+        >,
+    > + Send {
+        core::future::ready(Ok(self.credit(&request)))
     }
 }
 
@@ -1546,6 +1894,239 @@ impl ClientEndpoint {
             .commit(ChannelRecord::ResultVerified, &Secp256k1Verifier::new())?;
         Ok(())
     }
+
+    /// Takes the provider's invoice for a checked job, and makes it
+    /// durable before it is returned.
+    ///
+    /// What the store establishes, and nothing here spells a second
+    /// time: the entry is the one [`next_invoice_entry`] builds from
+    /// *this* client's ledger position, this job's own result, and the
+    /// price its authorization fixed; the signature is the provider's
+    /// over that entry's digest; and the job has reached the phase only
+    /// this client's own oracle verdict puts it in. A provider that
+    /// invoiced another price, another sequence, another cumulative, or
+    /// a job this client never checked is refused here rather than
+    /// paid.
+    ///
+    /// # Errors
+    ///
+    /// [`PaymentError::NoSuchJob`] when no open job carries this
+    /// `work_id`, [`PaymentError::Record`] when the entry does not
+    /// decode, [`PaymentError::Malformed`] for a signature that is not
+    /// 64 bytes, and [`PaymentError::Store`] for every rule above.
+    pub fn invoiced(
+        &mut self,
+        work_id: Digest,
+        invoiced: &WorkInvoiced,
+    ) -> Result<InvoiceEntryV1, PaymentError> {
+        let job = self.state().job().ok_or(PaymentError::NoSuchJob)?;
+        if job.work_id() != work_id {
+            return Err(PaymentError::NoSuchJob);
+        }
+        let entry = InvoiceEntryV1::decode(&invoiced.entry)?;
+        let provider_signature = signature(&invoiced.provider_signature)
+            .ok_or(PaymentError::Malformed("provider signature"))?;
+        self.store.commit(
+            ChannelRecord::InvoiceIssued {
+                entry,
+                provider_signature,
+            },
+            &Secp256k1Verifier::new(),
+        )?;
+        Ok(entry)
+    }
+
+    /// Signs the payment for one invoiced job, and returns the request
+    /// that carries it only once it is on the disk.
+    ///
+    /// This is the only place an [`EarnedCertificate`] is built outside
+    /// a test, and the transition it names is not a choice: the amount
+    /// is the invoice entry's `cumulative_after`, and the allocation
+    /// covers exactly that entry's sequence. The journal then runs
+    /// [`crate::protocol::work::CreditLedger::credit_allocation`] over
+    /// the job it recorded itself, so the two signatures below are made
+    /// before the ledger has agreed and released after it has — a
+    /// certificate the ledger refuses is one whose bytes never leave.
+    ///
+    /// Called again for a job this channel has already paid for, it
+    /// returns the retained bytes rather than signing a second
+    /// certificate: that is the crash between the commit and the send,
+    /// and re-sending is what recovers a lost acknowledgement.
+    ///
+    /// # Errors
+    ///
+    /// [`PaymentError::NoSuchJob`] when no open job carries this
+    /// `work_id` and no retained payment does either,
+    /// [`PaymentError::Unbilled`] before the invoice exists,
+    /// [`PaymentError::Record`] when the allocation's root cannot be
+    /// taken, and [`PaymentError::Store`] for every rule the journal
+    /// applies — including a payment signed past its deadline.
+    pub fn pay(&mut self, work_id: Digest) -> Result<AdmitCertificateRequest, PaymentError> {
+        if let Some(retained) = self
+            .state()
+            .last_payment()
+            .filter(|payment| payment.work_id == work_id)
+        {
+            return Ok(admit_request(retained));
+        }
+        let job = self.state().job().ok_or(PaymentError::NoSuchJob)?;
+        if job.work_id() != work_id {
+            return Err(PaymentError::NoSuchJob);
+        }
+        let Some((entry, _)) = job.entry() else {
+            return Err(PaymentError::Unbilled { phase: job.phase() });
+        };
+        let entry = *entry;
+
+        let channel = self.ready.channel();
+        let certificate = EarnedCertificate::new(
+            channel.payment_edge(),
+            channel.payment_terms_hash(),
+            entry.cumulative_after,
+        );
+        let certificate_digest = certificate.digest(channel.network());
+        let allocation = CertificateAllocationV1 {
+            channel_id: channel.id(),
+            certificate_digest,
+            first_invoice_seq: entry.invoice_seq,
+            last_invoice_seq: entry.invoice_seq,
+            invoice_entries_root: invoice_entries_root(channel, &[entry])?,
+        };
+        let allocation_signature = self
+            .signer
+            .sign(signing_hash(allocation_digest(channel, &allocation)));
+        let certificate_signature = self.signer.sign(certificate_digest);
+
+        self.store.commit(
+            ChannelRecord::CertificatePaid {
+                certificate,
+                allocation,
+                allocation_signature,
+                certificate_signature,
+            },
+            &Secp256k1Verifier::new(),
+        )?;
+        Ok(AdmitCertificateRequest {
+            certificate: encode_certificate(&certificate),
+            allocation: allocation.encode(),
+            allocation_signature: allocation_signature.as_bytes().to_vec(),
+            certificate_signature: certificate_signature.as_bytes().to_vec(),
+        })
+    }
+
+    /// Reads the provider's acknowledgement of a payment this client
+    /// has already made durable.
+    ///
+    /// Nothing is recorded here, and that is the point: the client's
+    /// state was complete before the request left, so this call has
+    /// nothing to add and can lose nothing. What it checks is that the
+    /// provider credited the amount this client signed — an
+    /// acknowledgement of another number is an endpoint whose ledger is
+    /// not the one this payment was for.
+    ///
+    /// # Errors
+    ///
+    /// [`PaymentError::Refused`] for a refusal,
+    /// [`PaymentError::Malformed`] for a response this service does not
+    /// define, [`PaymentError::NoSuchJob`] when no retained payment
+    /// carries this `work_id`, and [`PaymentError::Acknowledged`] when
+    /// the credited amount is not the one signed.
+    pub fn acknowledged(
+        &self,
+        work_id: Digest,
+        response: &AdmitCertificateResponse,
+    ) -> Result<u64, PaymentError> {
+        let credited = match response.outcome.as_ref() {
+            Some(AdmitOutcome::Paid(paid)) => paid.credited_cumulative,
+            Some(AdmitOutcome::Refused(refused)) => {
+                return Err(PaymentError::Refused {
+                    refusal: WorkRefusal::from_code(refused.code)
+                        .ok_or(PaymentError::Malformed("refusal code"))?,
+                    reason: refused.reason.clone(),
+                });
+            }
+            None => return Err(PaymentError::Malformed("outcome")),
+        };
+        let signed = self
+            .state()
+            .last_payment()
+            .filter(|payment| payment.work_id == work_id)
+            .ok_or(PaymentError::NoSuchJob)?
+            .certificate
+            .earned_cumulative();
+        if credited == signed {
+            Ok(credited)
+        } else {
+            Err(PaymentError::Acknowledged { signed, credited })
+        }
+    }
+}
+
+/// Asks for one checked job's invoice over a live transport and makes
+/// it durable.
+///
+/// It takes a client rather than a transport because the payment below
+/// is the same conversation: two calls, one connection, and no way for
+/// a caller to invoice over one peer and pay another.
+///
+/// # Errors
+///
+/// [`PaymentError::Transport`] when the call does not complete,
+/// [`PaymentError::Refused`] for a refusal,
+/// [`PaymentError::Malformed`] for a response this service does not
+/// define, and whatever [`ClientEndpoint::invoiced`] raises.
+pub async fn request_invoice<T>(
+    client: &WorkClientImpl<T>,
+    endpoint: &mut ClientEndpoint,
+    work_id: Digest,
+) -> Result<InvoiceEntryV1, PaymentError>
+where
+    T: StreamTransport + Sync,
+    T::Error: std::error::Error + Send + Sync + 'static,
+    T::Stream: 'static,
+{
+    let response = client
+        .request_invoice(RequestInvoiceRequest {
+            work_id: work_id.as_bytes().to_vec(),
+        })
+        .await?;
+    match response.outcome {
+        Some(InvoiceOutcome::Invoiced(invoiced)) => endpoint.invoiced(work_id, &invoiced),
+        Some(InvoiceOutcome::Refused(refused)) => Err(PaymentError::Refused {
+            refusal: WorkRefusal::from_code(refused.code)
+                .ok_or(PaymentError::Malformed("refusal code"))?,
+            reason: refused.reason,
+        }),
+        None => Err(PaymentError::Malformed("outcome")),
+    }
+}
+
+/// Signs one invoiced job's payment and sends it over a live transport.
+///
+/// The order is the durability rule at its last step: the certificate
+/// is fsynced by [`ClientEndpoint::pay`] before the request is built,
+/// and the provider fsyncs its own copy before the answer this reads is
+/// produced. A transport fault leaves a durable, unsent payment;
+/// calling this again re-sends exactly those bytes.
+///
+/// # Errors
+///
+/// [`PaymentError::Transport`] when the call does not complete, and
+/// whatever [`ClientEndpoint::pay`] or [`ClientEndpoint::acknowledged`]
+/// raises.
+pub async fn admit_payment<T>(
+    client: &WorkClientImpl<T>,
+    endpoint: &mut ClientEndpoint,
+    work_id: Digest,
+) -> Result<u64, PaymentError>
+where
+    T: StreamTransport + Sync,
+    T::Error: std::error::Error + Send + Sync + 'static,
+    T::Stream: 'static,
+{
+    let request = endpoint.pay(work_id)?;
+    let response = client.admit_certificate(request).await?;
+    endpoint.acknowledged(work_id, &response)
 }
 
 /// Asks for one accepted job's answer over a live transport and makes it

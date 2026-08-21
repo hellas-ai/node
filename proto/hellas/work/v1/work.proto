@@ -26,6 +26,25 @@ service Work {
   // delivery credit, so there is nothing to stream. A replay of the
   // same call returns the same bytes and costs the same one debit.
   rpc DeliverResult(DeliverResultRequest) returns (DeliverResultResponse);
+
+  // One priced line of the private ledger. The client names the job it
+  // has checked; the provider answers with the signed invoice entry for
+  // that job at its own next ledger position, or with one refusal code.
+  //
+  // The provider journals the entry before it answers, so the sequence
+  // and cumulative it commits to are the ones its own ledger holds. A
+  // replay returns the same entry: one job has one invoice.
+  rpc RequestInvoice(RequestInvoiceRequest) returns (RequestInvoiceResponse);
+
+  // One payment. The client sends the certificate it has already signed
+  // and the private allocation saying which invoice it pays; the
+  // provider answers with what it credited, or with one refusal code.
+  //
+  // The provider journals the certificate — which is also what retires
+  // the job's compute and delivery credit — before it answers. An
+  // acknowledgement lost to a crash costs a round trip: the same call
+  // made again is credited once and answered the same way.
+  rpc AdmitCertificate(AdmitCertificateRequest) returns (AdmitCertificateResponse);
 }
 
 message AcceptWorkRequest {
@@ -80,6 +99,59 @@ message WorkDelivered {
   // hashes these bytes: the client rebuilds the result from the decoded
   // events and requires it to be the one above.
   bytes transcript = 3;
+}
+
+message RequestInvoiceRequest {
+  // The checked job's `work_id`, exactly 32 bytes.
+  bytes work_id = 1;
+}
+
+message RequestInvoiceResponse {
+  oneof outcome {
+    WorkInvoiced invoiced = 1;
+    WorkRefused refused = 2;
+  }
+}
+
+message WorkInvoiced {
+  // Canonical `InvoiceEntryV1`, envelope included. The client rebuilds
+  // the one entry its own ledger allows and requires these bytes to be
+  // it, so the sequence, the price, and both cumulatives are the
+  // client's arithmetic and not the provider's claim.
+  bytes entry = 1;
+  // The provider's compact secp256k1 signature over the invoice
+  // digest: exactly 64 bytes.
+  bytes provider_signature = 2;
+}
+
+message AdmitCertificateRequest {
+  // The kernel's canonical `EarnedCertificate`: the scalar consensus
+  // settles, in the encoding the chain reads.
+  bytes certificate = 1;
+  // Canonical `CertificateAllocationV1`: which invoice prefix that
+  // scalar pays for. Private evidence, never consensus input.
+  bytes allocation = 2;
+  // The client's compact secp256k1 signature over the allocation
+  // digest: exactly 64 bytes.
+  bytes allocation_signature = 3;
+  // The client's compact secp256k1 signature over the kernel's earned
+  // digest: exactly 64 bytes. This is the one signature a close spends.
+  bytes certificate_signature = 4;
+}
+
+message AdmitCertificateResponse {
+  oneof outcome {
+    WorkPaid paid = 1;
+    WorkRefused refused = 2;
+  }
+}
+
+message WorkPaid {
+  // The cumulative amount this provider's invoice ledger has now
+  // credited. The client requires it to equal the certificate it
+  // signed: an acknowledgement of another number is an endpoint that
+  // credited something else.
+  uint64 credited_cumulative = 1;
 }
 
 message WorkRefused {
