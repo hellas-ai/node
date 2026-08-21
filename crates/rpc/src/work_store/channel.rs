@@ -198,6 +198,22 @@ pub enum ChannelStateError {
         /// Deadline the authorization carries.
         deadline: u64,
     },
+    /// A client signed a payment after the height it owed it by.
+    ///
+    /// Past that height the provider may end this job as expired and
+    /// charge its price to this client's loss ledger. A certificate
+    /// signed afterwards is executable money whatever the journal
+    /// later says, while nothing takes the loss back — so the client
+    /// would have paid for one job twice.
+    #[error(
+        "a payment signed at finalized height {height} is past the payment deadline {deadline}"
+    )]
+    PaymentLate {
+        /// Finalized height the client had processed through.
+        height: u64,
+        /// Deadline the authorization carries.
+        deadline: u64,
+    },
     /// The finalized cursor moved backwards or stood still.
     #[error("cursor height {actual} does not advance past {held}")]
     CursorNotAdvancing {
@@ -628,7 +644,13 @@ fn certificate(cursor: &mut Cursor<'_>) -> Result<EarnedCertificate, ChannelStat
     }
 }
 
-fn encode_certificate(certificate: &EarnedCertificate) -> Vec<u8> {
+/// Returns the kernel's own canonical encoding of a certificate.
+///
+/// The journal holds these bytes and the wire carries them, and both
+/// take them from here: the signature beside a certificate is over the
+/// digest of this encoding, so a second speller of it would be a second
+/// definition of what was signed.
+pub(crate) fn encode_certificate(certificate: &EarnedCertificate) -> Vec<u8> {
     let mut buf = vec![0_u8; certificate.encoded_size()];
     let written = certificate.write_to(&mut buf);
     buf.truncate(written);
@@ -722,6 +744,14 @@ impl JobState {
 /// One credited payment, exactly as it was recorded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PaidCertificate {
+    /// The job it paid for.
+    ///
+    /// Not a field of the record: it is read off the job this journal
+    /// was crediting when the record was applied, which is the same job
+    /// on commit and on replay. It is what lets a recovered endpoint
+    /// answer "what did I pay for that work id" after the job itself
+    /// has been closed by the payment.
+    pub work_id: Digest,
     /// The scalar consensus will settle.
     pub certificate: EarnedCertificate,
     /// The private evidence of what it bought.
@@ -730,6 +760,27 @@ pub struct PaidCertificate {
     pub allocation_signature: Sig,
     /// The client's signature over the kernel's earned digest.
     pub certificate_signature: Sig,
+}
+
+impl PaidCertificate {
+    /// Whether this retained payment is exactly these recorded bytes.
+    ///
+    /// The four fields a [`ChannelRecord::CertificatePaid`] carries, and
+    /// deliberately not [`Self::work_id`], which it does not carry: a
+    /// re-sent payment is the same payment when its bytes are the same
+    /// bytes, and the job those bytes closed is not offered again.
+    fn is_recorded_as(
+        &self,
+        certificate: &EarnedCertificate,
+        allocation: &CertificateAllocationV1,
+        allocation_signature: Sig,
+        certificate_signature: Sig,
+    ) -> bool {
+        self.certificate == *certificate
+            && self.allocation == *allocation
+            && self.allocation_signature == allocation_signature
+            && self.certificate_signature == certificate_signature
+    }
 }
 
 /// Unrecovered value one counterparty owes, in the two currencies v4
@@ -1477,17 +1528,26 @@ impl ChannelState {
         certificate_signature: Sig,
         verifier: &V,
     ) -> Result<Applied, ChannelStateError> {
-        let payment = PaidCertificate {
-            certificate: *certificate,
-            allocation: *allocation,
-            allocation_signature,
-            certificate_signature,
-        };
         // The retained payment, offered again. This is the crash
         // between writing the certificate and sending it: the job it
         // paid for is closed, and re-sending the retained bytes must
-        // not look like a second payment.
-        if self.last_payment.as_ref() == Some(&payment) {
+        // not look like a second payment — nor like a step a closed job
+        // cannot take, which is why this is answered before the rules
+        // below rather than among them.
+        // The retained payment, offered again. This is the crash
+        // between writing the certificate and sending it: the job it
+        // paid for is closed, and re-sending the retained bytes must
+        // not look like a second payment — nor like a step a closed job
+        // cannot take, which is why this is answered before the rules
+        // below rather than among them.
+        if self.last_payment.as_ref().is_some_and(|held| {
+            held.is_recorded_as(
+                certificate,
+                allocation,
+                allocation_signature,
+                certificate_signature,
+            )
+        }) {
             return Ok(Applied::Redundant);
         }
         let job = self.open_job("crediting an allocation")?;
@@ -1497,6 +1557,37 @@ impl ChannelState {
                 phase: job.phase.name(),
             });
         };
+
+        // A client pays by the height it signed to pay by, and this is
+        // the last step where refusing costs it nothing. Past that
+        // height the provider may end the job as expired and charge its
+        // price to this client's identity-wide loss ledger; a
+        // certificate signed afterwards is money the provider can still
+        // close on, so the job would be paid for twice. The provider is
+        // not bounded here: what stops it crediting a late payment is
+        // that ending the job is the only step left for a job whose
+        // loss is already on the disk (`ChannelStore::commit`), and
+        // whichever of the two reaches that file first is the one that
+        // happened.
+        if self.role == Role::Client {
+            // Unreachable through a client's own journal: a client
+            // cannot hold an invoice without having recorded a receipt,
+            // a receipt needs a cursor, and a cursor never goes back.
+            // It is a refusal rather than an assumed height because
+            // this rule must not pass for want of a number. No test
+            // isolates it, and none claims to.
+            let Some((height, _)) = self.cursor else {
+                return Err(ChannelStateError::NoCursor {
+                    step: "signing a payment",
+                });
+            };
+            if height > job.authorization.payment_deadline {
+                return Err(ChannelStateError::PaymentLate {
+                    height,
+                    deadline: job.authorization.payment_deadline,
+                });
+            }
+        }
         for (slot, signature, hash) in [
             (
                 "allocation",
@@ -1535,7 +1626,13 @@ impl ChannelState {
             self.delivery_outstanding = self.delivery_outstanding.saturating_sub(price);
         }
         self.retain_executable(certificate, certificate_signature);
-        self.last_payment = Some(payment);
+        self.last_payment = Some(PaidCertificate {
+            work_id: job.work_id,
+            certificate: *certificate,
+            allocation: *allocation,
+            allocation_signature,
+            certificate_signature,
+        });
         self.job = None;
         self.indeterminate = false;
         Ok(Applied::Changed)

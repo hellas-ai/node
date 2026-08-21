@@ -652,6 +652,64 @@ fn the_terminal_deadline_is_the_last_height_a_receipt_may_be_recorded_at() {
     }
 }
 
+/// A client signs a payment at the payment deadline and not after it.
+///
+/// One block either side of the deadline the job was signed under, with
+/// the cursor as the only thing varied. Past it the provider may end
+/// this job as expired and charge its price to this client's loss
+/// ledger, and a certificate signed then is money the provider can
+/// still close on: the same job, paid for and charged for.
+#[test]
+fn the_payment_deadline_is_the_last_height_a_payment_may_be_signed_at() {
+    let channel = channel();
+    let job = job_at(&channel, 1, 1, 0);
+    let deadline = job.authorization.payment_deadline;
+    for (height, timely) in [(deadline, true), (deadline + 1, false)] {
+        let dir = temp();
+        let mut store = open(dir.path(), Role::Client);
+        let sequence = client_sequence(&channel, &job);
+        commit_all(&mut store, &sequence[..7]);
+        assert_eq!(
+            store.state().job().map(JobState::phase),
+            Some(JobPhase::Invoiced),
+        );
+        commit_all(
+            &mut store,
+            &[ChannelRecord::CursorAdvanced {
+                height,
+                payload: [0xc2; 32],
+            }],
+        );
+
+        let paid = store.commit(job.paid(&channel), &Secp256k1Verifier::new());
+        if timely {
+            if let Err(error) = paid {
+                panic!("a payment at {height} is timely: {error}");
+            }
+            assert_eq!(store.state().ledger().credited_invoice_high_water(), PRICE);
+            continue;
+        }
+        let Err(error) = paid else {
+            panic!("a payment at {height} is late");
+        };
+        assert!(
+            matches!(
+                error,
+                WorkStoreError::Channel(ChannelStateError::PaymentLate {
+                    height: found,
+                    deadline: owed,
+                }) if found == height && owed == deadline
+            ),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            store.state().ledger().credited_invoice_high_water(),
+            0,
+            "a refused payment credits nothing",
+        );
+    }
+}
+
 /// A client with no processed block records no receipt at all.
 #[test]
 fn a_client_that_has_processed_no_block_records_no_receipt() {
@@ -917,6 +975,9 @@ fn re_sending_a_retained_payment_is_idempotent() {
     };
     assert_eq!(retained.certificate, job.certificate);
     assert_eq!(retained.allocation, job.allocation);
+    // The job it paid for, kept beside the bytes: the payment closed
+    // that job, so nothing else on this state can still name it.
+    assert_eq!(retained.work_id, job.work_id);
 
     let before = recovered.len();
     if let Err(error) = recovered.commit(job.paid(&channel), &Secp256k1Verifier::new()) {
