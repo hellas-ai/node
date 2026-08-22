@@ -40,7 +40,7 @@ use hellas_rpc::work::{
 };
 use hellas_rpc::work_close::{FinalizedWork, observe};
 use hellas_rpc::work_store::{
-    ChannelRecord, ChannelState, ChannelStore, JobEnd, JobPhase, JobState, Role,
+    ChannelRecord, ChannelState, ChannelStore, JobEnd, JobPhase, JobState, Role, SetupOrigin,
 };
 use hellas_rpc::{
     Assurance, Evaluate, EvaluateProgramManifest, EvaluateRequest, ProgramManifest, PublicKey,
@@ -221,6 +221,7 @@ fn store_with(
         ready().channel().clone(),
         settlement,
         role,
+        origin(),
         &Secp256k1Verifier::new(),
     ) {
         Ok(store) => store,
@@ -252,13 +253,25 @@ fn payload_at(height: u64) -> [u8; 32] {
     payload
 }
 
+/// Where the fixture channel was opened: the genesis block of the
+/// synthetic chain above, so a store starts with a clock and `advance`
+/// reads block one next.
+fn origin() -> SetupOrigin {
+    SetupOrigin {
+        payment_edge: payment_edge(),
+        height: 0,
+        payload: payload_at(0),
+        parent: [0_u8; 32],
+    }
+}
+
 /// Runs the production watcher over one empty finalized block per
 /// height, up through `height`.
 ///
 /// The same call the settlement loop makes, so a fixture cursor is a
 /// cursor this endpoint could have reached.
 fn advance(store: &mut ChannelStore, height: u64) {
-    let mut next = store.state().cursor().map_or(height, |(held, _)| held + 1);
+    let mut next = store.state().cursor().0.saturating_add(1);
     while next <= height {
         let block = FinalizedWork {
             height: next,
@@ -775,20 +788,6 @@ fn a_different_proposal_while_one_is_outstanding_conflicts() {
     assert!(
         matches!(conflict, Err(ProposeError::Conflict)),
         "a second job is a conflict, not a queue, got {conflict:?}",
-    );
-}
-
-#[test]
-fn a_client_with_no_finalized_block_signs_nothing() {
-    let root = temp();
-    let Ok(mut endpoint) = ClientEndpoint::new(ready(), store(root.path(), Role::Client), client())
-    else {
-        panic!("the endpoint binds");
-    };
-    let refused = endpoint.propose(&proposal(1));
-    assert!(
-        matches!(refused, Err(ProposeError::NoCursor)),
-        "no cursor, no signature, got {refused:?}",
     );
 }
 
@@ -1433,11 +1432,16 @@ fn an_endpoint_needs_its_own_store_settlement_role_and_key() {
     ) else {
         panic!("a second payment edge is a second channel");
     };
+    let other_origin = SetupOrigin {
+        payment_edge: elsewhere.payment_edge(),
+        ..origin()
+    };
     let Ok(other_store) = ChannelStore::open(
         fourth.path(),
         elsewhere,
         settlement(),
         Role::Provider,
+        other_origin,
         &Secp256k1Verifier::new(),
     ) else {
         panic!("the other channel's store opens");

@@ -32,8 +32,9 @@ use hellas_rpc::protocol::artifacts::{
 };
 use hellas_rpc::protocol::work::{
     JobDeadlines, PaidChannelPolicyV1, PaidExecutionPolicyV1, PaidJobAuthorizationV1,
-    PrivateRecord as _, encode_transcript, generation_policy_digest, identity_source_digest,
-    private_policy_commitment, propose_authorization, signing_hash, terminal_result, work_id,
+    PaidWorkError, PrivateRecord as _, encode_transcript, generation_policy_digest,
+    identity_source_digest, private_policy_commitment, propose_authorization, signing_hash,
+    terminal_result, work_id,
 };
 use hellas_rpc::protocol::work_setup::{
     ObservedChannel, ReadyChannel, WorkChannelConfig, WorkChannelDescriptor, WorkSetupError,
@@ -42,11 +43,11 @@ use hellas_rpc::protocol::work_setup::{
 use hellas_rpc::protocol::{ContentId, Digest};
 use hellas_rpc::services::work::{WorkClientImpl, WorkServer};
 use hellas_rpc::work::{
-    BackendFault, ClientEndpoint, DeliverError, PaidEvaluateBackend, ProviderEndpoint, RunOutcome,
-    WorkService, fetch_result, run_accepted_work,
+    BackendFault, ClientEndpoint, DeliverError, PaidEvaluateBackend, ProviderEndpoint, RunError,
+    RunOutcome, WorkService, fetch_result, run_accepted_work,
 };
 use hellas_rpc::work_close::{FinalizedWork, observe};
-use hellas_rpc::work_store::{ChannelRecord, ChannelStore, JobPhase, JobState, Role};
+use hellas_rpc::work_store::{ChannelRecord, ChannelStore, JobPhase, JobState, Role, SetupOrigin};
 use hellas_rpc::{
     Assurance, EvaluateProgramManifest, EvaluateRequest, OutputEventEnvelope, ProducerSigningKey,
     ProgramManifest, PublicKey,
@@ -251,6 +252,7 @@ fn store_at(root: &std::path::Path, ready: &ReadyChannel, role: Role, height: u6
         ready.channel().clone(),
         settlement(),
         role,
+        origin(),
         &Secp256k1Verifier::new(),
     ) {
         Ok(store) => store,
@@ -273,13 +275,25 @@ fn payload_at(height: u64) -> [u8; 32] {
     payload
 }
 
+/// Where the fixture channel was opened: the genesis block of the
+/// synthetic chain above, so a store starts with a clock and `advance`
+/// reads block one next.
+fn origin() -> SetupOrigin {
+    SetupOrigin {
+        payment_edge: payment_edge(),
+        height: 0,
+        payload: payload_at(0),
+        parent: [0_u8; 32],
+    }
+}
+
 /// Runs the production watcher over one empty finalized block per
 /// height, up through `height`.
 ///
 /// The same call the settlement loop makes, so a fixture cursor is a
 /// cursor this endpoint could have reached.
 fn advance(store: &mut ChannelStore, height: u64) {
-    let mut next = store.state().cursor().map_or(height, |(held, _)| held + 1);
+    let mut next = store.state().cursor().0.saturating_add(1);
     while next <= height {
         let block = FinalizedWork {
             height: next,
@@ -862,41 +876,108 @@ async fn a_delivery_named_for_another_job_finds_nothing() {
 
 // ── What the client will take ─────────────────────────────────────────
 
+/// A provider signs no result it could not deliver inside the frame.
+///
+/// The bound is the only thing varied: the same job and the same
+/// answer, under two channels that differ in
+/// `max_encoded_result_frame` alone. The tight one refuses before the
+/// signature exists — which is the point. A signed result the client
+/// may not take is a result the client can never record a receipt for,
+/// and a job that reaches its payment deadline with one on the
+/// provider's disk is a job whose price the ending ledger would charge
+/// to a client that was never able to have it.
+#[tokio::test]
+async fn a_provider_signs_no_result_the_frame_would_not_carry() {
+    let generous = delivered_frame_len(WIDE_FRAME).await;
+    let tight = u32::try_from(generous - 1).unwrap_or(u32::MAX);
+
+    let provider_root = temp();
+    let policy = policy_with(tight);
+    let ready = ready_of(&descriptor_with(policy), CURSOR);
+    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
+    let (id, _) = accept(&policy, &mut [&mut provider_store], 1);
+    let Ok(provider_endpoint) = ProviderEndpoint::new(ready.clone(), provider_store, provider())
+    else {
+        panic!("the provider endpoint binds");
+    };
+    let service = WorkService::new(provider_endpoint);
+    let backend = AnsweringBackend::new();
+    let outcome = run_accepted_work(&service, &ready, &backend, id).await;
+    let Err(RunError::Record(PaidWorkError::OverEnvelope {
+        field,
+        actual,
+        limit,
+    })) = outcome
+    else {
+        panic!("an undeliverable result is not signed: {outcome:?}");
+    };
+    assert_eq!(field, "encoded result frame");
+    assert_eq!(actual, generous);
+    assert_eq!(limit, u64::from(tight));
+
+    let Ok(endpoint) = service.endpoint() else {
+        panic!("the endpoint is reachable");
+    };
+    assert_eq!(
+        endpoint.state().job().map(JobState::phase),
+        None,
+        "and the job is over, at the provider's own cost",
+    );
+    assert_eq!(endpoint.state().loss().compute, 0);
+}
+
 /// The client refuses a delivery larger than the frame it signed a
 /// bound for.
 ///
-/// The bound is the only thing varied: the same job, the same answer,
-/// under two channels that differ in `max_encoded_result_frame` alone.
+/// The other end of the same bound, against a provider that does not
+/// apply the one above. It is built by hand for exactly that reason:
+/// an honest provider on this channel cannot produce these bytes, so
+/// there is no exchange this could be driven through.
 #[tokio::test]
 async fn a_client_refuses_a_frame_over_the_bound_it_signed() {
-    // Measure the legal delivery first, then re-run the whole exchange
-    // under a policy whose bound is one byte below it.
     let generous = delivered_frame_len(WIDE_FRAME).await;
     let tight = u32::try_from(generous - 1).unwrap_or(u32::MAX);
 
     let client_root = temp();
     let provider_root = temp();
     let policy = policy_with(tight);
-    let descriptor = descriptor_with(policy);
-    let ready = ready_of(&descriptor, CURSOR);
+    let ready = ready_of(&descriptor_with(policy), CURSOR);
     let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR);
     let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
     let (id, _) = accept(&policy, &mut [&mut client_store, &mut provider_store], 1);
-    let Ok(provider_endpoint) = ProviderEndpoint::new(ready.clone(), provider_store, provider())
-    else {
-        panic!("the provider endpoint binds");
-    };
-    let service = WorkService::new(provider_endpoint);
-    run_to_result(&service, &ready, id).await;
 
-    let (transport, server_transport) = transport_pair();
-    let serving = serve(server_transport, service.clone());
+    // The delivery a provider that ignored its own bound would send:
+    // the same job, the same answer, signed under the wide channel.
+    let wide_policy = policy_with(WIDE_FRAME);
+    let wide_ready = ready_of(&descriptor_with(wide_policy), CURSOR);
+    let oversized = {
+        let wide_root = temp();
+        let mut wide_store = store_at(wide_root.path(), &wide_ready, Role::Provider, CURSOR);
+        let (wide_id, _) = accept(&wide_policy, &mut [&mut wide_store], 1);
+        let Ok(wide_endpoint) = ProviderEndpoint::new(wide_ready.clone(), wide_store, provider())
+        else {
+            panic!("the provider endpoint binds");
+        };
+        let wide_service = WorkService::new(wide_endpoint);
+        run_to_result(&wide_service, &wide_ready, wide_id).await;
+        let Ok(mut wide_endpoint) = wide_service.endpoint() else {
+            panic!("the endpoint is reachable");
+        };
+        let Ok(delivery) = wide_endpoint.deliver(wide_id, &wide_ready) else {
+            panic!("the wide delivery is released");
+        };
+        WorkDelivered {
+            result: delivery.result.encode(),
+            provider_signature: delivery.signature.as_bytes().to_vec(),
+            transcript: delivery.transcript,
+        }
+    };
+
+    let _ = provider_store;
     let Ok(mut endpoint) = ClientEndpoint::new(ready.clone(), client_store, client()) else {
         panic!("the client endpoint binds");
     };
-    let refused = fetch_result(transport, &mut endpoint, &ready, id).await;
-    serving.abort();
-
+    let refused = endpoint.receive(id, &ready, &oversized);
     let Err(DeliverError::OverFrame { actual, limit }) = refused else {
         panic!("an oversized frame is refused: {refused:?}");
     };

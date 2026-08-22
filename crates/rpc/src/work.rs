@@ -347,7 +347,6 @@ const fn channel_refusal(error: &ChannelStateError) -> WorkRefusal {
         | ChannelStateError::LossRecorded
         | ChannelStateError::Closing { .. }
         | ChannelStateError::Indeterminate => WorkRefusal::Declined,
-        ChannelStateError::NoCursor { .. } => WorkRefusal::NotReady,
         ChannelStateError::ReceiptLate { .. } | ChannelStateError::PaymentLate { .. } => {
             WorkRefusal::Expired
         }
@@ -527,13 +526,7 @@ impl ProviderEndpoint {
             return Ok(retained);
         }
 
-        let Some((cursor_height, _)) = self.state().cursor() else {
-            return Err(Refusal::new(
-                WorkRefusal::NotReady,
-                "no finalized block has been processed on this channel",
-            ));
-        };
-
+        let (cursor_height, _) = self.state().cursor();
         let policy = *self.ready.execution_policy();
         check_authorization(self.ready.channel(), &authorization, &policy, cursor_height)?;
         let bundle = PreparedPaidInputV1::decode(&request.prepared_input, MAX_RECORD_BYTES)
@@ -610,8 +603,7 @@ impl ProviderEndpoint {
     ///
     /// [`RunError::NoSuchJob`] when no open job carries this
     /// `work_id`, [`RunError::NotAccepted`] before the co-signature
-    /// exists, [`RunError::NoCursor`] before any finalized block has
-    /// been processed, [`RunError::Endpoint`] when `ready` is not this
+    /// exists, [`RunError::Endpoint`] when `ready` is not this
     /// endpoint's channel, [`RunError::Policy`] when it carries another
     /// execution policy, [`RunError::Setup`] when the deadlines can no
     /// longer be met, [`RunError::Record`] when the stored bundle does
@@ -647,9 +639,7 @@ impl ProviderEndpoint {
         if ready.execution_policy() != self.ready.execution_policy() {
             return Err(RunError::Policy);
         }
-        let Some((cursor_height, _)) = self.state().cursor() else {
-            return Err(RunError::NoCursor);
-        };
+        let (cursor_height, _) = self.state().cursor();
         let authorization = *job.authorization();
         // The same arithmetic the co-signature was made under, asked
         // again at the height dispatch is happening at. It is the same
@@ -689,7 +679,8 @@ impl ProviderEndpoint {
     /// [`RunError::NoSuchJob`] when no open job carries this `work_id`,
     /// [`RunError::Transcript`] when the events are not this job's
     /// terminal transcript, [`RunError::Record`] when the transcript is
-    /// larger than the signed policy's spool, and [`RunError::Store`]
+    /// larger than the signed policy's spool or the delivery it would
+    /// become is larger than the signed frame, and [`RunError::Store`]
     /// when the journal refuses the record — which is what it does for a
     /// job that is not running, or one left indeterminate by a crash.
     pub fn record_result(
@@ -718,6 +709,31 @@ impl ProviderEndpoint {
         let signature = self
             .signer
             .sign(signing_hash(result_digest(channel, &result)));
+        // The delivery this result will become, measured before it is
+        // recorded. The client refuses a frame over the bound both
+        // parties signed, so a result that does not fit is one the
+        // client cannot record a receipt for and therefore cannot pay
+        // for — and recording it anyway would leave a job the ending
+        // ledger charges this client for over an answer it was never
+        // able to take. The client's own check is the other end of the
+        // same bound, against a provider that does not apply this one.
+        let frame = u64::try_from(
+            WorkDelivered {
+                result: result.encode(),
+                provider_signature: signature.as_bytes().to_vec(),
+                transcript: spool.clone(),
+            }
+            .encoded_len(),
+        )
+        .unwrap_or(u64::MAX);
+        let frame_limit = u64::from(self.ready.execution_policy().max_encoded_result_frame);
+        if frame > frame_limit {
+            return Err(RunError::Record(PaidWorkError::OverEnvelope {
+                field: "encoded result frame",
+                actual: frame,
+                limit: frame_limit,
+            }));
+        }
         self.store.commit(
             ChannelRecord::JobResult {
                 result,
@@ -758,8 +774,7 @@ impl ProviderEndpoint {
     /// `work_id`, [`DeliverError::NoResult`] before the result is
     /// signed, [`DeliverError::Endpoint`] when `ready` is not this
     /// endpoint's channel, [`DeliverError::Policy`] when it carries
-    /// another execution policy, [`DeliverError::NoCursor`] before any
-    /// finalized block has been processed, [`DeliverError::Setup`] when
+    /// another execution policy, [`DeliverError::Setup`] when
     /// the delivery margin no longer fits, and [`DeliverError::Store`]
     /// when the release cannot be made durable — which is what happens
     /// when this client's delivery credit is exhausted.
@@ -783,9 +798,7 @@ impl ProviderEndpoint {
         if ready.execution_policy() != self.ready.execution_policy() {
             return Err(DeliverError::Policy);
         }
-        let Some((cursor_height, _)) = self.state().cursor() else {
-            return Err(DeliverError::NoCursor);
-        };
+        let (cursor_height, _) = self.state().cursor();
         ready.check_releasable(cursor_height, terminal_deadline)?;
 
         self.store
@@ -849,22 +862,31 @@ impl ProviderEndpoint {
         Ok(state.ledger().credited_cumulative())
     }
 
-    /// Ends the open job, releasing what it still holds.
+    /// Ends the open job as this provider's own failure, releasing
+    /// what it still holds.
     ///
-    /// What ending costs is the journal's to decide from how far the job
-    /// got and why it stopped; this only records the decision.
+    /// There is no reason to pass, and that is the point. The only
+    /// ending a caller here can ask for is the one that charges this
+    /// client nothing: a backend that faulted, or a transcript that is
+    /// not this job's, is the provider's side going wrong. The ending
+    /// that *does* charge a client — a deadline it signed and let pass
+    /// — is decided from finalized heights by `work_close::observe`
+    /// and nowhere else, so no local caller can reach it by choosing an
+    /// argument.
     ///
     /// # Errors
     ///
     /// [`RunError::NoSuchJob`] when no open job carries this `work_id`,
     /// and [`RunError::Store`] when the ending cannot be made durable.
-    pub fn end_run(&mut self, work_id: Digest, reason: JobEnd) -> Result<(), RunError> {
+    pub fn end_run(&mut self, work_id: Digest) -> Result<(), RunError> {
         let job = self.state().job().ok_or(RunError::NoSuchJob)?;
         if job.work_id() != work_id {
             return Err(RunError::NoSuchJob);
         }
         self.store.commit(
-            ChannelRecord::JobEnded { reason },
+            ChannelRecord::JobEnded {
+                reason: JobEnd::Failed,
+            },
             &Secp256k1Verifier::new(),
         )?;
         Ok(())
@@ -898,7 +920,7 @@ impl ProviderEndpoint {
     pub async fn catch_up<S: FinalizedBlocks + ?Sized>(
         &mut self,
         source: &S,
-    ) -> Result<Option<u64>, CatchUpError> {
+    ) -> Result<u64, CatchUpError> {
         catch_up(source, &mut self.store, &Secp256k1Verifier::new()).await
     }
 
@@ -918,14 +940,11 @@ impl ProviderEndpoint {
     ///
     /// # Errors
     ///
-    /// [`CloseError::NoCursor`] before any finalized block has been
-    /// processed, [`CloseError::Store`] when a job is still open, a
-    /// contest is already live, or the journal refuses the record, and
-    /// the window errors [`close_start`] raises.
+    /// [`CloseError::Store`] when a job is still open, a contest is
+    /// already live, or the journal refuses the record, and the window
+    /// errors [`close_start`] raises.
     pub fn prepare_close(&mut self) -> Result<PaymentCloseStart, CloseError> {
-        let Some((height, _)) = self.state().cursor() else {
-            return Err(CloseError::NoCursor);
-        };
+        let (height, _) = self.state().cursor();
         if let Some(retained) = self.state().includable_close_start(height) {
             return Ok(retained.clone());
         }
@@ -966,7 +985,7 @@ impl ProviderEndpoint {
     /// provider's window has not run out, and [`CloseError::Unpayable`]
     /// when the settled total does not fit the route.
     pub fn adjudicated_close(&self, observed: &ObservedChannel<'_>) -> Result<Tx, CloseError> {
-        let held = self.state().close_opened().ok_or(CloseError::NoContest)?;
+        let (held, _) = self.state().close_opened().ok_or(CloseError::NoContest)?;
         let PendingSlot::Present(record) = observed.pending else {
             return Err(CloseError::NoContest);
         };
@@ -1005,7 +1024,7 @@ impl ProviderEndpoint {
     /// [`CloseError::NothingToAdd`] when this endpoint holds nothing
     /// the contest does not already settle.
     pub fn respond_to_close(&self, observed: &ObservedChannel<'_>) -> Result<Tx, CloseError> {
-        let held = self.state().close_opened().ok_or(CloseError::NoContest)?;
+        let (held, _) = self.state().close_opened().ok_or(CloseError::NoContest)?;
         let PendingSlot::Present(record) = observed.pending else {
             return Err(CloseError::NoContest);
         };
@@ -1065,7 +1084,7 @@ impl ClientEndpoint {
     pub async fn catch_up<S: FinalizedBlocks + ?Sized>(
         &mut self,
         source: &S,
-    ) -> Result<Option<u64>, CatchUpError> {
+    ) -> Result<u64, CatchUpError> {
         catch_up(source, &mut self.store, &Secp256k1Verifier::new()).await
     }
 }
@@ -1178,10 +1197,6 @@ pub enum RunError {
         /// How far the job has got.
         phase: JobPhase,
     },
-    /// No finalized block has been processed, so no deadline can be
-    /// measured.
-    #[error("no finalized block has been processed on this channel")]
-    NoCursor,
     /// The readiness offered is not this endpoint's own channel.
     #[error(transparent)]
     Endpoint(#[from] EndpointError),
@@ -1264,7 +1279,14 @@ where
     };
     match recorded {
         Ok((result, signature)) => Ok(RunOutcome::Completed { result, signature }),
-        Err(fault @ RunError::Transcript(_)) => Err(end_failed(service, work_id, fault)),
+        // A transcript that is not this job's, and a result the signed
+        // envelope would not carry, are the same kind of fault: the
+        // backend produced something this provider cannot turn into a
+        // delivery. Both end the job, and both charge the client
+        // nothing.
+        Err(fault @ (RunError::Transcript(_) | RunError::Record(_))) => {
+            Err(end_failed(service, work_id, fault))
+        }
         Err(error) => Err(error),
     }
 }
@@ -1307,10 +1329,6 @@ pub enum DeliverError {
     /// one this endpoint works under.
     #[error("the readiness offered was decided under another execution policy")]
     Policy,
-    /// No finalized block has been processed, so no deadline can be
-    /// measured.
-    #[error("no finalized block has been processed on this channel")]
-    NoCursor,
     /// The delivery margin no longer fits, or the endpoint is behind.
     #[error(transparent)]
     Setup(#[from] WorkSetupError),
@@ -1363,7 +1381,7 @@ impl From<DeliverError> for Refusal {
         let reason = error.to_string();
         let code = match error {
             DeliverError::NoSuchJob => WorkRefusal::Declined,
-            DeliverError::NoResult { .. } | DeliverError::NoCursor => WorkRefusal::NotReady,
+            DeliverError::NoResult { .. } => WorkRefusal::NotReady,
             DeliverError::Setup(setup) => return Refusal::from(setup),
             DeliverError::Store(store) => return Refusal::from(store),
             _ => WorkRefusal::Invalid,
@@ -1470,7 +1488,7 @@ fn end_failed(service: &WorkService, work_id: Digest, fault: RunError) -> RunErr
         Ok(endpoint) => endpoint,
         Err(error) => return RunError::Endpoint(error),
     };
-    match endpoint.end_run(work_id, JobEnd::Failed) {
+    match endpoint.end_run(work_id) {
         Ok(()) => fault,
         Err(error) => error,
     }
@@ -1654,10 +1672,6 @@ pub enum ProposeError {
     /// The response was not one of the shapes the service defines.
     #[error("the provider's response has no readable {0}")]
     Malformed(&'static str),
-    /// No finalized block has been processed, so no deadline can be
-    /// measured and nothing may be signed.
-    #[error("no finalized block has been processed on this channel")]
-    NoCursor,
     /// An acceptance was applied with no proposal outstanding.
     #[error("there is no proposal for this acceptance to answer")]
     NoOpenJob,
@@ -1740,15 +1754,12 @@ impl ClientEndpoint {
     ///
     /// # Errors
     ///
-    /// [`ProposeError::NoCursor`] before any finalized block has been
-    /// processed, [`ProposeError::JobInFlight`] once a job is past
+    /// [`ProposeError::JobInFlight`] once a job is past
     /// proposal, [`ProposeError::Conflict`] when a different proposal is
     /// outstanding, and the record, readiness, and journal errors the
     /// proposal itself raises.
     pub fn propose(&mut self, proposal: &JobProposal) -> Result<AcceptWorkRequest, ProposeError> {
-        let Some((cursor_height, _)) = self.state().cursor() else {
-            return Err(ProposeError::NoCursor);
-        };
+        let (cursor_height, _) = self.state().cursor();
         let policy = *self.ready.execution_policy();
 
         if let Some(job) = self.state().job() {
@@ -1878,8 +1889,7 @@ impl ClientEndpoint {
     /// [`DeliverError::NoSuchJob`] when no open job carries this
     /// `work_id`, [`DeliverError::Endpoint`] when `ready` is not this
     /// endpoint's channel, [`DeliverError::Policy`] when it carries
-    /// another execution policy, [`DeliverError::NoCursor`] before any
-    /// finalized block has been processed, [`DeliverError::Setup`] when
+    /// another execution policy, [`DeliverError::Setup`] when
     /// this endpoint has not caught up to that readiness,
     /// [`DeliverError::OverFrame`] above the signed frame bound,
     /// [`DeliverError::Malformed`] for a signature that is not 64
@@ -1900,9 +1910,7 @@ impl ClientEndpoint {
         if ready.execution_policy() != self.ready.execution_policy() {
             return Err(DeliverError::Policy);
         }
-        let Some((cursor_height, _)) = self.state().cursor() else {
-            return Err(DeliverError::NoCursor);
-        };
+        let (cursor_height, _) = self.state().cursor();
         ready.check_caught_up(cursor_height)?;
 
         // The bound is on the encoded message, which is what this

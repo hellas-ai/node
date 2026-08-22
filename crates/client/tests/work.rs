@@ -48,7 +48,7 @@ use hellas_rpc::work::{
     run_accepted_work,
 };
 use hellas_rpc::work_close::{FinalizedWork, observe};
-use hellas_rpc::work_store::{ChannelRecord, ChannelStore, JobPhase, JobState, Role};
+use hellas_rpc::work_store::{ChannelRecord, ChannelStore, JobPhase, JobState, Role, SetupOrigin};
 use hellas_rpc::{
     Assurance, EvaluateProgramManifest, EvaluateRequest, OutputEventEnvelope, ProducerSigningKey,
     ProgramManifest, PublicKey,
@@ -237,6 +237,7 @@ fn store_at(root: &std::path::Path, ready: &ReadyChannel, role: Role, height: u6
         ready.channel().clone(),
         settlement(),
         role,
+        origin(),
         &Secp256k1Verifier::new(),
     ) {
         Ok(store) => store,
@@ -259,13 +260,25 @@ fn payload_at(height: u64) -> [u8; 32] {
     payload
 }
 
+/// Where the fixture channel was opened: the genesis block of the
+/// synthetic chain above, so a store starts with a clock and `advance`
+/// reads block one next.
+fn origin() -> SetupOrigin {
+    SetupOrigin {
+        payment_edge: payment_edge(),
+        height: 0,
+        payload: payload_at(0),
+        parent: [0_u8; 32],
+    }
+}
+
 /// Runs the production watcher over one empty finalized block per
 /// height, up through `height`.
 ///
 /// The same call the settlement loop makes, so a fixture cursor is a
 /// cursor this endpoint could have reached.
 fn advance(store: &mut ChannelStore, height: u64) {
-    let mut next = store.state().cursor().map_or(height, |(held, _)| held + 1);
+    let mut next = store.state().cursor().0.saturating_add(1);
     while next <= height {
         let block = FinalizedWork {
             height: next,

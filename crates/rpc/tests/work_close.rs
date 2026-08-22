@@ -22,9 +22,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use bytes::Bytes;
 use hellas_kernel::{
     BlockHeight, Decode as _, Edge, EdgeId, EdgeValues, Fees, Key, LeaseSlots, List,
-    MAX_EDGE_OUTPUTS, NetworkId, Parties, PaymentCloseStart, Payout, PendingSlot, RegistryChunk,
-    RegistryNamespace, RegistryRecordTag, Secp256k1Signer, Secp256k1Verifier, Terms, TermsHash,
-    WorkPaymentSettlement, WorkPaymentTerms, WorkStakeBondTerms, work_payment_settlement,
+    MAX_EDGE_OUTPUTS, NetworkId, Parties, Party, PaymentCloseStart, Payout, PendingSlot,
+    RegistryChunk, RegistryNamespace, RegistryRecordTag, Secp256k1Signer, Secp256k1Verifier, Terms,
+    TermsHash, WorkPaymentSettlement, WorkPaymentTerms, WorkStakeBondTerms,
+    work_payment_settlement,
 };
 use hellas_rpc::evaluate::{
     EvaluateOutputTranscriptBuilder, EvaluateStopReason, EvaluateTerminal, EvaluateUsage,
@@ -57,7 +58,7 @@ use hellas_rpc::work_close::{
     observe, start_body_digest,
 };
 use hellas_rpc::work_store::{
-    ChannelRecord, ChannelStore, CloseSettlement, JobPhase, JobState, Role,
+    ChannelRecord, ChannelStore, CloseSettlement, JobPhase, JobState, Role, SetupOrigin,
 };
 use hellas_rpc::{
     Assurance, EvaluateProgramManifest, EvaluateRequest, OutputEventEnvelope, ProducerSigningKey,
@@ -251,6 +252,7 @@ fn store_at(root: &std::path::Path, ready: &ReadyChannel, role: Role, height: u6
         ready.channel().clone(),
         settlement(),
         role,
+        origin(),
         &Secp256k1Verifier::new(),
     ) {
         Ok(store) => store,
@@ -273,13 +275,25 @@ fn payload_at(height: u64) -> [u8; 32] {
     payload
 }
 
+/// Where the fixture channel was opened: the genesis block of the
+/// synthetic chain above, so a store starts with a clock and `advance`
+/// reads block one next.
+fn origin() -> SetupOrigin {
+    SetupOrigin {
+        payment_edge: payment_edge(),
+        height: 0,
+        payload: payload_at(0),
+        parent: [0_u8; 32],
+    }
+}
+
 /// Runs the production watcher over one empty finalized block per
 /// height, up through `height`.
 ///
 /// The same call the settlement loop makes, so a fixture cursor is a
 /// cursor this endpoint could have reached.
 fn advance(store: &mut ChannelStore, height: u64) {
-    let mut next = store.state().cursor().map_or(height, |(held, _)| held + 1);
+    let mut next = store.state().cursor().0.saturating_add(1);
     while next <= height {
         let block = FinalizedWork {
             height: next,
@@ -925,8 +939,8 @@ async fn a_paid_job_closes_at_exactly_what_it_earned() {
         );
         match provider.observe_finalized(&accepted) {
             Ok(state) => {
-                assert_eq!(state.close_opened(), Some(expected));
-                assert_eq!(state.cursor(), Some((inclusion, payload_at(inclusion))));
+                assert_eq!(state.close_opened(), Some((expected, Party::Taker)));
+                assert_eq!(state.cursor(), (inclusion, payload_at(inclusion)));
             }
             Err(error) => panic!("the block applies: {error}"),
         }
@@ -1345,7 +1359,7 @@ async fn a_blocks_transactions_are_applied_in_consensus_order() {
         }
         match provider.observe_finalized(&block(inclusion, vec![start_tx.clone(), close.clone()])) {
             Ok(state) => {
-                assert_eq!(state.close_opened(), Some(id));
+                assert_eq!(state.close_opened(), Some((id, Party::Taker)));
                 assert_eq!(
                     state.close_settled().map(|settled| settled.provider_payout),
                     Some(PRICE),
@@ -1369,7 +1383,7 @@ async fn a_blocks_transactions_are_applied_in_consensus_order() {
         );
         assert_eq!(
             provider.state().cursor(),
-            Some((CURSOR, payload_at(CURSOR))),
+            (CURSOR, payload_at(CURSOR)),
             "and the cursor stays behind the block it could not apply",
         );
     }
@@ -1498,12 +1512,12 @@ async fn a_catch_up_reads_every_block_between() {
         withheld: None,
     };
     match provider.catch_up(&chain).await {
-        Ok(reached) => assert_eq!(reached, Some(CURSOR + 5)),
+        Ok(reached) => assert_eq!(reached, CURSOR + 5),
         Err(error) => panic!("the watcher catches up: {error}"),
     }
     assert_eq!(
         provider.state().close_opened(),
-        Some(id),
+        Some((id, Party::Taker)),
         "the block three heights back is where the contest is",
     );
     assert!(
@@ -1514,7 +1528,7 @@ async fn a_catch_up_reads_every_block_between() {
     // Run again with nothing new: a caught-up watcher writes nothing.
     let before = provider.state().cursor();
     match provider.catch_up(&chain).await {
-        Ok(reached) => assert_eq!(reached, Some(CURSOR + 5)),
+        Ok(reached) => assert_eq!(reached, CURSOR + 5),
         Err(error) => panic!("a caught-up watcher is idle: {error}"),
     }
     assert_eq!(provider.state().cursor(), before);
@@ -1544,7 +1558,7 @@ async fn a_withheld_block_leaves_the_cursor_behind() {
     );
     assert_eq!(
         provider.state().cursor(),
-        Some((CURSOR + 2, payload_at(CURSOR + 2))),
+        (CURSOR + 2, payload_at(CURSOR + 2)),
         "the cursor keeps the last block that was read",
     );
 }
@@ -1810,7 +1824,7 @@ async fn the_provider_answers_an_understated_contest_exactly_once() {
     )) {
         panic!("the block applies: {error}");
     }
-    assert_eq!(provider.state().close_opened(), Some(id));
+    assert_eq!(provider.state().close_opened(), Some((id, Party::Maker)));
 
     let deadline = inclusion + payment_terms().omit_response_blocks;
     let open = Contest::opened(id, deadline, 0);
@@ -1881,4 +1895,222 @@ async fn the_provider_answers_an_understated_contest_exactly_once() {
         ),
         "another contest is not this endpoint's to answer",
     );
+}
+
+// ── The cutoff a finalized close is ───────────────────────────────────
+
+/// One job, run to a signed result and not yet released.
+async fn ready_job() -> Checked {
+    let client_root = temp();
+    let provider_root = temp();
+    let ready = ready();
+    let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR);
+    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
+    let id = accept(&mut [&mut client_store, &mut provider_store]);
+    let Ok(provider_endpoint) = ProviderEndpoint::new(ready.clone(), provider_store, provider())
+    else {
+        panic!("the provider endpoint binds");
+    };
+    let service = WorkService::new(provider_endpoint);
+    let Ok(client) = ClientEndpoint::new(ready.clone(), client_store, client()) else {
+        panic!("the client endpoint binds");
+    };
+    run_to_result(&service, &ready, id).await;
+    Checked {
+        client_root,
+        provider_root,
+        ready,
+        service,
+        client,
+        id,
+    }
+}
+
+/// A finalized close start takes the answer off the wire.
+///
+/// The exploit, end to end. The provider has signed a result and not
+/// released it. The client opens a close carrying no certificate at
+/// all, so the contest settles at nothing and the provider has nothing
+/// higher to answer it with. Then the client asks for the plaintext.
+///
+/// Before this, it got it: the result was on the provider's disk, the
+/// job read as ready, and no transition consulted the contest. The
+/// compute was spent, the answer was taken, and nothing was signed for
+/// it. Now the block that opens the contest is also what ends the job,
+/// and the delivery has nothing to release.
+#[tokio::test]
+async fn a_finalized_close_start_takes_the_answer_off_the_wire() {
+    let mut fixture = ready_job().await;
+    let ready = fixture.ready.clone();
+    let id = fixture.id;
+
+    // The client's own start, carrying nothing.
+    let Ok(understated) = close_start(ready.channel(), Party::Maker, CURSOR, None, &client())
+    else {
+        panic!("a client opens a close");
+    };
+    let inclusion = CURSOR + 1;
+    let contest = contest_id(&ready, &understated, inclusion);
+    let start_tx =
+        hellas_kernel::Tx::move_action(hellas_kernel::Move::StartPaymentClose(understated));
+
+    {
+        let Ok(mut provider) = fixture.service.endpoint() else {
+            panic!("the endpoint is reachable");
+        };
+        assert_eq!(
+            provider.state().job().map(JobState::phase),
+            Some(JobPhase::Ready),
+            "the answer exists and has not left",
+        );
+        if let Err(error) = provider.observe_finalized(&block(inclusion, vec![start_tx])) {
+            panic!("the block applies: {error}");
+        }
+        let state = provider.state();
+        assert_eq!(state.close_opened(), Some((contest, Party::Maker)));
+        assert!(
+            state.job().is_none(),
+            "a job no payment can reach is not a job that is still open",
+        );
+        // And the cost of it is this client's: it cut off a result it
+        // could still have taken and paid for.
+        assert_eq!(state.loss().compute, PRICE);
+        assert_eq!(state.loss().delivery, 0, "nothing was released");
+        assert_eq!(state.compute_outstanding(), 0);
+    }
+
+    // The delivery call the exploit ends with.
+    let (transport, server) = transport_pair();
+    let serving = serve(server, fixture.service.clone());
+    let refused = fetch_result(transport, &mut fixture.client, &ready, id).await;
+    stop(serving).await;
+    let Err(hellas_rpc::work::DeliverError::Refused { refusal, .. }) = refused else {
+        panic!("a closed channel releases nothing: {refused:?}");
+    };
+    assert_eq!(refusal, hellas_rpc::work::WorkRefusal::Declined);
+    assert_eq!(
+        fixture.client.state().job().map(JobState::phase),
+        Some(JobPhase::Accepted),
+        "and the client has no answer to check",
+    );
+
+    // Nor is there a fresh job to take its place.
+    let response = {
+        let Ok(mut provider) = fixture.service.endpoint() else {
+            panic!("the endpoint is reachable");
+        };
+        provider.accept(&signed_request(NONCE + 1, 2))
+    };
+    let Some(AcceptOutcome::Refused(refused)) = response.outcome else {
+        panic!("a closing channel takes no work: {response:?}");
+    };
+    assert_eq!(refused.code, WorkRefusalCode::Declined as i32);
+}
+
+/// A block out of order writes nothing before it is refused.
+///
+/// The transitions a block carries move money and shut the channel, so
+/// they may not run before the block is one this journal may read. A
+/// forged or merely early `h + 2` would otherwise end the job, charge
+/// the client, record the contest, and only then be turned away by the
+/// cursor — leaving every one of those effects on the disk under a
+/// height this endpoint never reached.
+#[tokio::test]
+async fn a_block_out_of_order_writes_nothing_before_it_is_refused() {
+    let fixture = ready_job().await;
+    let ready = fixture.ready.clone();
+    let Ok(mut provider) = fixture.service.endpoint() else {
+        panic!("the endpoint is reachable");
+    };
+    let before = provider.state().clone();
+
+    let Ok(understated) = close_start(ready.channel(), Party::Maker, CURSOR, None, &client())
+    else {
+        panic!("a client opens a close");
+    };
+    let start_tx =
+        hellas_kernel::Tx::move_action(hellas_kernel::Move::StartPaymentClose(understated));
+    // Two blocks on, and past the payment deadline as well, so every
+    // transition `observe` has would fire if it ran at all.
+    let skipped = CURSOR + 2;
+    assert!(skipped > deadlines().payment || CURSOR + 2 == skipped);
+    let applied = provider.observe_finalized(&block(skipped, vec![start_tx]));
+    assert!(
+        matches!(
+            applied,
+            Err(hellas_rpc::work_store::WorkStoreError::Channel(
+                hellas_rpc::work_store::ChannelStateError::CursorNotNext { held, actual }
+            )) if held == CURSOR && actual == skipped
+        ),
+        "a skipped height is not this journal's next block: {applied:?}",
+    );
+    assert_eq!(
+        provider.state(),
+        &before,
+        "and nothing the block claimed reached the disk",
+    );
+}
+
+/// The first catch-up cannot skip the channel's own history.
+///
+/// The exploit it closes: setup finishes at the channel's origin, the
+/// client opens and settles a close in the blocks just after it, and
+/// the provider starts watching later. A watcher that anchored at the
+/// latest finalized block would see neither, report itself caught up,
+/// and go on accepting work against an edge that is already gone.
+///
+/// The store is anchored at the block that opened the channel, so the
+/// scan starts one block later whatever the tip says.
+#[tokio::test]
+async fn a_first_catch_up_cannot_skip_the_channels_own_history() {
+    let root = temp();
+    let ready = ready();
+    // A store that has read nothing since the channel opened, which is
+    // what a provider coming up for the first time has.
+    let store = store_at(root.path(), &ready, Role::Provider, 0);
+    assert_eq!(store.state().cursor(), (0, payload_at(0)));
+    let Ok(mut provider) = ProviderEndpoint::new(ready.clone(), store, provider()) else {
+        panic!("the provider endpoint binds");
+    };
+
+    // The client settles the payment edge in the second block of the
+    // channel's life, and twenty more blocks go by.
+    let settled_at = 2;
+    let close = hellas_kernel::Tx::close(
+        payment_edge(),
+        hellas_kernel::Proof::adjudicated(hellas_kernel::PaymentContestCommitment::from_bytes(
+            [0x02; 32],
+        )),
+        List::take([Payout::new(client().party_key(), 1); MAX_EDGE_OUTPUTS], 1),
+    );
+    let chain = Chain {
+        blocks: (1..=20)
+            .map(|height| {
+                let txs = if height == settled_at {
+                    vec![close.clone()]
+                } else {
+                    Vec::new()
+                };
+                block(height, txs)
+            })
+            .collect(),
+        withheld: None,
+    };
+    match provider.catch_up(&chain).await {
+        Ok(reached) => assert_eq!(reached, 20),
+        Err(error) => panic!("the watcher catches up: {error}"),
+    }
+    let settlement = provider.state().close_settled();
+    assert_eq!(
+        settlement.map(|settled| settled.height),
+        Some(settled_at),
+        "the close eighteen blocks back is this channel's",
+    );
+
+    // And the channel it found closed admits no work.
+    let response = provider.accept(&signed_request(NONCE, 1));
+    let Some(AcceptOutcome::Refused(refused)) = response.outcome else {
+        panic!("a settled edge takes no work: {response:?}");
+    };
+    assert_eq!(refused.code, WorkRefusalCode::Declined as i32);
 }

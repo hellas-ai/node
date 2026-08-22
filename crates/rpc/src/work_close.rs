@@ -78,7 +78,9 @@ use hellas_kernel::{
 };
 
 use crate::protocol::work::PaidChannel;
-use crate::work_store::{ChannelRecord, ChannelStore, JobEnd, Role, WorkStoreError};
+use crate::work_store::{
+    Applied, ChannelRecord, ChannelStore, JobEnd, JobPhase, Role, WorkStoreError,
+};
 
 /// One finalized block, as a watcher must see it.
 ///
@@ -144,10 +146,6 @@ pub trait FinalizedBlocks {
 /// Why a close could not be built.
 #[derive(Debug, thiserror::Error)]
 pub enum CloseError {
-    /// No finalized block has been processed, so there is no height to
-    /// anchor the signed validity window at.
-    #[error("a close start needs a finalized block, and none has been processed")]
-    NoCursor,
     /// The terms fix a zero-block start window, so no signature could
     /// ever be included.
     #[error("the payment terms admit no start validity window")]
@@ -393,45 +391,53 @@ pub fn adjudicated_close(
 
 /// Applies one finalized block to one channel's journal.
 ///
-/// The order is the order a crash must be able to stop in. Everything
-/// the block *means* is committed before the cursor that says the block
-/// was read, so a process that dies between them re-reads the same
-/// block and re-commits the same records — which the journal answers as
-/// the retries they are. The other order would advance past a block
-/// whose close it had not recorded, and no later scan would go back for
-/// it.
+/// # Nothing is written for a block this journal may not read
+///
+/// The height and the parent are checked first, against
+/// [`ChannelState::reading`](crate::work_store::ChannelState) — the
+/// same rule the cursor record itself applies, asked before any of the
+/// block's meaning reaches the disk. It has to be first. The
+/// transitions below move money and shut the channel, and a block that
+/// is not this journal's next one is a block whose contents are not
+/// facts: a forged or merely out-of-order `h + 2` would otherwise end a
+/// job, record a contest, and only then be refused by the cursor.
+///
+/// A block this journal has already read is [`Applied::Redundant`] and
+/// returns here, having written nothing. Everything it meant is already
+/// on the disk.
+///
+/// # Then the order a crash must be able to stop in
+///
+/// Everything the block *means* is committed before the cursor that
+/// says the block was read, so a process that dies between them
+/// re-reads the same block and re-commits the same records — which the
+/// journal answers as the retries they are. The other order would
+/// advance past a block whose close it had not recorded, and no later
+/// scan would go back for it.
 ///
 /// # Errors
 ///
-/// [`WorkStoreError`] when a record is refused or cannot be made
-/// durable. The cursor is the last thing written, so a refusal
+/// [`WorkStoreError`] when the block is not the contiguous next one —
+/// before anything is written — and when a record is refused or cannot
+/// be made durable. The cursor is the last thing written, so a refusal
 /// anywhere leaves this endpoint still behind this block.
 pub fn observe<V: SigVerifier>(
     store: &mut ChannelStore,
     block: &FinalizedWork,
     verifier: &V,
 ) -> Result<(), WorkStoreError> {
+    if store
+        .state()
+        .reading(block.height, &block.parent, &block.payload)?
+        == Applied::Redundant
+    {
+        return Ok(());
+    }
     let channel = store.state().channel().clone();
     let edge = channel.payment_edge();
 
-    // The one height-driven transition this milestone applies. Past the
-    // deadline the client signed to pay by, the job is over: its price
-    // moves once to this client's identity-wide loss — which is
-    // `loss_of`'s decision and only for a job that produced something
-    // payable — and the channel is free to close. Earlier deadlines are
-    // deliberately not applied here; missing them costs this provider a
-    // reservation it holds slightly too long, and costs the client
-    // nothing.
-    if store.state().role() == Role::Provider
-        && let Some(job) = store.state().job()
-        && block.height > job.authorization().payment_deadline
-    {
-        store.commit(
-            ChannelRecord::JobEnded {
-                reason: JobEnd::Expired,
-            },
-            verifier,
-        )?;
+    if let Some(ending) = expiry_at(store.state(), block.height) {
+        store.commit(ChannelRecord::JobEnded { reason: ending }, verifier)?;
     }
 
     for tx in &block.txs {
@@ -439,12 +445,28 @@ pub fn observe<V: SigVerifier>(
             Tx::Move {
                 action: hellas_kernel::Move::StartPaymentClose(start),
             } if start.payment_edge() == edge => {
+                // A contest on this edge is the cutoff, and the open
+                // job does not survive it: no payment will be credited
+                // after this record, so a job still in flight is a job
+                // that can no longer be paid for. Who bears it is the
+                // opener's to answer — a counterparty that cut this
+                // endpoint off owes for what it took, and an endpoint
+                // that cut itself off owes nobody anything.
+                if store.state().job().is_some() {
+                    let reason = if start.opener_role() == opposite(store.state().role()) {
+                        JobEnd::Expired
+                    } else {
+                        JobEnd::Failed
+                    };
+                    store.commit(ChannelRecord::JobEnded { reason }, verifier)?;
+                }
                 store.commit(
                     ChannelRecord::CloseOpened {
                         start_id: hellas_kernel::start_id(
                             start_body_digest(&channel, start),
                             block.height,
                         ),
+                        opener: start.opener_role(),
                     },
                     verifier,
                 )?;
@@ -455,6 +477,14 @@ pub fn observe<V: SigVerifier>(
                     .iter()
                     .find(|payout| payout.owner() == channel.provider_key())
                     .map_or(0, |payout| payout.value());
+                if store.state().job().is_some() {
+                    store.commit(
+                        ChannelRecord::JobEnded {
+                            reason: JobEnd::Expired,
+                        },
+                        verifier,
+                    )?;
+                }
                 store.commit(
                     ChannelRecord::CloseSettled {
                         height: block.height,
@@ -479,16 +509,63 @@ pub fn observe<V: SigVerifier>(
     Ok(())
 }
 
+/// Returns the party on the other side of the channel from `role`.
+const fn opposite(role: Role) -> Party {
+    match role {
+        Role::Client => Party::Taker,
+        Role::Provider => Party::Maker,
+    }
+}
+
+/// Returns why the open job is over at `height`, if it is.
+///
+/// Three deadlines, and each says a different thing about who failed.
+///
+/// - **Acceptance.** A proposal the provider never co-signed cannot be
+///   co-signed now, so the job is over and its reservation goes back.
+///   Nobody produced anything and nobody owes for it.
+/// - **Terminal.** Past it there is no result either party can use: the
+///   client's own journal refuses a receipt, so a result signed now
+///   could never be paid for. A job that reached this height without
+///   one is the provider's own side not finishing, and
+///   [`JobEnd::Failed`] is what says the client is not charged for it.
+/// - **Payment.** A result exists, it was in time, and the height the
+///   client signed to pay by has passed. That is the one ending this
+///   counterparty is charged for, and what it costs is
+///   `ChannelState::loss_of`'s to decide from how far the job got.
+///
+/// Only a provider applies them. A client's own journal has no loss
+/// ledger to move and no reservation to release, and ending a job it
+/// might still be paying for would be a client deciding against itself.
+fn expiry_at(state: &crate::work_store::ChannelState, height: u64) -> Option<JobEnd> {
+    if state.role() != Role::Provider {
+        return None;
+    }
+    let job = state.job()?;
+    let authorization = job.authorization();
+    if height > authorization.payment_deadline {
+        return Some(JobEnd::Expired);
+    }
+    if height > authorization.terminal_deadline && job.result().is_none() {
+        return Some(JobEnd::Failed);
+    }
+    if height > authorization.acceptance_deadline && job.phase() == JobPhase::HalfSigned {
+        return Some(JobEnd::Expired);
+    }
+    None
+}
+
 /// Reads every finalized block this journal has not seen, in order.
 ///
-/// A journal with no cursor anchors at the latest finalized block. It
-/// makes no claim about anything earlier, and needs none: an endpoint
-/// only exists over a channel whose readiness read found no contest
-/// open, so the history this skips is history in which nothing had
-/// happened to this edge.
+/// There is no anchoring step and no height this may start at other
+/// than the one after the cursor: the store was opened at the block
+/// that opened the channel, so "everything this journal has not seen"
+/// is everything that has ever happened to this edge. A scan that
+/// chose its own starting height would skip the blocks between the
+/// channel opening and the first catch-up, and a close settled in one
+/// of them is a close this endpoint would never learn about.
 ///
-/// Returns the height the cursor reached, or `None` when the source has
-/// finalized nothing.
+/// Returns the height the cursor reached.
 ///
 /// # Errors
 ///
@@ -499,18 +576,15 @@ pub async fn catch_up<S, V>(
     source: &S,
     store: &mut ChannelStore,
     verifier: &V,
-) -> Result<Option<u64>, CatchUpError>
+) -> Result<u64, CatchUpError>
 where
     S: FinalizedBlocks + ?Sized,
     V: SigVerifier,
 {
     let Some(latest) = source.latest_height().await? else {
-        return Ok(store.state().cursor().map(|(height, _)| height));
+        return Ok(store.state().cursor().0);
     };
-    let mut next = match store.state().cursor() {
-        Some((height, _)) => height.saturating_add(1),
-        None => latest,
-    };
+    let mut next = store.state().cursor().0.saturating_add(1);
     while next <= latest {
         let block = source
             .block_at(next)
@@ -519,5 +593,5 @@ where
         observe(store, &block, verifier)?;
         next = next.saturating_add(1);
     }
-    Ok(store.state().cursor().map(|(height, _)| height))
+    Ok(store.state().cursor().0)
 }

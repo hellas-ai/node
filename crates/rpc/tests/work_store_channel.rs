@@ -10,8 +10,9 @@
 
 use hellas_kernel::{
     BlockHeight, EarnedCertificate, EdgeId, EdgeValues, Encode as _, Fees, List, MAX_EDGE_OUTPUTS,
-    NetworkId, Parties, PayloadHash, Payout, Secp256k1Signer, Secp256k1Verifier, Sig, TermsHash,
-    WorkPaymentSettlement, WorkPaymentTerms, WorkStakeBondTerms, work_payment_settlement,
+    NetworkId, Parties, Party, PayloadHash, Payout, Secp256k1Signer, Secp256k1Verifier, Sig,
+    TermsHash, WorkPaymentSettlement, WorkPaymentTerms, WorkStakeBondTerms,
+    work_payment_settlement,
 };
 use hellas_rpc::evaluate::{
     EvaluateOutputTranscriptBuilder, EvaluateStopReason, EvaluateTerminal, EvaluateUsage,
@@ -31,7 +32,7 @@ use hellas_rpc::protocol::{ContentId, Digest};
 use hellas_rpc::work_store::journal::{Journal, JournalError, JournalId, JournalKind};
 use hellas_rpc::work_store::{
     ChannelRecord, ChannelStateError, ChannelStore, CounterpartyLoss, JobEnd, JobPhase, JobState,
-    Role, WorkStoreError,
+    Role, SetupOrigin, WorkStoreError,
 };
 use hellas_rpc::{
     Assurance, Evaluate, EvaluateProgramManifest, EvaluateRequest, OutputEventEnvelope,
@@ -143,9 +144,29 @@ fn open(root: &std::path::Path, role: Role) -> ChannelStore {
 }
 
 fn open_on(root: &std::path::Path, channel: PaidChannel, role: Role) -> ChannelStore {
-    match ChannelStore::open(root, channel, settlement(), role, &Secp256k1Verifier::new()) {
+    let origin = origin_of(&channel);
+    match ChannelStore::open(
+        root,
+        channel,
+        settlement(),
+        role,
+        origin,
+        &Secp256k1Verifier::new(),
+    ) {
         Ok(store) => store,
         Err(error) => panic!("the fixture store opens: {error}"),
+    }
+}
+
+/// Where a fixture channel was opened: the block before the one a
+/// client records its receipt at, so a fixture cursor record is the
+/// contiguous next block and nothing has to be skipped to reach it.
+fn origin_of(channel: &PaidChannel) -> SetupOrigin {
+    SetupOrigin {
+        payment_edge: channel.payment_edge(),
+        height: RECEIPT_HEIGHT - 1,
+        payload: payload_at(RECEIPT_HEIGHT - 1),
+        parent: payload_at(RECEIPT_HEIGHT - 2),
     }
 }
 
@@ -418,7 +439,7 @@ fn cursor_at(height: u64) -> ChannelRecord {
 
 /// Moves one store's cursor to `height`, one block at a time.
 fn advance(store: &mut ChannelStore, height: u64) {
-    let mut next = store.state().cursor().map_or(height, |(held, _)| held + 1);
+    let mut next = store.state().cursor().0.saturating_add(1);
     while next <= height {
         commit_all(store, &[cursor_at(next)]);
         next += 1;
@@ -615,10 +636,8 @@ fn the_terminal_deadline_is_the_last_height_a_receipt_may_be_recorded_at() {
     for (height, timely) in [(deadline, true), (deadline + 1, false)] {
         let dir = temp();
         let mut store = open(dir.path(), Role::Client);
-        commit_all(
-            &mut store,
-            &[cursor_at(height), job.proposed(), job.accepted()],
-        );
+        advance(&mut store, height);
+        commit_all(&mut store, &[job.proposed(), job.accepted()]);
         let recorded = store.commit(job.result_record(&channel), &Secp256k1Verifier::new());
         if timely {
             if let Err(error) = recorded {
@@ -694,22 +713,42 @@ fn the_payment_deadline_is_the_last_height_a_payment_may_be_signed_at() {
     }
 }
 
-/// A client with no processed block records no receipt at all.
+/// A store's clock starts at the block that opened the channel.
+///
+/// There is no "before the first block" state to reach, and that is
+/// what makes every deadline rule below mean something: a journal whose
+/// cursor could be absent would be a journal on which a receipt three
+/// hundred blocks late reads as timely.
 #[test]
-fn a_client_that_has_processed_no_block_records_no_receipt() {
+fn a_store_opens_anchored_at_the_channels_origin() {
     let dir = temp();
-    let channel = channel();
-    let job = job_at(&channel, 1, 0);
-    let mut store = open(dir.path(), Role::Client);
-    commit_all(&mut store, &[job.proposed(), job.accepted()]);
-    let error = store
-        .commit(job.result_record(&channel), &Secp256k1Verifier::new())
-        .expect_err("a receipt needs a height to be timely at");
+    let store = open(dir.path(), Role::Client);
+    assert_eq!(
+        store.state().cursor(),
+        (RECEIPT_HEIGHT - 1, payload_at(RECEIPT_HEIGHT - 1))
+    );
+
+    // And the origin is this channel's. One opened at another edge's
+    // origin would be reading a height that is not about it.
+    let error = ChannelStore::open(
+        dir.path().join("elsewhere").as_path(),
+        channel(),
+        settlement(),
+        Role::Client,
+        SetupOrigin {
+            payment_edge: EdgeId::from_bytes([0x5e; 32]),
+            height: RECEIPT_HEIGHT - 1,
+            payload: payload_at(RECEIPT_HEIGHT - 1),
+            parent: payload_at(RECEIPT_HEIGHT - 2),
+        },
+        &Secp256k1Verifier::new(),
+    )
+    .expect_err("that origin is another channel's");
     assert!(
         matches!(
             error,
-            WorkStoreError::Channel(ChannelStateError::NoCursor {
-                step: "recording a delivered result"
+            WorkStoreError::Channel(ChannelStateError::WrongChannel {
+                field: "setup origin payment_edge"
             })
         ),
         "unexpected error: {error}"
@@ -1641,6 +1680,7 @@ fn every_prefix_reopens_as_it_was(channel: &PaidChannel, sequence: &[ChannelReco
             channel.clone(),
             settlement(),
             Role::Provider,
+            origin_of(channel),
             &verifier,
         ) {
             Ok(store) => store,
@@ -1728,6 +1768,7 @@ fn a_journal_reopens_when_the_clients_loss_has_passed_this_channels_limit() {
         narrow.clone(),
         settlement(),
         Role::Provider,
+        origin_of(&narrow),
         &verifier,
     ) {
         Ok(store) => store,
@@ -1812,8 +1853,16 @@ fn replay_refuses_a_reservation_this_journals_own_losses_forbid() {
         }
     }
 
-    let error = ChannelStore::open(dir.path(), channel, settlement(), Role::Provider, &verifier)
-        .expect_err("that reservation was never one this channel could make");
+    let origin = origin_of(&channel);
+    let error = ChannelStore::open(
+        dir.path(),
+        channel,
+        settlement(),
+        Role::Provider,
+        origin,
+        &verifier,
+    )
+    .expect_err("that reservation was never one this channel could make");
     let WorkStoreError::Channel(ChannelStateError::OverCredit {
         ledger,
         used,
@@ -2297,18 +2346,19 @@ fn the_cursor_only_moves_to_the_contiguous_next_block() {
     let dir = temp();
     let verifier = Secp256k1Verifier::new();
     let mut store = open(dir.path(), Role::Provider);
-    commit_all(&mut store, &[cursor_at(7)]);
-    assert_eq!(store.state().cursor(), Some((7, payload_at(7))));
+    let anchor = RECEIPT_HEIGHT - 1;
+    commit_all(&mut store, &[cursor_at(anchor + 1)]);
+    assert_eq!(store.state().cursor(), (anchor + 1, payload_at(anchor + 1)));
 
     // Every height but the next one, with the parent left correct. The
     // repeated height carries a different payload, so it is a second
-    // block at height seven rather than the retry answered below.
-    for height in [7_u64, 6, 0, 9, 20] {
+    // block at the held height rather than the retry answered below.
+    for height in [anchor + 1, anchor, 0, anchor + 3, anchor + 20] {
         let error = store
             .commit(
                 ChannelRecord::CursorAdvanced {
                     height,
-                    parent: payload_at(7),
+                    parent: payload_at(anchor + 1),
                     payload: [0x99; 32],
                 },
                 &verifier,
@@ -2318,9 +2368,9 @@ fn the_cursor_only_moves_to_the_contiguous_next_block() {
             matches!(
                 error,
                 WorkStoreError::Channel(ChannelStateError::CursorNotNext {
-                    held: 7,
+                    held,
                     actual,
-                }) if actual == height
+                }) if held == anchor + 1 && actual == height
             ),
             "unexpected error at {height}: {error}"
         );
@@ -2330,9 +2380,9 @@ fn the_cursor_only_moves_to_the_contiguous_next_block() {
     let error = store
         .commit(
             ChannelRecord::CursorAdvanced {
-                height: 8,
-                parent: payload_at(6),
-                payload: payload_at(8),
+                height: anchor + 2,
+                parent: payload_at(anchor),
+                payload: payload_at(anchor + 2),
             },
             &verifier,
         )
@@ -2340,18 +2390,19 @@ fn the_cursor_only_moves_to_the_contiguous_next_block() {
     assert!(
         matches!(
             error,
-            WorkStoreError::Channel(ChannelStateError::CursorNotContiguous { height: 8 })
+            WorkStoreError::Channel(ChannelStateError::CursorNotContiguous { height })
+                if height == anchor + 2
         ),
         "unexpected error: {error}"
     );
 
     // The same two fields, correct: the cursor moves by exactly one.
-    commit_all(&mut store, &[cursor_at(8)]);
-    assert_eq!(store.state().cursor(), Some((8, payload_at(8))));
+    commit_all(&mut store, &[cursor_at(anchor + 2)]);
+    assert_eq!(store.state().cursor(), (anchor + 2, payload_at(anchor + 2)));
 
     // The same block again is the same fact.
     let before = store.len();
-    commit_all(&mut store, &[cursor_at(8)]);
+    commit_all(&mut store, &[cursor_at(anchor + 2)]);
     assert_eq!(store.len(), before);
 }
 
@@ -2365,6 +2416,7 @@ fn a_second_process_cannot_hold_the_same_channel() {
         channel(),
         settlement(),
         Role::Provider,
+        origin_of(&channel()),
         &Secp256k1Verifier::new(),
     )
     .expect_err("the journal is already held");
@@ -2430,9 +2482,10 @@ fn a_corrupt_channel_journal_is_not_replayed_as_an_earlier_state() {
     }
     let error = ChannelStore::open(
         dir.path(),
-        channel,
+        channel.clone(),
         settlement(),
         Role::Provider,
+        origin_of(&channel),
         &Secp256k1Verifier::new(),
     )
     .expect_err("a corrupt frame is refused");
@@ -2573,6 +2626,7 @@ fn a_complete_frame_that_does_not_verify_is_refused_wherever_it_is() {
                 channel.clone(),
                 settlement(),
                 Role::Provider,
+                origin_of(&channel),
                 &Secp256k1Verifier::new(),
             )
             .expect_err("a whole frame that does not verify is not a tear");
@@ -2650,9 +2704,10 @@ fn a_journal_torn_inside_its_header_is_written_again() {
     }
     let error = ChannelStore::open(
         dir.path(),
-        channel,
+        channel.clone(),
         settlement(),
         Role::Provider,
+        origin_of(&channel),
         &Secp256k1Verifier::new(),
     )
     .expect_err("that is not this endpoint's journal");
@@ -2811,14 +2866,37 @@ fn the_record_codec_is_exact_and_ordered() {
     assert_eq!(bytes, expected);
     assert_eq!(ChannelRecord::decode(&bytes), Ok(prepared));
 
+    // tag || contest id || opener. The opener is one byte after the
+    // digest, and a round trip would pass with the two exchanged.
     let opened = ChannelRecord::CloseOpened {
         start_id: hellas_kernel::StartId::from_bytes([0xcd; 32]),
+        opener: Party::Maker,
     };
     let bytes = opened.encode();
     let mut expected = vec![10_u8];
     expected.extend_from_slice(&[0xcd; 32]);
+    expected.push(0);
     assert_eq!(bytes, expected);
     assert_eq!(ChannelRecord::decode(&bytes), Ok(opened));
+
+    let opened = ChannelRecord::CloseOpened {
+        start_id: hellas_kernel::StartId::from_bytes([0xcd; 32]),
+        opener: Party::Taker,
+    };
+    let bytes = opened.encode();
+    let mut expected = vec![10_u8];
+    expected.extend_from_slice(&[0xcd; 32]);
+    expected.push(1);
+    assert_eq!(bytes, expected);
+    assert_eq!(ChannelRecord::decode(&bytes), Ok(opened));
+
+    // And nothing else is a party.
+    let mut unknown = bytes;
+    unknown[33] = 2;
+    assert_eq!(
+        ChannelRecord::decode(&unknown),
+        Err(ChannelStateError::Malformed)
+    );
 
     let settled = ChannelRecord::CloseSettled {
         height: 0x1112_1314_1516_1718,
@@ -2995,6 +3073,7 @@ fn replay_checks_the_signatures_again() {
             channel.clone(),
             settlement(),
             Role::Provider,
+            origin_of(&channel),
             &AcceptAll,
         ) else {
             panic!("the store opens");
@@ -3005,9 +3084,10 @@ fn replay_checks_the_signatures_again() {
     }
     let error = ChannelStore::open(
         dir.path(),
-        channel,
+        channel.clone(),
         settlement(),
         Role::Provider,
+        origin_of(&channel),
         &Secp256k1Verifier::new(),
     )
     .expect_err("the client never signed that");
@@ -3186,6 +3266,7 @@ fn inputs_swapped_on_the_disk_are_not_a_job_to_execute() {
             channel.clone(),
             settlement(),
             Role::Provider,
+            origin_of(&channel),
             &Secp256k1Verifier::new(),
         );
         if readable {

@@ -54,7 +54,7 @@ use hellas_rpc::work::{
     RunOutcome, WorkRefusal, WorkService, admit_payment, fetch_result, run_accepted_work,
 };
 use hellas_rpc::work_close::{FinalizedWork, observe};
-use hellas_rpc::work_store::{ChannelRecord, ChannelStore, JobEnd, JobPhase, JobState, Role};
+use hellas_rpc::work_store::{ChannelRecord, ChannelStore, JobPhase, JobState, Role, SetupOrigin};
 use hellas_rpc::{
     Assurance, EvaluateProgramManifest, EvaluateRequest, OutputEventEnvelope, ProducerSigningKey,
     ProgramManifest, PublicKey,
@@ -247,6 +247,7 @@ fn store_at(root: &std::path::Path, ready: &ReadyChannel, role: Role, height: u6
         ready.channel().clone(),
         settlement(),
         role,
+        origin(),
         &Secp256k1Verifier::new(),
     ) {
         Ok(store) => store,
@@ -269,13 +270,25 @@ fn payload_at(height: u64) -> [u8; 32] {
     payload
 }
 
+/// Where the fixture channel was opened: the genesis block of the
+/// synthetic chain above, so a store starts with a clock and `advance`
+/// reads block one next.
+fn origin() -> SetupOrigin {
+    SetupOrigin {
+        payment_edge: payment_edge(),
+        height: 0,
+        payload: payload_at(0),
+        parent: [0_u8; 32],
+    }
+}
+
 /// Runs the production watcher over one empty finalized block per
 /// height, up through `height`.
 ///
 /// The same call the settlement loop makes, so a fixture cursor is a
 /// cursor this endpoint could have reached.
 fn advance(store: &mut ChannelStore, height: u64) {
-    let mut next = store.state().cursor().map_or(height, |(held, _)| held + 1);
+    let mut next = store.state().cursor().0.saturating_add(1);
     while next <= height {
         let block = FinalizedWork {
             height: next,
@@ -822,12 +835,14 @@ async fn one_certificate_pays_for_one_job() {
         Role::Provider,
         CURSOR,
     );
-    // Client: cursor, proposal, acceptance, result, verdict, payment.
-    // Provider: cursor, proposal, acceptance, running marker, result,
-    // release, payment.
+    // One cursor record per block read from the channel's origin to
+    // `CURSOR`, and then the job's own steps.
+    // Client: proposal, acceptance, result, verdict, payment.
+    // Provider: proposal, acceptance, running marker, result, release,
+    // payment.
     for (store, role, records) in [
-        (&client_store, "client", 6),
-        (&provider_store, "provider", 7),
+        (&client_store, "client", CURSOR + 5),
+        (&provider_store, "provider", CURSOR + 6),
     ] {
         assert_eq!(
             store.len(),
@@ -1211,8 +1226,20 @@ async fn a_defaulted_job_is_not_paid_for_as_well() {
         let Ok(mut provider) = fixture.service.endpoint() else {
             panic!("the endpoint is reachable");
         };
-        if let Err(error) = provider.end_run(id, JobEnd::Expired) {
-            panic!("the provider defaults the job: {error}");
+        // The default is the watcher's, reached the only way it can
+        // be: finalized blocks past the height this client signed to
+        // pay by. No local call can ask for it.
+        let mut next = provider.state().cursor().0.saturating_add(1);
+        while next <= deadlines().payment + 1 {
+            if let Err(error) = provider.observe_finalized(&FinalizedWork {
+                height: next,
+                parent: payload_at(next.saturating_sub(1)),
+                payload: payload_at(next),
+                txs: Vec::new(),
+            }) {
+                panic!("the fixture block applies: {error}");
+            }
+            next += 1;
         }
         assert_eq!(provider.state().loss().compute, PRICE);
         assert_eq!(provider.state().loss().delivery, PRICE);
@@ -1252,7 +1279,7 @@ async fn a_defaulted_job_is_not_paid_for_as_well() {
     let Ok(mut provider) = fixture.service.endpoint() else {
         panic!("the endpoint is reachable");
     };
-    let ended = provider.end_run(id, JobEnd::Expired);
+    let ended = provider.end_run(id);
     assert!(
         matches!(ended, Err(RunError::NoSuchJob)),
         "a paid job is closed: {ended:?}",

@@ -96,6 +96,7 @@ use crate::protocol::work::{
     prepared_input_digest, result_digest, signing_hash, terminal_result, work_id,
 };
 use crate::work_store::journal::{Journal, JournalId, JournalKind, MAX_RECORD_BYTES, Role};
+use crate::work_store::setup::SetupOrigin;
 use crate::work_store::{Applied, WorkStoreError, cursor::Cursor, hex, put_u64};
 
 /// Domain of a channel journal's key.
@@ -174,12 +175,6 @@ pub enum ChannelStateError {
     /// cannot know the outcome of.
     #[error("the job's invocation is indeterminate after a restart; a result now would be a guess")]
     Indeterminate,
-    /// A step needs a finalized height and none has been processed.
-    #[error("{step} needs a finalized block, and none has been processed")]
-    NoCursor {
-        /// Step that was attempted.
-        step: &'static str,
-    },
     /// A result reached the client after the height it was owed by.
     ///
     /// Late plaintext earns nothing: the provider signed a terminal
@@ -443,14 +438,19 @@ pub enum ChannelRecord {
     },
     /// A close contest on this channel's payment edge was finalized.
     ///
-    /// The contest identifier is the whole of what this adds, and it is
-    /// the one thing about a close that cannot be derived from a
-    /// retained signature: the kernel derives it from the start digest
-    /// *and the height that accepted it*, so only the block tells an
-    /// endpoint which contest its start became.
+    /// Two things the block says and nothing else can. The contest
+    /// identifier cannot be derived from a retained signature: the
+    /// kernel takes it from the start digest *and the height that
+    /// accepted it*. And the opener cannot be recovered from the
+    /// identifier, which is a hash — so an endpoint that dropped it
+    /// could never afterwards say whether the contest that shut its
+    /// channel was its own or the counterparty's, which is the whole of
+    /// who owes for the job it cut off.
     CloseOpened {
         /// Contest a later response or close must name.
         start_id: StartId,
+        /// Which party opened it.
+        opener: Party,
     },
     /// A close consuming this channel's payment edge was finalized.
     CloseSettled {
@@ -559,9 +559,10 @@ impl ChannelRecord {
                 // length.
                 out.extend_from_slice(&encode_kernel(start.as_ref()));
             }
-            Self::CloseOpened { start_id } => {
+            Self::CloseOpened { start_id, opener } => {
                 out.push(tag::CLOSE_OPENED);
                 out.extend_from_slice(&start_id.to_bytes());
+                out.push(party_code(*opener));
             }
             Self::CloseSettled {
                 height,
@@ -649,6 +650,7 @@ impl ChannelRecord {
                         .array::<{ StartId::LENGTH }>()
                         .ok_or(ChannelStateError::Malformed)?,
                 ),
+                opener: party(cursor.byte().ok_or(ChannelStateError::Malformed)?)?,
             },
             tag::CLOSE_SETTLED => Self::CloseSettled {
                 height: cursor.u64().ok_or(ChannelStateError::Malformed)?,
@@ -672,6 +674,22 @@ fn private_record<R: crate::protocol::work::PrivateRecord>(
         .take(R::ENCODED_SIZE)
         .ok_or(ChannelStateError::Malformed)?;
     Ok(R::decode(bytes)?)
+}
+
+/// The one byte a party is written as.
+const fn party_code(party: Party) -> u8 {
+    match party {
+        Party::Maker => 0,
+        Party::Taker => 1,
+    }
+}
+
+fn party(code: u8) -> Result<Party, ChannelStateError> {
+    match code {
+        0 => Ok(Party::Maker),
+        1 => Ok(Party::Taker),
+        _ => Err(ChannelStateError::Malformed),
+    }
 }
 
 fn signature(cursor: &mut Cursor<'_>) -> Result<Sig, ChannelStateError> {
@@ -879,10 +897,10 @@ pub struct ChannelState {
     last_payment: Option<PaidCertificate>,
     compute_outstanding: u64,
     delivery_outstanding: u64,
-    cursor: Option<(u64, [u8; 32])>,
+    cursor: (u64, [u8; 32]),
     indeterminate: bool,
     close_prepared: Option<PaymentCloseStart>,
-    close_opened: Option<StartId>,
+    close_opened: Option<(StartId, Party)>,
     close_settled: Option<CloseSettlement>,
 }
 
@@ -909,6 +927,7 @@ impl ChannelState {
         settlement: WorkPaymentSettlement,
         role: Role,
         loss: LossTotals,
+        origin: SetupOrigin,
     ) -> Self {
         Self {
             channel,
@@ -927,7 +946,7 @@ impl ChannelState {
             last_payment: None,
             compute_outstanding: 0,
             delivery_outstanding: 0,
-            cursor: None,
+            cursor: (origin.height, origin.payload),
             indeterminate: false,
             close_prepared: None,
             close_opened: None,
@@ -1042,13 +1061,19 @@ impl ChannelState {
 
     /// Returns the finalized block this endpoint has processed through.
     ///
-    /// Contiguous by construction: every block from the first one this
-    /// journal recorded to this one was read, in order, each naming the
-    /// last as its parent. That is what makes it usable as a clock — a
-    /// height reached by skipping is a height at which this endpoint
-    /// does not know what happened.
+    /// Contiguous by construction, and contiguous all the way back to
+    /// the block that opened the channel: the store is anchored at that
+    /// origin when it is opened, and every record since named the block
+    /// before it as its parent. That is what makes it usable as a clock
+    /// — a height reached by skipping is a height at which this
+    /// endpoint does not know what happened, and there is no height
+    /// here that was reached by skipping.
+    ///
+    /// There is no "before the first block" case, and that is the whole
+    /// point of the origin: an endpoint whose clock could be absent is
+    /// an endpoint every deadline rule passes for.
     #[must_use]
-    pub const fn cursor(&self) -> Option<(u64, [u8; 32])> {
+    pub const fn cursor(&self) -> (u64, [u8; 32]) {
         self.cursor
     }
 
@@ -1077,9 +1102,10 @@ impl ChannelState {
             .filter(|start| height <= start.valid_through_height())
     }
 
-    /// Returns the finalized contest on this channel's payment edge.
+    /// Returns the finalized contest on this channel's payment edge,
+    /// and the party that opened it.
     #[must_use]
-    pub const fn close_opened(&self) -> Option<StartId> {
+    pub const fn close_opened(&self) -> Option<(StartId, Party)> {
         self.close_opened
     }
 
@@ -1203,7 +1229,9 @@ impl ChannelState {
             ),
             ChannelRecord::JobEnded { reason } => self.apply_ended(*reason),
             ChannelRecord::ClosePrepared { start } => self.apply_close_prepared(start),
-            ChannelRecord::CloseOpened { start_id } => self.apply_close_opened(*start_id),
+            ChannelRecord::CloseOpened { start_id, opener } => {
+                self.apply_close_opened(*start_id, *opener)
+            }
             ChannelRecord::CloseSettled {
                 height,
                 payload,
@@ -1218,37 +1246,64 @@ impl ChannelState {
 
     /// Moves the cursor on by exactly one contiguous block.
     ///
-    /// Two rules, and they are the whole of what a cursor means here.
-    /// The height must be the next one, so nothing is skipped; and the
-    /// block must name the held block as its parent, so the chain that
-    /// was read is one chain. A watcher that fetched heights alone
-    /// would accept a block from a history this endpoint never saw.
-    ///
-    /// The first record has neither to check against. It anchors the
-    /// scan, and its parent is checked against nothing — an endpoint
-    /// that starts watching at height 900 has read no block before 900
-    /// and this makes no claim that it has.
+    /// The rule itself is [`Self::reading`], which is asked twice about
+    /// every block: once by the watcher before it records anything the
+    /// block *means*, and once here when the cursor itself is written.
+    /// One function, so the two askings cannot disagree about which
+    /// block this journal may read next.
     fn apply_cursor(
         &mut self,
         height: u64,
         parent: &[u8; 32],
         payload: &[u8; 32],
     ) -> Result<Applied, ChannelStateError> {
-        if self.cursor == Some((height, *payload)) {
+        match self.reading(height, parent, payload)? {
+            Applied::Redundant => Ok(Applied::Redundant),
+            Applied::Changed => {
+                self.cursor = (height, *payload);
+                Ok(Applied::Changed)
+            }
+        }
+    }
+
+    /// Whether this journal may read `height`, and whether reading it
+    /// moves the cursor.
+    ///
+    /// Two rules, and they are the whole of what a cursor means here.
+    /// The height must be the next one, so nothing is skipped; and the
+    /// block must name the held block as its parent, so the chain that
+    /// was read is one chain. A watcher that fetched heights alone
+    /// would accept a block from a history this endpoint never saw.
+    ///
+    /// The block already held is [`Applied::Redundant`] rather than a
+    /// refusal: a watcher that died after recording what a block meant
+    /// and before recording that it read it re-reads that same block,
+    /// and every record it re-offers is the retry it is.
+    ///
+    /// # Errors
+    ///
+    /// [`ChannelStateError::CursorNotNext`] for any other height and
+    /// [`ChannelStateError::CursorNotContiguous`] for the next height
+    /// on another chain.
+    pub(crate) fn reading(
+        &self,
+        height: u64,
+        parent: &[u8; 32],
+        payload: &[u8; 32],
+    ) -> Result<Applied, ChannelStateError> {
+        let (held_height, held_payload) = self.cursor;
+        if (height, *payload) == (held_height, held_payload) {
             return Ok(Applied::Redundant);
         }
-        if let Some((held_height, held_payload)) = self.cursor {
-            if height != held_height.saturating_add(1) {
-                return Err(ChannelStateError::CursorNotNext {
-                    held: held_height,
-                    actual: height,
-                });
-            }
-            if *parent != held_payload {
-                return Err(ChannelStateError::CursorNotContiguous { height });
-            }
+        if height != held_height.saturating_add(1) {
+            return Err(ChannelStateError::CursorNotNext {
+                held: held_height,
+                actual: height,
+            });
         }
-        self.cursor = Some((height, *payload));
+        if *parent != held_payload {
+            return Err(ChannelStateError::CursorNotContiguous { height });
+        }
         Ok(Applied::Changed)
     }
 
@@ -1313,11 +1368,7 @@ impl ChannelState {
                 return Err(ChannelStateError::WrongChannel { field });
             }
         }
-        let Some((cursor_height, _)) = self.cursor else {
-            return Err(ChannelStateError::NoCursor {
-                step: "signing a close start",
-            });
-        };
+        let (cursor_height, _) = self.cursor;
         if self.includable_close_start(cursor_height).is_some() {
             return Err(ChannelStateError::Conflict {
                 what: "a close start that can still be included",
@@ -1327,15 +1378,28 @@ impl ChannelState {
         Ok(Applied::Changed)
     }
 
-    /// Records the contest a finalized start opened.
+    /// Records the contest a finalized start opened, and who opened it.
     ///
     /// Refused once the edge is gone, and that is the rule that makes
     /// the watcher's ordering visible: a block carrying a start and the
     /// close that ends it is one history read in the validator's order
     /// and another read backwards, and only one of them is a history
     /// this journal takes.
-    fn apply_close_opened(&mut self, start_id: StartId) -> Result<Applied, ChannelStateError> {
-        if self.close_opened == Some(start_id) {
+    ///
+    /// Refused too while a job is open, and that is the cutoff itself.
+    /// Nothing after this record credits a certificate, so a job still
+    /// in flight is a job that can no longer be paid for, and leaving
+    /// it open would leave an endpoint holding a result it may still
+    /// release for a payment that can never arrive. The watcher ends it
+    /// first — see `work_close::observe` — and this refusal is what
+    /// makes that the only order a journal can be written or replayed
+    /// in.
+    fn apply_close_opened(
+        &mut self,
+        start_id: StartId,
+        opener: Party,
+    ) -> Result<Applied, ChannelStateError> {
+        if self.close_opened == Some((start_id, opener)) {
             return Ok(Applied::Redundant);
         }
         if self.close_settled.is_some() {
@@ -1348,10 +1412,17 @@ impl ChannelState {
                 what: "this edge's close contest",
             });
         }
-        self.close_opened = Some(start_id);
+        self.refuse_open_job("opening a close contest")?;
+        self.close_opened = Some((start_id, opener));
         Ok(Applied::Changed)
     }
 
+    /// Records the close that consumed this edge.
+    ///
+    /// It refuses an open job for the reason above, and it is a
+    /// separate arrival rather than a consequence of one: a cooperative
+    /// freeze consumes the edge with no contest in front of it, so this
+    /// is reachable without [`Self::apply_close_opened`] ever running.
     fn apply_close_settled(
         &mut self,
         settlement: CloseSettlement,
@@ -1364,8 +1435,19 @@ impl ChannelState {
                 what: "this edge's close",
             });
         }
+        self.refuse_open_job("closing the payment edge")?;
         self.close_settled = Some(settlement);
         Ok(Applied::Changed)
+    }
+
+    fn refuse_open_job(&self, step: &'static str) -> Result<(), ChannelStateError> {
+        match &self.job {
+            Some(job) => Err(ChannelStateError::WrongPhase {
+                step,
+                phase: job.phase.name(),
+            }),
+            None => Ok(()),
+        }
     }
 
     fn apply_proposed<V: SigVerifier>(
@@ -1584,26 +1666,25 @@ impl ChannelState {
             });
         }
 
-        // A client records what was delivered to it, and delivery has a
-        // deadline. The height is this journal's own cursor, so what it
+        // A result is owed by a height, and both roles are bounded by
+        // it. The height is this journal's own cursor, so what it
         // measures is when this endpoint had *processed* a block, not
         // when a peer said one existed; how fresh that cursor is stays
         // the caller's, in the sense `ReadyChannel` already documents.
-        // A provider is not bounded here: its own release gate is what
-        // stops late plaintext, and journaling a result it computed but
-        // may not release is honest evidence rather than a step.
-        if self.role == Role::Client {
-            let Some((height, _)) = self.cursor else {
-                return Err(ChannelStateError::NoCursor {
-                    step: "recording a delivered result",
-                });
-            };
-            if height > job.authorization.terminal_deadline {
-                return Err(ChannelStateError::ReceiptLate {
-                    height,
-                    deadline: job.authorization.terminal_deadline,
-                });
-            }
+        //
+        // The provider is bounded here for the reason the client is,
+        // read from the other side: a result recorded past the terminal
+        // deadline is one the client's own journal will refuse a
+        // receipt for, so it can never be paid for — and recording it
+        // anyway would make it a result the ending ledger charges this
+        // client for. Late compute is the provider's own loss, and this
+        // is where that is decided.
+        let (height, _) = self.cursor;
+        if height > job.authorization.terminal_deadline {
+            return Err(ChannelStateError::ReceiptLate {
+                height,
+                deadline: job.authorization.terminal_deadline,
+            });
         }
 
         let events = decode_transcript(transcript, MAX_RECORD_BYTES)?;
@@ -1705,11 +1786,13 @@ impl ChannelState {
         }) {
             return Ok(Applied::Redundant);
         }
-        // No cutoff check here, and none is needed: a payment credits
-        // the open job, and a close start is refused while there is
-        // one. The two are excluded by the same fact, and a second
-        // spelling of it would be a second chance to spell it
-        // differently.
+        // No cutoff check here, and none is needed — but the reason is
+        // the open job below, not a rule spelled twice. Closing and
+        // having a job in flight are mutually exclusive states of this
+        // journal: signing a close start is refused while a job is
+        // open, and a finalized contest or close is refused until the
+        // watcher has ended it. So a channel that is closing has no
+        // open job, and this reads as the phase refusal it is.
         let job = self.open_job("crediting a payment")?;
         // A provider credits what it has delivered. A client has no
         // delivery marker of its own; what it has is the verdict its own
@@ -1748,17 +1831,7 @@ impl ChannelState {
         // whichever of the two reaches that file first is the one that
         // happened.
         if self.role == Role::Client {
-            // Unreachable through a client's own journal: a client
-            // cannot hold a result without having recorded a receipt, a
-            // receipt needs a cursor, and a cursor never goes back. It
-            // is a refusal rather than an assumed height because this
-            // rule must not pass for want of a number. No test isolates
-            // it, and none claims to.
-            let Some((height, _)) = self.cursor else {
-                return Err(ChannelStateError::NoCursor {
-                    step: "signing a payment",
-                });
-            };
+            let (height, _) = self.cursor;
             if height > job.authorization.payment_deadline {
                 return Err(ChannelStateError::PaymentLate {
                     height,
@@ -2082,6 +2155,16 @@ impl ChannelStore {
     /// is a channel constant: a payment edge's value is fixed when it is
     /// opened, and every payment this store admits is bounded by it.
     ///
+    /// `origin` is where the channel begins: the finalized block that
+    /// carried its payment Open, which the setup handshake recorded.
+    /// The cursor starts there rather than at nothing, and that is the
+    /// whole of why it is required. A store that began with no cursor
+    /// would have its watcher anchor at whatever height it first
+    /// caught up to — skipping every block between the channel opening
+    /// and that catch-up, and with them every close and every payment
+    /// those blocks carried. The origin's payment edge must be this
+    /// channel's, so the height cannot be another channel's.
+    ///
     /// A job left in its running phase by the process that did not come
     /// back makes the state indeterminate. Opening does not resolve it,
     /// does not invoke anything, and refuses a result for it.
@@ -2099,15 +2182,23 @@ impl ChannelStore {
     /// # Errors
     ///
     /// [`WorkStoreError::Journal`] when a file is held, corrupt, or
-    /// another journal, and [`WorkStoreError::Channel`] when a replayed
-    /// record does not obey the transition rules.
+    /// another journal, and [`WorkStoreError::Channel`] when the origin
+    /// is another channel's or a replayed record does not obey the
+    /// transition rules.
     pub fn open<V: SigVerifier>(
         root: &Path,
         channel: PaidChannel,
         settlement: WorkPaymentSettlement,
         role: Role,
+        origin: SetupOrigin,
         verifier: &V,
     ) -> Result<Self, WorkStoreError> {
+        if origin.payment_edge != channel.payment_edge() {
+            return Err(ChannelStateError::WrongChannel {
+                field: "setup origin payment_edge",
+            }
+            .into());
+        }
         let loss = CounterpartyLoss::open(root, channel.network(), channel.client_key(), role)?;
         let key = channel_key(&channel).into_bytes();
         let (journal, replay) = Journal::open(
@@ -2123,7 +2214,7 @@ impl ChannelStore {
         // credit rule reads [`ChannelState::loss`], and a rule re-run
         // over a total that only existed later is a rule asking a
         // different question than the one that was answered.
-        let mut state = ChannelState::new(channel, settlement, role, LossTotals::default());
+        let mut state = ChannelState::new(channel, settlement, role, LossTotals::default(), origin);
         let mut counted = BTreeSet::new();
         for bytes in &replay.records {
             let record = ChannelRecord::decode(bytes)?;
