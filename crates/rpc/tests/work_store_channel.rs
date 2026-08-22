@@ -1909,17 +1909,19 @@ fn channel_journal_id(root: &std::path::Path, role: Role) -> JournalId {
     }
 }
 
-/// A job whose loss is already on the disk goes no further than its
-/// ending.
+/// A job whose loss reached the disk is ended by the store that opens
+/// it.
 ///
-/// Ending a job writes two files, the loss first. The crash between them
-/// leaves the loss counted and the job reading as open, and from there
-/// the phase rules alone would let it be carried forward and paid for —
-/// crediting the client for a job whose price stays in a ledger that
-/// never gives anything back. The client would have paid *and* be short
-/// of that much credit, for good.
+/// Ending a job writes two files, the loss first, and they cannot share
+/// one `fsync`. The crash between them leaves the loss counted and the
+/// job reading as open — a state in which the price is charged twice
+/// against the credit limit, a payment would credit a job whose price
+/// no ledger gives back, and the channel can never be closed, because a
+/// close start is refused while a job is open. So opening finishes the
+/// write rather than reporting it, and no caller ever sees the state
+/// between the two files.
 #[test]
-fn a_job_whose_loss_is_recorded_takes_no_step_but_its_ending() {
+fn a_job_whose_loss_reached_the_disk_is_ended_when_the_store_opens() {
     let channel = channel();
     let verifier = Secp256k1Verifier::new();
 
@@ -1955,37 +1957,14 @@ fn a_job_whose_loss_is_recorded_takes_no_step_but_its_ending() {
         }
 
         let mut recovered = open(dir.path(), Role::Provider);
-        assert_eq!(recovered.loss().compute, compute, "case {label}");
-        let Some(open_job) = recovered.state().job() else {
-            panic!("case {label}: the job still reads as open");
-        };
-        assert_eq!(open_job.work_id(), job.work_id);
-
-        let next = provider_sequence(&channel, &job)[prefix].clone();
-        let before = recovered.len();
-        let error = recovered
-            .commit(next, &verifier)
-            .expect_err("this job's ending was already decided");
         assert!(
-            matches!(
-                error,
-                WorkStoreError::Channel(ChannelStateError::LossRecorded)
-            ),
-            "case {label}: unexpected error: {error}"
+            recovered.state().job().is_none(),
+            "case {label}: the interrupted ending is finished"
         );
-        assert_eq!(recovered.len(), before, "case {label}: nothing is written");
+        assert_eq!(recovered.state().compute_outstanding(), 0, "case {label}");
+        assert_eq!(recovered.state().delivery_outstanding(), 0, "case {label}");
 
-        // The one step that is left, and the loss it already wrote is
-        // counted once.
-        if let Err(error) = recovered.commit(
-            ChannelRecord::JobEnded {
-                reason: JobEnd::Expired,
-            },
-            &verifier,
-        ) {
-            panic!("case {label}: the ending re-commits: {error}");
-        }
-        assert!(recovered.state().job().is_none(), "case {label}");
+        // The loss it already wrote is counted once, not twice.
         assert_eq!(recovered.loss().compute, compute, "case {label}");
         assert_eq!(recovered.loss().delivery, delivery, "case {label}");
         assert_eq!(
@@ -1993,6 +1972,29 @@ fn a_job_whose_loss_is_recorded_takes_no_step_but_its_ending() {
             0,
             "case {label}: nothing was paid for"
         );
+
+        // And the step the interrupted process would have gone on to
+        // write has no job left to be about.
+        let next = provider_sequence(&channel, &job)[prefix].clone();
+        let before = recovered.len();
+        let error = recovered
+            .commit(next, &verifier)
+            .expect_err("this job is over");
+        assert!(
+            matches!(
+                error,
+                WorkStoreError::Channel(ChannelStateError::WrongPhase { phase: "none", .. })
+            ),
+            "case {label}: unexpected error: {error}"
+        );
+        assert_eq!(recovered.len(), before, "case {label}: nothing is written");
+
+        // Opening again writes nothing more: the ending is on the disk.
+        let length = recovered.len();
+        drop(recovered);
+        let reopened = open(dir.path(), Role::Provider);
+        assert_eq!(reopened.len(), length, "case {label}");
+        assert_eq!(reopened.loss().compute, compute, "case {label}");
     }
 }
 

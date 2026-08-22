@@ -344,7 +344,6 @@ const fn channel_refusal(error: &ChannelStateError) -> WorkRefusal {
         }
         ChannelStateError::WrongPhase { .. }
         | ChannelStateError::OverCredit { .. }
-        | ChannelStateError::LossRecorded
         | ChannelStateError::Closing { .. }
         | ChannelStateError::Indeterminate => WorkRefusal::Declined,
         ChannelStateError::ReceiptLate { .. } | ChannelStateError::PaymentLate { .. } => {

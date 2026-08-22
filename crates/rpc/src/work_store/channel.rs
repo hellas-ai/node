@@ -236,10 +236,6 @@ pub enum ChannelStateError {
         /// What repeated.
         what: &'static str,
     },
-    /// This job's loss is already on the disk, so the ending it belongs
-    /// to is the only step left for it.
-    #[error("this job's loss is already recorded; only its ending may be committed now")]
-    LossRecorded,
     /// A record's bytes were not canonical.
     #[error("channel record is not canonical")]
     Malformed,
@@ -576,24 +572,6 @@ impl ChannelRecord {
             }
         }
         out
-    }
-
-    /// Whether this record carries the open job forward.
-    ///
-    /// The six steps between a proposal and its payment. Not the
-    /// ending, which is what stops it; not the proposal, which is what
-    /// there would be no open job without; and not the cursor or the
-    /// close records, which say nothing about a job.
-    const fn advances_the_open_job(&self) -> bool {
-        matches!(
-            self,
-            Self::JobAccepted { .. }
-                | Self::JobRunning
-                | Self::JobResult { .. }
-                | Self::PlaintextReleased
-                | Self::ResultVerified
-                | Self::CertificateAdmitted { .. }
-        )
     }
 
     /// Reads one record from exactly its canonical bytes.
@@ -2245,12 +2223,49 @@ impl ChannelStore {
             .job
             .as_ref()
             .is_some_and(|job| job.phase == JobPhase::Running);
-        Ok(Self {
+        let mut store = Self {
             journal,
             loss,
             state,
             torn_tail: replay.truncated_tail,
-        })
+        };
+        store.finish_interrupted_ending(verifier)?;
+        Ok(store)
+    }
+
+    /// Writes the ending whose loss is already on the disk.
+    ///
+    /// The other half of the two-file write [`Self::commit`] describes.
+    /// The loss goes first, so the crash between them leaves a job
+    /// whose price is already charged to this counterparty and whose
+    /// journal still reads as open. That state is not one any caller
+    /// may act from: it double-counts the price against the credit
+    /// limit, it would let a payment credit a job whose price a ledger
+    /// will never give back, and — because a close start is refused
+    /// while a job is open — it is a channel that can never be closed.
+    ///
+    /// So opening finishes it rather than reporting it. The reason is
+    /// not guessed: [`ChannelState::loss_of`] charges this counterparty
+    /// for one ending only, so a loss on the disk for the open job is
+    /// an expiry that was decided and interrupted. Recording the same
+    /// amounts again is what the loss ledger already counts once.
+    fn finish_interrupted_ending<V: SigVerifier>(
+        &mut self,
+        verifier: &V,
+    ) -> Result<(), WorkStoreError> {
+        let Some(job) = self.state.job.as_ref() else {
+            return Ok(());
+        };
+        if !self.loss.holds(job.work_id) {
+            return Ok(());
+        }
+        self.commit(
+            ChannelRecord::JobEnded {
+                reason: JobEnd::Expired,
+            },
+            verifier,
+        )?;
+        Ok(())
     }
 
     /// Returns whether opening removed an interrupted write.
@@ -2285,20 +2300,15 @@ impl ChannelStore {
     /// written twice, so retrying after a crash between the write and
     /// the release costs nothing and changes nothing.
     ///
-    /// Ending a job writes two files. The counterparty's loss goes
-    /// first, so a crash between them leaves the loss counted and the
-    /// job still open — which over-counts what the client owes until
-    /// the ending is re-committed, and never under-counts it.
-    ///
-    /// Re-committing that ending is then the *only* step this store
-    /// will take for that job. A journal alone cannot see it: the job
-    /// reads as open, so a late payment would credit it while its price
-    /// stayed in a ledger that has no way to give it back, and the
-    /// client would have both paid and been charged. The loss file is
-    /// consulted here rather than on replay, because once the ending is
-    /// recorded the phase rules say the same thing from the journal
-    /// itself — and a replay that judged old records by a file which
-    /// outlived them is the defect this store had once already.
+    /// Ending a job writes two files, and they cannot share one
+    /// `fsync`. The counterparty's loss goes first, so a crash between
+    /// them leaves the loss counted and the job reading as open —
+    /// which over-counts what the client owes, and never under-counts
+    /// it. What makes the pair atomic anyway is that no endpoint ever
+    /// sees the state between them: an append that fails poisons the
+    /// journal (see [`super::journal`]), so this store takes no further
+    /// step at all, and [`ChannelStore::open`] finishes the ending
+    /// before it hands back a state.
     ///
     /// # Errors
     ///
@@ -2317,20 +2327,7 @@ impl ChannelStore {
             ChannelRecord::JobEnded { reason } => next.loss_of(reason),
             _ => None,
         };
-        // Read before the record is applied, because a payment is one
-        // of the steps that would close the job this asks about.
-        let decided = self
-            .state
-            .job
-            .as_ref()
-            .is_some_and(|job| self.loss.holds(job.work_id));
         if next.apply(&record, verifier)? == Applied::Changed {
-            // Gated on `Changed`, so a record this state already holds
-            // is still the free retry it was: the refusal is for a job
-            // being carried forward, never for one being repeated.
-            if decided && record.advances_the_open_job() {
-                return Err(ChannelStateError::LossRecorded.into());
-            }
             if let Some((work_id, compute, delivery)) = loss {
                 self.loss.record(work_id, compute, delivery)?;
                 // Installed on the live state as well as on the one
