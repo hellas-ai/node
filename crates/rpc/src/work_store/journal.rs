@@ -23,25 +23,36 @@
 //! orderly. The frame is not on the disk until `sync_all` returns, and
 //! until then it is pages in a cache that reach the platter in whatever
 //! order they like — while the file's length may already have grown.
-//! A record here runs to [`MAX_RECORD_BYTES`], hundreds of pages, so
-//! the last frame can come back full-length with a hole in it, or with
-//! a length field that is not a length at all.
 //!
-//! So the rule is about *position*, not about shape: a frame that does
-//! not verify and has nothing after it is the interrupted append, in
-//! whichever of those shapes, and recovery truncates it. A frame that
-//! does not verify with bytes after it is not an interrupted append —
-//! those bytes were written later, so this one was complete once. That
-//! is a file that is not the file this endpoint wrote, and recovery
-//! refuses it rather than reconstructing an earlier state the endpoint
-//! may already have acted past: [`JournalError::Corrupt`], deliberately
-//! terminal.
+//! So the rule is about *extent*, and only about extent. A frame whose
+//! bytes are not all in the file is an append the file ends inside:
+//! nothing was written after it, its writer was never given an `Ok`,
+//! and recovery truncates it. A frame whose bytes are all there and
+//! whose digest does not verify is a different thing — it is
+//! indistinguishable from a record this endpoint was told it had
+//! written and may already have acted on. Recovery refuses the file
+//! rather than reconstructing a state behind one: it is
+//! [`JournalError::Corrupt`], deliberately terminal, wherever in the
+//! file it is.
 //!
-//! The cost of that rule is named: media rot in the *last* frame is
-//! silently truncated rather than refused. It is the trade this file
-//! chooses, because the alternative wedges a channel permanently on the
-//! failure it is most likely to meet, and because the record it drops
-//! is one whose writer was never given an `Ok`.
+//! That is the fail-closed half of the trade, and it is chosen over the
+//! other one. Truncating a complete-length frame silently drops a
+//! record whose signature may already be in a peer's hands, and the
+//! endpoint would then contradict what it has promised — which is the
+//! one failure this whole module family exists to stop. A channel that
+//! will not open is loud and an operator can act on it; an endpoint
+//! quietly behind its own signature is neither.
+//!
+//! # A failed append is terminal for the writer
+//!
+//! [`Journal::append`] either returns after `fsync` or poisons the
+//! journal. A write or a sync that fails leaves the file in a state
+//! this process cannot describe: a prefix may be on the platter, the
+//! length may have grown, and the sequence this frame would occupy may
+//! or may not be free. So no further append is admitted through that
+//! handle — [`JournalError::Poisoned`] — and the only way on is to
+//! reopen, which is the one path that reads the file and finds out what
+//! is actually there.
 //!
 //! # What it is not
 //!
@@ -218,6 +229,10 @@ pub enum JournalError {
         /// Length the record claimed.
         len: usize,
     },
+    /// An earlier append failed, so what this file holds is unknown to
+    /// this handle. Reopening is the only way to find out.
+    #[error("an earlier append failed; this journal must be reopened before it is written again")]
+    Poisoned,
 }
 
 /// What opening a journal found.
@@ -242,6 +257,7 @@ pub struct Journal {
     path: PathBuf,
     header: Digest,
     next_seq: u64,
+    poisoned: bool,
 }
 
 impl Journal {
@@ -283,6 +299,7 @@ impl Journal {
             path,
             header,
             next_seq: 0,
+            poisoned: false,
         };
 
         if bytes.is_empty() {
@@ -373,14 +390,12 @@ impl Journal {
                 break;
             };
             if stored != frame_digest(self.header, self.next_seq, payload).as_bytes() {
-                // Nothing after it: the interrupted append, arrived out
-                // of order or short, and never acknowledged. Bytes after
-                // it: this frame was whole when they were written, so
-                // what changed it was not a crash.
-                if frame.len() == rest.len() {
-                    truncated_tail = true;
-                    break;
-                }
+                // Every byte this frame claims is in the file, so it was
+                // long enough to be a complete append — and a complete
+                // append is one whose caller may have been given an
+                // `Ok`. Nothing here can tell that from a machine that
+                // died mid-flush, so the file is refused rather than
+                // read back one record short of what a peer may hold.
                 return Err(JournalError::Corrupt { seq: self.next_seq });
             }
             records.push(payload.to_vec());
@@ -404,11 +419,24 @@ impl Journal {
 
     /// Appends one record and returns only once it is on the disk.
     ///
+    /// A write or a sync that fails poisons this handle: what the file
+    /// holds afterwards is not something this process can describe, and
+    /// a second append would be a guess about where the next frame
+    /// starts and which sequence is free. Every later call is refused
+    /// until the journal is reopened and the file is read again.
+    ///
+    /// A record refused for its *size* is not one of those. Nothing was
+    /// written, so nothing is unknown, and the journal stays usable.
+    ///
     /// # Errors
     ///
-    /// [`JournalError::RecordTooLarge`] above [`MAX_RECORD_BYTES`], and
-    /// [`JournalError::Io`] when the write or the sync fails.
+    /// [`JournalError::RecordTooLarge`] above [`MAX_RECORD_BYTES`],
+    /// [`JournalError::Poisoned`] after any earlier append failed, and
+    /// [`JournalError::Io`] when this write or its sync fails.
     pub fn append(&mut self, payload: &[u8]) -> Result<(), JournalError> {
+        if self.poisoned {
+            return Err(JournalError::Poisoned);
+        }
         if payload.len() > MAX_RECORD_BYTES {
             return Err(JournalError::RecordTooLarge { len: payload.len() });
         }
@@ -422,12 +450,20 @@ impl Journal {
         frame.extend_from_slice(digest.as_bytes());
         // One `write_all` of the whole frame: the most an interrupted
         // *process* can leave behind is a short prefix of it, rather
-        // than a length and a payload from two different calls. It says
-        // nothing about an interrupted machine, whose pages land in
-        // their own order; that case is recovery's, above.
-        self.file.write_all(&frame)?;
-        self.file.sync_all()?;
+        // than a length and a payload from two different calls.
+        //
+        // Poisoned before the failure is reported, so a caller cannot
+        // answer an i/o error by offering the next record.
+        self.write_frame(&frame).inspect_err(|_| {
+            self.poisoned = true;
+        })?;
         self.next_seq = self.next_seq.saturating_add(1);
+        Ok(())
+    }
+
+    fn write_frame(&mut self, frame: &[u8]) -> Result<(), JournalError> {
+        self.file.write_all(frame)?;
+        self.file.sync_all()?;
         Ok(())
     }
 
@@ -476,5 +512,81 @@ fn sync_directory(path: &Path) -> Result<(), JournalError> {
         },
         Err(_) if cfg!(not(unix)) => Ok(()),
         Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Digest, Journal, JournalError, OpenOptions};
+
+    /// An append that fails takes the journal with it.
+    ///
+    /// The failure is real rather than simulated: the handle is a
+    /// read-only descriptor, so `write_all` returns the operating
+    /// system's own refusal. What the second call proves is that the
+    /// refusal is remembered — a writer that answered an i/o error by
+    /// offering the next record would be writing a frame at a sequence
+    /// it cannot know is free, over bytes it cannot know are there.
+    #[test]
+    fn a_failed_append_poisons_the_journal() {
+        let Ok(dir) = tempfile::tempdir() else {
+            panic!("a temporary directory");
+        };
+        let path = dir.path().join("unwritable.journal");
+        if let Err(error) = std::fs::write(&path, b"") {
+            panic!("the file is created: {error}");
+        }
+        let file = match OpenOptions::new().read(true).open(&path) {
+            Ok(file) => file,
+            Err(error) => panic!("the file opens for reading: {error}"),
+        };
+        let mut journal = Journal {
+            file,
+            path,
+            header: Digest::from_bytes([0_u8; 32]),
+            next_seq: 0,
+            poisoned: false,
+        };
+        match journal.append(b"one record") {
+            Err(JournalError::Io(_)) => {}
+            other => panic!("a read-only handle cannot be appended to: {other:?}"),
+        }
+        match journal.append(b"another record") {
+            Err(JournalError::Poisoned) => {}
+            other => panic!("the second append is refused without a write: {other:?}"),
+        }
+    }
+
+    /// A record refused for its size leaves the journal usable.
+    ///
+    /// Nothing was written, so nothing about the file is unknown, and
+    /// poisoning it would turn one caller's oversized record into a
+    /// channel that cannot be written again.
+    #[test]
+    fn an_oversized_record_does_not_poison_the_journal() {
+        use super::{JournalId, JournalKind, MAX_RECORD_BYTES, Role};
+
+        let Ok(dir) = tempfile::tempdir() else {
+            panic!("a temporary directory");
+        };
+        let (mut journal, _) = match Journal::open(
+            dir.path().join("sized.journal"),
+            JournalId {
+                kind: JournalKind::Channel,
+                role: Role::Provider,
+                key: [0x22; 32],
+            },
+        ) {
+            Ok(opened) => opened,
+            Err(error) => panic!("the journal opens: {error}"),
+        };
+        match journal.append(&vec![0_u8; MAX_RECORD_BYTES + 1]) {
+            Err(JournalError::RecordTooLarge { .. }) => {}
+            other => panic!("an oversized record is refused: {other:?}"),
+        }
+        if let Err(error) = journal.append(b"one record") {
+            panic!("the journal still takes a record: {error}");
+        }
+        assert_eq!(journal.len(), 1);
     }
 }

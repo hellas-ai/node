@@ -586,54 +586,35 @@ fn a_torn_tail_recovers_and_a_corrupt_frame_does_not() {
         );
     }
 
-    // A byte changed inside the *last* frame is the same interruption
-    // wearing another shape: a page that never landed. Nothing follows
-    // it, nothing acknowledged it, and it goes the same way.
-    let mut torn = whole.clone();
-    let last = torn.len().saturating_sub(64);
-    if let Some(byte) = torn.get_mut(last) {
-        *byte ^= 0xff;
+    // A byte changed inside a frame that is all there — the last one,
+    // or one with two more written after it. Both are long enough to
+    // have been complete appends, so both are records this endpoint may
+    // have been told it had written, and neither is read back as an
+    // earlier state.
+    for (label, at) in [
+        ("the last frame", whole.len().saturating_sub(64)),
+        ("a frame with two after it", header_len() + 8),
+    ] {
+        let mut corrupt = whole.clone();
+        if let Some(byte) = corrupt.get_mut(at) {
+            *byte ^= 0xff;
+        }
+        if let Err(error) = std::fs::write(&path, &corrupt) {
+            panic!("case {label}: the corrupt journal writes: {error}");
+        }
+        let error = SetupStore::open(
+            dir.path(),
+            network(),
+            bond_edge(),
+            Role::Provider,
+            &verifier,
+        )
+        .expect_err("a whole frame that does not verify is refused");
+        assert!(
+            matches!(error, WorkStoreError::Journal(JournalError::Corrupt { .. })),
+            "case {label}: unexpected error: {error}"
+        );
     }
-    if let Err(error) = std::fs::write(&path, &torn) {
-        panic!("the torn journal writes: {error}");
-    }
-    let recovered = match SetupStore::open(
-        dir.path(),
-        network(),
-        bond_edge(),
-        Role::Provider,
-        &verifier,
-    ) {
-        Ok(store) => store,
-        Err(error) => panic!("a torn last frame recovers: {error}"),
-    };
-    assert!(recovered.recovered_torn_tail());
-    assert_eq!(recovered.state().revision(), Some(2));
-    drop(recovered);
-
-    // A byte changed in a frame with two more written after it. Those
-    // two say this one was whole when they were written, so what
-    // changed it was not a crash, and no earlier state is invented from
-    // it.
-    let mut corrupt = whole;
-    if let Some(byte) = corrupt.get_mut(header_len() + 8) {
-        *byte ^= 0xff;
-    }
-    if let Err(error) = std::fs::write(&path, &corrupt) {
-        panic!("the corrupt journal writes: {error}");
-    }
-    let error = SetupStore::open(
-        dir.path(),
-        network(),
-        bond_edge(),
-        Role::Provider,
-        &verifier,
-    )
-    .expect_err("a corrupt frame is refused");
-    assert!(
-        matches!(error, WorkStoreError::Journal(JournalError::Corrupt { .. })),
-        "unexpected error: {error}"
-    );
 }
 
 /// The file one setup journal is kept in, derived the way the store
@@ -1208,26 +1189,18 @@ fn a_frame_cannot_be_moved_duplicated_or_lifted() {
     if let Err(error) = std::fs::write(&path, &duplicated) {
         panic!("the duplicated journal writes: {error}");
     }
-    let recovered = match SetupStore::open(
+    let error = SetupStore::open(
         dir.path(),
         network(),
         bond_edge(),
         Role::Provider,
         &verifier,
-    ) {
-        Ok(store) => store,
-        Err(error) => panic!("the journal opens: {error}"),
-    };
+    )
+    .expect_err("a frame at another position does not verify at it");
     assert!(
-        recovered.recovered_torn_tail(),
-        "a frame at another position does not verify at it"
+        matches!(error, WorkStoreError::Journal(JournalError::Corrupt { .. })),
+        "a whole copied frame is not a tear: {error}"
     );
-    assert_eq!(
-        recovered.len(),
-        3,
-        "the copy is not a fourth record, and the three real ones stand"
-    );
-    drop(recovered);
 
     // The same frames, under another channel's header.
     let elsewhere = EdgeId::from_bytes([0x88; EdgeId::LENGTH]);

@@ -2442,24 +2442,47 @@ fn a_corrupt_channel_journal_is_not_replayed_as_an_earlier_state() {
     );
 }
 
-/// A last frame that does not verify is the write that was interrupted,
-/// whatever shape the interruption left it in.
+/// A last frame the file ends inside is the write that was
+/// interrupted, and only that.
 ///
-/// A dead process leaves a short prefix, which the test above covers. A
-/// dead machine leaves whatever reached the platter: a frame that is
-/// full-length with a hole in it, a digest from a write that never
-/// finished, or a length field that is not a length. None of those was
-/// acknowledged, and refusing them all — as this journal once did — puts
-/// the endpoint permanently out of business over its most likely
-/// failure.
+/// The two shapes an append can leave the file ending inside: a short
+/// prefix of the frame, which a dead process leaves, and a length field
+/// that says the frame runs past the end of the file. Neither could
+/// have been acknowledged — there is no complete frame there to have
+/// acknowledged — so both truncate.
 #[test]
-fn an_interrupted_final_frame_is_removed_rather_than_refused() {
+fn an_append_the_file_ends_inside_is_removed() {
     let channel = channel();
     let job = job_at(&channel, 1, 0);
     let sequence = provider_sequence(&channel, &job);
 
-    let mut damage = verifiable_damage();
-    damage.push(("a length field that is not a length", unreadable_length));
+    type Tear = fn(&mut Vec<u8>, (usize, usize));
+    let damage: Vec<(&'static str, Tear)> = vec![
+        (
+            "a length field that is not a length",
+            |bytes, (start, _)| {
+                bytes[start..start + 4].copy_from_slice(&u32::MAX.to_be_bytes());
+            },
+        ),
+        (
+            "a frame the file stops nine bytes short of",
+            |bytes, (_, end)| {
+                bytes.truncate(end - 9);
+            },
+        ),
+        (
+            "a frame only its length field reached",
+            |bytes, (start, _)| {
+                bytes.truncate(start + 4);
+            },
+        ),
+        (
+            "a frame not even a whole length field reached",
+            |bytes, (start, _)| {
+                bytes.truncate(start + 2);
+            },
+        ),
+    ];
 
     for (label, break_it) in damage {
         let dir = temp();
@@ -2513,57 +2536,65 @@ fn an_interrupted_final_frame_is_removed_rather_than_refused() {
     }
 }
 
-/// The same damage with a frame after it is not an interrupted write.
+/// A frame whose bytes are all there and whose digest is wrong is
+/// refused, wherever in the file it is.
 ///
-/// Those later bytes were written after this frame was whole, so
-/// whatever changed it was not a crash — and reconstructing a state the
-/// endpoint may already have acted past is worse than refusing.
+/// The position is what used to decide this, and it was the wrong
+/// question. A frame that is long enough to be complete is a frame this
+/// endpoint may have been told it had written — so truncating it drops
+/// a record whose signature a peer may already hold, and the endpoint
+/// comes back contradicting what it promised. Being unable to open is
+/// the failure an operator can see.
 ///
-/// With one named exception, which is the price of reading a file by
-/// following its length fields: a length that is not a length says the
-/// file ends inside this frame, and nothing that follows can be found to
-/// contradict it. That case truncates, and takes records this endpoint
-/// *was* told it had written with it. It is pinned here because it is
-/// real, not because it is wanted.
+/// Both positions are checked, and the last frame is the one that
+/// matters: it is the only place the old rule differed.
 #[test]
-fn damage_with_a_frame_after_it_is_not_treated_as_a_tear() {
+fn a_complete_frame_that_does_not_verify_is_refused_wherever_it_is() {
     let channel = channel();
     let job = job_at(&channel, 1, 0);
     let sequence = provider_sequence(&channel, &job);
-    // The result record: three frames still follow it.
-    let wounded = 3;
+    // The result record, with three frames still after it; and the
+    // last record, with nothing after it at all.
+    let last = sequence.len() - 1;
 
     for (label, break_it) in verifiable_damage() {
-        let dir = temp();
-        let (path, starts) = frames_of(dir.path(), &channel, &sequence);
-        let Ok(mut bytes) = std::fs::read(&path) else {
-            panic!("case {label}: the journal reads");
-        };
-        break_it(&mut bytes, (starts[wounded], starts[wounded + 1]));
-        if let Err(error) = std::fs::write(&path, &bytes) {
-            panic!("case {label}: the damaged journal writes: {error}");
+        for wounded in [3, last] {
+            let dir = temp();
+            let (path, starts) = frames_of(dir.path(), &channel, &sequence);
+            let Ok(mut bytes) = std::fs::read(&path) else {
+                panic!("case {label}: the journal reads");
+            };
+            break_it(&mut bytes, (starts[wounded], starts[wounded + 1]));
+            if let Err(error) = std::fs::write(&path, &bytes) {
+                panic!("case {label}: the damaged journal writes: {error}");
+            }
+            let error = ChannelStore::open(
+                dir.path(),
+                channel.clone(),
+                settlement(),
+                Role::Provider,
+                &Secp256k1Verifier::new(),
+            )
+            .expect_err("a whole frame that does not verify is not a tear");
+            assert!(
+                matches!(error, WorkStoreError::Journal(JournalError::Corrupt { .. })),
+                "case {label} at frame {wounded}: unexpected error: {error}"
+            );
         }
-        let error = ChannelStore::open(
-            dir.path(),
-            channel.clone(),
-            settlement(),
-            Role::Provider,
-            &Secp256k1Verifier::new(),
-        )
-        .expect_err("a frame with records after it was whole once");
-        assert!(
-            matches!(error, WorkStoreError::Journal(JournalError::Corrupt { .. })),
-            "case {label}: unexpected error: {error}"
-        );
     }
 
-    // The exception, exactly as far as it goes.
+    // The one exception, and it is the price of reading a file by
+    // following its length fields: a length that says the file ends
+    // inside this frame cannot be seen past, so nothing after it is
+    // found to contradict it. That case truncates, and takes records
+    // this endpoint *was* told it had written with it. It is pinned
+    // because it is real, not because it is wanted.
     let dir = temp();
     let (path, starts) = frames_of(dir.path(), &channel, &sequence);
     let Ok(mut bytes) = std::fs::read(&path) else {
         panic!("the journal reads");
     };
-    unreadable_length(&mut bytes, (starts[wounded], starts[wounded + 1]));
+    unreadable_length(&mut bytes, (starts[3], starts[4]));
     if let Err(error) = std::fs::write(&path, &bytes) {
         panic!("the damaged journal writes: {error}");
     }
@@ -2571,7 +2602,7 @@ fn damage_with_a_frame_after_it_is_not_treated_as_a_tear() {
     assert!(recovered.recovered_torn_tail());
     assert_eq!(
         recovered.len(),
-        wounded as u64,
+        3,
         "everything from the unreadable length onwards is gone"
     );
 }
