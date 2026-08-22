@@ -385,6 +385,19 @@ impl SetupState {
         self.bundle.as_ref().map(WorkChannelSetupBundleV1::revision)
     }
 
+    /// Returns the retained revision itself.
+    ///
+    /// Beside [`Self::bundle_bytes`] rather than instead of it, and the
+    /// two are for different things. An endpoint that is *re-exporting*
+    /// what it already exported wants the bytes, verbatim. An endpoint
+    /// that is about to add its own signature wants the value, because
+    /// re-decoding bytes this journal has already decoded and checked
+    /// would be a second parse whose failure would have no meaning.
+    #[must_use]
+    pub const fn bundle(&self) -> Option<&WorkChannelSetupBundleV1> {
+        self.bundle.as_ref()
+    }
+
     /// Returns the exact bytes of the retained revision.
     ///
     /// The bytes that were handed in, kept verbatim rather than

@@ -252,13 +252,13 @@ impl core::fmt::Display for WorkRefusal {
 ///
 /// The text is for an operator reading a log. Nothing decides on it, no
 /// digest covers it, and no test asserts its wording.
-struct Refusal {
-    code: WorkRefusal,
-    reason: String,
+pub(crate) struct Refusal {
+    pub(crate) code: WorkRefusal,
+    pub(crate) reason: String,
 }
 
 impl Refusal {
-    fn new(code: WorkRefusal, reason: impl Into<String>) -> Self {
+    pub(crate) fn new(code: WorkRefusal, reason: impl Into<String>) -> Self {
         Self {
             code,
             reason: reason.into(),

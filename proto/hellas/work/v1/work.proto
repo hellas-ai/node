@@ -44,6 +44,68 @@ service Work {
   rpc AdmitCertificate(AdmitCertificateRequest) returns (AdmitCertificateResponse);
 }
 
+// The carrier for the offline two-Open handshake: how the bond and the
+// payment channel that every call above presumes get opened by two
+// endpoints that have never met.
+//
+// A separate service from `Work` because it is a separate lifetime. The
+// handler here owns a setup journal and no channel; the handler there
+// owns a channel and no setup journal. Folding them into one service
+// would make every paid method answer for a channel that does not exist
+// yet, and every setup method answer for one that already does.
+service WorkSetup {
+  // One step of the handshake: the caller offers the revision it holds,
+  // and is answered with the revision that extends it.
+  //
+  // Symmetric in shape and asymmetric in who acts. The client drives,
+  // because the client dials: it asks with nothing and is given the
+  // provider's bond proposal, it asks with its own countersigned
+  // payment proposal and is given the provider's countersignature.
+  //
+  // The provider journals every revision — the one it imports and the
+  // one it signs — before either leaves the process, which is
+  // `SetupStore`'s rule and the reason this is not a function that
+  // signs in the handler.
+  //
+  // A replay of the same call returns the same bytes and writes
+  // nothing: the journal recognises a revision it already holds.
+  rpc ExchangeSetup(ExchangeSetupRequest) returns (ExchangeSetupResponse);
+}
+
+message ExchangeSetupRequest {
+  // Canonical `WorkChannelSetupBundleV1` the caller has journaled, or
+  // empty to ask for the provider's own proposal.
+  //
+  // Empty is unambiguous rather than a sentinel: no revision encodes to
+  // zero bytes, so there is nothing an empty field could be confused
+  // with.
+  //
+  // Nothing else is carried, and nothing else is needed. The bundle
+  // names the network, both parties, and the bond edge this journal is
+  // keyed to, and every signature it carries is checked against the
+  // party its own terms name — so this request identifies itself and
+  // authorises itself out of the same bytes. There is no id here whose
+  // possession would grant anything: a caller replaying a captured
+  // revision gets back a revision the provider had already exported to
+  // the party that signed it, and cannot produce a revision that party
+  // did not sign.
+  bytes bundle = 1;
+}
+
+message ExchangeSetupResponse {
+  oneof outcome {
+    SetupAdvanced advanced = 1;
+    WorkRefused refused = 2;
+  }
+}
+
+message SetupAdvanced {
+  // Canonical `WorkChannelSetupBundleV1`: the revision the answering
+  // endpoint has journaled, which is the caller's own plus whatever
+  // this endpoint added to it.
+  bytes bundle = 1;
+}
+
 message AcceptWorkRequest {
   // Canonical `PaidJobAuthorizationV1`, envelope included.
   bytes authorization = 1;

@@ -176,6 +176,21 @@ mod id_pins {
         assert_eq!(<AdmitCertificate as MethodMarker>::METHOD_ID, 0x0ffb_b4f9);
     }
 
+    /// The handshake carrier is its own service, so its ids are its own.
+    ///
+    /// Pinned separately from `Work` above for the reason both are
+    /// pinned at all: these two services are mounted on different ALPNs
+    /// and answered by different handlers, and a build that rotated one
+    /// would otherwise be caught only by whichever of them a test
+    /// happened to dial.
+    #[cfg(feature = "work")]
+    #[test]
+    fn work_setup_ids_are_stable() {
+        use super::services::work_setup::{ExchangeSetup, WorkSetup};
+        assert_eq!(<WorkSetup as ServiceMarker>::SERVICE_ID, 0x0235_ddf0);
+        assert_eq!(<ExchangeSetup as MethodMarker>::METHOD_ID, 0x1cde_46e8);
+    }
+
     #[cfg(feature = "chain")]
     #[test]
     fn chain_ids_are_stable() {

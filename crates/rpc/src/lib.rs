@@ -30,6 +30,10 @@ pub mod work;
 /// measured against, and the close that spends a certificate.
 #[cfg(feature = "work")]
 pub mod work_close;
+/// The two-Open handshake on the wire: the exchange that gives two
+/// endpoints a channel to do paid work on.
+#[cfg(feature = "work")]
+pub mod work_handshake;
 /// Durable endpoint state for paid work: the setup journal, the channel
 /// journal, and the counterparty loss ledger.
 #[cfg(feature = "work")]
