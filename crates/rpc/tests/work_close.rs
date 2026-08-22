@@ -181,7 +181,6 @@ fn execution_policy() -> PaidExecutionPolicyV1 {
         max_prompt_tokens: 512,
         max_new_tokens: 128,
         max_stop_token_ids: 4,
-        max_canonical_output_bytes: 65_536,
         max_spool_bytes: 1_048_576,
         max_encoded_result_frame: WIDE_FRAME,
         max_encoded_quote_response: 1_048_576,
@@ -1200,7 +1199,12 @@ async fn a_job_after_the_cutoff_is_refused() {
     );
 }
 
-/// A start that can no longer be included stops holding the gate shut.
+/// A start that can no longer be included is replaced, and one that
+/// can is offered again.
+///
+/// This is about which bytes `prepare_close` hands back and nothing
+/// else — that the same expiry also reopens the channel to work is
+/// `a_start_that_never_landed_reopens_the_channel`'s.
 ///
 /// The cursor is the whole proof. It is contiguous, so every block up
 /// to it was read: a contest opened by the old start would be on this

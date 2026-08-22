@@ -394,8 +394,6 @@ pub struct PaidExecutionPolicyV1 {
     pub max_new_tokens: u32,
     /// Largest stop-token list this channel accepts.
     pub max_stop_token_ids: u16,
-    /// Largest canonical output the oracle will be asked to compare.
-    pub max_canonical_output_bytes: u64,
     /// Largest spool the provider may retain for one job.
     pub max_spool_bytes: u64,
     /// Largest complete encoded result frame, transport framing
@@ -415,7 +413,7 @@ pub struct PaidExecutionPolicyV1 {
 
 impl PrivateRecord for PaidExecutionPolicyV1 {
     const TAG: u8 = tag::PAID_EXECUTION_POLICY;
-    const BODY_SIZE: usize = 3 * 32 + 4 + 4 + 2 + 8 + 8 + 4 + 4 + 8 + 8 + 8 + 8;
+    const BODY_SIZE: usize = 3 * 32 + 4 + 4 + 2 + 8 + 4 + 4 + 8 + 8 + 8 + 8;
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(self.allowed_environment.as_bytes());
@@ -424,7 +422,6 @@ impl PrivateRecord for PaidExecutionPolicyV1 {
         put_u32(out, self.max_prompt_tokens);
         put_u32(out, self.max_new_tokens);
         out.extend_from_slice(&self.max_stop_token_ids.to_be_bytes());
-        put_u64(out, self.max_canonical_output_bytes);
         put_u64(out, self.max_spool_bytes);
         put_u32(out, self.max_encoded_result_frame);
         put_u32(out, self.max_encoded_quote_response);
@@ -442,7 +439,6 @@ impl PrivateRecord for PaidExecutionPolicyV1 {
             max_prompt_tokens: reader.u32()?,
             max_new_tokens: reader.u32()?,
             max_stop_token_ids: reader.u16()?,
-            max_canonical_output_bytes: reader.u64()?,
             max_spool_bytes: reader.u64()?,
             max_encoded_result_frame: reader.u32()?,
             max_encoded_quote_response: reader.u32()?,
@@ -1162,10 +1158,6 @@ pub fn check_execution_policy(policy: &PaidExecutionPolicyV1) -> Result<(), Paid
         ("fixed_price", policy.fixed_price),
         ("max_prompt_tokens", u64::from(policy.max_prompt_tokens)),
         ("max_new_tokens", u64::from(policy.max_new_tokens)),
-        (
-            "max_canonical_output_bytes",
-            policy.max_canonical_output_bytes,
-        ),
         ("max_spool_bytes", policy.max_spool_bytes),
         (
             "max_encoded_result_frame",

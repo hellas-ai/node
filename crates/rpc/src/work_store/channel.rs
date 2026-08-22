@@ -420,10 +420,13 @@ pub enum ChannelRecord {
     /// bytes.
     ///
     /// Written before the signature leaves the process, like every
-    /// other signature here — and it is also the cutoff: from this
-    /// record on the channel admits no new job and credits no new
-    /// certificate, because a close that left out a certificate it was
-    /// still admitting would be a close below what was earned.
+    /// other signature here — and it is the cutoff for as long as those
+    /// bytes could still reach a block. While they could, the channel
+    /// admits no new job and credits no new certificate, because a
+    /// close that left out a certificate it was still admitting would
+    /// be a close below what was earned. Once the window has passed
+    /// with no contest on this disk, the signature can reach nothing
+    /// and holds nothing shut; see [`ChannelState::is_closing`].
     ClosePrepared {
         /// The signed start, exactly as it will be submitted.
         ///
@@ -1057,9 +1060,11 @@ impl ChannelState {
 
     /// Returns the close start this endpoint signed and retains.
     ///
-    /// What a resubmission sends. It stays here until a finalized block
-    /// shows a contest opened, or until the cursor has passed the last
-    /// height the signature could have been included at.
+    /// What a resubmission sends, and only while
+    /// [`Self::includable_close_start`] still offers it: the record
+    /// itself is never taken back — nothing on this journal is — but a
+    /// signature whose window has passed is history rather than a
+    /// pending close.
     #[must_use]
     pub const fn close_prepared(&self) -> Option<&PaymentCloseStart> {
         self.close_prepared.as_ref()

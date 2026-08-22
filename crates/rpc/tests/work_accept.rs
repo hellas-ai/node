@@ -144,7 +144,6 @@ fn execution_policy() -> PaidExecutionPolicyV1 {
         max_prompt_tokens: 512,
         max_new_tokens: 128,
         max_stop_token_ids: 4,
-        max_canonical_output_bytes: 65_536,
         max_spool_bytes: 1_048_576,
         max_encoded_result_frame: 262_144,
         max_encoded_quote_response: 1_048_576,

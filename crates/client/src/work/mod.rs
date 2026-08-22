@@ -39,13 +39,14 @@
 //!
 //! # What is not here
 //!
-//! No retry loop and no deadline timer. Both need a running finalized
-//! cursor to be bounded by, and nothing in this tree advances one yet;
-//! a loop written now would poll until it was killed. What this module
-//! gives a caller instead is the provider's own answer about whether
-//! asking again could help — [`CollectOutcome::NotReady`] — so the
-//! policy that owns a clock can be written over a signal rather than a
-//! guess.
+//! No retry loop and no deadline timer. The cursor they would be
+//! bounded by does move — `hellas_rpc::work_close::catch_up` is what
+//! moves it, and `ClientEndpoint::catch_up` is how this endpoint asks
+//! it to — but nothing here owns a clock, and a loop written without
+//! one polls until it is killed. What this module gives a caller
+//! instead is the provider's own answer about whether asking again
+//! could help — [`CollectOutcome::NotReady`] — so the policy that owns
+//! a clock can be written over a signal rather than a guess.
 
 pub mod oracle;
 pub mod payment;

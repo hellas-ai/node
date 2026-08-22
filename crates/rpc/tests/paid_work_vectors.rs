@@ -228,7 +228,6 @@ fn execution_policy() -> PaidExecutionPolicyV1 {
         max_prompt_tokens: 8,
         max_new_tokens: 64,
         max_stop_token_ids: 4,
-        max_canonical_output_bytes: 4096,
         max_spool_bytes: 65_536,
         max_encoded_result_frame: 262_144,
         max_encoded_quote_response: 1_048_576,
@@ -280,8 +279,8 @@ fn job_result(work_id: Digest) -> PaidJobResultV1 {
 fn golden_record_encodings_are_pinned() {
     assert_eq!(PaidChannelPolicyV1::BODY_SIZE, 16);
     assert_eq!(PaidChannelPolicyV1::ENCODED_SIZE, 18);
-    assert_eq!(PaidExecutionPolicyV1::BODY_SIZE, 162);
-    assert_eq!(PaidExecutionPolicyV1::ENCODED_SIZE, 164);
+    assert_eq!(PaidExecutionPolicyV1::BODY_SIZE, 154);
+    assert_eq!(PaidExecutionPolicyV1::ENCODED_SIZE, 156);
     assert_eq!(PaidJobAuthorizationV1::BODY_SIZE, 328);
     assert_eq!(PaidJobAuthorizationV1::ENCODED_SIZE, 330);
     assert_eq!(PaidJobResultV1::BODY_SIZE, 96);
@@ -338,7 +337,6 @@ fn golden_record_encodings_are_pinned() {
         max_prompt_tokens: 1,
         max_new_tokens: 2,
         max_stop_token_ids: 3,
-        max_canonical_output_bytes: 4,
         max_spool_bytes: 5,
         max_encoded_result_frame: 6,
         max_encoded_quote_response: 7,
@@ -358,7 +356,6 @@ fn golden_record_encodings_are_pinned() {
             "00000001", // max_prompt_tokens
             "00000002", // max_new_tokens
             "0003", // max_stop_token_ids
-            "0000000000000004", // max_canonical_output_bytes
             "0000000000000005", // max_spool_bytes
             "00000006", // max_encoded_result_frame
             "00000007", // max_encoded_quote_response
@@ -548,7 +545,7 @@ fn a_body_cannot_be_reinterpreted_under_another_record() {
         PaidJobAuthorizationV1::decode(&policy),
         Err(PaidWorkError::RecordLength {
             expected: 330,
-            actual: 164
+            actual: 156
         })
     );
 
@@ -560,7 +557,7 @@ fn a_body_cannot_be_reinterpreted_under_another_record() {
         PaidJobAuthorizationV1::decode(&disguised),
         Err(PaidWorkError::RecordLength {
             expected: 330,
-            actual: 164
+            actual: 156
         })
     );
 }
@@ -581,7 +578,7 @@ fn golden_digests_bind_the_encoded_network() {
     );
     assert_eq!(
         hex(&work_id(&channel, &authorization()).into_bytes()),
-        "f80e92feefa240a2323f8eddfbf4e75838485818763e8641ebda92631c9f7524"
+        "31da0ee655712af1122b16e94eccb2d9a511089bfc9cb7cdbcbffbb871b8873a"
     );
 
     let other = channel_on(
@@ -1180,11 +1177,6 @@ fn every_execution_policy_field_moves_its_digest() {
             m.max_stop_token_ids += 1;
             m
         }),
-        ("max_canonical_output_bytes", {
-            let mut m = base;
-            m.max_canonical_output_bytes += 1;
-            m
-        }),
         ("max_spool_bytes", {
             let mut m = base;
             m.max_spool_bytes += 1;
@@ -1221,7 +1213,7 @@ fn every_execution_policy_field_moves_its_digest() {
             m
         }),
     ];
-    assert_eq!(mutations.len(), 14, "every field must be mutated");
+    assert_eq!(mutations.len(), 13, "every field must be mutated");
     for (field, mutated) in mutations {
         assert_ne!(
             execution_policy_digest(&channel, &mutated),
@@ -1389,13 +1381,6 @@ fn an_absent_execution_policy_bound_is_refused() {
             },
         ),
         (
-            "max_canonical_output_bytes",
-            PaidExecutionPolicyV1 {
-                max_canonical_output_bytes: 0,
-                ..base
-            },
-        ),
-        (
             "max_spool_bytes",
             PaidExecutionPolicyV1 {
                 max_spool_bytes: 0,
@@ -1438,7 +1423,7 @@ fn an_absent_execution_policy_bound_is_refused() {
             },
         ),
     ];
-    assert_eq!(zeroed.len(), 10, "every required bound must be zeroed");
+    assert_eq!(zeroed.len(), 9, "every required bound must be zeroed");
     for (field, policy) in zeroed {
         assert_eq!(
             check_execution_policy(&policy),
@@ -2532,7 +2517,7 @@ fn digest_preimages_are_reproducible_by_hand() {
     assert_eq!(preimage.len(), 30 + 16 + 32 + 98);
     assert_eq!(
         hex(&Digest::hash(&preimage).into_bytes()),
-        "53a140ae47ca3abd2a848238aca5bbcb958f48f0c087c2966d66ea1b5e350590"
+        "b87ec7409ea7ff0fa55527d526aec7a5140d8181384b82b7f5a3ab7d73c9134d"
     );
 
     // The payment binding, whose three fields are all 32 bytes: a round
@@ -2611,7 +2596,7 @@ fn the_canonical_output_preimage_is_reproducible_by_hand() {
     );
     assert_eq!(
         hex(&Digest::hash(&preimage).into_bytes()),
-        "277d76e032a9a0218f94a13b859c02935a2861dd2d69a4f90162811d32c37804"
+        "9482ac37fa8dd59fb55d95f1cf48d7299b168ccebfa838ceae7d72c58ef60878"
     );
 }
 
