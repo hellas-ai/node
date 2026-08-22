@@ -1106,16 +1106,28 @@ impl ChannelState {
             .map(|payment| (payment.certificate, payment.certificate_signature))
     }
 
-    /// Whether this channel has begun closing.
+    /// Whether this channel is closing now.
     ///
-    /// True from the moment a close start of this endpoint's is on the
-    /// disk, or a contest is finalized on this edge, or the edge is
-    /// gone. It is the cutoff: past it no job is admitted and no
-    /// certificate is credited, because a close cannot carry what it
-    /// did not know about.
+    /// True while a close start of this endpoint's could still be
+    /// included, and from the moment a contest is finalized on this
+    /// edge or the edge is gone. It is the cutoff: while it holds, no
+    /// job is admitted and no certificate is credited, because a close
+    /// cannot carry what it did not know about.
+    ///
+    /// A start that can no longer be included is not a closing channel,
+    /// and that is [`Self::includable_close_start`]'s judgement rather
+    /// than a second one. The cursor is contiguous, so every block in
+    /// that start's window was read: had it opened a contest,
+    /// [`Self::close_opened`] would say so. It did not, it never will,
+    /// and a channel shut for good by a signature that reached no block
+    /// is a channel whose certificate can never be spent — the endpoint
+    /// would have to close it to be paid, and closing is the thing it
+    /// could no longer do.
     #[must_use]
-    pub const fn is_closing(&self) -> bool {
-        self.close_prepared.is_some() || self.close_opened.is_some() || self.close_settled.is_some()
+    pub fn is_closing(&self) -> bool {
+        self.close_opened.is_some()
+            || self.close_settled.is_some()
+            || self.includable_close_start(self.cursor.0).is_some()
     }
 
     fn refuse_if_closing(&self, step: &'static str) -> Result<(), ChannelStateError> {

@@ -105,12 +105,17 @@
 //! is no moment at which this client is owed service for a payment the
 //! provider's disk does not hold.
 //!
-//! # What this phase does not carry
+//! # Closing
 //!
-//! Closing. Nothing here builds a `PaymentCloseStart`, so nothing here
-//! spends the certificate on L1 or bounds admission by a close cutoff;
-//! [`ChannelState::max_executable_certificate`] is the value such a
-//! builder starts from, and it is P8's to use.
+//! Both endpoints sign a close start, retain its exact bytes before
+//! they leave, and hand them to consensus until a finalized block says
+//! the contest opened or the window they were signed for has passed.
+//! It is symmetric because the deadlock is: a provider that stops
+//! answering leaves the client's funded edge locked, and a client that
+//! stops paying leaves the provider's earnings unspendable.
+//!
+//! What neither endpoint does here is wait. `advance_close` is one
+//! step, and the caller that owns a clock is the one that repeats it.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -140,8 +145,8 @@ use crate::protocol::work::{
 use crate::protocol::work_setup::{ObservedChannel, ReadyChannel, WorkSetupError};
 use crate::services::work::{WorkClientImpl, WorkHandler};
 use crate::work_close::{
-    CatchUpError, CloseError, FinalizedBlocks, FinalizedWork, adjudicated_close, catch_up,
-    close_response, close_start, observe,
+    CatchUpError, CloseError, CloseProgress, FinalizedBlocks, FinalizedWork, TxSink,
+    adjudicated_close, advance_close, catch_up, close_response, close_start, observe,
 };
 use crate::work_store::channel::encode_kernel;
 use crate::work_store::journal::MAX_RECORD_BYTES;
@@ -983,6 +988,26 @@ impl ProviderEndpoint {
             &Secp256k1Verifier::new(),
         )?;
         Ok(start)
+    }
+
+    /// Reads to the tip and resubmits this endpoint's retained close
+    /// start if it has not landed.
+    ///
+    /// # Errors
+    ///
+    /// [`CatchUpError`] when the source fails, a block in range cannot
+    /// be read, the journal refuses one, or the sink will not take the
+    /// transaction.
+    pub async fn advance_close<S, T>(
+        &mut self,
+        source: &S,
+        sink: &T,
+    ) -> Result<CloseProgress, CatchUpError>
+    where
+        S: FinalizedBlocks + ?Sized,
+        T: TxSink + ?Sized,
+    {
+        advance_close(source, sink, &mut self.store, &Secp256k1Verifier::new()).await
     }
 
     /// Builds the close that ends this endpoint's contest.
@@ -1909,6 +1934,69 @@ impl ClientEndpoint {
 }
 
 impl ClientEndpoint {
+    /// Signs the close start that spends this channel's certificate,
+    /// and retains its exact bytes before returning them.
+    ///
+    /// The client's half of the same step, and it is not optional
+    /// symmetry. A provider that stops answering leaves the client's
+    /// funded payment edge locked up, and the only thing that unlocks
+    /// it is a close this client opens itself. The certificate it
+    /// carries is the client's own last payment, because opening below
+    /// what one has already signed for is what the omission bond
+    /// exists to punish — and the client is the party that would be
+    /// punished for it.
+    ///
+    /// Everything else is [`ProviderEndpoint::prepare_close`]'s: the
+    /// journal takes the bytes before they are returned, a start that
+    /// can still be included is offered again rather than replaced,
+    /// and the record is what shuts this channel to new work.
+    ///
+    /// # Errors
+    ///
+    /// [`CloseError::Store`] when a job is still open, a contest is
+    /// already live, or the journal refuses the record, and the window
+    /// errors [`close_start`] raises.
+    pub fn prepare_close(&mut self) -> Result<PaymentCloseStart, CloseError> {
+        let (height, _) = self.state().cursor();
+        if let Some(retained) = self.state().includable_close_start(height) {
+            return Ok(retained.clone());
+        }
+        let start = close_start(
+            self.ready.channel(),
+            Party::Maker,
+            height,
+            self.state().executable_certificate(),
+            &self.signer,
+        )?;
+        self.store.commit(
+            ChannelRecord::ClosePrepared {
+                start: Box::new(start.clone()),
+            },
+            &Secp256k1Verifier::new(),
+        )?;
+        Ok(start)
+    }
+
+    /// Reads to the tip and resubmits this endpoint's retained close
+    /// start if it has not landed.
+    ///
+    /// # Errors
+    ///
+    /// [`CatchUpError`] when the source fails, a block in range cannot
+    /// be read, the journal refuses one, or the sink will not take the
+    /// transaction.
+    pub async fn advance_close<S, T>(
+        &mut self,
+        source: &S,
+        sink: &T,
+    ) -> Result<CloseProgress, CatchUpError>
+    where
+        S: FinalizedBlocks + ?Sized,
+        T: TxSink + ?Sized,
+    {
+        advance_close(source, sink, &mut self.store, &Secp256k1Verifier::new()).await
+    }
+
     /// Takes one delivered answer, and makes it durable before it is
     /// returned.
     ///

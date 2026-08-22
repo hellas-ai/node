@@ -54,8 +54,8 @@ use hellas_rpc::work::{
     WorkService, admit_payment, fetch_result, run_accepted_work,
 };
 use hellas_rpc::work_close::{
-    BlockSourceError, CatchUpError, CloseError, FinalizedBlocks, FinalizedWork, close_start,
-    observe, start_body_digest,
+    BlockSourceError, CatchUpError, CloseError, CloseProgress, FinalizedBlocks, FinalizedWork,
+    close_start, observe, start_body_digest,
 };
 use hellas_rpc::work_store::{
     ChannelRecord, ChannelStore, CloseSettlement, JobPhase, JobState, Role, SetupOrigin,
@@ -2130,4 +2130,209 @@ async fn a_first_catch_up_cannot_skip_the_channels_own_history() {
         panic!("a settled edge takes no work: {response:?}");
     };
     assert_eq!(refused.code, WorkRefusalCode::Declined as i32);
+}
+
+// ── Getting the close to a validator ──────────────────────────────────
+
+/// Every transaction one sink was handed, in order.
+#[derive(Default)]
+struct Mempool {
+    submitted: std::sync::Mutex<Vec<hellas_kernel::Tx>>,
+    refuse: bool,
+}
+
+impl Mempool {
+    fn taken(&self) -> Vec<hellas_kernel::Tx> {
+        match self.submitted.lock() {
+            Ok(taken) => taken.clone(),
+            Err(error) => panic!("the fixture mempool is readable: {error}"),
+        }
+    }
+}
+
+impl hellas_rpc::work_close::TxSink for Mempool {
+    async fn submit(&self, tx: hellas_kernel::Tx) -> Result<(), BlockSourceError> {
+        if self.refuse {
+            return Err(BlockSourceError::new("this validator is not taking work"));
+        }
+        match self.submitted.lock() {
+            Ok(mut taken) => taken.push(tx),
+            Err(error) => panic!("the fixture mempool is writable: {error}"),
+        }
+        Ok(())
+    }
+}
+
+/// A retained start is submitted until a block carries it.
+///
+/// The step before this one built a transaction and handed it back to
+/// nobody: `chain::submit_tx` existed and was never called, so a signed
+/// close sat on the disk and the channel it was signed to end stayed
+/// open for good. What this drives is the whole of the rest — read to
+/// the tip, resubmit if no contest is there yet, and stop on the block
+/// that says one is.
+#[tokio::test]
+async fn a_retained_start_is_resubmitted_until_a_block_carries_it() {
+    let fixture = paid_job().await;
+    let ready = fixture.ready.clone();
+    let mut watcher = restarted(fixture);
+    let provider = &mut watcher.provider;
+    let Ok(start) = provider.prepare_close() else {
+        panic!("a paid channel closes");
+    };
+    let start_tx =
+        hellas_kernel::Tx::move_action(hellas_kernel::Move::StartPaymentClose(start.clone()));
+    let sink = Mempool::default();
+
+    // Two rounds against a chain that has not carried it. The same
+    // bytes each time: a resubmission is the same close.
+    let quiet = Chain {
+        blocks: ((CURSOR + 1)..=(CURSOR + 2))
+            .map(|h| block(h, Vec::new()))
+            .collect(),
+        withheld: None,
+    };
+    for round in 0..2 {
+        match provider.advance_close(&quiet, &sink).await {
+            Ok(CloseProgress::Submitted { valid_through }) => {
+                assert_eq!(valid_through, start.valid_through_height());
+            }
+            other => panic!("round {round}: the start is submitted: {other:?}"),
+        }
+    }
+    assert_eq!(sink.taken(), vec![start_tx.clone(), start_tx.clone()]);
+
+    // The block that carries it. The contest is finalized, and nothing
+    // is submitted again.
+    let inclusion = CURSOR + 3;
+    let carried = Chain {
+        blocks: ((CURSOR + 1)..=(CURSOR + 4))
+            .map(|h| {
+                if h == inclusion {
+                    block(h, vec![start_tx.clone()])
+                } else {
+                    block(h, Vec::new())
+                }
+            })
+            .collect(),
+        withheld: None,
+    };
+    let expected = contest_id(&ready, &start, inclusion);
+    match provider.advance_close(&carried, &sink).await {
+        Ok(CloseProgress::Opened { start_id }) => assert_eq!(start_id, expected),
+        other => panic!("the contest is open: {other:?}"),
+    }
+    assert_eq!(
+        sink.taken().len(),
+        2,
+        "an opened contest is not resubmitted"
+    );
+    assert_eq!(
+        provider.state().close_opened(),
+        Some((expected, Party::Taker)),
+    );
+}
+
+/// A start that can no longer be included leaves the channel open.
+///
+/// The gate this releases: a signature that reached no block used to
+/// shut the channel for good, so an endpoint whose start was never
+/// included could take no more work *and* could never close — the
+/// close it needed was the one thing it was no longer allowed to sign.
+#[tokio::test]
+async fn a_start_that_never_landed_reopens_the_channel() {
+    let fixture = paid_job().await;
+    let mut watcher = restarted(fixture);
+    let provider = &mut watcher.provider;
+    let Ok(start) = provider.prepare_close() else {
+        panic!("a paid channel closes");
+    };
+    assert!(provider.state().is_closing(), "the window is open");
+    let sink = Mempool::default();
+
+    // Every block of the window, and none of them carries it.
+    let last = start.valid_through_height();
+    let quiet = Chain {
+        blocks: ((CURSOR + 1)..=last)
+            .map(|h| block(h, Vec::new()))
+            .collect(),
+        withheld: None,
+    };
+    match provider.advance_close(&quiet, &sink).await {
+        Ok(CloseProgress::Submitted { .. }) => {}
+        other => panic!("the last block of the window still admits it: {other:?}"),
+    }
+
+    // One block past it.
+    let past = Chain {
+        blocks: ((CURSOR + 1)..=(last + 1))
+            .map(|h| block(h, Vec::new()))
+            .collect(),
+        withheld: None,
+    };
+    match provider.advance_close(&past, &sink).await {
+        Ok(CloseProgress::Nothing) => {}
+        other => panic!("a start that cannot land is nothing: {other:?}"),
+    }
+    assert!(
+        !provider.state().is_closing(),
+        "a signature that reached no block does not shut a channel for good",
+    );
+
+    // And the channel takes work again.
+    let response = provider.accept(&signed_request(NONCE + 1, 2));
+    assert!(
+        matches!(response.outcome, Some(AcceptOutcome::Accepted(_))),
+        "the reopened channel accepts: {response:?}",
+    );
+}
+
+/// The client closes its own channel, and it is the same step.
+///
+/// Symmetry is not tidiness here. A provider that stops answering
+/// leaves the client's funded payment edge locked up, and the only
+/// thing that frees it is a close the client opens itself.
+#[tokio::test]
+async fn a_client_closes_the_channel_its_provider_stopped_answering() {
+    let mut fixture = paid_job().await;
+    let start = match fixture.client.prepare_close() {
+        Ok(start) => start,
+        Err(error) => panic!("a client closes its own channel: {error}"),
+    };
+    assert_eq!(start.opener_role(), Party::Maker);
+    assert_eq!(start.payment_edge(), payment_edge());
+    // At what it has already signed for, which is what the omission
+    // bond punishes a client for understating.
+    let Some(payment) = fixture.client.state().last_payment() else {
+        panic!("the client retains what it paid");
+    };
+    assert_eq!(
+        start.certificate().copied(),
+        Some((payment.certificate, payment.certificate_signature)),
+    );
+
+    // Retained, and offered again rather than signed twice.
+    match fixture.client.prepare_close() {
+        Ok(again) => assert_eq!(again, start),
+        Err(error) => panic!("the retained start is offered again: {error}"),
+    }
+
+    // And handed to consensus.
+    let sink = Mempool::default();
+    let quiet = Chain {
+        blocks: vec![block(CURSOR + 1, Vec::new())],
+        withheld: None,
+    };
+    match fixture.client.advance_close(&quiet, &sink).await {
+        Ok(CloseProgress::Submitted { valid_through }) => {
+            assert_eq!(valid_through, start.valid_through_height());
+        }
+        other => panic!("the client's start is submitted: {other:?}"),
+    }
+    assert_eq!(
+        sink.taken(),
+        vec![hellas_kernel::Tx::move_action(
+            hellas_kernel::Move::StartPaymentClose(start)
+        )],
+    );
 }

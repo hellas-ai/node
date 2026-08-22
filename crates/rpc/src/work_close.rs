@@ -118,6 +118,26 @@ impl BlockSourceError {
     }
 }
 
+/// Where a close transaction is handed to consensus.
+///
+/// One method, and it is deliberately not a query: submitting says
+/// nothing about inclusion, and an endpoint learns whether its start
+/// landed from the blocks it reads, never from the answer to this. It
+/// is in this crate rather than in the chain crate for
+/// [`FinalizedBlocks`]'s reason — both endpoints need exactly this and
+/// neither needs a mempool.
+pub trait TxSink {
+    /// Hands one transaction to consensus.
+    ///
+    /// Submitting the same bytes twice is not an error here and must
+    /// not be treated as one: the kernel admits at most one contest per
+    /// edge, so a resubmission is the same close, not a second.
+    fn submit(
+        &self,
+        tx: Tx,
+    ) -> impl core::future::Future<Output = Result<(), BlockSourceError>> + Send;
+}
+
 /// Where a watcher gets its finalized blocks.
 ///
 /// Narrow on purpose, and in this crate rather than in the chain crate,
@@ -204,6 +224,31 @@ pub enum CloseError {
     /// The step could not be made durable, or the journal refused it.
     #[error(transparent)]
     Store(#[from] WorkStoreError),
+}
+
+/// How far this channel's close has got.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CloseProgress {
+    /// The edge is gone, and this is what the close paid the provider.
+    Settled {
+        /// What the finalized close paid the provider.
+        provider_payout: u64,
+    },
+    /// A contest is finalized on this edge.
+    Opened {
+        /// The contest a response or a close must name.
+        start_id: StartId,
+    },
+    /// A retained start was handed to consensus at this height. It is
+    /// not included until a block says so.
+    Submitted {
+        /// Last height the submitted signature can be included at.
+        valid_through: u64,
+    },
+    /// Nothing is retained that could still be included, and no contest
+    /// opened. The channel is open again, and closing it needs a fresh
+    /// signature.
+    Nothing,
 }
 
 /// Why a catch-up did not finish.
@@ -572,6 +617,59 @@ fn expiry_at(state: &crate::work_store::ChannelState, height: u64) -> Option<Job
 /// [`CatchUpError::Missing`] when a block inside the range cannot be
 /// read — the scan stops there and the cursor keeps the last height it
 /// did read — plus the source's own failures and the journal's.
+/// Reads to the tip, then resubmits this endpoint's retained close
+/// start if it has not landed yet.
+///
+/// One step, not a loop, and that is what a caller with a clock is
+/// for: nothing in this crate has one, and a loop written here would
+/// spin against a chain that finalizes at its own rate. What the step
+/// gives that caller is the whole answer — [`CloseProgress`] says
+/// whether to call again, and the two terminal answers are the two
+/// ways a close ends.
+///
+/// The reading comes first, and it has to: the retained bytes are
+/// resubmitted only while the journal still shows no contest, and the
+/// journal only shows one after the block that opened it has been
+/// read. The other order resubmits a start that is already a contest.
+///
+/// Nothing is journaled here. A submission is not a decision — the
+/// signature was journaled before it left [`crate::work::ProviderEndpoint::prepare_close`],
+/// and these are those same bytes.
+///
+/// # Errors
+///
+/// [`CatchUpError`] for the read, and [`BlockSourceError`] wrapped in
+/// it when the sink will not take the transaction.
+pub async fn advance_close<S, T, V>(
+    source: &S,
+    sink: &T,
+    store: &mut ChannelStore,
+    verifier: &V,
+) -> Result<CloseProgress, CatchUpError>
+where
+    S: FinalizedBlocks + ?Sized,
+    T: TxSink + ?Sized,
+    V: SigVerifier,
+{
+    let height = catch_up(source, store, verifier).await?;
+    let state = store.state();
+    if let Some(settled) = state.close_settled() {
+        return Ok(CloseProgress::Settled {
+            provider_payout: settled.provider_payout,
+        });
+    }
+    if let Some((start_id, _)) = state.close_opened() {
+        return Ok(CloseProgress::Opened { start_id });
+    }
+    let Some(start) = state.includable_close_start(height) else {
+        return Ok(CloseProgress::Nothing);
+    };
+    let valid_through = start.valid_through_height();
+    let tx = Tx::move_action(hellas_kernel::Move::StartPaymentClose(start.clone()));
+    sink.submit(tx).await?;
+    Ok(CloseProgress::Submitted { valid_through })
+}
+
 pub async fn catch_up<S, V>(
     source: &S,
     store: &mut ChannelStore,

@@ -22,8 +22,16 @@
 //! trust: a transfer or a merge cannot open a contest or close an edge,
 //! so the relative order of everything that *can* is exactly the
 //! validator's.
+//!
+//! # And one way back
+//!
+//! The same pairing carries a close *out*. An endpoint that could read
+//! blocks and not submit would sign a start it had no way to hand to
+//! anyone, so the sink is here rather than in a second adapter — one
+//! light client, one channel, one direction each way.
 
-use hellas_rpc::work_close::{BlockSourceError, FinalizedBlocks, FinalizedWork};
+use hellas_kernel::Tx;
+use hellas_rpc::work_close::{BlockSourceError, FinalizedBlocks, FinalizedWork, TxSink};
 
 use crate::block_view::FinalizedBlockView;
 use crate::domain::{Digest, Transaction};
@@ -53,6 +61,15 @@ fn bytes(digest: &Digest) -> [u8; 32] {
         *slot = *byte;
     }
     out
+}
+
+impl<C: LightClient> TxSink for WorkBlocks<C> {
+    async fn submit(&self, tx: Tx) -> Result<(), BlockSourceError> {
+        self.0
+            .submit_tx(Transaction::Kernel(tx))
+            .await
+            .map_err(|error| BlockSourceError::new(error.to_string()))
+    }
 }
 
 impl<C: LightClient> FinalizedBlocks for WorkBlocks<C> {
