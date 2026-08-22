@@ -16,7 +16,8 @@ service Work {
   // one refusal code.
   rpc AcceptWork(AcceptWorkRequest) returns (AcceptWorkResponse);
 
-  // One whole delivery. The client names an accepted job; the provider
+  // One whole delivery. The client asks for an accepted job's answer,
+  // proving on this connection that it is the client; the provider
   // answers with the complete signed result and the transcript it was
   // derived from, or with one refusal code.
   //
@@ -74,7 +75,22 @@ message DeliverResultRequest {
   // The accepted job's `work_id`: the authorization's own digest,
   // exactly 32 bytes. There is one job in flight per channel, so this
   // names it rather than selecting among many.
+  //
+  // It is an identifier and not an authority. What authorises the
+  // release is the signature below.
   bytes work_id = 1;
+  // The client's compact secp256k1 signature over the delivery-request
+  // digest: exactly 64 bytes.
+  //
+  // The digest binds the channel, this job, the action, and the TLS
+  // exporter of the connection the request arrives on — so it proves
+  // the caller holds the channel's client key *here*, and it is worth
+  // nothing replayed on any other connection. A `work_id` travels: it
+  // is in the client's own logs, and it is the first thing a peer
+  // learns from a proposal. Without this, anyone who saw one could
+  // make the provider release the plaintext and durably debit the real
+  // client's delivery credit.
+  bytes client_signature = 2;
 }
 
 message DeliverResultResponse {

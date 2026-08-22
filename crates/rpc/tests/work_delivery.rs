@@ -32,9 +32,9 @@ use hellas_rpc::protocol::artifacts::{
 };
 use hellas_rpc::protocol::work::{
     JobDeadlines, PaidChannelPolicyV1, PaidExecutionPolicyV1, PaidJobAuthorizationV1,
-    PaidWorkError, PrivateRecord as _, encode_transcript, generation_policy_digest,
-    identity_source_digest, private_policy_commitment, propose_authorization, signing_hash,
-    terminal_result, work_id,
+    PaidWorkError, PrivateRecord as _, delivery_request_digest, encode_transcript,
+    generation_policy_digest, identity_source_digest, private_policy_commitment,
+    propose_authorization, signing_hash, terminal_result, work_id,
 };
 use hellas_rpc::protocol::work_setup::{
     ObservedChannel, ReadyChannel, WorkChannelConfig, WorkChannelDescriptor, WorkSetupError,
@@ -510,6 +510,42 @@ impl MessagePipe for Pipe {
     }
 }
 
+/// The request a client signs on the fixture session for `work_id`.
+///
+/// A `work_id` is an identifier; this is what makes it an authority,
+/// and only on the connection whose exporter it covers.
+fn delivery_request(
+    channel: &hellas_rpc::protocol::work::PaidChannel,
+    work_id: Digest,
+) -> DeliverResultRequest {
+    DeliverResultRequest {
+        work_id: work_id.as_bytes().to_vec(),
+        client_signature: client()
+            .sign(signing_hash(delivery_request_digest(
+                channel, work_id, &EXPORTER,
+            )))
+            .as_bytes()
+            .to_vec(),
+    }
+}
+
+/// What the two ends of one live session both know.
+///
+/// A mux over a pair of in-memory pipes has no TLS of its own, so the
+/// exporter is supplied here — which is what a QUIC connection does for
+/// itself. Both halves are handed the same value, because that is the
+/// one property the delivery binding rests on: the number is known to
+/// exactly the two ends of one connection.
+fn session() -> hellas_wire::TransportContext {
+    hellas_wire::TransportContext {
+        open_exporter: Some(EXPORTER),
+        ..hellas_wire::TransportContext::default()
+    }
+}
+
+/// The exporter the fixture session exports.
+const EXPORTER: [u8; 32] = [0x5e; 32];
+
 fn transport_pair() -> (MuxTransport, MuxTransport) {
     let (to_server, server_inbox) = mpsc::unbounded_channel();
     let (to_client, client_inbox) = mpsc::unbounded_channel();
@@ -521,7 +557,7 @@ fn transport_pair() -> (MuxTransport, MuxTransport) {
             out: to_server,
             inbox: client_inbox,
         },
-        None,
+        session(),
     );
     let server = MuxTransport::spawn::<8, _, _>(
         MuxRole::Server,
@@ -531,7 +567,7 @@ fn transport_pair() -> (MuxTransport, MuxTransport) {
             out: to_client,
             inbox: server_inbox,
         },
-        None,
+        session(),
     );
     (client, server)
 }
@@ -694,7 +730,7 @@ async fn the_last_height_the_delivery_margin_fits_is_the_last_that_may_release()
         else {
             panic!("the provider endpoint binds at the release height");
         };
-        let released = endpoint.deliver(id, &ready);
+        let released = endpoint.deliver(&delivery_request(ready.channel(), id), &ready, &EXPORTER);
         if may_release {
             if let Err(error) = released {
                 panic!("at {height} the margin still fits: {error}");
@@ -741,9 +777,7 @@ async fn a_job_with_no_result_releases_nothing_yet() {
     let (transport, server_transport) = transport_pair();
     let serving = serve(server_transport, service.clone());
     let response = match WorkClientImpl::new(transport)
-        .deliver_result(DeliverResultRequest {
-            work_id: id.as_bytes().to_vec(),
-        })
+        .deliver_result(delivery_request(ready.channel(), id))
         .await
     {
         Ok(response) => response,
@@ -764,9 +798,7 @@ async fn a_job_with_no_result_releases_nothing_yet() {
     let (transport, server_transport) = transport_pair();
     let serving = serve(server_transport, service.clone());
     let response = match WorkClientImpl::new(transport)
-        .deliver_result(DeliverResultRequest {
-            work_id: id.as_bytes().to_vec(),
-        })
+        .deliver_result(delivery_request(ready.channel(), id))
         .await
     {
         Ok(response) => response,
@@ -803,7 +835,7 @@ async fn a_release_past_the_deadline_is_expired_on_the_wire() {
     let ready = ready_at(late);
     let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, late);
     advance(&mut provider_store, late);
-    let Ok(endpoint) = ProviderEndpoint::new(ready, provider_store, provider()) else {
+    let Ok(endpoint) = ProviderEndpoint::new(ready.clone(), provider_store, provider()) else {
         panic!("the provider endpoint binds at the late height");
     };
     let service = WorkService::new(endpoint);
@@ -811,9 +843,7 @@ async fn a_release_past_the_deadline_is_expired_on_the_wire() {
     let (transport, server_transport) = transport_pair();
     let serving = serve(server_transport, service.clone());
     let response = match WorkClientImpl::new(transport)
-        .deliver_result(DeliverResultRequest {
-            work_id: id.as_bytes().to_vec(),
-        })
+        .deliver_result(delivery_request(ready.channel(), id))
         .await
     {
         Ok(response) => response,
@@ -851,7 +881,17 @@ async fn a_delivery_named_for_another_job_finds_nothing() {
         let (transport, server_transport) = transport_pair();
         let serving = serve(server_transport, service.clone());
         let response = match WorkClientImpl::new(transport)
-            .deliver_result(DeliverResultRequest { work_id })
+            .deliver_result(DeliverResultRequest {
+                work_id,
+                client_signature: client()
+                    .sign(signing_hash(delivery_request_digest(
+                        ready.channel(),
+                        other,
+                        &EXPORTER,
+                    )))
+                    .as_bytes()
+                    .to_vec(),
+            })
             .await
         {
             Ok(response) => response,
@@ -963,7 +1003,11 @@ async fn a_client_refuses_a_frame_over_the_bound_it_signed() {
         let Ok(mut wide_endpoint) = wide_service.endpoint() else {
             panic!("the endpoint is reachable");
         };
-        let Ok(delivery) = wide_endpoint.deliver(wide_id, &wide_ready) else {
+        let Ok(delivery) = wide_endpoint.deliver(
+            &delivery_request(wide_ready.channel(), wide_id),
+            &wide_ready,
+            &EXPORTER,
+        ) else {
             panic!("the wide delivery is released");
         };
         WorkDelivered {
@@ -1007,7 +1051,8 @@ async fn delivered_frame_len(frame: u32) -> u64 {
     let Ok(mut endpoint) = service.endpoint() else {
         panic!("the endpoint is reachable");
     };
-    let Ok(delivery) = endpoint.deliver(id, &ready) else {
+    let Ok(delivery) = endpoint.deliver(&delivery_request(ready.channel(), id), &ready, &EXPORTER)
+    else {
         panic!("the fixture delivery is released");
     };
     WorkDelivered {
@@ -1045,7 +1090,8 @@ async fn a_transcript_swapped_in_transit_is_not_recorded() {
     let Ok(mut provider) = service.endpoint() else {
         panic!("the endpoint is reachable");
     };
-    let Ok(delivery) = provider.deliver(id, &ready) else {
+    let Ok(delivery) = provider.deliver(&delivery_request(ready.channel(), id), &ready, &EXPORTER)
+    else {
         panic!("the fixture delivery is released");
     };
     drop(provider);
@@ -1113,7 +1159,8 @@ async fn a_client_behind_its_readiness_records_no_receipt() {
     let Ok(mut provider) = service.endpoint() else {
         panic!("the endpoint is reachable");
     };
-    let Ok(delivery) = provider.deliver(id, &ready) else {
+    let Ok(delivery) = provider.deliver(&delivery_request(ready.channel(), id), &ready, &EXPORTER)
+    else {
         panic!("the fixture delivery is released");
     };
     drop(provider);
@@ -1240,4 +1287,175 @@ fn lease_over(bond: EdgeId, payment: EdgeId) -> LeaseSlots {
         "the hand-written lease is readable, got {parsed:?}",
     );
     parsed
+}
+
+// ── Who may be handed the answer ──────────────────────────────────────
+
+/// A `work_id` is an identifier, and not an authority.
+///
+/// The exploit it closes: any peer that learned one — off a log, or by
+/// having been offered the proposal — called `DeliverResult` and was
+/// handed the plaintext, while the debit for it landed on the real
+/// client's delivery credit and, at the payment deadline, on that
+/// client's identity-wide loss. The request carried nothing else.
+///
+/// Now it carries a signature over the channel, this job, the action,
+/// and the exporter of the connection it arrives on. A stranger has
+/// none of the three things that would produce one: not the channel's
+/// client key, not a signature for this action, and not one made on
+/// this connection.
+#[tokio::test]
+async fn a_work_id_alone_releases_nothing() {
+    let provider_root = temp();
+    let ready = ready();
+    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
+    let (id, _) = accept(&execution_policy(), &mut [&mut provider_store], 1);
+    let Ok(endpoint) = ProviderEndpoint::new(ready.clone(), provider_store, provider()) else {
+        panic!("the provider endpoint binds");
+    };
+    let service = WorkService::new(endpoint);
+    run_to_result(&service, &ready, id).await;
+
+    let signed_with =
+        |signer: &hellas_kernel::Secp256k1Signer, exporter: &[u8; 32]| DeliverResultRequest {
+            work_id: id.as_bytes().to_vec(),
+            client_signature: signer
+                .sign(signing_hash(delivery_request_digest(
+                    ready.channel(),
+                    id,
+                    exporter,
+                )))
+                .as_bytes()
+                .to_vec(),
+        };
+    let cases = vec![
+        (
+            "a bare work id",
+            DeliverResultRequest {
+                work_id: id.as_bytes().to_vec(),
+                client_signature: Vec::new(),
+            },
+        ),
+        (
+            "a signature that is not this channel's client's",
+            signed_with(&provider(), &EXPORTER),
+        ),
+        (
+            // The whole point of the exporter: the client's own
+            // request, lifted off the connection it was made on.
+            "the client's own signature from another connection",
+            signed_with(&client(), &[0xa1; 32]),
+        ),
+    ];
+
+    for (name, request) in cases {
+        let (transport, server_transport) = transport_pair();
+        let serving = serve(server_transport, service.clone());
+        let response = match WorkClientImpl::new(transport).deliver_result(request).await {
+            Ok(response) => response,
+            Err(status) => panic!("the call for {name} completes: {status}"),
+        };
+        serving.abort();
+        assert_eq!(
+            refusal_code(&response),
+            WorkRefusalCode::Invalid,
+            "{name} releases nothing: {response:?}",
+        );
+        let Ok(endpoint) = service.endpoint() else {
+            panic!("the endpoint is reachable");
+        };
+        assert_eq!(
+            endpoint.state().delivery_outstanding(),
+            0,
+            "{name} debits nothing",
+        );
+        assert_eq!(
+            endpoint.state().job().map(JobState::phase),
+            Some(JobPhase::Ready),
+            "{name} leaves the answer where it was",
+        );
+    }
+
+    // The control: the same job, the same connection, the client's own
+    // signature over this connection's exporter.
+    let (transport, server_transport) = transport_pair();
+    let serving = serve(server_transport, service.clone());
+    let response = match WorkClientImpl::new(transport)
+        .deliver_result(delivery_request(ready.channel(), id))
+        .await
+    {
+        Ok(response) => response,
+        Err(status) => panic!("the call completes: {status}"),
+    };
+    serving.abort();
+    assert!(
+        matches!(response.outcome, Some(Outcome::Delivered(_))),
+        "the client is handed its own answer: {response:?}",
+    );
+}
+
+/// A transport that exports nothing binds nothing, and releases
+/// nothing.
+///
+/// There is no fallback here and there must not be: a connection that
+/// cannot export keying material is one on which no signature can be
+/// tied to *this* call, so every request over it is a bearer request
+/// again.
+#[tokio::test]
+async fn a_transport_without_an_exporter_delivers_nothing() {
+    let provider_root = temp();
+    let client_root = temp();
+    let ready = ready();
+    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
+    let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR);
+    let (id, _) = accept(
+        &execution_policy(),
+        &mut [&mut client_store, &mut provider_store],
+        1,
+    );
+    let Ok(endpoint) = ProviderEndpoint::new(ready.clone(), provider_store, provider()) else {
+        panic!("the provider endpoint binds");
+    };
+    let service = WorkService::new(endpoint);
+    run_to_result(&service, &ready, id).await;
+
+    let (to_server, server_inbox) = mpsc::unbounded_channel();
+    let (to_client, client_inbox) = mpsc::unbounded_channel();
+    let bare = |out, inbox| {
+        MuxTransport::spawn::<8, _, _>(
+            MuxRole::Client,
+            DefaultClock,
+            MuxConfig::default(),
+            Pipe { out, inbox },
+            hellas_wire::TransportContext::default(),
+        )
+    };
+    let client_transport = bare(to_server, client_inbox);
+    let server_transport = MuxTransport::spawn::<8, _, _>(
+        MuxRole::Server,
+        DefaultClock,
+        MuxConfig::default(),
+        Pipe {
+            out: to_client,
+            inbox: server_inbox,
+        },
+        hellas_wire::TransportContext::default(),
+    );
+    let serving = serve(server_transport, service.clone());
+
+    // The client holds the accepted job and still cannot ask for it.
+    let Ok(mut client_endpoint) = ClientEndpoint::new(ready.clone(), client_store, client()) else {
+        panic!("the client endpoint binds");
+    };
+    let refused = fetch_result(client_transport, &mut client_endpoint, &ready, id).await;
+    serving.abort();
+    assert!(
+        matches!(refused, Err(DeliverError::Unbindable)),
+        "an unbindable connection asks for nothing: {refused:?}",
+    );
+
+    let Ok(endpoint) = service.endpoint() else {
+        panic!("the endpoint is reachable");
+    };
+    assert_eq!(endpoint.state().delivery_outstanding(), 0);
 }

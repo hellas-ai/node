@@ -116,6 +116,9 @@ const PAID_JOB_AUTHORIZE: &[u8] = b"hellas.work.paid-job-authorize.v1";
 const PAID_JOB_RESULT: &[u8] = b"hellas.work.paid-job-result.v1";
 /// The client's binding of one certificate to one job's result.
 const PAYMENT_BINDING: &[u8] = b"hellas.work.payment-binding.v1";
+/// The client's request that one job's plaintext be released to it, on
+/// one connection.
+const DELIVERY_REQUEST: &[u8] = b"hellas.work.delivery-request.v1";
 /// The normalized Evaluate answer the client's oracle compares.
 const EVALUATE_OUTPUT: &[u8] = b"hellas.work.evaluate-output.v1";
 
@@ -1048,6 +1051,39 @@ pub fn payment_binding_digest(channel: &PaidChannel, binding: &PaymentBindingV1)
             network_bytes.as_slice(),
             channel.id.as_bytes(),
             &binding.encode(),
+        ],
+    )
+}
+
+/// Returns the digest the client signs to ask for one job's plaintext.
+///
+/// Four things, and each is load-bearing. The network and the channel,
+/// because a signature is only ever about one channel of one network.
+/// The `work_id`, because it is the job whose answer is being asked
+/// for. The domain string above, because it is the action — a
+/// signature made to pay for a job is not a signature to be handed the
+/// job. And the connection's TLS exporter, because it is what makes
+/// this unreplayable: the value is derived from the live QUIC session
+/// and is known to exactly its two ends, so a request lifted off one
+/// connection authorises nothing on another.
+///
+/// A `work_id` is not any of that. It is in the client's logs, it is
+/// the first thing a provider learns from a proposal, and it names a
+/// job rather than granting anything about it.
+#[must_use]
+pub fn delivery_request_digest(
+    channel: &PaidChannel,
+    work_id: Digest,
+    exporter: &[u8; 32],
+) -> Digest {
+    let network_bytes = channel.network_bytes();
+    xh(
+        DELIVERY_REQUEST,
+        &[
+            network_bytes.as_slice(),
+            channel.id.as_bytes(),
+            work_id.as_bytes(),
+            exporter,
         ],
     )
 }

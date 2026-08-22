@@ -71,7 +71,7 @@ pub async fn connect(url: &str) -> Result<MuxTransport, WsError> {
         DefaultClock,
         MuxConfig::default(),
         pipe,
-        None,
+        crate::TransportContext::default(),
         |fut| {
             wasm_bindgen_futures::spawn_local(fut);
         },

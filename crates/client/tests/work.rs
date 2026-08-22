@@ -511,6 +511,20 @@ impl MessagePipe for Pipe {
     }
 }
 
+/// What the two ends of one live session both know.
+///
+/// A mux over a pair of in-memory pipes has no TLS of its own, so the
+/// exporter is supplied here — which is what a QUIC connection does for
+/// itself. Both halves are handed the same value, because that is the
+/// one property the delivery binding rests on: the number is known to
+/// exactly the two ends of one connection.
+fn session() -> hellas_wire::TransportContext {
+    hellas_wire::TransportContext {
+        open_exporter: Some([0x5e; 32]),
+        ..hellas_wire::TransportContext::default()
+    }
+}
+
 fn transport_pair() -> (MuxTransport, MuxTransport) {
     let (to_server, server_inbox) = mpsc::unbounded_channel();
     let (to_client, client_inbox) = mpsc::unbounded_channel();
@@ -522,7 +536,7 @@ fn transport_pair() -> (MuxTransport, MuxTransport) {
             out: to_server,
             inbox: client_inbox,
         },
-        None,
+        session(),
     );
     let server = MuxTransport::spawn::<8, _, _>(
         MuxRole::Server,
@@ -532,7 +546,7 @@ fn transport_pair() -> (MuxTransport, MuxTransport) {
             out: to_client,
             inbox: server_inbox,
         },
-        None,
+        session(),
     );
     (client, server)
 }

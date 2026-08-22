@@ -11,7 +11,7 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use crate::clock::Clock;
 use crate::metadata::Metadata;
 use crate::status::WireCode;
-use crate::transport::{AuthLevel, Inbound, PeerIdentity, StreamTransport, TransportContext};
+use crate::transport::{Inbound, StreamTransport, TransportContext};
 
 use super::slot::{Role, SlotIndex};
 use super::state::{Event, Multiplexer, MuxConfig, MuxError};
@@ -65,6 +65,12 @@ pub(crate) enum Command {
 pub struct MuxTransport {
     cmd_tx: mpsc::UnboundedSender<Command>,
     inbound_rx: Arc<Mutex<mpsc::UnboundedReceiver<Inbound<MuxStream>>>>,
+    /// What the enclosing session vouches for: the peer it authenticated,
+    /// and the keying material it can export. A mux is carried by
+    /// something else — a WebSocket, a QUIC connection — and only that
+    /// carrier knows either. It is held here as well as in the driver so
+    /// outbound callers read the same facts inbound ones are handed.
+    context: TransportContext,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -85,9 +91,9 @@ impl MuxTransport {
         clock: C,
         config: MuxConfig,
         pipe: P,
-        peer: Option<PeerIdentity>,
+        context: TransportContext,
     ) -> Self {
-        Self::spawn_with::<N, C, P, _>(role, clock, config, pipe, peer, |fut| {
+        Self::spawn_with::<N, C, P, _>(role, clock, config, pipe, context, |fut| {
             tokio::spawn(fut);
         })
     }
@@ -103,7 +109,7 @@ impl MuxTransport {
         clock: C,
         config: MuxConfig,
         pipe: P,
-        peer: Option<PeerIdentity>,
+        context: TransportContext,
         spawn: F,
     ) -> Self
     where
@@ -121,13 +127,14 @@ impl MuxTransport {
             inbound_tx,
             slot_to_chans: Default::default(),
             pending_sends: Default::default(),
-            peer,
+            context: context.clone(),
         };
         spawn(Box::pin(driver.run()));
 
         Self {
             cmd_tx,
             inbound_rx: Arc::new(Mutex::new(inbound_rx)),
+            context,
         }
     }
 }
@@ -135,6 +142,10 @@ impl MuxTransport {
 impl StreamTransport for MuxTransport {
     type Stream = MuxStream;
     type Error = MuxTransportError;
+
+    fn context(&self) -> TransportContext {
+        self.context.clone()
+    }
 
     async fn open(&self, method_id: u32, headers: Metadata) -> Result<Self::Stream, Self::Error> {
         let (tx, rx) = oneshot::channel();
@@ -171,7 +182,7 @@ struct MuxDriver<const N: usize, C: Clock + Clone, P: MessagePipe> {
     /// At most one blocked send per slot; `SendHalf::send_body` takes
     /// `&mut self`, so well-formed callers cannot create a second one.
     pending_sends: std::collections::HashMap<SlotIndex, PendingSend>,
-    peer: Option<PeerIdentity>,
+    context: TransportContext,
 }
 
 struct PendingSend {
@@ -369,16 +380,7 @@ impl<const N: usize, C: Clock + Clone, P: MessagePipe> MuxDriver<N, C, P> {
                     method_id,
                     headers,
                     stream,
-                    context: TransportContext {
-                        peer: self.peer,
-                        rtt_ms: None,
-                        auth_level: if self.peer.is_some() {
-                            AuthLevel::Vouched
-                        } else {
-                            AuthLevel::None
-                        },
-                        open_exporter: None,
-                    },
+                    context: self.context.clone(),
                 };
                 let _ = self.inbound_tx.send(inbound);
             }
@@ -481,7 +483,7 @@ mod tests {
             inbound_tx,
             slot_to_chans: Default::default(),
             pending_sends: Default::default(),
-            peer: None,
+            context: TransportContext::default(),
         };
 
         let slot = driver.mux.open(7, Metadata::new()).unwrap();
@@ -523,7 +525,7 @@ mod tests {
                 recv_rx: wire_rx,
                 dropped: Some(dropped_tx),
             },
-            None,
+            TransportContext::default(),
         );
 
         drop(transport);

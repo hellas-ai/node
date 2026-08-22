@@ -116,9 +116,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use hellas_kernel::{
     Decode as _, EarnedCertificate, Move, Party, PaymentCloseStart, PendingSlot, Secp256k1Signer,
-    Secp256k1Verifier, Sig, Tx,
+    Secp256k1Verifier, Sig, SigVerifier as _, Tx,
 };
-use hellas_wire::{StreamTransport, WireStatus};
+use hellas_wire::{StreamTransport, TransportContext, WireStatus};
 
 use prost::Message as _;
 
@@ -133,9 +133,9 @@ use crate::protocol::Digest;
 use crate::protocol::artifacts::PreparedPaidInputV1;
 use crate::protocol::work::{
     JobDeadlines, PaidJobAuthorizationV1, PaidJobResultV1, PaidWorkError, PaymentBindingV1,
-    PrivateRecord as _, check_authorization, check_prepared_input, encode_transcript, next_payment,
-    payment_binding_digest, propose_authorization, result_digest, signing_hash, terminal_result,
-    work_id,
+    PrivateRecord as _, check_authorization, check_prepared_input, delivery_request_digest,
+    encode_transcript, next_payment, payment_binding_digest, propose_authorization, result_digest,
+    signing_hash, terminal_result, work_id,
 };
 use crate::protocol::work_setup::{ObservedChannel, ReadyChannel, WorkSetupError};
 use crate::services::work::{WorkClientImpl, WorkHandler};
@@ -769,8 +769,11 @@ impl ProviderEndpoint {
     ///
     /// # Errors
     ///
-    /// [`DeliverError::NoSuchJob`] when no open job carries this
-    /// `work_id`, [`DeliverError::NoResult`] before the result is
+    /// [`DeliverError::Malformed`] when a field is not the identifier
+    /// or signature it must be, [`DeliverError::NoSuchJob`] when no
+    /// open job carries this `work_id`, [`DeliverError::Unbound`] when
+    /// the signature is not the channel's client's over this connection,
+    /// [`DeliverError::NoResult`] before the result is
     /// signed, [`DeliverError::Endpoint`] when `ready` is not this
     /// endpoint's channel, [`DeliverError::Policy`] when it carries
     /// another execution policy, [`DeliverError::Setup`] when
@@ -779,12 +782,31 @@ impl ProviderEndpoint {
     /// when this client's delivery credit is exhausted.
     pub fn deliver(
         &mut self,
-        work_id: Digest,
+        request: &DeliverResultRequest,
         ready: &ReadyChannel,
+        exporter: &[u8; 32],
     ) -> Result<Delivery, DeliverError> {
+        let work_id = work_id_bytes(&request.work_id).ok_or(DeliverError::Malformed("work id"))?;
+        let signature = signature(&request.client_signature)
+            .ok_or(DeliverError::Malformed("client signature"))?;
         let job = self.state().job().ok_or(DeliverError::NoSuchJob)?;
         if job.work_id() != work_id {
             return Err(DeliverError::NoSuchJob);
+        }
+        // Who is asking, on this connection. A `work_id` says which job;
+        // it says nothing about who may be handed it, and it travels —
+        // so without this the plaintext goes to whoever learned one, and
+        // the debit for it lands on the client that never asked.
+        if !Secp256k1Verifier::new().verify_sig(
+            signature,
+            self.ready.channel().client_key(),
+            signing_hash(delivery_request_digest(
+                self.ready.channel(),
+                work_id,
+                exporter,
+            )),
+        ) {
+            return Err(DeliverError::Unbound);
         }
         let Some((result, signature)) = job.result() else {
             return Err(DeliverError::NoResult { phase: job.phase() });
@@ -1331,6 +1353,13 @@ pub enum DeliverError {
     /// The delivery margin no longer fits, or the endpoint is behind.
     #[error(transparent)]
     Setup(#[from] WorkSetupError),
+    /// The request is not this channel's client's, on this connection.
+    #[error("the delivery request is not this channel's client's over this connection")]
+    Unbound,
+    /// The transport exposes no connection exporter, so nothing here
+    /// can be bound to it.
+    #[error("this transport exposes no connection exporter to bind a delivery request to")]
+    Unbindable,
     /// The response is larger than the frame both parties authorized.
     #[error("the delivered frame is {actual} bytes, over the authorized {limit}")]
     OverFrame {
@@ -1381,6 +1410,7 @@ impl From<DeliverError> for Refusal {
         let code = match error {
             DeliverError::NoSuchJob => WorkRefusal::Declined,
             DeliverError::NoResult { .. } => WorkRefusal::NotReady,
+            DeliverError::Unbound => WorkRefusal::Invalid,
             DeliverError::Setup(setup) => return Refusal::from(setup),
             DeliverError::Store(store) => return Refusal::from(store),
             _ => WorkRefusal::Invalid,
@@ -1543,22 +1573,31 @@ impl WorkService {
 
     /// Releases one job's answer, or says why not.
     ///
+    /// The exporter comes from `context`, which is the transport's own
+    /// account of the connection this request arrived on. It is never
+    /// read out of the request: a value the caller chooses proves
+    /// nothing about where the caller is.
+    ///
     /// The readiness it releases against is this service's own, which is
     /// the endpoint's — the one the channel was configured with, at the
     /// height it was decided at. Its freshness is the operator's in
     /// exactly the sense [`ReadyChannel`] documents; what is measured
     /// against it is the height this endpoint has actually processed
     /// finalized blocks through.
-    fn release(&self, request: &DeliverResultRequest) -> DeliverResultResponse {
-        let outcome = match self.endpoint() {
-            Ok(mut endpoint) => match work_id_bytes(&request.work_id) {
-                Some(work_id) => {
-                    let ready = endpoint.ready.clone();
-                    endpoint.deliver(work_id, &ready).map_err(Refusal::from)
-                }
-                None => Err(Refusal::invalid("the work id is not 32 bytes")),
-            },
-            Err(error) => Err(Refusal::new(WorkRefusal::Unavailable, error.to_string())),
+    fn release(
+        &self,
+        request: &DeliverResultRequest,
+        context: &TransportContext,
+    ) -> DeliverResultResponse {
+        let outcome = match (self.endpoint(), context.open_exporter) {
+            (Ok(mut endpoint), Some(exporter)) => {
+                let ready = endpoint.ready.clone();
+                endpoint
+                    .deliver(request, &ready, &exporter)
+                    .map_err(Refusal::from)
+            }
+            (Ok(_), None) => Err(Refusal::from(DeliverError::Unbindable)),
+            (Err(error), _) => Err(Refusal::new(WorkRefusal::Unavailable, error.to_string())),
         };
         DeliverResultResponse {
             outcome: Some(match outcome {
@@ -1603,6 +1642,7 @@ impl WorkHandler for WorkService {
     fn accept_work(
         &self,
         request: AcceptWorkRequest,
+        _context: TransportContext,
     ) -> impl core::future::Future<
         Output = Result<impl Into<crate::call::WithTrailer<AcceptWorkResponse>> + Send, WireStatus>,
     > + Send {
@@ -1612,18 +1652,20 @@ impl WorkHandler for WorkService {
     fn deliver_result(
         &self,
         request: DeliverResultRequest,
+        context: TransportContext,
     ) -> impl core::future::Future<
         Output = Result<
             impl Into<crate::call::WithTrailer<DeliverResultResponse>> + Send,
             WireStatus,
         >,
     > + Send {
-        core::future::ready(Ok(self.release(&request)))
+        core::future::ready(Ok(self.release(&request, &context)))
     }
 
     fn admit_certificate(
         &self,
         request: AdmitCertificateRequest,
+        _context: TransportContext,
     ) -> impl core::future::Future<
         Output = Result<
             impl Into<crate::call::WithTrailer<AdmitCertificateResponse>> + Send,
@@ -1939,6 +1981,39 @@ impl ClientEndpoint {
         })
     }
 
+    /// Signs the request that asks for one job's plaintext on one
+    /// connection.
+    ///
+    /// Nothing durable is written and nothing is spent: the signature
+    /// says who is asking and where, and it authorises a release the
+    /// provider journals for itself. Made again on the same connection
+    /// it is the same bytes; made on another it is a different request,
+    /// because the exporter it covers is that connection's.
+    ///
+    /// # Errors
+    ///
+    /// [`DeliverError::NoSuchJob`] when no open job carries this
+    /// `work_id`.
+    pub fn request_delivery(
+        &self,
+        work_id: Digest,
+        exporter: &[u8; 32],
+    ) -> Result<DeliverResultRequest, DeliverError> {
+        let job = self.state().job().ok_or(DeliverError::NoSuchJob)?;
+        if job.work_id() != work_id {
+            return Err(DeliverError::NoSuchJob);
+        }
+        let signature = self.signer.sign(signing_hash(delivery_request_digest(
+            self.ready.channel(),
+            work_id,
+            exporter,
+        )));
+        Ok(DeliverResultRequest {
+            work_id: work_id.as_bytes().to_vec(),
+            client_signature: signature.as_bytes().to_vec(),
+        })
+    }
+
     /// Records that this client's own oracle reproduced the answer.
     ///
     /// It takes no verdict argument, and that is deliberate: a function
@@ -2126,10 +2201,13 @@ where
 ///
 /// # Errors
 ///
+/// [`DeliverError::Unbindable`] when the transport exposes no
+/// connection exporter to bind the request to,
 /// [`DeliverError::Transport`] when the call does not complete,
 /// [`DeliverError::Refused`] for a refusal, [`DeliverError::Malformed`]
 /// for a response this service does not define, and whatever
-/// [`ClientEndpoint::receive`] raises.
+/// [`ClientEndpoint::request_delivery`] or [`ClientEndpoint::receive`]
+/// raise.
 pub async fn fetch_result<T>(
     transport: T,
     endpoint: &mut ClientEndpoint,
@@ -2141,10 +2219,12 @@ where
     T::Error: std::error::Error + Send + Sync + 'static,
     T::Stream: 'static,
 {
+    let Some(exporter) = transport.context().open_exporter else {
+        return Err(DeliverError::Unbindable);
+    };
+    let request = endpoint.request_delivery(work_id, &exporter)?;
     let response = WorkClientImpl::new(transport)
-        .deliver_result(DeliverResultRequest {
-            work_id: work_id.as_bytes().to_vec(),
-        })
+        .deliver_result(request)
         .await?;
     match response.outcome {
         Some(DeliverOutcome::Delivered(delivered)) => endpoint.receive(work_id, ready, &delivered),

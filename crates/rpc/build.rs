@@ -444,6 +444,8 @@ struct MethodPlan {
     /// Absolute Rust path of the prost response type.
     response: syn::Path,
     shape: Shape,
+    /// Whether the handler is handed the connection's own context.
+    connection_bound: bool,
 }
 
 /// The RPC shapes the hellas wire protocol supports. Client-streaming
@@ -508,6 +510,7 @@ fn plan_service(service: &RpcService, index: &SchemaIndex) -> ServicePlan {
                 request: rust_path(&m.request_proto_type),
                 response: rust_path(&m.response_proto_type),
                 shape,
+                connection_bound: connection_bound(&service.package),
             }
         })
         .collect();
@@ -525,6 +528,22 @@ fn plan_service(service: &RpcService, index: &SchemaIndex) -> ServicePlan {
         methods,
         fqn,
     }
+}
+
+/// Whether a service's handlers are handed the transport's own context.
+///
+/// One package needs it, and it is not a convenience. `hellas.work.v1`
+/// releases paid plaintext and debits a client's credit for it, so its
+/// caller must prove on *this* connection that it is the client the
+/// channel names — and the value that proves it is the connection's TLS
+/// exporter, which no request field may carry because a request field
+/// is exactly what an attacker chooses.
+///
+/// Every other package authenticates what it is asked, not who is
+/// asking, and a context those handlers ignored would be a parameter
+/// that looked like a check.
+fn connection_bound(package: &str) -> bool {
+    package == "hellas.work.v1"
 }
 
 fn build_method_schema(service_fqn: &str, method: &RpcMethod, index: &SchemaIndex) -> MethodSchema {
@@ -719,6 +738,11 @@ fn handler_signature(m: &MethodPlan) -> TokenStream {
         Shape::BidiStreaming => boxed_stream(request),
         _ => quote! { #request },
     };
+    let context = if m.connection_bound && m.shape == Shape::Unary {
+        quote! { , context: ::hellas_wire::TransportContext }
+    } else {
+        quote! {}
+    };
     // Unary handlers may return the bare response or `WithTrailer<R>`
     // (which carries response-side metadata like provenance); streaming
     // handlers return their response stream.
@@ -729,7 +753,8 @@ fn handler_signature(m: &MethodPlan) -> TokenStream {
     quote! {
         fn #fn_name(
             &self,
-            request: #request_ty,
+            request: #request_ty
+            #context,
         ) -> impl ::core::future::Future<
             Output = ::core::result::Result<#output, ::hellas_wire::WireStatus>,
         > + Send;
@@ -787,6 +812,20 @@ fn dispatch_arm(m: &MethodPlan) -> TokenStream {
     let MethodPlan {
         marker, fn_name, ..
     } = m;
+    if m.connection_bound && m.shape == Shape::Unary {
+        return quote! {
+            <#marker as ::hellas_wire::MethodMarker>::METHOD_ID => {
+                crate::call::dispatch_unary_with_context::<T, #marker, _, _, _>(
+                    inbound,
+                    |req, context| {
+                        let h = &self.0;
+                        async move { h.#fn_name(req, context).await }
+                    },
+                )
+                .await
+            }
+        };
+    }
     let helper = match m.shape {
         Shape::Unary => quote! { dispatch_unary },
         Shape::ServerStreaming => quote! { dispatch_server_streaming },
