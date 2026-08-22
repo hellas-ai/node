@@ -2340,3 +2340,126 @@ async fn a_client_closes_the_channel_its_provider_stopped_answering() {
         )],
     );
 }
+
+// ── Three deadlines, three answers ────────────────────────────────────
+
+/// Each deadline ends the job it is about, and says whose it was.
+///
+/// One deadline used to do all three, and it did them at the wrong
+/// height and under the wrong name. A proposal the provider never
+/// co-signed held its reservation until the *payment* deadline; a job
+/// that produced no result in time held it just as long and was then
+/// written down as the client's expiry, though what failed was the
+/// provider's own side.
+///
+/// The three cases below are the three phases the height can find a job
+/// in, and the only thing varied is which deadline the block has
+/// passed.
+#[tokio::test]
+async fn each_deadline_ends_its_own_job_and_names_its_own_fault() {
+    // A proposal with no co-signature, past the acceptance deadline.
+    // Nobody produced anything, so nobody owes for it.
+    {
+        let root = temp();
+        let ready = ready();
+        let mut store = store_at(root.path(), &ready, Role::Provider, CURSOR);
+        let authorization = authorization();
+        let Ok(prepared_input) = bundle(NONCE).encode() else {
+            panic!("the fixture bundle encodes");
+        };
+        commit(
+            &mut store,
+            ChannelRecord::JobProposed {
+                authorization,
+                client_signature: client()
+                    .sign(signing_hash(work_id(ready.channel(), &authorization))),
+                prepared_input,
+            },
+        );
+        let Ok(mut provider) = ProviderEndpoint::new(ready, store, provider()) else {
+            panic!("the provider endpoint binds");
+        };
+        assert_eq!(provider.state().compute_outstanding(), PRICE);
+
+        for height in (CURSOR + 1)..=deadlines().acceptance {
+            if let Err(error) = provider.observe_finalized(&block(height, Vec::new())) {
+                panic!("the block at {height} applies: {error}");
+            }
+        }
+        assert!(
+            provider.state().job().is_some(),
+            "the deadline itself is still a height the co-signature may be made at",
+        );
+        if let Err(error) =
+            provider.observe_finalized(&block(deadlines().acceptance + 1, Vec::new()))
+        {
+            panic!("the block past acceptance applies: {error}");
+        }
+        assert!(provider.state().job().is_none(), "the proposal is over");
+        assert_eq!(provider.state().compute_outstanding(), 0, "and released");
+        let loss = provider.state().loss();
+        assert_eq!((loss.compute, loss.delivery), (0, 0), "and cost nobody");
+    }
+
+    // An accepted job with no result, past the terminal deadline. The
+    // provider did not finish, and that is the provider's own loss.
+    {
+        let root = temp();
+        let ready = ready();
+        let mut store = store_at(root.path(), &ready, Role::Provider, CURSOR);
+        let _ = accept(&mut [&mut store]);
+        let Ok(mut provider) = ProviderEndpoint::new(ready, store, provider()) else {
+            panic!("the provider endpoint binds");
+        };
+        for height in (CURSOR + 1)..=deadlines().terminal {
+            if let Err(error) = provider.observe_finalized(&block(height, Vec::new())) {
+                panic!("the block at {height} applies: {error}");
+            }
+        }
+        assert!(
+            provider.state().job().is_some(),
+            "a result at the deadline itself is still owed and still payable",
+        );
+        if let Err(error) = provider.observe_finalized(&block(deadlines().terminal + 1, Vec::new()))
+        {
+            panic!("the block past the terminal deadline applies: {error}");
+        }
+        assert!(provider.state().job().is_none(), "the job is over");
+        let loss = provider.state().loss();
+        assert_eq!(
+            (loss.compute, loss.delivery),
+            (0, 0),
+            "a provider that did not finish does not charge the client for it",
+        );
+    }
+
+    // A job whose result exists and was in time, past the payment
+    // deadline, is the one ending the client is charged for. That is
+    // `the_watcher_ends_a_job_its_payment_deadline_has_passed`'s.
+}
+
+/// Only the watcher can end a job at this client's expense.
+///
+/// The ending that charges a counterparty is decided from finalized
+/// heights, and the local surface has no way to ask for it: `end_run`
+/// takes no reason, and the one it records charges nobody. A caller
+/// that could choose could exhaust a client's identity-wide credit by
+/// accepting jobs and defaulting them.
+#[tokio::test]
+async fn a_local_caller_cannot_charge_the_client_for_a_job() {
+    let fixture = checked_job().await;
+    let id = fixture.id;
+    let Ok(mut provider) = fixture.service.endpoint() else {
+        panic!("the endpoint is reachable");
+    };
+    if let Err(error) = provider.end_run(id) {
+        panic!("the local ending records: {error}");
+    }
+    assert!(provider.state().job().is_none(), "the job is over");
+    let loss = provider.state().loss();
+    assert_eq!(
+        (loss.compute, loss.delivery),
+        (0, 0),
+        "and a delivered job ended locally costs this client nothing",
+    );
+}
