@@ -1,6 +1,6 @@
 //! The one coherent finalized read a paid work channel is decided from.
 //!
-//! # Why one read rather than four
+//! # Why one read rather than several
 //!
 //! A work channel is four pieces of consensus state: the tag-4 bond
 //! edge, the tag-2 payment edge, the bond's lease slots, and the payment
@@ -9,6 +9,15 @@
 //! combinations that produces are not hypothetical — a payment edge from
 //! before a contest opened, beside a lease from after the bond was timed
 //! out, reads as a healthy channel and is not one.
+//!
+//! A channel being *set up* is those four and one more: whether the
+//! coins the two retained Opens spend are still there. That question
+//! belongs to the same read for a sharper version of the same reason.
+//! `SetupState::decide` locks a provider's stake only if the client's
+//! payment funding is live, and a coin read at a later state than the
+//! edges is a premise about a state the decision is not being made at.
+//! Which coins those are is not derivable here, so the query carries
+//! them.
 //!
 //! So [`WorkChannelSnapshot`] is one answer at one finalized block, read
 //! under one database snapshot, and it carries the block it was read at
@@ -36,24 +45,38 @@
 //! own [`parse_bond_lease`] and [`parse_pending_close`] are called, so
 //! an endpoint and a close cannot disagree about what a slot holds.
 
+use std::collections::BTreeSet;
+
 use crate::light_client::{LatestBlock, QueryError};
 use hellas_kernel::{
-    BOND_LEASE_CHUNKS, Edge, EdgeId, LeaseSlots, PendingSlot, RegistryChunk, parse_bond_lease,
-    parse_pending_close,
+    BOND_LEASE_CHUNKS, CoinId, Edge, EdgeId, LeaseSlots, PendingSlot, RegistryChunk,
+    parse_bond_lease, parse_pending_close,
 };
 
-/// Which channel a snapshot answers for.
+/// Which channel a snapshot answers for, and which coins it must answer
+/// for at the same block.
 ///
 /// Both edges, because neither alone identifies the channel: the payment
 /// terms name the bond, but the lease is keyed by the bond and the
 /// pending record by the payment edge, so a reader that knew only one of
 /// them could not derive both slots.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// And the coins, because a setup decision is made from the two edges
+/// *and* the liveness of the coins the two retained Opens spend. Those
+/// coins are named by the caller rather than derived here — only the
+/// retained transactions say which they are — and they are asked for in
+/// this query rather than in a second call, because a coin read at some
+/// other state is a preflight that answers about a state it is not
+/// protecting. A caller with no such question passes an empty set.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct WorkChannelQuery {
     /// The tag-4 work-stake bond insuring the channel.
     pub bond_edge: EdgeId,
     /// The tag-2 payment edge work is paid from.
     pub payment_edge: EdgeId,
+    /// Coins whose liveness is to be read at the same block as the
+    /// objects above.
+    pub funding: BTreeSet<CoinId>,
 }
 
 /// Everything one paid work channel is decided from, at one finalized
@@ -72,6 +95,7 @@ pub struct WorkChannelSnapshot {
     payment: Option<Edge>,
     lease_slots: [Option<RegistryChunk>; BOND_LEASE_CHUNKS as usize],
     pending_slot: Option<RegistryChunk>,
+    live_funding: BTreeSet<CoinId>,
 }
 
 impl WorkChannelSnapshot {
@@ -91,6 +115,7 @@ impl WorkChannelSnapshot {
         payment: Option<Edge>,
         lease_slots: [Option<RegistryChunk>; BOND_LEASE_CHUNKS as usize],
         pending_slot: Option<RegistryChunk>,
+        live_funding: BTreeSet<CoinId>,
     ) -> Self {
         Self {
             query,
@@ -99,13 +124,14 @@ impl WorkChannelSnapshot {
             payment,
             lease_slots,
             pending_slot,
+            live_funding,
         }
     }
 
     /// Returns the channel this snapshot answers for.
     #[must_use]
-    pub const fn query(&self) -> WorkChannelQuery {
-        self.query
+    pub const fn query(&self) -> &WorkChannelQuery {
+        &self.query
     }
 
     /// Returns the finalized block every object here was read at.
@@ -156,6 +182,35 @@ impl WorkChannelSnapshot {
     pub fn pending(&self) -> PendingSlot {
         parse_pending_close(self.pending_slot, self.query.payment_edge)
     }
+
+    /// Returns which of the coins the query named are still live at this
+    /// block.
+    ///
+    /// A subset of [`WorkChannelQuery::funding`], never anything else: a
+    /// coin absent from it is a coin that was asked about and is gone,
+    /// and a coin that was never asked about is absent from both. That
+    /// is why the two sets are read together through
+    /// [`Self::live_funding_of`] rather than this being trusted on its
+    /// own — an empty answer means "all spent" and "nothing asked" alike.
+    #[must_use]
+    pub const fn live_funding(&self) -> &BTreeSet<CoinId> {
+        &self.live_funding
+    }
+
+    /// Returns which of `funding` are live, or `None` if this snapshot
+    /// did not ask about exactly those coins.
+    ///
+    /// The one way a decision should read the coin answer. `live_funding`
+    /// is a set of survivors, and survivors of *what* is the query's to
+    /// say: a snapshot taken for a different transaction, or for no
+    /// coins at all, would report an empty set that a caller could read
+    /// as "every coin is spent" and abort a healthy setup on. Asking for
+    /// the coins the caller actually cares about turns that into a
+    /// refusal it cannot miss.
+    #[must_use]
+    pub fn live_funding_of(&self, funding: &BTreeSet<CoinId>) -> Option<&BTreeSet<CoinId>> {
+        (&self.query.funding == funding).then_some(&self.live_funding)
+    }
 }
 
 /// A narrow finalized read of one work channel.
@@ -201,6 +256,7 @@ mod tests {
         WorkChannelQuery {
             bond_edge: bond(),
             payment_edge: payment(),
+            funding: BTreeSet::new(),
         }
     }
 
@@ -214,7 +270,15 @@ mod tests {
     }
 
     fn empty(query: WorkChannelQuery) -> WorkChannelSnapshot {
-        WorkChannelSnapshot::new(query, block(), None, None, [None, None], None)
+        WorkChannelSnapshot::new(
+            query,
+            block(),
+            None,
+            None,
+            [None, None],
+            None,
+            BTreeSet::new(),
+        )
     }
 
     /// The canonical bytes of one bond lease, spelled out here rather
@@ -260,7 +324,8 @@ mod tests {
         let value = lease_value();
         let slots = lease_slots(&value);
 
-        let held = WorkChannelSnapshot::new(query(), block(), None, None, slots, None);
+        let held =
+            WorkChannelSnapshot::new(query(), block(), None, None, slots, None, BTreeSet::new());
         let LeaseSlots::Present(lease) = held.lease() else {
             panic!(
                 "the canonical bytes are a readable lease, got {:?}",
@@ -278,8 +343,10 @@ mod tests {
         let other = WorkChannelQuery {
             bond_edge: EdgeId::from_bytes([0x99; EdgeId::LENGTH]),
             payment_edge: payment(),
+            funding: BTreeSet::new(),
         };
-        let elsewhere = WorkChannelSnapshot::new(other, block(), None, None, slots, None);
+        let elsewhere =
+            WorkChannelSnapshot::new(other, block(), None, None, slots, None, BTreeSet::new());
         assert!(matches!(elsewhere.lease(), LeaseSlots::Faulty(_)));
 
         assert_eq!(empty(query()).lease(), LeaseSlots::Absent);

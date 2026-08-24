@@ -68,10 +68,17 @@ message GetEdgeResponse {
   optional bytes state_root = 2;
 }
 
-// One work channel, named by the two edges that constitute it.
+// One work channel, named by the two edges that constitute it, and the
+// coins whose liveness must be read at the same block.
+//
+// The coins are the caller's to name: only the transactions it retained
+// say which coins its setup spends. Asking here rather than in a second
+// call is what makes the answer a fact about the same state the edges
+// came from.
 message GetWorkChannelSnapshotRequest {
   bytes bond_edge = 1;
   bytes payment_edge = 2;
+  repeated bytes funding_coins = 3;
 }
 
 // One registry slot's contents, as canonical kernel chunk bytes.
@@ -100,6 +107,11 @@ message GetWorkChannelSnapshotResponse {
   repeated RegistrySlot lease_slots = 4;
   // The payment edge's derived pending-close slot.
   RegistrySlot pending_slot = 5;
+  // Which of the request's `funding_coins` still exist at this block,
+  // in the same canonical order the request's set has. A coin the
+  // request named and this list omits is a coin that is gone; a coin
+  // here that the request did not name is a reply to another question.
+  repeated bytes live_funding = 6;
 }
 
 message GetFinalizationRequest {

@@ -385,6 +385,11 @@ impl FinalizedWorkView for RemoteLightClient {
                 .get_work_channel_snapshot(GetWorkChannelSnapshotRequest {
                     bond_edge: query.bond_edge.to_bytes().to_vec(),
                     payment_edge: query.payment_edge.to_bytes().to_vec(),
+                    funding_coins: query
+                        .funding
+                        .iter()
+                        .map(|coin| coin.to_bytes().to_vec())
+                        .collect(),
                 })
                 .await
                 .map_err(QueryError::from)?;
@@ -406,6 +411,14 @@ impl FinalizedWorkView for RemoteLightClient {
 /// omitted the field entirely would read as that permission. The server
 /// always sends the message, present or empty, so a missing one is a
 /// peer this build does not agree with.
+///
+/// The live-funding list is checked against the coins the query named,
+/// for the same class of reason and in the opposite direction: a coin
+/// reported live that was never asked about is a peer answering some
+/// other transaction's preflight, and there is nothing in an
+/// unrequested coin id that this build could have checked. A coin the
+/// query named and the reply omits is *not* refused — that is exactly
+/// how a spent coin is reported.
 pub(crate) fn work_channel_snapshot_from_proto(
     query: WorkChannelQuery,
     response: GetWorkChannelSnapshotResponse,
@@ -434,6 +447,18 @@ pub(crate) fn work_channel_snapshot_from_proto(
     };
     let pending_slot = registry_chunk_from_wire(pending.chunk, "pending-close slot")?;
 
+    let mut live_funding = std::collections::BTreeSet::new();
+    for bytes in response.live_funding {
+        let coin = hellas_kernel::CoinId::decode_exact(&bytes)
+            .map_err(|_| QueryError::Remote("live funding was not a coin id".to_string()))?;
+        if !query.funding.contains(&coin) {
+            return Err(QueryError::Remote(
+                "work channel snapshot reported a live coin the query did not name".to_string(),
+            ));
+        }
+        live_funding.insert(coin);
+    }
+
     Ok(Some(WorkChannelSnapshot::new(
         query,
         block,
@@ -441,6 +466,7 @@ pub(crate) fn work_channel_snapshot_from_proto(
         edge_from_wire(response.payment_edge, "payment edge")?,
         lease_slots,
         pending_slot,
+        live_funding,
     )))
 }
 

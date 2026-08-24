@@ -216,9 +216,14 @@ where
     ) -> impl Future<Output = Result<GetWorkChannelSnapshotResponse, WireStatus>> + Send {
         let client = self.client.clone();
         async move {
+            let mut funding = std::collections::BTreeSet::new();
+            for bytes in request.funding_coins {
+                funding.insert(coin_id_from_bytes(bytes, "funding_coins")?);
+            }
             let query = WorkChannelQuery {
                 bond_edge: edge_id_from_bytes(request.bond_edge, "bond_edge")?,
                 payment_edge: edge_id_from_bytes(request.payment_edge, "payment_edge")?,
+                funding,
             };
             let snapshot = client
                 .work_channel_snapshot(query)
@@ -576,6 +581,11 @@ pub(crate) fn work_channel_snapshot_response(
             pending_slot: Some(RegistrySlot {
                 chunk: snapshot.pending_slot().as_ref().map(kernel_bytes),
             }),
+            live_funding: snapshot
+                .live_funding()
+                .iter()
+                .map(|coin| coin.to_bytes().to_vec())
+                .collect(),
         },
         None => GetWorkChannelSnapshotResponse {
             snapshot: None,
@@ -583,6 +593,7 @@ pub(crate) fn work_channel_snapshot_response(
             payment_edge: None,
             lease_slots: Vec::new(),
             pending_slot: None,
+            live_funding: Vec::new(),
         },
     }
 }
@@ -598,6 +609,21 @@ fn kernel_bytes<E: hellas_kernel::Encode>(value: &E) -> Vec<u8> {
     let written = value.write_to(&mut buf);
     buf.truncate(written);
     buf
+}
+
+fn coin_id_from_bytes(
+    bytes: Vec<u8>,
+    field: &'static str,
+) -> Result<hellas_kernel::CoinId, WireStatus> {
+    hellas_kernel::CoinId::decode_exact(&bytes).map_err(|_| {
+        WireStatus::new(
+            WireCode::InvalidArgument,
+            format!(
+                "{field} was not {} canonical bytes",
+                hellas_kernel::CoinId::LENGTH
+            ),
+        )
+    })
 }
 
 fn edge_id_from_bytes(bytes: Vec<u8>, field: &'static str) -> Result<EdgeId, WireStatus> {
@@ -900,6 +926,7 @@ mod tests {
             pb::GetWorkChannelSnapshotRequest {
                 bond_edge: ok[..EdgeId::LENGTH - 1].to_vec(),
                 payment_edge: ok.clone(),
+                funding_coins: Vec::new(),
             },
         )
         .await
@@ -911,6 +938,7 @@ mod tests {
             pb::GetWorkChannelSnapshotRequest {
                 bond_edge: ok.clone(),
                 payment_edge: ok,
+                funding_coins: Vec::new(),
             },
         )
         .await

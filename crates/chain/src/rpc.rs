@@ -1,7 +1,9 @@
 //! Local implementation of the light-client query interface.
 
+use std::collections::BTreeSet;
+
 use crate::domain::{
-    Coin, Object, ObjectId, ObjectKind, SettlementKey, Transaction, edge_object_id,
+    Coin, Object, ObjectId, ObjectKind, SettlementKey, Transaction, coin_object_id, edge_object_id,
     registry_chunk_object_id,
 };
 use crate::{
@@ -136,9 +138,15 @@ async fn get_coin_at(
 /// Reads every object of one work channel under one database snapshot.
 ///
 /// The reader is taken once and every object comes out of it, which is
-/// the whole point: four separate `get` calls would answer from up to
-/// four states, and the combinations that produces read as healthy
-/// channels that never existed.
+/// the whole point: separate `get` calls would answer from up to as many
+/// states, and the combinations that produces read as healthy channels
+/// that never existed.
+///
+/// The queried funding coins come out of that same reader, not out of
+/// the owner index and not out of a second call. A setup decision locks
+/// a provider's stake on the premise that the client's funding is still
+/// live, and a coin read at any other state is a premise about a state
+/// the decision is not being made at.
 ///
 /// The state the reader holds is the state the owner index has applied
 /// up to, so the finalized block reported beside the objects is that
@@ -217,6 +225,29 @@ async fn work_channel_snapshot_at(
     }
     let [lease_first, lease_second, pending_slot] = registry;
 
+    let mut live_funding = BTreeSet::new();
+    for coin in &query.funding {
+        match reader
+            .get(&coin_object_id(*coin))
+            .await
+            .map_err(|error| QueryError::StateUnavailable(format!("coin read failed: {error:?}")))?
+        {
+            Some(Object::Coin(_)) => {
+                live_funding.insert(*coin);
+            }
+            // A spent coin is absent, and that is the answer the
+            // preflight wants. An object of another kind under a coin's
+            // derived id is not an answer at all.
+            None => {}
+            Some(object) => {
+                return Err(QueryError::WrongObjectKind {
+                    expected: ObjectKind::Coin,
+                    actual: object.kind(),
+                });
+            }
+        }
+    }
+
     Ok(Some(WorkChannelSnapshot::new(
         query,
         LatestBlock {
@@ -229,6 +260,7 @@ async fn work_channel_snapshot_at(
         payment,
         [lease_first, lease_second],
         pending_slot,
+        live_funding,
     )))
 }
 
@@ -529,9 +561,20 @@ mod tests {
             Auth::native(provider.sign(payment_open_hash)),
         );
 
+        // The two coins the opens spend, and one the fixture leaves
+        // alone. After both opens are applied the first two are gone and
+        // the third is not, which is the whole of what a setup preflight
+        // asks.
+        let spent_by_bond = CoinId::from_bytes(genesis_object_id(1).into());
+        let spent_by_payment = CoinId::from_bytes(genesis_object_id(0).into());
+        let untouched = CoinId::from_bytes(genesis_object_id(2).into());
+        let funding: BTreeSet<CoinId> = [spent_by_bond, spent_by_payment, untouched]
+            .into_iter()
+            .collect();
         let query = WorkChannelQuery {
             bond_edge,
             payment_edge,
+            funding: funding.clone(),
         };
 
         run_qmdb(|runtime| async move {
@@ -591,7 +634,8 @@ mod tests {
             // to answer from, which is not the same fact as "this is not
             // a channel".
             assert!(matches!(
-                work_channel_snapshot_at(&database, &index, &chain_indexer, network, query).await,
+                work_channel_snapshot_at(&database, &index, &chain_indexer, network, query.clone())
+                    .await,
                 Ok(None),
             ));
 
@@ -605,12 +649,12 @@ mod tests {
             );
 
             let snapshot =
-                work_channel_snapshot_at(&database, &index, &chain_indexer, network, query)
+                work_channel_snapshot_at(&database, &index, &chain_indexer, network, query.clone())
                     .await
                     .expect("work channel snapshot")
                     .expect("finalized state is available");
 
-            assert_eq!(snapshot.query(), query);
+            assert_eq!(snapshot.query(), &query);
             assert_eq!(
                 snapshot.block().height,
                 commonware_consensus::Heightable::height(&open_block).get()
@@ -634,6 +678,21 @@ mod tests {
             assert_eq!(lease.admission_horizon(), HORIZON);
             assert_eq!(snapshot.pending(), PendingSlot::Absent);
 
+            // The coin answer, at the same block and out of the same
+            // reader. Both opens have executed, so the two coins they
+            // funded are gone and the third is not — and the reply is
+            // the survivors, not the question.
+            let live: BTreeSet<CoinId> = [untouched].into_iter().collect();
+            assert_eq!(snapshot.live_funding(), &live);
+            assert_eq!(snapshot.live_funding_of(&funding), Some(&live));
+            // A snapshot is an answer about the coins its own query
+            // named. Asked about any other set it says so rather than
+            // reporting a subset of a different question.
+            assert_eq!(
+                snapshot.live_funding_of(&[spent_by_bond].into_iter().collect()),
+                None,
+            );
+
             // The same answer, through the wire, byte for byte. The
             // response carries canonical kernel objects, so what comes
             // back is the object consensus stored and not a re-spelling
@@ -641,8 +700,12 @@ mod tests {
             // equality below would not catch if the wire carried one.
             let encoded = crate::server::work_channel_snapshot_response(Some(snapshot.clone()));
             assert_eq!(
-                crate::client::work_channel_snapshot_from_proto(query, encoded.clone(), None)
-                    .expect("the wire carries a decodable snapshot"),
+                crate::client::work_channel_snapshot_from_proto(
+                    query.clone(),
+                    encoded.clone(),
+                    None
+                )
+                .expect("the wire carries a decodable snapshot"),
                 Some(snapshot.clone()),
             );
 
@@ -652,7 +715,7 @@ mod tests {
             let mut short = encoded.clone();
             short.lease_slots.truncate(1);
             assert!(matches!(
-                crate::client::work_channel_snapshot_from_proto(query, short, None),
+                crate::client::work_channel_snapshot_from_proto(query.clone(), short, None),
                 Err(QueryError::Remote(_)),
             ));
 
@@ -665,7 +728,7 @@ mod tests {
                 chunk.pop();
             }
             assert!(matches!(
-                crate::client::work_channel_snapshot_from_proto(query, corrupt, None),
+                crate::client::work_channel_snapshot_from_proto(query.clone(), corrupt, None),
                 Err(QueryError::Remote(_)),
             ));
 
@@ -676,7 +739,7 @@ mod tests {
             let mut silent = encoded;
             silent.pending_slot = None;
             assert!(matches!(
-                crate::client::work_channel_snapshot_from_proto(query, silent, None),
+                crate::client::work_channel_snapshot_from_proto(query.clone(), silent, None),
                 Err(QueryError::Remote(_)),
             ));
 
@@ -700,7 +763,14 @@ mod tests {
                 "the behind cursor's own block is finalized, so only the root disagrees",
             );
             assert!(matches!(
-                work_channel_snapshot_at(&database, &behind, &chain_indexer, network, query).await,
+                work_channel_snapshot_at(
+                    &database,
+                    &behind,
+                    &chain_indexer,
+                    network,
+                    query.clone()
+                )
+                .await,
                 Err(QueryError::StateUnavailable(_)),
             ));
 
@@ -714,6 +784,9 @@ mod tests {
                 WorkChannelQuery {
                     bond_edge: hellas_kernel::EdgeId::from_bytes([0xa7; 32]),
                     payment_edge: hellas_kernel::EdgeId::from_bytes([0xa8; 32]),
+                    funding: [CoinId::from_bytes([0xa9; CoinId::LENGTH])]
+                        .into_iter()
+                        .collect(),
                 },
             )
             .await
@@ -723,6 +796,35 @@ mod tests {
             assert!(absent.payment().is_none());
             assert_eq!(absent.lease(), LeaseSlots::Absent);
             assert_eq!(absent.pending(), PendingSlot::Absent);
+            assert!(
+                absent.live_funding().is_empty(),
+                "a coin nobody minted is not live",
+            );
+
+            // A live edge named as a funding coin is a typed refusal
+            // too. Coin, edge, and chunk ids share one address space, so
+            // the kind of the object found is the only thing that says
+            // the question was answered.
+            assert!(matches!(
+                work_channel_snapshot_at(
+                    &database,
+                    &index,
+                    &chain_indexer,
+                    network,
+                    WorkChannelQuery {
+                        bond_edge,
+                        payment_edge,
+                        funding: [CoinId::from_bytes(payment_edge.to_bytes())]
+                            .into_iter()
+                            .collect(),
+                    },
+                )
+                .await,
+                Err(QueryError::WrongObjectKind {
+                    expected: ObjectKind::Coin,
+                    actual: ObjectKind::Edge,
+                }),
+            ));
 
             // A coin where an edge was asked for is a typed refusal, not
             // an absent edge.
@@ -735,6 +837,7 @@ mod tests {
                     WorkChannelQuery {
                         bond_edge: hellas_kernel::EdgeId::from_bytes(genesis_object_id(2).into()),
                         payment_edge,
+                        funding: BTreeSet::new(),
                     },
                 )
                 .await,
