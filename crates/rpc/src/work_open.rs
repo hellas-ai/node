@@ -18,10 +18,10 @@
 //! transaction handed to a sink. A crash between the two leaves a
 //! journal that says the bond was submitted when it may not have been,
 //! and that is the safe half — the next run re-decides from the chain,
-//! sees no bond, and submits the *retained* bytes again. The kernel
-//! consumes each funding coin once, so a resubmission of the same Open
-//! is the same Open; it is not a second one, and the coin it would
-//! double-spend is the coin it already spent.
+//! sees no bond, and submits the *retained* bytes again. A resubmission
+//! is the same Open and not a second one: `apply_open` refuses it twice
+//! over, once because the funding coins the first one consumed are gone
+//! and once with `ApplyError::EdgeExists` for the edge already there.
 //!
 //! The other order is the one that cannot be recovered from: broadcast
 //! first, crash, and the journal has no record that a transaction
