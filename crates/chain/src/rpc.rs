@@ -736,12 +736,40 @@ mod tests {
             // permission — it is what says no contest is open and new
             // work may be admitted — so an omitted field must not be
             // read as one.
-            let mut silent = encoded;
+            let mut silent = encoded.clone();
             silent.pending_slot = None;
             assert!(matches!(
                 crate::client::work_channel_snapshot_from_proto(query.clone(), silent, None),
                 Err(QueryError::Remote(_)),
             ));
+
+            // A coin reported live that the query never named. Nothing
+            // in an unrequested coin id could have been checked, and a
+            // decision would read it as this transaction's funding, so
+            // the reply is refused rather than trimmed.
+            let mut invented = encoded.clone();
+            invented.live_funding.push(
+                CoinId::from_bytes([0xc0; CoinId::LENGTH])
+                    .to_bytes()
+                    .to_vec(),
+            );
+            assert!(matches!(
+                crate::client::work_channel_snapshot_from_proto(query.clone(), invented, None),
+                Err(QueryError::Remote(_)),
+            ));
+
+            // A coin the query named and the reply leaves out is not
+            // refused: that omission is exactly how a spent coin is
+            // reported, and refusing it would make every real
+            // preflight failure unreadable.
+            let mut spent = encoded;
+            spent.live_funding.clear();
+            let Ok(Some(reported)) =
+                crate::client::work_channel_snapshot_from_proto(query.clone(), spent, None)
+            else {
+                panic!("an empty live set is an answer");
+            };
+            assert!(reported.live_funding().is_empty());
 
             // An index one block behind the database it is reporting
             // for. Its cursor block is finalized and its finalization
