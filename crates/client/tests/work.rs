@@ -39,7 +39,8 @@ use hellas_rpc::protocol::work::{
     propose_authorization, signing_hash, work_id,
 };
 use hellas_rpc::protocol::work_setup::{
-    ObservedChannel, ReadyChannel, WorkChannelConfig, WorkChannelDescriptor, payment_terms_hash,
+    ObservedChannel, OmissionMeasurements, ReadyChannel, WorkChannelConfig, WorkChannelDescriptor,
+    payment_terms_hash,
 };
 use hellas_rpc::protocol::{ContentId, Digest};
 use hellas_rpc::services::work::WorkServer;
@@ -187,8 +188,11 @@ fn descriptor_with(policy: PaidExecutionPolicyV1) -> WorkChannelDescriptor {
         channel_policy: channel_policy(),
         execution_policy: policy,
         expected_payment_values: payment_values(),
-        omission_response_probability: Q,
-        omission_response_cost_cap: COST_CAP,
+        omission: OmissionMeasurements {
+            response_probability: Q,
+            response_blocks: hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
+            response_cost_cap: COST_CAP,
+        },
     };
     match WorkChannelDescriptor::open(config) {
         Ok(descriptor) => descriptor,

@@ -5,7 +5,7 @@
 //! [`WorkChannelDescriptor`] is everything an endpoint was told about
 //! one paid channel: the network, both edge ids, the complete tag-2
 //! payment terms — which embed the complete tag-4 bond — the private
-//! policy body and its salt, the execution policy, and the two live
+//! policy body and its salt, the execution policy, and the three
 //! measurements the omission contest's economics depend on. It is
 //! configuration, and none of it is evidence.
 //!
@@ -230,6 +230,18 @@ pub enum OmissionError {
         /// Probability numerator that was configured.
         q: u64,
     },
+    /// The terms give the watcher less time to answer than the window
+    /// the response probability was measured over.
+    #[error(
+        "the terms admit {window} blocks to answer a contest, under the {measured} blocks \
+         the response probability was measured over"
+    )]
+    ResponseWindowUnderMeasured {
+        /// `omit_response_blocks`, as the terms fix it.
+        window: u64,
+        /// Blocks the measurement allowed for the response.
+        measured: u64,
+    },
     /// The funded bond does not exceed the measured cost of responding.
     #[error("omission bond {bond} does not exceed the measured response cost cap {cap}")]
     BondBelowResponseCost {
@@ -250,6 +262,36 @@ pub enum OmissionError {
         /// `(M - q) * payment_capacity`.
         omitted: u128,
     },
+}
+
+/// What one operator measured about its own watcher.
+///
+/// The window travels with the probability because the probability is
+/// only ever a number about *that* window. "Answers a contest in time"
+/// is not a property of a watcher alone; it is a property of a watcher
+/// and a deadline, and the deadline is the terms'
+/// `omit_response_blocks`. A `q` measured over sixty blocks says nothing
+/// about a channel whose terms admit six, and
+/// [`check_omission_economics`] would otherwise spend it as though it
+/// did — which is why the check is here and not in a provider-side floor
+/// beside it. A floor is a second number with its own justification; the
+/// measurement window is the justification the first number already had.
+///
+/// The comparison is one-sided on purpose: a window *longer* than the one
+/// measured is admitted. The measured probability is the chance of
+/// answering within `response_blocks`, and more blocks cannot make that
+/// answer less likely, so `q` is a lower bound for every longer window
+/// and the inequality it feeds stays conservative.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OmissionMeasurements {
+    /// Probability, out of [`OMISSION_PROBABILITY_SCALE`], that this
+    /// provider's watcher answers a contest within
+    /// [`Self::response_blocks`].
+    pub response_probability: u64,
+    /// Blocks the measurement above allowed the watcher to answer in.
+    pub response_blocks: u64,
+    /// Measured cost cap of answering one contest.
+    pub response_cost_cap: u64,
 }
 
 /// What an operator configured for one paid channel, before anything
@@ -276,11 +318,70 @@ pub struct WorkChannelConfig {
     /// The payment edge's value, reserve, and close fees as the
     /// operator expects them to be funded.
     pub expected_payment_values: EdgeValues,
-    /// Measured probability, out of [`OMISSION_PROBABILITY_SCALE`], that
-    /// the provider's watcher answers a contest in time.
-    pub omission_response_probability: u64,
-    /// Measured cost cap of answering one contest.
-    pub omission_response_cost_cap: u64,
+    /// What the provider measured about its own watcher.
+    pub omission: OmissionMeasurements,
+}
+
+/// Everything a provider fixes about a channel before a client names the
+/// two things it does not.
+///
+/// A [`WorkChannelConfig`] is this plus the client's own two choices —
+/// the payment terms and the edge they derive — which is exactly the
+/// split the handshake has: the provider proposes a bond, and the client
+/// answers by naming the channel it wants over it. Holding the
+/// provider's half as its own value is what lets
+/// [`Self::admit`] run the same gates on proposed terms that
+/// [`WorkChannelDescriptor::open`] runs on configured ones, before the
+/// countersignature that makes those terms executable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderChannelPolicy {
+    /// The network every signature on this channel is bound to.
+    pub network: NetworkId,
+    /// Salt of the private credit-policy commitment.
+    pub policy_salt: [u8; 32],
+    /// The credit policy this provider will work under.
+    pub channel_policy: PaidChannelPolicyV1,
+    /// The execution policy this provider will run jobs under.
+    pub execution_policy: PaidExecutionPolicyV1,
+    /// The payment edge's value, reserve, and close fees as the provider
+    /// requires them to be funded.
+    pub expected_payment_values: EdgeValues,
+    /// What the provider measured about its own watcher.
+    pub omission: OmissionMeasurements,
+}
+
+impl ProviderChannelPolicy {
+    /// Opens the descriptor for terms a client has proposed, or says why
+    /// this provider will not work over them.
+    ///
+    /// Every gate is [`WorkChannelDescriptor::open`]'s, reached by
+    /// filling in the two fields the client chose and the six this
+    /// provider fixed. In particular `private_policy_commitment` stops
+    /// being the client's free choice here: [`PaidChannel::new`] opens it
+    /// against *this* provider's salt and credit policy, so terms
+    /// committing to any other policy are refused rather than signed.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`WorkChannelDescriptor::open`] raises: the commitment,
+    /// the execution policy, the settleability of the expected funding,
+    /// and the omission economics.
+    pub fn admit(
+        &self,
+        payment_edge: EdgeId,
+        payment_terms: WorkPaymentTerms,
+    ) -> Result<WorkChannelDescriptor, WorkSetupError> {
+        WorkChannelDescriptor::open(WorkChannelConfig {
+            network: self.network,
+            payment_edge,
+            payment_terms,
+            policy_salt: self.policy_salt,
+            channel_policy: self.channel_policy,
+            execution_policy: self.execution_policy,
+            expected_payment_values: self.expected_payment_values,
+            omission: self.omission,
+        })
+    }
 }
 
 /// A configured channel whose static gates have passed.
@@ -296,8 +397,7 @@ pub struct WorkChannelDescriptor {
     bond_edge: EdgeId,
     bond_terms_hash: TermsHash,
     execution_policy: PaidExecutionPolicyV1,
-    omission_response_probability: u64,
-    omission_response_cost_cap: u64,
+    omission: OmissionMeasurements,
 }
 
 impl WorkChannelDescriptor {
@@ -327,6 +427,7 @@ impl WorkChannelDescriptor {
         let bond_edge = config.payment_terms.bond_edge;
         let bond_terms_hash = config.payment_terms.bond_terms_hash();
         let omission_bond = config.payment_terms.omission_bond;
+        let omit_response_blocks = config.payment_terms.omit_response_blocks;
         let channel = PaidChannel::new(
             config.network,
             config.payment_edge,
@@ -339,9 +440,9 @@ impl WorkChannelDescriptor {
         let settlement = work_payment_settlement(config.expected_payment_values, omission_bond)
             .ok_or(WorkSetupError::Unsettleable)?;
         check_omission_economics(
-            config.omission_response_probability,
+            config.omission,
+            omit_response_blocks,
             omission_bond,
-            config.omission_response_cost_cap,
             settlement.capacity(),
         )?;
 
@@ -350,8 +451,7 @@ impl WorkChannelDescriptor {
             bond_edge,
             bond_terms_hash,
             execution_policy: config.execution_policy,
-            omission_response_probability: config.omission_response_probability,
-            omission_response_cost_cap: config.omission_response_cost_cap,
+            omission: config.omission,
         })
     }
 
@@ -475,9 +575,9 @@ impl WorkChannelDescriptor {
         let settlement = work_payment_settlement(payment.values(), terms.omission_bond)
             .ok_or(WorkSetupError::Unsettleable)?;
         check_omission_economics(
-            self.omission_response_probability,
+            self.omission,
+            terms.omit_response_blocks,
             terms.omission_bond,
-            self.omission_response_cost_cap,
             settlement.capacity(),
         )?;
 
@@ -751,8 +851,13 @@ impl ReadyChannel {
 /// [`OMISSION_PROBABILITY_SCALE`]:
 ///
 /// - `1 <= q <= M`, where `q/M` is the measured probability that this
-///   provider's watcher answers a contest in time;
-/// - `omission_bond > omission_response_cost_cap`, so answering pays the
+///   provider's watcher answers a contest within
+///   [`OmissionMeasurements::response_blocks`];
+/// - `omit_response_blocks >= response_blocks`, so the deadline the
+///   terms actually impose is one `q` was measured against. Without it
+///   `q` is a number about a window this channel does not have, and the
+///   third inequality spends it anyway;
+/// - `omission_bond > response_cost_cap`, so answering pays the
 ///   provider more than answering costs it, and the response the whole
 ///   deterrence rests on is one the provider actually wants to make;
 /// - `q * omission_bond > (M - q) * payment_capacity`, so the client's
@@ -777,18 +882,25 @@ impl ReadyChannel {
 ///
 /// One [`OmissionError`] naming the inequality that failed.
 pub fn check_omission_economics(
-    q: u64,
+    measured: OmissionMeasurements,
+    omit_response_blocks: u64,
     omission_bond: u64,
-    omission_response_cost_cap: u64,
     payment_capacity: u64,
 ) -> Result<(), OmissionError> {
+    let q = measured.response_probability;
     if q == 0 || q > OMISSION_PROBABILITY_SCALE {
         return Err(OmissionError::ProbabilityOutOfRange { q });
     }
-    if omission_bond <= omission_response_cost_cap {
+    if omit_response_blocks < measured.response_blocks {
+        return Err(OmissionError::ResponseWindowUnderMeasured {
+            window: omit_response_blocks,
+            measured: measured.response_blocks,
+        });
+    }
+    if omission_bond <= measured.response_cost_cap {
         return Err(OmissionError::BondBelowResponseCost {
             bond: omission_bond,
-            cap: omission_response_cost_cap,
+            cap: measured.response_cost_cap,
         });
     }
     let responded = u128::from(q) * u128::from(omission_bond);

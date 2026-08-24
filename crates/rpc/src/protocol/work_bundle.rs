@@ -322,6 +322,19 @@ impl WorkChannelSetupBundleV1 {
         ))
     }
 
+    /// Returns the payment terms the client has proposed, once it has
+    /// proposed them.
+    ///
+    /// Reachable a revision earlier than [`Self::payment_open`], and
+    /// that gap is the whole reason it exists: the provider has to
+    /// decide whether it will work over these terms *before* it
+    /// countersigns them, and the open they belong to is not executable
+    /// until it has.
+    #[must_use]
+    pub fn payment_terms(&self) -> Option<&WorkPaymentTerms> {
+        Some(&self.payment()?.terms)
+    }
+
     /// Returns the hash both parties sign to authorize the bond open.
     #[must_use]
     pub fn bond_open_hash(&self) -> PayloadHash {

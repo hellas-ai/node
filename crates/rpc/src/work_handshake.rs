@@ -64,12 +64,36 @@
 //! commit. There is no role argument on any function below, because a
 //! role argument would be a second answer to a question the signatures
 //! already answer.
+//!
+//! # What the provider will sign it over
+//!
+//! That *is* decided here, and it is the one judgement this module
+//! makes. Revision 2 is the client's, and four of the fields in it are
+//! the client's free choice: `private_policy_commitment`,
+//! `omission_bond`, `omit_response_blocks`, and
+//! `start_validity_blocks`. A provider that countersigned whatever
+//! arrived would be staking on terms it had never checked.
+//!
+//! So [`PaymentAdmission`] carries the provider's own configuration and
+//! [`ProviderChannelPolicy::admit`] runs the gates
+//! `WorkChannelDescriptor::open` already had — the credit-policy
+//! commitment against this provider's salt, the execution policy, the
+//! settleability of the funding it expects, and the omission
+//! economics — before the countersignature is made. No gate is spelled
+//! a second time here.
+//!
+//! What that refusal costs a provider that skips it is bounded rather
+//! than fatal: `check_ready` re-runs the economics against the funded
+//! edge, so terms that fail them yield a channel this endpoint will
+//! never admit work over. It is bounded by the stake sitting locked
+//! until the horizon, and no automatic step returns it — see
+//! `hellas_rpc::work_open`'s note on `SetupDecision::TimeoutBond`.
 
 use std::sync::{Arc, Mutex};
 
 use hellas_kernel::{
-    Auth, Funding, NetworkId, Secp256k1Signer, Secp256k1Verifier, Terms, Tx, WorkPaymentTerms,
-    WorkStakeBondTerms,
+    Auth, EdgeId, Funding, NetworkId, Secp256k1Signer, Secp256k1Verifier, Terms, Tx,
+    WorkPaymentTerms, WorkStakeBondTerms,
 };
 use hellas_wire::{StreamTransport, TransportContext, WireStatus};
 
@@ -78,6 +102,7 @@ use crate::pb::work::{
     exchange_setup_response::Outcome,
 };
 use crate::protocol::work_bundle::WorkChannelSetupBundleV1;
+use crate::protocol::work_setup::ProviderChannelPolicy;
 use crate::services::work_setup::{WorkSetupClientImpl, WorkSetupHandler};
 use crate::work::{Refusal, WorkRefusal};
 use crate::work_store::{SetupRecord, SetupState, SetupStateError, SetupStore, WorkStoreError};
@@ -136,6 +161,24 @@ pub enum SetupExchangeError {
 
 // ── One endpoint's half of the handshake ──────────────────────────────
 
+/// Whether this endpoint countersigns payment terms, and over what.
+///
+/// Not a role argument. Which signatures an endpoint *may* make is the
+/// bundle's question and the terms answer it; this answers a different
+/// one, which no signature can: whether the channel a client has
+/// proposed is a channel this operator will work over. A client has no
+/// answer to give, and [`Self::Proposes`] is that rather than a policy
+/// nobody filled in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PaymentAdmission {
+    /// This endpoint proposes payment terms and never countersigns
+    /// them. Asked to, it declines.
+    Proposes,
+    /// This endpoint countersigns a payment only over terms its own
+    /// configuration admits.
+    Admits(Box<ProviderChannelPolicy>),
+}
+
 /// One endpoint's setup journal and the key it signs revisions with.
 ///
 /// Either endpoint: there is no role field, and the three steps below
@@ -145,14 +188,24 @@ pub enum SetupExchangeError {
 pub struct SetupEndpoint {
     store: SetupStore,
     signer: Secp256k1Signer,
+    admission: PaymentAdmission,
 }
 
 impl SetupEndpoint {
-    /// Takes one setup journal and the settlement key its revisions are
-    /// signed with.
+    /// Takes one setup journal, the settlement key its revisions are
+    /// signed with, and what this endpoint will countersign a payment
+    /// over.
     #[must_use]
-    pub const fn new(store: SetupStore, signer: Secp256k1Signer) -> Self {
-        Self { store, signer }
+    pub const fn new(
+        store: SetupStore,
+        signer: Secp256k1Signer,
+        admission: PaymentAdmission,
+    ) -> Self {
+        Self {
+            store,
+            signer,
+            admission,
+        }
     }
 
     /// Returns what this endpoint's handshake has durably reached.
@@ -287,21 +340,33 @@ impl SetupEndpoint {
         }
 
         // The one revision that asks this endpoint for a signature.
-        // `payment_open_hash` is `Some` exactly when a payment leg
-        // exists, which is what revision 2 means, so the hash is read
-        // through the accessor rather than respelled here.
-        let countersigned = self
+        // `payment_open_hash`, `payment_edge`, and `payment_terms` are
+        // `Some` exactly when a payment leg exists, which is what
+        // revision 2 means, so all three are read through their
+        // accessors rather than respelled here.
+        let proposal = self
             .state()
             .bundle()
             .filter(|bundle| bundle.revision() == 2)
-            .and_then(|bundle| Some((bundle.clone(), bundle.payment_open_hash()?)))
-            .map(|(bundle, hash)| bundle.countersign_payment(Auth::native(self.signer.sign(hash))));
-        if let Some(next) = countersigned {
+            .and_then(|bundle| {
+                Some((
+                    bundle.clone(),
+                    bundle.payment_open_hash()?,
+                    bundle.payment_edge()?,
+                    bundle.payment_terms()?.clone(),
+                ))
+            });
+        if let Some((bundle, hash, payment_edge, terms)) = proposal {
+            // Before the signature, and that order is the whole of it: a
+            // refusal here is a refusal this endpoint made with nothing
+            // signed and nothing written.
+            self.admit(payment_edge, terms)?;
             // `countersign_payment` refuses every stage but the second,
             // and the filter above is that stage. Mapped so the match
             // is total; no test reaches it, and none claims to.
-            let next =
-                next.map_err(|error| Refusal::new(WorkRefusal::Invalid, error.to_string()))?;
+            let next = bundle
+                .countersign_payment(Auth::native(self.signer.sign(hash)))
+                .map_err(|error| Refusal::new(WorkRefusal::Invalid, error.to_string()))?;
             self.commit(&next).map_err(|error| match error {
                 SetupExchangeError::Store(store) => refuse(&store),
                 other => Refusal::new(WorkRefusal::Unavailable, other.to_string()),
@@ -317,6 +382,28 @@ impl SetupEndpoint {
                     "this endpoint has journaled no revision of this handshake",
                 )
             })
+    }
+
+    /// Decides whether this endpoint will work over the channel a
+    /// client has proposed.
+    ///
+    /// The descriptor `admit` returns is dropped. What is wanted here is
+    /// the judgement, not the value: nothing in the handshake acts on a
+    /// descriptor, and the endpoint that eventually mounts this channel
+    /// builds its own from the same configuration against the *funded*
+    /// edge. Keeping this one would be a second copy of a decision that
+    /// has to be retaken there anyway.
+    fn admit(&self, payment_edge: EdgeId, terms: WorkPaymentTerms) -> Result<(), Refusal> {
+        match &self.admission {
+            PaymentAdmission::Proposes => Err(Refusal::new(
+                WorkRefusal::Declined,
+                "this endpoint proposes payment terms and does not countersign them",
+            )),
+            PaymentAdmission::Admits(policy) => match policy.admit(payment_edge, terms) {
+                Ok(_descriptor) => Ok(()),
+                Err(error) => Err(Refusal::new(WorkRefusal::Declined, error.to_string())),
+            },
+        }
     }
 
     /// Journals one revision this endpoint built.

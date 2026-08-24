@@ -15,17 +15,24 @@
 
 use bytes::Bytes;
 use hellas_kernel::{
-    BlockHeight, CoinId, EdgeId, Funding, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, NetworkId,
-    Parties, Payout, Secp256k1Signer, Secp256k1Verifier, SigVerifier as _, Terms, Tx,
-    WorkPaymentTerms, WorkStakeBondTerms,
+    BlockHeight, CoinId, EdgeId, EdgeValues, Fees, Funding, List, MAX_EDGE_OUTPUTS,
+    MAX_PARTY_INPUTS, NetworkId, Parties, Payout, Secp256k1Signer, Secp256k1Verifier,
+    SigVerifier as _, Terms, Tx, WorkPaymentTerms, WorkStakeBondTerms,
 };
 use hellas_rpc::pb::work::{
     ExchangeSetupRequest, ExchangeSetupResponse, SetupAdvanced, WorkRefusalCode, WorkRefused,
     exchange_setup_response::Outcome,
 };
+use hellas_rpc::protocol::work::{
+    PaidChannelPolicyV1, PaidExecutionPolicyV1, private_policy_commitment,
+};
 use hellas_rpc::protocol::work_bundle::WorkChannelSetupBundleV1;
+use hellas_rpc::protocol::work_setup::{OmissionMeasurements, ProviderChannelPolicy};
+use hellas_rpc::protocol::{ContentId, Digest};
 use hellas_rpc::services::work_setup::{WorkSetup, WorkSetupClientImpl, WorkSetupServer};
-use hellas_rpc::work_handshake::{SetupEndpoint, SetupExchangeError, SetupService, exchange_setup};
+use hellas_rpc::work_handshake::{
+    PaymentAdmission, SetupEndpoint, SetupExchangeError, SetupService, exchange_setup,
+};
 use hellas_rpc::work_store::{Role, SetupStore};
 use hellas_wire::mux::{MessagePipe, MuxConfig, MuxTransport, Role as MuxRole};
 use hellas_wire::{DefaultClock, Dispatcher, ServiceMarker, StreamTransport};
@@ -36,6 +43,18 @@ use tokio::sync::mpsc;
 
 const HORIZON: u64 = 500;
 const STAKE: u64 = 64;
+const SALT: [u8; 32] = [0x5a; 32];
+const OMISSION_BOND: u64 = 4;
+const PAYMENT_VALUE: u64 = 1_000;
+const PAYMENT_RESERVE: u64 = 200;
+/// The window the provider measured its own response probability over,
+/// and the one the fixture's terms admit.
+///
+/// Above the kernel's floor by enough that a test can propose a
+/// *shorter* window and still be proposing terms the kernel itself
+/// would accept — so what refuses it is the provider's measurement and
+/// not a consensus rule standing in front of it.
+const WINDOW: u64 = hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS + 4;
 
 fn network() -> NetworkId {
     let Some(network) = NetworkId::new("hellas-test") else {
@@ -103,11 +122,63 @@ fn payment_terms(bond_edge: EdgeId) -> WorkPaymentTerms {
     WorkPaymentTerms {
         bond_edge,
         bond_terms: bond_terms(),
-        private_policy_commitment: [0x25; 32],
-        omit_response_blocks: hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
+        // The provider's own commitment, because the provider's
+        // admission policy opens it against its own salt and credit
+        // policy before it will countersign.
+        private_policy_commitment: private_policy_commitment(network(), &SALT, &channel_policy()),
+        omit_response_blocks: WINDOW,
         start_validity_blocks: 8,
-        omission_bond: 4,
+        omission_bond: OMISSION_BOND,
     }
+}
+
+fn channel_policy() -> PaidChannelPolicyV1 {
+    PaidChannelPolicyV1 {
+        compute_credit_limit: 40,
+        delivery_credit_limit: 40,
+    }
+}
+
+fn execution_policy() -> PaidExecutionPolicyV1 {
+    PaidExecutionPolicyV1 {
+        allowed_environment: ContentId::from_bytes([0x31; 32]),
+        generation_policy_digest: Digest::from_bytes([0x32; 32]),
+        identity_source_digest: Digest::from_bytes([0x33; 32]),
+        max_prompt_tokens: 512,
+        max_new_tokens: 128,
+        max_stop_token_ids: 4,
+        max_spool_bytes: 1_048_576,
+        max_encoded_result_frame: 262_144,
+        max_encoded_quote_response: 1_048_576,
+        dispatch_margin_blocks: 4,
+        delivery_margin_blocks: 2,
+        oracle_grace_blocks: 6,
+        fixed_price: 10,
+    }
+}
+
+/// What this provider will countersign a payment over.
+fn provider_policy() -> ProviderChannelPolicy {
+    ProviderChannelPolicy {
+        network: network(),
+        policy_salt: SALT,
+        channel_policy: channel_policy(),
+        execution_policy: execution_policy(),
+        expected_payment_values: EdgeValues::new(
+            PAYMENT_VALUE,
+            PAYMENT_RESERVE,
+            Fees::new(0, 0, 0, 0),
+        ),
+        omission: OmissionMeasurements {
+            response_probability: 999_000,
+            response_blocks: WINDOW,
+            response_cost_cap: 1,
+        },
+    }
+}
+
+fn admits() -> PaymentAdmission {
+    PaymentAdmission::Admits(Box::new(provider_policy()))
 }
 
 fn bond_edge() -> EdgeId {
@@ -115,7 +186,12 @@ fn bond_edge() -> EdgeId {
 }
 
 /// Opens one endpoint's setup journal under its own directory.
-fn endpoint(root: &std::path::Path, role: Role, signer: Secp256k1Signer) -> SetupEndpoint {
+fn endpoint(
+    root: &std::path::Path,
+    role: Role,
+    signer: Secp256k1Signer,
+    admission: PaymentAdmission,
+) -> SetupEndpoint {
     let store = match SetupStore::open(
         root,
         network(),
@@ -126,14 +202,14 @@ fn endpoint(root: &std::path::Path, role: Role, signer: Secp256k1Signer) -> Setu
         Ok(store) => store,
         Err(error) => panic!("the fixture journal opens: {error}"),
     };
-    SetupEndpoint::new(store, signer)
+    SetupEndpoint::new(store, signer, admission)
 }
 
 /// A provider endpoint that has already signed and journaled its bond
 /// proposal, which is the state an operator's configuration leaves it
 /// in.
 fn proposing_provider(root: &std::path::Path) -> SetupEndpoint {
-    let mut endpoint = endpoint(root, Role::Provider, provider());
+    let mut endpoint = endpoint(root, Role::Provider, provider(), admits());
     if let Err(error) = endpoint.propose_bond(network(), bond_funding(), bond_terms()) {
         panic!("the fixture provider proposes its bond: {error}");
     }
@@ -253,7 +329,12 @@ async fn two_endpoints_that_have_never_met_open_a_channel() {
     let provider_root = tempfile::tempdir().expect("a temp dir");
     let client_root = tempfile::tempdir().expect("a temp dir");
     let service = SetupService::new(proposing_provider(provider_root.path()));
-    let mut caller = endpoint(client_root.path(), Role::Client, client());
+    let mut caller = endpoint(
+        client_root.path(),
+        Role::Client,
+        client(),
+        PaymentAdmission::Proposes,
+    );
 
     let (dialer, listener) = transport_pair();
     let serving = serve(listener, service.clone());
@@ -314,6 +395,164 @@ async fn two_endpoints_that_have_never_met_open_a_channel() {
     assert_eq!(bundle.bond_edge(), bond_edge());
 }
 
+/// Terms the provider's own configuration refuses are terms it does not
+/// countersign — and it writes nothing when it refuses them.
+///
+/// Three of the four fields revision 2 leaves to the client, each moved
+/// on its own with the other two at the fixture's admitted values. The
+/// fourth, `start_validity_blocks`, is not gated here and no assertion
+/// below claims it is: nothing in the descriptor reads it.
+///
+/// What each case checks is the same two facts — the refusal is
+/// `Declined`, and the provider's reopened journal is still at revision
+/// 2. The second is the load-bearing one: revision 3 *is* the
+/// provider's countersignature, so a journal that stops at 2 is a
+/// provider that did not make one. The offered revision itself is
+/// retained, which is the order `advance` has always had — the client's
+/// bytes are journaled, and only the provider's own signature is
+/// withheld.
+#[tokio::test]
+async fn a_provider_does_not_countersign_terms_its_own_policy_refuses() {
+    let base = payment_terms(bond_edge());
+    let refused: [(&str, WorkPaymentTerms); 3] = [
+        (
+            "a credit policy that is not this provider's",
+            WorkPaymentTerms {
+                private_policy_commitment: [0x25; 32],
+                ..base.clone()
+            },
+        ),
+        (
+            "an omission bond that does not clear the measured response cost",
+            WorkPaymentTerms {
+                omission_bond: 1,
+                ..base.clone()
+            },
+        ),
+        (
+            "a response window shorter than the one the probability was measured over",
+            WorkPaymentTerms {
+                omit_response_blocks: WINDOW - 1,
+                ..base.clone()
+            },
+        ),
+    ];
+
+    for (what, terms) in refused {
+        let provider_root = tempfile::tempdir().expect("a temp dir");
+        let client_root = tempfile::tempdir().expect("a temp dir");
+        let service = SetupService::new(proposing_provider(provider_root.path()));
+        let mut caller = endpoint(
+            client_root.path(),
+            Role::Client,
+            client(),
+            PaymentAdmission::Proposes,
+        );
+        let (dialer, listener) = transport_pair();
+        let serving = serve(listener, service.clone());
+
+        if let Err(error) = exchange_setup(dialer.clone(), &mut caller).await {
+            panic!("the first exchange completes: {error}");
+        }
+        if let Err(error) = caller.propose_payment(payment_funding(), terms) {
+            panic!("the client is free to propose {what}: {error}");
+        }
+        assert_eq!(caller.state().revision(), Some(2));
+
+        match exchange_setup(dialer, &mut caller).await {
+            Err(SetupExchangeError::Refused { refusal, reason }) => {
+                assert_eq!(
+                    refusal,
+                    hellas_rpc::work::WorkRefusal::Declined,
+                    "{what}: refused as {refusal} — {reason}",
+                );
+            }
+            other => panic!("{what} is countersigned rather than refused: {other:?}"),
+        }
+        stop(serving, service).await;
+
+        assert_eq!(
+            reopen(provider_root.path(), Role::Provider)
+                .state()
+                .revision(),
+            Some(2),
+            "{what}: the provider countersigned terms it was configured to refuse",
+        );
+        assert_eq!(
+            caller.state().revision(),
+            Some(2),
+            "{what}: the client's own revision is untouched by the refusal",
+        );
+    }
+
+    // The same three fields at the values this provider admits complete
+    // the handshake, which is what says the refusals above were the
+    // mutations and not the fixture.
+    let provider_root = tempfile::tempdir().expect("a temp dir");
+    let client_root = tempfile::tempdir().expect("a temp dir");
+    let service = SetupService::new(proposing_provider(provider_root.path()));
+    let mut caller = endpoint(
+        client_root.path(),
+        Role::Client,
+        client(),
+        PaymentAdmission::Proposes,
+    );
+    let (dialer, listener) = transport_pair();
+    let serving = serve(listener, service.clone());
+    complete(&dialer, &mut caller).await;
+    assert_eq!(caller.state().revision(), Some(3));
+    stop(serving, service).await;
+}
+
+/// An endpoint that proposes payment terms does not countersign them,
+/// whoever asks and however good the terms are.
+///
+/// The terms offered here are the ones the provider admits in the test
+/// above, so what refuses them is the admission and not the economics.
+#[tokio::test]
+async fn a_proposing_endpoint_declines_to_countersign_admissible_terms() {
+    let root = tempfile::tempdir().expect("a temp dir");
+    let mut proposer = endpoint(
+        root.path(),
+        Role::Provider,
+        provider(),
+        PaymentAdmission::Proposes,
+    );
+    if let Err(error) = proposer.propose_bond(network(), bond_funding(), bond_terms()) {
+        panic!("the fixture provider proposes its bond: {error}");
+    }
+    let service = SetupService::new(proposer);
+
+    let client_root = tempfile::tempdir().expect("a temp dir");
+    let mut caller = endpoint(
+        client_root.path(),
+        Role::Client,
+        client(),
+        PaymentAdmission::Proposes,
+    );
+    let (dialer, listener) = transport_pair();
+    let serving = serve(listener, service.clone());
+
+    if let Err(error) = exchange_setup(dialer.clone(), &mut caller).await {
+        panic!("the first exchange completes: {error}");
+    }
+    if let Err(error) = caller.propose_payment(payment_funding(), payment_terms(bond_edge())) {
+        panic!("the client proposes its payment: {error}");
+    }
+    match exchange_setup(dialer, &mut caller).await {
+        Err(SetupExchangeError::Refused { refusal, .. }) => {
+            assert_eq!(refusal, hellas_rpc::work::WorkRefusal::Declined);
+        }
+        other => panic!("a proposing endpoint countersigned: {other:?}"),
+    }
+    stop(serving, service).await;
+    assert_eq!(
+        reopen(root.path(), Role::Provider).state().revision(),
+        Some(2),
+        "the offered revision is retained; the countersignature that would be revision 3 is not",
+    );
+}
+
 /// The provider's countersignature is over *this* payment open, and
 /// over nothing else it could be confused with.
 ///
@@ -326,7 +565,12 @@ async fn the_answer_is_signed_over_this_payment_open_and_no_other_hash() {
     let provider_root = tempfile::tempdir().expect("a temp dir");
     let client_root = tempfile::tempdir().expect("a temp dir");
     let service = SetupService::new(proposing_provider(provider_root.path()));
-    let mut caller = endpoint(client_root.path(), Role::Client, client());
+    let mut caller = endpoint(
+        client_root.path(),
+        Role::Client,
+        client(),
+        PaymentAdmission::Proposes,
+    );
     let (dialer, listener) = transport_pair();
     let serving = serve(listener, service.clone());
 
@@ -381,7 +625,12 @@ async fn every_revision_is_durable_before_its_signature_leaves() {
     let provider_root = tempfile::tempdir().expect("a temp dir");
     let client_root = tempfile::tempdir().expect("a temp dir");
     let service = SetupService::new(proposing_provider(provider_root.path()));
-    let mut caller = endpoint(client_root.path(), Role::Client, client());
+    let mut caller = endpoint(
+        client_root.path(),
+        Role::Client,
+        client(),
+        PaymentAdmission::Proposes,
+    );
     let (dialer, listener) = transport_pair();
     let serving = serve(listener, service.clone());
 
@@ -432,7 +681,12 @@ async fn a_replay_is_answered_the_same_and_writes_nothing() {
     let provider_root = tempfile::tempdir().expect("a temp dir");
     let client_root = tempfile::tempdir().expect("a temp dir");
     let service = SetupService::new(proposing_provider(provider_root.path()));
-    let mut caller = endpoint(client_root.path(), Role::Client, client());
+    let mut caller = endpoint(
+        client_root.path(),
+        Role::Client,
+        client(),
+        PaymentAdmission::Proposes,
+    );
     let (dialer, listener) = transport_pair();
     let serving = serve(listener, service.clone());
 
@@ -476,7 +730,12 @@ async fn a_replay_is_answered_the_same_and_writes_nothing() {
 #[tokio::test]
 async fn a_provider_with_no_proposal_is_not_ready() {
     let provider_root = tempfile::tempdir().expect("a temp dir");
-    let service = SetupService::new(endpoint(provider_root.path(), Role::Provider, provider()));
+    let service = SetupService::new(endpoint(
+        provider_root.path(),
+        Role::Provider,
+        provider(),
+        admits(),
+    ));
     let (dialer, listener) = transport_pair();
     let serving = serve(listener, service);
 
@@ -508,7 +767,12 @@ async fn a_stranger_cannot_make_the_provider_countersign() {
     let provider_root = tempfile::tempdir().expect("a temp dir");
     let stranger_root = tempfile::tempdir().expect("a temp dir");
     let service = SetupService::new(proposing_provider(provider_root.path()));
-    let mut interloper = endpoint(stranger_root.path(), Role::Client, stranger());
+    let mut interloper = endpoint(
+        stranger_root.path(),
+        Role::Client,
+        stranger(),
+        PaymentAdmission::Proposes,
+    );
     let (dialer, listener) = transport_pair();
     let serving = serve(listener, service.clone());
 
