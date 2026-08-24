@@ -200,7 +200,7 @@ mod tests {
     use hellas_rpc::services::work_setup::WorkSetupHandler;
     use hellas_rpc::work_close::BlockSourceError;
     use hellas_rpc::work_handshake::{PaymentAdmission, SetupEndpoint, SetupService};
-    use hellas_rpc::work_open::{SetupProgress, SetupStep, advance_setup};
+    use hellas_rpc::work_open::{SetupDriveError, SetupProgress, SetupStep, advance_setup};
     use hellas_rpc::work_store::{Role, SetupAbort, SetupEnd, SetupOrigin, SetupStore};
     use hellas_wire::TransportContext;
 
@@ -607,6 +607,17 @@ mod tests {
             let floor = chain.seal().await;
             let floor_height = commonware_consensus::Heightable::height(&floor).get();
 
+            // The client, at the same state, has nothing to do. Both
+            // submissions are the provider's, and the client's journal
+            // says so rather than trying to make one.
+            let mut client_store = open_store(client_root.path(), Role::Client);
+            assert_eq!(
+                step(&blocks, &blocks, &mut client_store, floor_height).await,
+                SetupProgress::AwaitingCounterparty,
+            );
+            assert!(chain.mempool.snapshot().await.is_empty());
+            drop(client_store);
+
             // The sink refuses. The marker must already be durable, and
             // it must be durable *on the disk* rather than in the state
             // this process is holding.
@@ -650,6 +661,31 @@ mod tests {
                 },
             );
             let origin_block = chain.seal().await;
+            let tip = commonware_consensus::Heightable::height(&origin_block).get();
+
+            // A floor above the block that carried the payment open
+            // finds nothing, and refuses. The scan's starting height is
+            // a cost and not a premise precisely because of this: too
+            // low is slow, and too high does not record a cursor it
+            // guessed.
+            let missed = advance_setup(
+                &blocks,
+                &blocks,
+                &blocks,
+                &mut provider_store,
+                &verifier,
+                tip,
+            )
+            .await;
+            assert!(
+                matches!(missed, Err(SetupDriveError::OriginNotFound { .. })),
+                "a floor past the origin refuses, got {missed:?}",
+            );
+            assert_eq!(
+                provider_store.state().origin(),
+                None,
+                "and nothing was recorded",
+            );
 
             // Both edges are live and the bond is leased to this payment
             // channel, so the driver records where that happened.
@@ -778,6 +814,60 @@ mod tests {
                     .state()
                     .end(),
                 Some(SetupEnd::Aborted(SetupAbort::PaymentFundingSpent)),
+            );
+        });
+    }
+
+    /// A bond already on chain over a channel that cannot be funded is
+    /// reported, not resolved.
+    ///
+    /// The same unfundable channel as above, except that the bond Open
+    /// reaches consensus anyway — the retained bytes are executable and
+    /// anyone holding them can send them. `decide` answers `TimeoutBond`
+    /// and the driver hands that answer back untouched: the setup
+    /// journal has no record for a Timeout submission, and this driver
+    /// broadcasts nothing it cannot write down first. Nothing else in
+    /// the workspace sends one either, so the assertion below that the
+    /// mempool is empty is also the whole story of the provider's stake.
+    #[test]
+    fn an_unusable_live_bond_is_reported_and_not_timed_out() {
+        run_qmdb(|runtime| async move {
+            let provider_root = tempfile::tempdir().expect("a temp dir");
+            let client_root = tempfile::tempdir().expect("a temp dir");
+            let payment_funding = Funding::new(
+                one_coin(CoinId::from_bytes(genesis_object_id(9).into())),
+                no_coins(),
+            );
+            shake_hands(provider_root.path(), client_root.path(), payment_funding).await;
+
+            let mut chain = Chain::start(runtime, "work_setup_stranded").await;
+            let blocks = WorkBlocks::new(chain.light_client());
+            let floor = chain.seal().await;
+            let floor_height = commonware_consensus::Heightable::height(&floor).get();
+
+            // The bond, posted by something that is not this driver.
+            let mut provider_store = open_store(provider_root.path(), Role::Provider);
+            let bond_open = provider_store
+                .state()
+                .bond_open()
+                .expect("the completed handshake is an executable bond open");
+            chain.mempool.submit(Transaction::Kernel(bond_open)).await;
+            let bond_block = chain.seal().await;
+            assert_eq!(bond_block.txs().len(), 1);
+
+            assert_eq!(
+                step(&blocks, &blocks, &mut provider_store, floor_height).await,
+                SetupProgress::TimeoutBond,
+            );
+            assert_eq!(
+                chain.mempool.snapshot().await.len(),
+                1,
+                "the driver sent nothing: the one entry is the bond above",
+            );
+            assert_eq!(
+                provider_store.state().end(),
+                None,
+                "and it recorded no ending it could not act on",
             );
         });
     }
