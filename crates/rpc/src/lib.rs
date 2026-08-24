@@ -34,6 +34,10 @@ pub mod work_close;
 /// endpoints a channel to do paid work on.
 #[cfg(feature = "work")]
 pub mod work_handshake;
+/// Posting a completed handshake: the driver that submits the two
+/// Opens, observes them finalize, and records where the channel began.
+#[cfg(feature = "work")]
+pub mod work_open;
 /// Durable endpoint state for paid work: the setup journal, the channel
 /// journal, and the counterparty loss ledger.
 #[cfg(feature = "work")]

@@ -113,6 +113,16 @@ let
       mk "check-chain-work-watcher"
         "cargo clippy -p hellas-chain --no-default-features --features work-watcher --all-targets -- -D warnings"
         (cargoEnv rustToolchain);
+    # The setup driver end to end. It needs both halves at once —
+    # `validator` for the database, the kernel, and the indexer, and
+    # `work-watcher` for the journal and the driver — and neither of the
+    # two dimensions above runs a test with the other's code compiled
+    # in. This is the only line that runs a paid channel being opened
+    # against real finalized blocks.
+    chain-setup =
+      mk "check-chain-setup"
+        "cargo test -p hellas-chain --no-default-features --features validator,work-watcher"
+        (cargoEnv rustToolchain);
     sort = mk "check-sort" "cargo-sort --workspace --check --no-format" [ pkgs.cargo-sort ];
     taplo =
       mk "check-taplo" "taplo fmt --option 'indent_string=    ' --check '*.toml' 'crates/**/Cargo.toml'"

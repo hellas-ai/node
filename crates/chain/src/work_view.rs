@@ -213,6 +213,59 @@ impl WorkChannelSnapshot {
     }
 }
 
+/// The two decisions this snapshot can be handed to.
+///
+/// Both are `hellas_rpc`'s, and both take a struct of `Option<&Edge>`s
+/// whose coherence their own docs say is the caller's to owe. This is
+/// where that debt is paid: every field of both comes out of one
+/// snapshot, which came out of one database reader at one finalized
+/// block. A caller that filled either struct in by hand would satisfy
+/// the type and not the requirement, so these two functions exist to
+/// make the coherent way the short way.
+#[cfg(feature = "work-watcher")]
+impl WorkChannelSnapshot {
+    /// Returns this read as a readiness decision's input.
+    ///
+    /// The height carried is the block the objects were read at, which
+    /// is the height `check_ready` measures the admission horizon
+    /// against. It is not the height an endpoint has *processed* — that
+    /// is the cursor, and `ReadyChannel::check_caught_up` is where the
+    /// two are compared.
+    #[must_use]
+    pub fn observed_channel(&self) -> hellas_rpc::protocol::work_setup::ObservedChannel<'_> {
+        hellas_rpc::protocol::work_setup::ObservedChannel {
+            height: self.block.height,
+            bond: self.bond(),
+            payment: self.payment(),
+            lease: self.lease(),
+            pending: self.pending(),
+        }
+    }
+
+    /// Returns this read as a setup decision's input, or `None` if this
+    /// snapshot did not ask about exactly `funding`.
+    ///
+    /// The coin set is passed in rather than taken from the query so
+    /// that the caller's own answer — the coins its retained
+    /// transactions name — is what the snapshot is checked against.
+    /// A snapshot read for another transaction's coins reports survivors
+    /// of a question this decision is not asking, and an empty set of
+    /// those reads as "every coin is spent".
+    #[must_use]
+    pub fn finalized_setup(
+        &self,
+        funding: &BTreeSet<CoinId>,
+    ) -> Option<hellas_rpc::work_open::FinalizedSetup> {
+        Some(hellas_rpc::work_open::FinalizedSetup {
+            height: self.block.height,
+            bond: self.bond,
+            payment: self.payment,
+            lease: self.lease(),
+            live_funding: self.live_funding_of(funding)?.clone(),
+        })
+    }
+}
+
 /// A narrow finalized read of one work channel.
 ///
 /// Separate from [`crate::LightClient`] on purpose. This is the whole of
