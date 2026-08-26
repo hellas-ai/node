@@ -516,6 +516,124 @@ impl<R> From<R> for WithTrailer<R> {
     }
 }
 
+/// Node-scoped concurrency bounds for close responses.
+///
+/// The outer permits are acquired by method routing before a request body is
+/// received. Bodies admitted there wait behind the smaller worker semaphore,
+/// so signature verification can never create more than four workers.
+#[derive(Debug)]
+pub struct WorkResponseRoute {
+    permits: PermitPool,
+    workers: PermitPool,
+}
+
+/// Node-scoped waiting bound for general submissions.
+#[derive(Debug)]
+pub struct GeneralSubmitRoute {
+    permits: PermitPool,
+}
+
+impl Default for GeneralSubmitRoute {
+    fn default() -> Self {
+        Self {
+            permits: PermitPool::new(48),
+        }
+    }
+}
+
+impl Default for WorkResponseRoute {
+    fn default() -> Self {
+        Self {
+            permits: PermitPool::new(16),
+            workers: PermitPool::new(4),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PermitPool {
+    available: std::sync::atomic::AtomicUsize,
+    waiters: std::sync::Mutex<Vec<std::task::Waker>>,
+}
+
+impl PermitPool {
+    const fn new(available: usize) -> Self {
+        Self {
+            available: std::sync::atomic::AtomicUsize::new(available),
+            waiters: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn try_acquire(&self) -> Option<PoolPermit<'_>> {
+        self.available
+            .fetch_update(
+                std::sync::atomic::Ordering::Acquire,
+                std::sync::atomic::Ordering::Relaxed,
+                |available| available.checked_sub(1),
+            )
+            .ok()
+            .map(|_| PoolPermit { pool: self })
+    }
+
+    fn acquire(&self) -> AcquirePermit<'_> {
+        AcquirePermit { pool: self }
+    }
+}
+
+struct PoolPermit<'a> {
+    pool: &'a PermitPool,
+}
+
+impl Drop for PoolPermit<'_> {
+    fn drop(&mut self) {
+        self.pool
+            .available
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        let waiters = core::mem::take(
+            &mut *self
+                .pool
+                .waiters
+                .lock()
+                .expect("work response permit waiters mutex poisoned"),
+        );
+        for waiter in waiters {
+            waiter.wake();
+        }
+    }
+}
+
+struct AcquirePermit<'a> {
+    pool: &'a PermitPool,
+}
+
+impl<'a> std::future::Future for AcquirePermit<'a> {
+    type Output = PoolPermit<'a>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        if let Some(permit) = self.pool.try_acquire() {
+            return std::task::Poll::Ready(permit);
+        }
+        let mut waiters = self
+            .pool
+            .waiters
+            .lock()
+            .expect("work response permit waiters mutex poisoned");
+        if let Some(permit) = self.pool.try_acquire() {
+            return std::task::Poll::Ready(permit);
+        }
+        if !waiters
+            .iter()
+            .any(|waiter| waiter.will_wake(context.waker()))
+        {
+            waiters.push(context.waker().clone());
+        }
+        std::task::Poll::Pending
+    }
+}
+
 /// Server-side helper: decode a single prost message off the recv stream,
 /// emit a single response, then close with an Ok trailer (optionally
 /// carrying provenance metadata via `WithTrailer`).
@@ -560,6 +678,121 @@ where
         |request, _context| handler(request),
     )
     .await
+}
+
+/// General submission route with its own 48 waiting permits and transport
+/// context. Its permit pool is disjoint from `SubmitWorkResponse`.
+pub async fn dispatch_general_submit_bounded<T, M, F, Fut, RespOrTrailer>(
+    inbound: hellas_wire::transport::Inbound<T::Stream>,
+    route: &GeneralSubmitRoute,
+    max_request_bytes: usize,
+    handler: F,
+) -> Result<(), TransportError>
+where
+    T: StreamTransport,
+    M: MethodMarker,
+    M::Request: Message + Default,
+    M::Response: Message,
+    F: FnOnce(M::Request, hellas_wire::TransportContext) -> Fut + Send,
+    Fut: std::future::Future<Output = Result<RespOrTrailer, WireStatus>> + Send,
+    RespOrTrailer: Into<WithTrailer<M::Response>>,
+{
+    let Some(_permit) = route.permits.try_acquire() else {
+        let (mut send, _recv) = WireStream::split(inbound.stream);
+        send.close_send(Some(
+            WireStatus::new(
+                WireCode::ResourceExhausted,
+                "general submission route is full",
+            )
+            .into(),
+        ))
+        .await
+        .map_err(|error| TransportError::Io(format!("close-with-status: {error}")))?;
+        return Ok(());
+    };
+    dispatch_unary_with_context_and_limit::<T, M, _, _, _>(
+        inbound,
+        Some(max_request_bytes),
+        handler,
+    )
+    .await
+}
+
+/// The dedicated work-response route: reserve one of sixteen request slots
+/// before reading bytes, reject raw overflow before decoding, then enter one
+/// of four bounded validation workers.
+pub async fn dispatch_work_response_bounded<T, M, F, Fut, RespOrTrailer>(
+    inbound: hellas_wire::transport::Inbound<T::Stream>,
+    route: &WorkResponseRoute,
+    max_request_bytes: usize,
+    handler: F,
+) -> Result<(), TransportError>
+where
+    T: StreamTransport,
+    M: MethodMarker,
+    M::Request: Message + Default,
+    M::Response: Message,
+    F: FnOnce(M::Request) -> Fut + Send,
+    Fut: std::future::Future<Output = Result<RespOrTrailer, WireStatus>> + Send,
+    RespOrTrailer: Into<WithTrailer<M::Response>>,
+{
+    let Some(_permit) = route.permits.try_acquire() else {
+        let (mut send, _recv) = WireStream::split(inbound.stream);
+        send.close_send(Some(
+            WireStatus::new(WireCode::ResourceExhausted, "work response route is full").into(),
+        ))
+        .await
+        .map_err(|error| TransportError::Io(format!("close-with-status: {error}")))?;
+        return Ok(());
+    };
+
+    let (mut send, recv) = WireStream::split(inbound.stream);
+    let mut recv = Box::pin(recv);
+    let req_bytes = match recv.next().await {
+        Some(Ok(bytes)) => bytes,
+        Some(Err(error)) => return Err(TransportError::Io(format!("recv: {error}"))),
+        None => return Err(TransportError::Protocol("empty unary request".into())),
+    };
+    if let Some(status) = raw_request_limit_status(req_bytes.len(), Some(max_request_bytes)) {
+        send.close_send(Some(status.into()))
+            .await
+            .map_err(|error| TransportError::Io(format!("close-with-status: {error}")))?;
+        return Ok(());
+    }
+
+    let _worker = route.workers.acquire().await;
+    let request = M::Request::decode(&req_bytes[..])
+        .map_err(|error| TransportError::Protocol(format!("prost decode: {error}")))?;
+    match handler(request).await {
+        Ok(result) => {
+            let WithTrailer { response, metadata } = result.into();
+            let mut buf = BytesMut::with_capacity(response.encoded_len());
+            response
+                .encode(&mut buf)
+                .map_err(|error| TransportError::Protocol(format!("prost encode: {error}")))?;
+            send.send_body(buf.freeze())
+                .await
+                .map_err(|error| TransportError::Io(format!("send: {error}")))?;
+            let trailer = if metadata.is_empty() {
+                Trailer::ok()
+            } else {
+                Trailer {
+                    status: WireCode::Ok,
+                    message: smol_str::SmolStr::new_static(""),
+                    metadata,
+                }
+            };
+            send.close_send(Some(trailer))
+                .await
+                .map_err(|error| TransportError::Io(format!("close: {error}")))?;
+        }
+        Err(status) => {
+            send.close_send(Some(status.into()))
+                .await
+                .map_err(|error| TransportError::Io(format!("close-with-status: {error}")))?;
+        }
+    }
+    Ok(())
 }
 
 /// Context-aware unary dispatch. This is used by connection-bound protocols
@@ -837,12 +1070,39 @@ impl<Q: Message + Default> futures_core::Stream for RequestStream<Q> {
 mod streaming_call_tests {
     use super::*;
     use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     #[derive(Clone, PartialEq, ::prost::Message)]
     struct U32Msg {
         #[prost(uint32, tag = "1")]
         x: u32,
+    }
+
+    #[derive(Clone, PartialEq, ::prost::Message)]
+    struct BytesMsg {
+        #[prost(bytes = "vec", tag = "1")]
+        payload: Vec<u8>,
+    }
+
+    struct MockService;
+
+    impl hellas_wire::ServiceMarker for MockService {
+        const NAME: &'static str = "test.Mock";
+        const ALPN: &'static str = "/test.Mock/1.0";
+        const SERVICE_ID: u32 = 1;
+    }
+
+    struct MockMethod;
+
+    impl MethodMarker for MockMethod {
+        type Service = MockService;
+        type Request = BytesMsg;
+        type Response = BytesMsg;
+        const NAME: &'static str = "Route";
+        const METHOD_ID: u32 = 2;
+        const REQUEST_STREAMING: bool = false;
+        const RESPONSE_STREAMING: bool = false;
     }
 
     /// Synthetic recv: pre-loaded chunks + optional trailer.
@@ -910,6 +1170,107 @@ mod streaming_call_tests {
         fn reset(&mut self, code: WireCode) {
             *self.state.reset.lock().unwrap() = Some(code);
         }
+    }
+
+    struct RouteRecv {
+        body: Option<Bytes>,
+        pending: bool,
+        polled: bool,
+        first_polls: Option<Arc<AtomicUsize>>,
+    }
+
+    impl futures_core::Stream for RouteRecv {
+        type Item = Result<Bytes, std::io::Error>;
+
+        fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            if !self.polled {
+                self.polled = true;
+                if let Some(polls) = &self.first_polls {
+                    polls.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            if self.pending {
+                Poll::Pending
+            } else {
+                Poll::Ready(self.body.take().map(Ok))
+            }
+        }
+    }
+
+    impl RecvHalf for RouteRecv {
+        type Error = std::io::Error;
+
+        fn trailer(&self) -> Option<&Trailer> {
+            None
+        }
+
+        fn reset(&mut self, _code: WireCode) {}
+    }
+
+    struct MockWireStream {
+        send: MockSend,
+        recv: RouteRecv,
+    }
+
+    impl WireStream for MockWireStream {
+        type SendError = std::io::Error;
+        type RecvError = std::io::Error;
+        type SendHalf = MockSend;
+        type RecvHalf = RouteRecv;
+
+        fn split(self) -> (Self::SendHalf, Self::RecvHalf) {
+            (self.send, self.recv)
+        }
+
+        fn reset(&mut self, code: WireCode) {
+            self.send.reset(code);
+        }
+    }
+
+    struct MockTransport;
+
+    impl StreamTransport for MockTransport {
+        type Stream = MockWireStream;
+        type Error = std::io::Error;
+
+        async fn open(
+            &self,
+            _method_id: u32,
+            _headers: Metadata,
+        ) -> Result<Self::Stream, Self::Error> {
+            Err(std::io::Error::other("mock transport cannot open"))
+        }
+
+        async fn accept(&self) -> Result<Option<hellas_wire::Inbound<Self::Stream>>, Self::Error> {
+            Ok(None)
+        }
+    }
+
+    fn route_inbound(
+        body: Option<Bytes>,
+        pending: bool,
+        first_polls: Option<Arc<AtomicUsize>>,
+    ) -> (hellas_wire::Inbound<MockWireStream>, MockSendState) {
+        let state = MockSendState::default();
+        (
+            hellas_wire::Inbound {
+                method_id: MockMethod::METHOD_ID,
+                headers: Metadata::new(),
+                stream: MockWireStream {
+                    send: MockSend {
+                        state: state.clone(),
+                    },
+                    recv: RouteRecv {
+                        body,
+                        pending,
+                        polled: false,
+                        first_polls,
+                    },
+                },
+                context: hellas_wire::TransportContext::default(),
+            },
+            state,
+        )
     }
 
     #[tokio::test]
@@ -1016,5 +1377,192 @@ mod streaming_call_tests {
         let status = raw_request_limit_status(65_541, Some(65_540))
             .expect("one byte over the raw cap is rejected");
         assert_eq!(status.code(), WireCode::InvalidArgument);
+        assert!(raw_request_limit_status(65_536, Some(65_536)).is_none());
+        assert_eq!(
+            raw_request_limit_status(65_537, Some(65_536))
+                .expect("work-response overflow")
+                .code(),
+            WireCode::InvalidArgument,
+        );
+    }
+
+    #[test]
+    fn work_response_route_has_sixteen_waiters_and_four_workers() {
+        let route = WorkResponseRoute::default();
+        let permits: Vec<_> = (0..16)
+            .map(|_| {
+                route
+                    .permits
+                    .try_acquire()
+                    .expect("reserved response permit")
+            })
+            .collect();
+        assert!(route.permits.try_acquire().is_none());
+
+        let workers: Vec<_> = (0..4)
+            .map(|_| {
+                route
+                    .workers
+                    .try_acquire()
+                    .expect("bounded response worker")
+            })
+            .collect();
+        assert!(route.workers.try_acquire().is_none());
+        drop(workers);
+        drop(permits);
+        assert!(route.permits.try_acquire().is_some());
+        assert!(route.workers.try_acquire().is_some());
+    }
+
+    #[tokio::test]
+    async fn work_response_route_reserves_permit_before_reading_body() {
+        let route = Arc::new(WorkResponseRoute::default());
+        let first_polls = Arc::new(AtomicUsize::new(0));
+        let mut held = Vec::new();
+        for _ in 0..16 {
+            let (inbound, _state) = route_inbound(None, true, Some(first_polls.clone()));
+            let route = route.clone();
+            held.push(tokio::spawn(async move {
+                dispatch_work_response_bounded::<MockTransport, MockMethod, _, _, BytesMsg>(
+                    inbound,
+                    &route,
+                    65_536,
+                    |_| async { Ok(BytesMsg::default()) },
+                )
+                .await
+            }));
+        }
+        while first_polls.load(Ordering::SeqCst) != 16 {
+            tokio::task::yield_now().await;
+        }
+
+        let overflow_polls = Arc::new(AtomicUsize::new(0));
+        let (overflow, state) = route_inbound(None, true, Some(overflow_polls.clone()));
+        dispatch_work_response_bounded::<MockTransport, MockMethod, _, _, BytesMsg>(
+            overflow,
+            &route,
+            65_536,
+            |_| async { Ok(BytesMsg::default()) },
+        )
+        .await
+        .expect("saturation is returned as a wire trailer");
+        assert_eq!(overflow_polls.load(Ordering::SeqCst), 0);
+        let trailer = state
+            .close
+            .lock()
+            .unwrap()
+            .clone()
+            .flatten()
+            .expect("resource-exhausted trailer");
+        assert_eq!(trailer.status, WireCode::ResourceExhausted);
+        for task in held {
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn work_response_raw_cap_is_inclusive_and_precedes_decode() {
+        let route = WorkResponseRoute::default();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let request = BytesMsg {
+            payload: vec![0; 65_532],
+        };
+        let mut encoded = BytesMut::new();
+        request.encode(&mut encoded).unwrap();
+        assert_eq!(encoded.len(), 65_536);
+        let (inbound, state) = route_inbound(Some(encoded.freeze()), false, None);
+        let called = calls.clone();
+        dispatch_work_response_bounded::<MockTransport, MockMethod, _, _, BytesMsg>(
+            inbound,
+            &route,
+            65_536,
+            move |_| async move {
+                called.fetch_add(1, Ordering::SeqCst);
+                Ok(BytesMsg::default())
+            },
+        )
+        .await
+        .expect("the exact boundary is accepted");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            state
+                .close
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .status,
+            WireCode::Ok,
+        );
+
+        let (overflow, state) = route_inbound(Some(Bytes::from(vec![0xff; 65_537])), false, None);
+        dispatch_work_response_bounded::<MockTransport, MockMethod, _, _, BytesMsg>(
+            overflow,
+            &route,
+            65_536,
+            |_| async { Ok(BytesMsg::default()) },
+        )
+        .await
+        .expect("raw overflow is a wire rejection, not a decode error");
+        assert_eq!(
+            state
+                .close
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .status,
+            WireCode::InvalidArgument,
+        );
+    }
+
+    #[tokio::test]
+    async fn work_response_route_runs_only_four_handlers() {
+        let route = Arc::new(WorkResponseRoute::default());
+        let entered = Arc::new(AtomicUsize::new(0));
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let request = BytesMsg { payload: vec![7] };
+        let mut encoded = BytesMut::new();
+        request.encode(&mut encoded).unwrap();
+        let encoded = encoded.freeze();
+        let mut tasks = Vec::new();
+        for _ in 0..5 {
+            let (inbound, _state) = route_inbound(Some(encoded.clone()), false, None);
+            let route = route.clone();
+            let entered = entered.clone();
+            let notify = notify.clone();
+            let release = release.clone();
+            tasks.push(tokio::spawn(async move {
+                dispatch_work_response_bounded::<MockTransport, MockMethod, _, _, BytesMsg>(
+                    inbound,
+                    &route,
+                    65_536,
+                    move |_| async move {
+                        entered.fetch_add(1, Ordering::SeqCst);
+                        notify.notify_waiters();
+                        release.acquire().await.unwrap().forget();
+                        Ok(BytesMsg::default())
+                    },
+                )
+                .await
+            }));
+        }
+        while entered.load(Ordering::SeqCst) < 4 {
+            notify.notified().await;
+        }
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(entered.load(Ordering::SeqCst), 4);
+        release.add_permits(5);
+        for task in tasks {
+            task.await.unwrap().unwrap();
+        }
+        assert_eq!(entered.load(Ordering::SeqCst), 5);
     }
 }

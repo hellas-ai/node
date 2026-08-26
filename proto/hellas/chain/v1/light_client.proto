@@ -12,6 +12,7 @@ service LightClient {
   rpc GetLatestBlock(GetLatestBlockRequest) returns (GetLatestBlockResponse);
   rpc GetFinalizedBlock(GetFinalizedBlockRequest) returns (GetFinalizedBlockResponse);
   rpc SubmitTx(SubmitTxRequest) returns (SubmitTxResponse);
+  rpc SubmitWorkResponse(SubmitWorkResponseRequest) returns (SubmitTxResponse);
   rpc SubscribeActivity(SubscribeActivityRequest) returns (stream ActivityEvent);
   rpc GetValidators(GetValidatorsRequest) returns (GetValidatorsResponse);
   rpc GetCoinsByOwner(GetCoinsByOwnerRequest) returns (GetCoinsByOwnerResponse);
@@ -155,6 +156,12 @@ message SubmitTxRequest {
     MergeCoinTx merge_coin = 2;
     bytes kernel_tx = 3;
   }
+}
+
+// A canonical kernel PaymentCloseResponse body. This method deliberately
+// carries no transport identity or caller-supplied admission key.
+message SubmitWorkResponseRequest {
+  bytes response = 1;
 }
 
 message WebAuthnSignature {

@@ -57,7 +57,10 @@ pub use execution::store::{UtxoDb, utxo_db_config};
 #[cfg(feature = "validator")]
 pub use execution::{ChainVerifier, ExecutionError};
 #[cfg(any(feature = "client-core", feature = "server"))]
-pub use hellas_rpc::{MAX_CANONICAL_TRANSACTION_BYTES, MAX_SUBMIT_TX_PROTO_BYTES, SubmitTxOutcome};
+pub use hellas_rpc::{
+    MAX_CANONICAL_TRANSACTION_BYTES, MAX_SUBMIT_TX_PROTO_BYTES,
+    MAX_SUBMIT_WORK_RESPONSE_PROTO_BYTES, SubmitTxOutcome,
+};
 #[cfg(any(feature = "indexer", feature = "validator"))]
 pub use indexer::{
     BlockStore, ChainIndexer, FinalizationStore, IngestError, IngestOutcome, init_block_store,
@@ -73,7 +76,8 @@ pub use light_client::{
 pub use owner_index::{ApplyOutcome, OwnerCursor, OwnerIndex, OwnerIndexError};
 #[cfg(feature = "server")]
 pub use server::{
-    LightClientRpc, LightClientServerError, serve_light_client_transport, spawn_light_client_server,
+    LightClientRpc, LightClientRpcState, LightClientServerError, serve_light_client_transport,
+    spawn_light_client_server,
 };
 #[cfg(feature = "work-watcher")]
 pub use work_blocks::WorkBlocks;

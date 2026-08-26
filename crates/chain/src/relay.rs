@@ -2,7 +2,7 @@
 
 use crate::domain::PrivateKey;
 use crate::genesis::Genesis;
-use crate::{LightClient, LightClientRpc, serve_light_client_transport};
+use crate::{LightClient, LightClientRpc, LightClientRpcState, serve_light_client_transport};
 use commonware_codec::Encode;
 use commonware_cryptography::Signer;
 use hellas_wire::PeerIdentity;
@@ -110,6 +110,7 @@ pub async fn serve_light_client_relay<C>(
     private_key: &PrivateKey,
     client: C,
     activity_tx: broadcast::Sender<crate::ConsensusActivity>,
+    rpc_state: LightClientRpcState,
 ) -> Result<(), RelayConnectError>
 where
     C: LightClient + crate::work_view::FinalizedWorkView,
@@ -124,9 +125,12 @@ where
     let request =
         authenticated_relay_request(relay_origin, genesis, private_key, timestamp_ms, nonce)?;
     let transport = hellas_wire::ws::connect_server(request).await?;
-    serve_light_client_transport(transport, LightClientRpc::new(client, activity_tx))
-        .await
-        .map_err(|error| RelayConnectError::Serve(error.to_string()))
+    serve_light_client_transport(
+        transport,
+        LightClientRpc::with_state(client, activity_tx, rpc_state),
+    )
+    .await
+    .map_err(|error| RelayConnectError::Serve(error.to_string()))
 }
 
 #[cfg(test)]

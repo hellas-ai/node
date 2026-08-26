@@ -8,6 +8,8 @@ pub const GIT_REV: &str = match option_env!("GIT_REV") {
 pub const MAX_CANONICAL_TRANSACTION_BYTES: usize = 65_536;
 /// Exact protobuf envelope size of a maximum-size `SubmitTx` kernel payload.
 pub const MAX_SUBMIT_TX_PROTO_BYTES: usize = 65_540;
+/// Raw protobuf request-body ceiling for `SubmitWorkResponse`.
+pub const MAX_SUBMIT_WORK_RESPONSE_PROTO_BYTES: usize = 65_536;
 
 /// What happened when a transaction was submitted to a node.
 ///

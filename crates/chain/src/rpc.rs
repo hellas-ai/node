@@ -1,13 +1,13 @@
 //! Local implementation of the light-client query interface.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::domain::{
     Coin, Object, ObjectId, ObjectKind, SettlementKey, Transaction, coin_object_id, edge_object_id,
     registry_chunk_object_id,
 };
 use crate::{
-    app::Mempool,
+    app::{Mempool, MempoolEntry, RESPONSE_MEMPOOL_CAPACITY},
     execution::store::UtxoDatabase,
     indexer::ChainIndexer,
     light_client::{
@@ -18,7 +18,12 @@ use crate::{
     work_view::{FinalizedWorkView, WorkChannelQuery, WorkChannelSnapshot},
 };
 use commonware_cryptography::sha256::Digest;
-use hellas_kernel::{NetworkId, bond_lease_slots, pending_payment_close_slot};
+use hellas_kernel::{
+    Batch as KernelBatch, BlockHash, BlockHeight, Coin as KernelCoin, CoinId,
+    Context as KernelContext, Edge, EdgeId, InsertError, KernelResult, NetworkId,
+    PaymentCloseResponse, RegistryChunk, RegistryChunkId, bond_lease_slots, check_response,
+    pending_payment_close_slot,
+};
 use hellas_rpc::SubmitTxOutcome;
 
 /// In-process [`LightClient`] backed by the local application handle.
@@ -47,6 +52,243 @@ impl LocalLightClient {
             consensus_info,
         }
     }
+
+    async fn submit_general(&self, tx: Transaction) -> SubmitTxOutcome {
+        let entry = MempoolEntry::new(tx);
+        let mut mempool = self.mempool.inner.lock().await;
+        if mempool
+            .general
+            .iter()
+            .any(|resident| resident.digest == entry.digest)
+        {
+            return SubmitTxOutcome::Duplicate;
+        }
+        if mempool.general.len() >= crate::GENERAL_MEMPOOL_CAPACITY {
+            return SubmitTxOutcome::Full;
+        }
+        mempool.general.push_back(entry);
+        SubmitTxOutcome::Enqueued
+    }
+
+    async fn submit_response(
+        &self,
+        response: PaymentCloseResponse,
+    ) -> Result<SubmitTxOutcome, QueryError> {
+        let Some(network) = NetworkId::new(&self.consensus_info.network_id) else {
+            return Err(QueryError::StateUnavailable(format!(
+                "network id `{}` does not fit a kernel NetworkId",
+                self.consensus_info.network_id
+            )));
+        };
+        let transaction = Transaction::Kernel(hellas_kernel::Tx::move_action(
+            hellas_kernel::Move::RespondPaymentClose(response),
+        ));
+        let incoming = MempoolEntry::new(transaction);
+        let slot = (response.payment_edge(), response.start_id());
+
+        // Hold one finalized reader across authentication, the resident sweep,
+        // and insertion. An unauthenticated newcomer is checked before taking
+        // the mempool lock, so it cannot make the node reverify residents.
+        let reader = self.databases.read().await;
+        let state_root = reader.root();
+        let cursor = self.owner_index.cursor();
+        if cursor.height == 0 {
+            return Err(QueryError::StateUnavailable(
+                "no finalized application state is available".to_string(),
+            ));
+        }
+        if cursor.state_root != state_root {
+            return Err(QueryError::StateUnavailable(
+                "owner index and application state are not synchronized".to_string(),
+            ));
+        }
+        if self
+            .chain_indexer
+            .get_finalization(cursor.payload)
+            .await?
+            .is_none()
+        {
+            return Err(QueryError::StateUnavailable(
+                "owner index cursor finalization is unavailable".to_string(),
+            ));
+        }
+        let Some(admission_height) = cursor.height.checked_add(1) else {
+            return Err(QueryError::StateUnavailable(
+                "finalized height has no successor for response admission".to_string(),
+            ));
+        };
+        let context = KernelContext::with_fees(
+            network,
+            BlockHeight::new(admission_height),
+            BlockHash::from_bytes(cursor.payload.0),
+            crate::domain::KERNEL_FEES,
+        );
+
+        let mut batch = ResponseAdmissionBatch::default();
+        let incoming_edge = response.payment_edge();
+        match reader
+            .get(&edge_object_id(incoming_edge))
+            .await
+            .map_err(|error| QueryError::StateUnavailable(format!("edge read failed: {error:?}")))?
+        {
+            Some(Object::Edge(edge)) => {
+                batch.edges.insert(incoming_edge, edge);
+            }
+            Some(object) => {
+                return Err(QueryError::WrongObjectKind {
+                    expected: ObjectKind::Edge,
+                    actual: object.kind(),
+                });
+            }
+            None => {}
+        }
+        let incoming_pending = pending_payment_close_slot(network, incoming_edge);
+        match reader
+            .get(&registry_chunk_object_id(incoming_pending))
+            .await
+            .map_err(|error| {
+                QueryError::StateUnavailable(format!("registry read failed: {error:?}"))
+            })? {
+            Some(Object::RegistryChunk(chunk)) => {
+                batch.registry.insert(incoming_pending, chunk);
+            }
+            Some(object) => {
+                return Err(QueryError::WrongObjectKind {
+                    expected: ObjectKind::RegistryChunk,
+                    actual: object.kind(),
+                });
+            }
+            None => {}
+        }
+
+        let verifier = crate::execution::ChainVerifier::new();
+        if check_response(&response, context, &verifier, &batch).is_err() {
+            return Ok(SubmitTxOutcome::ValidationRejected);
+        }
+
+        // Serialize the sweep and insertion only after the newcomer has
+        // authenticated. Residents are still judged against the same reader.
+        let mut mempool = self.mempool.inner.lock().await;
+        let residents: Vec<PaymentCloseResponse> = mempool
+            .responses
+            .values()
+            .filter_map(|entry| payment_close_response(&entry.transaction).copied())
+            .collect();
+        for candidate in residents.iter().copied() {
+            let edge_id = candidate.payment_edge();
+            if !batch.edges.contains_key(&edge_id) {
+                match reader
+                    .get(&edge_object_id(edge_id))
+                    .await
+                    .map_err(|error| {
+                        QueryError::StateUnavailable(format!("edge read failed: {error:?}"))
+                    })? {
+                    Some(Object::Edge(edge)) => {
+                        batch.edges.insert(edge_id, edge);
+                    }
+                    Some(object) => {
+                        return Err(QueryError::WrongObjectKind {
+                            expected: ObjectKind::Edge,
+                            actual: object.kind(),
+                        });
+                    }
+                    None => {}
+                }
+            }
+            let pending_id = pending_payment_close_slot(network, edge_id);
+            if !batch.registry.contains_key(&pending_id) {
+                match reader
+                    .get(&registry_chunk_object_id(pending_id))
+                    .await
+                    .map_err(|error| {
+                        QueryError::StateUnavailable(format!("registry read failed: {error:?}"))
+                    })? {
+                    Some(Object::RegistryChunk(chunk)) => {
+                        batch.registry.insert(pending_id, chunk);
+                    }
+                    Some(object) => {
+                        return Err(QueryError::WrongObjectKind {
+                            expected: ObjectKind::RegistryChunk,
+                            actual: object.kind(),
+                        });
+                    }
+                    None => {}
+                }
+            }
+        }
+
+        mempool.responses.retain(|_, resident| {
+            payment_close_response(&resident.transaction).is_some_and(|resident_response| {
+                check_response(resident_response, context, &verifier, &batch).is_ok()
+            })
+        });
+        if mempool
+            .responses
+            .get(&slot)
+            .is_some_and(|resident| resident.digest == incoming.digest)
+        {
+            return Ok(SubmitTxOutcome::Duplicate);
+        }
+
+        if mempool.responses.contains_key(&slot)
+            || mempool.responses.len() >= RESPONSE_MEMPOOL_CAPACITY
+        {
+            return Ok(SubmitTxOutcome::Full);
+        }
+        mempool.responses.insert(slot, incoming);
+        Ok(SubmitTxOutcome::Enqueued)
+    }
+}
+
+fn payment_close_response(transaction: &Transaction) -> Option<&PaymentCloseResponse> {
+    let Transaction::Kernel(hellas_kernel::Tx::Move {
+        action: hellas_kernel::Move::RespondPaymentClose(response),
+    }) = transaction
+    else {
+        return None;
+    };
+    Some(response)
+}
+
+#[derive(Default)]
+struct ResponseAdmissionBatch {
+    edges: BTreeMap<EdgeId, Edge>,
+    registry: BTreeMap<RegistryChunkId, RegistryChunk>,
+}
+
+impl KernelBatch for ResponseAdmissionBatch {
+    fn coin(&self, _id: CoinId) -> Option<KernelCoin> {
+        None
+    }
+    fn insert_coin(&mut self, _id: CoinId, _coin: KernelCoin) -> KernelResult<(), InsertError> {
+        Err(InsertError::Unavailable.into())
+    }
+    fn remove_coin(&mut self, _id: CoinId) -> Option<KernelCoin> {
+        None
+    }
+    fn edge(&self, id: EdgeId) -> Option<Edge> {
+        self.edges.get(&id).copied()
+    }
+    fn insert_edge(&mut self, _id: EdgeId, _edge: Edge) -> KernelResult<(), InsertError> {
+        Err(InsertError::Unavailable.into())
+    }
+    fn remove_edge(&mut self, _id: EdgeId) -> Option<Edge> {
+        None
+    }
+    fn registry_chunk(&self, id: RegistryChunkId) -> Option<RegistryChunk> {
+        self.registry.get(&id).copied()
+    }
+    fn insert_registry_chunk(
+        &mut self,
+        _id: RegistryChunkId,
+        _chunk: RegistryChunk,
+    ) -> KernelResult<(), InsertError> {
+        Err(InsertError::Unavailable.into())
+    }
+    fn remove_registry_chunk(&mut self, _id: RegistryChunkId) -> Option<RegistryChunk> {
+        None
+    }
+    fn commit(self) {}
 }
 
 fn owner_lookup_error(error: OwnerIndexError) -> QueryError {
@@ -350,7 +592,11 @@ impl LightClient for LocalLightClient {
                 crate::MAX_CANONICAL_TRANSACTION_BYTES,
             )));
         }
-        Ok(self.mempool.submit(tx).await)
+        if let Some(response) = payment_close_response(&tx).copied() {
+            self.submit_response(response).await
+        } else {
+            Ok(self.submit_general(tx).await)
+        }
     }
 
     async fn get_validators(&self) -> Result<Vec<String>, QueryError> {
@@ -438,6 +684,595 @@ mod tests {
     use commonware_glue::stateful::db::{DatabaseSet, Merkleized as _, Unmerkleized as _};
     use commonware_runtime::{Handle, Supervisor as _};
     use hellas_kernel::{BlockHash, BlockHeight, Context as KernelContext};
+
+    struct ResponseFixture {
+        client: LocalLightClient,
+        database: UtxoDatabase<commonware_runtime::tokio::Context>,
+        owner_index: OwnerIndex,
+        chain_indexer: ChainIndexer,
+        allocations: Vec<(SettlementKey, u64)>,
+        contest: crate::HellasBlock,
+        valid: PaymentCloseResponse,
+        second: PaymentCloseResponse,
+        bad_action: PaymentCloseResponse,
+        absent: PaymentCloseResponse,
+        valid_responses: Vec<PaymentCloseResponse>,
+        _indexer: Handle<()>,
+    }
+
+    async fn response_fixture(
+        runtime: commonware_runtime::tokio::Context,
+        partition: &'static str,
+    ) -> ResponseFixture {
+        response_fixture_with_contests(runtime, partition, 1).await
+    }
+
+    async fn response_fixture_with_contests(
+        runtime: commonware_runtime::tokio::Context,
+        partition: &'static str,
+        contest_count: usize,
+    ) -> ResponseFixture {
+        use hellas_kernel::{
+            Auth, EarnedCertificate, Funding, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Move,
+            Parties, Party, PaymentCloseStart, Payout, Secp256k1Signer, Terms, WorkPaymentTerms,
+            WorkStakeBondTerms,
+        };
+
+        const FUNDING: u64 = 100;
+        const STAKE: u64 = 12;
+        const HORIZON: u64 = 500;
+        const START_AMOUNT: u64 = 30;
+        let network = crate::domain::TEST_NETWORK;
+        let client_signer = Secp256k1Signer::from_secret_scalar([0x21; 32]).expect("client key");
+        let provider_signer =
+            Secp256k1Signer::from_secret_scalar([0x22; 32]).expect("provider key");
+        let client_key = client_signer.party_key();
+        let provider_key = provider_signer.party_key();
+
+        let mut allocations = Vec::with_capacity(contest_count * 2);
+        let mut transactions = Vec::with_capacity(contest_count * 3);
+        let mut valid_responses = Vec::with_capacity(contest_count);
+        let mut first_responses = None;
+        for contest_index in 0..contest_count {
+            let payment_coin = u16::try_from(contest_index * 2).expect("fixture coin index");
+            let bond_coin = payment_coin
+                .checked_add(1)
+                .expect("fixture bond coin index");
+            allocations.push((SettlementKey::from(client_key), FUNDING));
+            allocations.push((SettlementKey::from(provider_key), STAKE));
+
+            let bond = WorkStakeBondTerms {
+                parties: Parties::new(provider_key, client_key),
+                timeout: BlockHeight::new(HORIZON),
+                timeout_outputs: List::take(
+                    [Payout::new(provider_key, STAKE); MAX_EDGE_OUTPUTS],
+                    1,
+                ),
+                max_job_price: 4,
+            };
+            let bond_terms = Terms::work_stake_bond(bond.clone());
+            let bond_funding = Funding::new(
+                List::take(
+                    [CoinId::from_bytes(genesis_object_id(bond_coin).into()); MAX_PARTY_INPUTS],
+                    1,
+                ),
+                List::take(
+                    [CoinId::from_bytes([0; CoinId::LENGTH]); MAX_PARTY_INPUTS],
+                    0,
+                ),
+            );
+            let bond_edge = hellas_kernel::Tx::edge_id_of(&bond_funding, &bond_terms);
+            let bond_hash = hellas_kernel::Tx::open_hash(network, &bond_funding, &bond_terms);
+            let bond_open = hellas_kernel::Tx::open(
+                bond_funding,
+                bond_terms,
+                Auth::native(provider_signer.sign(bond_hash)),
+                Auth::native(client_signer.sign(bond_hash)),
+            );
+
+            let terms = Terms::work_payment(WorkPaymentTerms {
+                bond_edge,
+                bond_terms: bond,
+                private_policy_commitment: [0x25; 32],
+                omit_response_blocks: hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
+                start_validity_blocks: 64,
+                omission_bond: 2,
+            });
+            let funding = Funding::new(
+                List::take(
+                    [CoinId::from_bytes(genesis_object_id(payment_coin).into()); MAX_PARTY_INPUTS],
+                    1,
+                ),
+                List::take(
+                    [CoinId::from_bytes([0; CoinId::LENGTH]); MAX_PARTY_INPUTS],
+                    0,
+                ),
+            );
+            let edge = hellas_kernel::Tx::edge_id_of(&funding, &terms);
+            let open_hash = hellas_kernel::Tx::open_hash(network, &funding, &terms);
+            let payment_open = hellas_kernel::Tx::open(
+                funding,
+                terms.clone(),
+                Auth::native(client_signer.sign(open_hash)),
+                Auth::native(provider_signer.sign(open_hash)),
+            );
+
+            let understated = EarnedCertificate::new(edge, terms.hash(), START_AMOUNT);
+            let understated_digest = understated.digest(network);
+            let start_digest = hellas_kernel::start_digest(
+                network,
+                edge,
+                terms.hash(),
+                Party::Maker,
+                (2, 65),
+                understated_digest,
+            );
+            let start =
+                hellas_kernel::Tx::move_action(Move::StartPaymentClose(PaymentCloseStart::new(
+                    edge,
+                    terms.clone(),
+                    Party::Maker,
+                    (2, 65),
+                    Some((understated, client_signer.sign(understated_digest))),
+                    client_signer.sign(start_digest),
+                )));
+            let start_id = hellas_kernel::start_id(start_digest, 2);
+            let make_response = |amount: u64, action_by_provider: bool| {
+                let certificate = EarnedCertificate::new(edge, terms.hash(), amount);
+                let earned_digest = certificate.digest(network);
+                let action_digest = hellas_kernel::response_digest(
+                    network,
+                    edge,
+                    terms.hash(),
+                    start_id,
+                    Party::Taker,
+                    earned_digest,
+                );
+                PaymentCloseResponse::new(
+                    edge,
+                    start_id,
+                    Party::Taker,
+                    (certificate, client_signer.sign(earned_digest)),
+                    if action_by_provider {
+                        provider_signer.sign(action_digest)
+                    } else {
+                        client_signer.sign(action_digest)
+                    },
+                )
+            };
+            let valid = make_response(60, true);
+            if contest_index == 0 {
+                first_responses = Some((
+                    valid,
+                    make_response(61, true),
+                    make_response(62, false),
+                    start_id,
+                    terms.hash(),
+                    understated_digest,
+                    start_digest,
+                ));
+            }
+            valid_responses.push(valid);
+            transactions.extend([
+                Transaction::Kernel(bond_open),
+                Transaction::Kernel(payment_open),
+                Transaction::Kernel(start),
+            ]);
+        }
+        let (valid, second, bad_action, start_id, terms_hash, understated_digest, start_digest) =
+            first_responses.expect("response fixture has at least one contest");
+        let absent = PaymentCloseResponse::new(
+            EdgeId::from_bytes([0xa8; EdgeId::LENGTH]),
+            start_id,
+            Party::Taker,
+            (
+                EarnedCertificate::new(EdgeId::from_bytes([0xa8; EdgeId::LENGTH]), terms_hash, 63),
+                client_signer.sign(understated_digest),
+            ),
+            provider_signer.sign(start_digest),
+        );
+
+        let config = utxo_db_config(&runtime, partition, 1024, 8);
+        let database =
+            <UtxoDatabase<_> as DatabaseSet<_>>::init(runtime.child("response_database"), config)
+                .await;
+        let genesis = index_genesis();
+        let floor_root = apply(&database, &allocations, 1, &[]).await;
+        let floor = index_block(&genesis, floor_root, Vec::new());
+        let contest_root = apply(&database, &allocations, 2, &transactions).await;
+        let contest = index_block(&floor, contest_root, transactions);
+
+        let consensus = consensus_fixture(95);
+        let (chain_indexer, handle) = spawn_follower_indexer(
+            runtime,
+            partition,
+            Config {
+                mailbox_size: 32,
+                replay_buffer: 32,
+                write_buffer: 32,
+                page_cache_size: 1024,
+                page_cache_count: 8,
+                ..Config::default()
+            },
+            consensus.verifier.clone(),
+            genesis.clone(),
+        )
+        .await
+        .expect("chain indexer");
+        for block in [&floor, &contest] {
+            chain_indexer
+                .ingest_finalized(block.clone(), finalization(&consensus, block))
+                .await
+                .expect("finalized ingest");
+        }
+        let owner_index = OwnerIndex::new(network, &genesis, allocations.clone());
+        assert_eq!(
+            owner_index.apply_finalized(&floor),
+            Ok(ApplyOutcome::Applied)
+        );
+        assert_eq!(
+            owner_index.apply_finalized(&contest),
+            Ok(ApplyOutcome::Applied)
+        );
+        let client = LocalLightClient::new(
+            database.clone(),
+            owner_index.clone(),
+            Mempool::default(),
+            chain_indexer.clone(),
+            ConsensusInfo {
+                validators: Vec::new(),
+                threshold_identity: Vec::new(),
+                network_id: network.as_str().to_string(),
+            },
+        );
+        ResponseFixture {
+            client,
+            database,
+            owner_index,
+            chain_indexer,
+            allocations,
+            contest,
+            valid,
+            second,
+            bad_action,
+            absent,
+            valid_responses,
+            _indexer: handle,
+        }
+    }
+
+    fn response_transaction(response: PaymentCloseResponse) -> Transaction {
+        Transaction::Kernel(hellas_kernel::Tx::move_action(
+            hellas_kernel::Move::RespondPaymentClose(response),
+        ))
+    }
+
+    #[test]
+    fn round7_general_ids_cannot_block_response() {
+        use hellas_kernel::Encode as _;
+        use hellas_rpc::pb::{
+            chain::{
+                SubmitTxOutcome as ProtoOutcome, SubmitTxRequest, SubmitWorkResponseRequest,
+                submit_tx_request,
+            },
+            services::light_client::LightClientHandler,
+        };
+        use hellas_wire::{PeerIdentity, TransportContext};
+
+        run_qmdb(|runtime| async move {
+            let fixture = response_fixture(runtime, "round7_response_source_isolation").await;
+            let (activity_tx, _activity_rx) = tokio::sync::broadcast::channel(1);
+            let rpc = crate::server::LightClientRpc::new(fixture.client.clone(), activity_tx);
+            let general = hellas_kernel::test_support::valid_open_tx().expect("general tx fixture");
+            let mut general_bytes = vec![0; hellas_kernel::Tx::MAX_ENCODED_SIZE];
+            let written = general.write_to(&mut general_bytes);
+            general_bytes.truncate(written);
+            let request = SubmitTxRequest {
+                tx: Some(submit_tx_request::Tx::KernelTx(general_bytes)),
+            };
+
+            for identity in 0_u16..256 {
+                let mut bytes = [0_u8; 32];
+                bytes[..2].copy_from_slice(&identity.to_be_bytes());
+                let response = LightClientHandler::submit_tx(
+                    &rpc,
+                    request.clone(),
+                    TransportContext {
+                        peer: Some(PeerIdentity(bytes)),
+                        ..TransportContext::default()
+                    },
+                )
+                .await
+                .expect("general submission has an honest outcome");
+                assert!(matches!(
+                    ProtoOutcome::try_from(response.outcome),
+                    Ok(ProtoOutcome::Enqueued | ProtoOutcome::Duplicate)
+                ));
+            }
+            let response = LightClientHandler::submit_tx(
+                &rpc,
+                request,
+                TransportContext {
+                    peer: Some(PeerIdentity([0xff; 32])),
+                    ..TransportContext::default()
+                },
+            )
+            .await
+            .expect("a saturated source table returns an outcome");
+            assert_eq!(response.outcome, ProtoOutcome::Full as i32);
+
+            let mut response_bytes = vec![0; hellas_kernel::PaymentCloseResponse::MAX_ENCODED_SIZE];
+            let written = fixture.valid.write_to(&mut response_bytes);
+            response_bytes.truncate(written);
+            let response = LightClientHandler::submit_work_response(
+                &rpc,
+                SubmitWorkResponseRequest {
+                    response: response_bytes,
+                },
+            )
+            .await
+            .expect("response route is independent of general identities");
+            assert_eq!(response.outcome, ProtoOutcome::Enqueued as i32);
+            let mempool = fixture.client.mempool.inner.lock().await;
+            assert_eq!(mempool.general.len(), 1);
+            assert_eq!(mempool.responses.len(), 1);
+        });
+    }
+
+    #[test]
+    fn round3_certificate_only_response_is_rejected_and_one_slot_per_finalized_contest() {
+        use hellas_kernel::Encode as _;
+        use hellas_rpc::pb::{
+            chain::{SubmitTxRequest, submit_tx_request},
+            services::light_client::LightClientHandler,
+        };
+        use hellas_wire::TransportContext;
+
+        run_qmdb(|runtime| async move {
+            let fixture = response_fixture(runtime, "response_finalized_slot").await;
+            assert_eq!(
+                fixture
+                    .client
+                    .submit_tx(response_transaction(fixture.absent))
+                    .await
+                    .expect("absent contest is an admission outcome"),
+                SubmitTxOutcome::ValidationRejected,
+            );
+            assert!(
+                fixture
+                    .client
+                    .mempool
+                    .inner
+                    .lock()
+                    .await
+                    .responses
+                    .is_empty()
+            );
+
+            assert_eq!(
+                fixture
+                    .client
+                    .submit_tx(response_transaction(fixture.bad_action))
+                    .await
+                    .expect("bad action is an admission outcome"),
+                SubmitTxOutcome::ValidationRejected,
+            );
+            assert!(
+                fixture
+                    .client
+                    .mempool
+                    .inner
+                    .lock()
+                    .await
+                    .responses
+                    .is_empty()
+            );
+
+            assert_eq!(
+                fixture
+                    .client
+                    .submit_tx(response_transaction(fixture.valid))
+                    .await
+                    .expect("valid response admission"),
+                SubmitTxOutcome::Enqueued,
+            );
+            assert_eq!(
+                fixture
+                    .client
+                    .submit_tx(response_transaction(fixture.valid))
+                    .await
+                    .expect("exact resident admission"),
+                SubmitTxOutcome::Duplicate,
+            );
+            assert_eq!(
+                fixture
+                    .client
+                    .submit_tx(response_transaction(fixture.second))
+                    .await
+                    .expect("occupied contest admission"),
+                SubmitTxOutcome::Full,
+            );
+            let mempool = fixture.client.mempool.inner.lock().await;
+            assert_eq!(mempool.responses.len(), 1);
+            assert_eq!(
+                payment_close_response(&mempool.responses.values().next().unwrap().transaction),
+                Some(&fixture.valid),
+            );
+            drop(mempool);
+
+            // The general wire method cannot smuggle the response into the
+            // general queue; the dedicated method is the only wire spelling.
+            let tx = hellas_kernel::Tx::move_action(hellas_kernel::Move::RespondPaymentClose(
+                fixture.valid,
+            ));
+            let mut bytes = vec![0; hellas_kernel::Tx::MAX_ENCODED_SIZE];
+            let written = tx.write_to(&mut bytes);
+            bytes.truncate(written);
+            let (activity_tx, _activity_rx) = tokio::sync::broadcast::channel(1);
+            let rpc = crate::server::LightClientRpc::new(fixture.client, activity_tx);
+            let error = LightClientHandler::submit_tx(
+                &rpc,
+                SubmitTxRequest {
+                    tx: Some(submit_tx_request::Tx::KernelTx(bytes)),
+                },
+                TransportContext::default(),
+            )
+            .await
+            .expect_err("SubmitTx rejects PaymentCloseResponse");
+            assert_eq!(error.code(), hellas_wire::WireCode::InvalidArgument);
+        });
+    }
+
+    #[test]
+    fn resident_invalidated_by_finality_is_dropped_before_full() {
+        run_qmdb(|runtime| async move {
+            let fixture =
+                response_fixture_with_contests(runtime, "response_finality_sweep", 2).await;
+            assert_eq!(
+                fixture
+                    .client
+                    .submit_tx(response_transaction(fixture.valid))
+                    .await
+                    .expect("valid response admission"),
+                SubmitTxOutcome::Enqueued,
+            );
+
+            // Consensus executes the same response authoritatively. Once that
+            // block finalizes, the old resident is no longer valid because
+            // the contest record is answered.
+            let transactions = vec![response_transaction(fixture.valid)];
+            let root = apply(&fixture.database, &fixture.allocations, 3, &transactions).await;
+            let answered = index_block(&fixture.contest, root, transactions);
+            let consensus = consensus_fixture(95);
+            fixture
+                .chain_indexer
+                .ingest_finalized(answered.clone(), finalization(&consensus, &answered))
+                .await
+                .expect("answered block finalizes");
+            assert_eq!(
+                fixture.owner_index.apply_finalized(&answered),
+                Ok(ApplyOutcome::Applied)
+            );
+
+            let fresh = fixture.valid_responses[1];
+            assert_eq!(
+                fixture
+                    .client
+                    .submit_tx(response_transaction(fresh))
+                    .await
+                    .expect("fresh finalized contest is admitted"),
+                SubmitTxOutcome::Enqueued,
+            );
+            let mempool = fixture.client.mempool.inner.lock().await;
+            assert_eq!(
+                mempool.responses.len(),
+                1,
+                "the finalized-invalid resident is removed before insertion",
+            );
+            assert!(
+                mempool
+                    .responses
+                    .contains_key(&(fresh.payment_edge(), fresh.start_id())),
+                "the freed response slot is reusable",
+            );
+        });
+    }
+
+    #[test]
+    fn invalid_incoming_response_does_not_sweep_residents() {
+        run_qmdb(|runtime| async move {
+            let fixture = response_fixture(runtime, "response_auth_before_sweep").await;
+            let resident = MempoolEntry::new(response_transaction(fixture.bad_action));
+            let resident_digest = resident.digest;
+            fixture.client.mempool.inner.lock().await.responses.insert(
+                (
+                    fixture.bad_action.payment_edge(),
+                    fixture.bad_action.start_id(),
+                ),
+                resident,
+            );
+
+            assert_eq!(
+                fixture
+                    .client
+                    .submit_tx(response_transaction(fixture.bad_action))
+                    .await
+                    .expect("bad action is an admission outcome"),
+                SubmitTxOutcome::ValidationRejected,
+            );
+            let mempool = fixture.client.mempool.inner.lock().await;
+            assert_eq!(mempool.responses.len(), 1);
+            assert_eq!(
+                mempool.responses.values().next().map(|entry| entry.digest),
+                Some(resident_digest),
+                "an unauthenticated newcomer never reaches the resident sweep",
+            );
+        });
+    }
+
+    #[test]
+    fn full_response_mempool_reuses_slot_invalidated_by_finality() {
+        run_qmdb(|runtime| async move {
+            let fixture = response_fixture_with_contests(
+                runtime,
+                "response_full_finality_sweep",
+                RESPONSE_MEMPOOL_CAPACITY + 1,
+            )
+            .await;
+            for response in fixture
+                .valid_responses
+                .iter()
+                .take(RESPONSE_MEMPOOL_CAPACITY)
+                .copied()
+            {
+                assert_eq!(
+                    fixture
+                        .client
+                        .submit_tx(response_transaction(response))
+                        .await
+                        .expect("live response admission"),
+                    SubmitTxOutcome::Enqueued,
+                );
+            }
+            assert_eq!(
+                fixture.client.mempool.inner.lock().await.responses.len(),
+                RESPONSE_MEMPOOL_CAPACITY,
+            );
+
+            let invalidated = fixture.valid_responses[0];
+            let transactions = vec![response_transaction(invalidated)];
+            let root = apply(&fixture.database, &fixture.allocations, 3, &transactions).await;
+            let answered = index_block(&fixture.contest, root, transactions);
+            let consensus = consensus_fixture(95);
+            fixture
+                .chain_indexer
+                .ingest_finalized(answered.clone(), finalization(&consensus, &answered))
+                .await
+                .expect("answered block finalizes");
+            assert_eq!(
+                fixture.owner_index.apply_finalized(&answered),
+                Ok(ApplyOutcome::Applied)
+            );
+
+            let fresh = fixture.valid_responses[RESPONSE_MEMPOOL_CAPACITY];
+            assert_eq!(
+                fixture
+                    .client
+                    .submit_tx(response_transaction(fresh))
+                    .await
+                    .expect("fresh contest admission"),
+                SubmitTxOutcome::Enqueued,
+                "the finalized-invalid resident is swept before the capacity decision",
+            );
+            let mempool = fixture.client.mempool.inner.lock().await;
+            assert_eq!(mempool.responses.len(), RESPONSE_MEMPOOL_CAPACITY);
+            assert!(
+                mempool
+                    .responses
+                    .contains_key(&(fresh.payment_edge(), fresh.start_id()))
+            );
+        });
+    }
 
     async fn finalized_payload_indexer(
         context: commonware_runtime::tokio::Context,

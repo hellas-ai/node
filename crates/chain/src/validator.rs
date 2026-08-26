@@ -4,7 +4,7 @@ use crate::domain::{
 };
 use crate::{
     ActivityReporter, Application, ApplicationConfig, BlockStore, ChainIndexer, ConsensusInfo,
-    Mempool, OwnerIndex, UtxoDb,
+    LightClientRpcState, Mempool, OwnerIndex, UtxoDb,
     config::{
         Config, ConfigError, Genesis, GenesisEntry, GenesisValidator, PeerEntry, ValidatorConfig,
         encode_private_key, encode_threshold_polynomial, encode_threshold_share,
@@ -1224,6 +1224,7 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
             ChainIndexer::new(marshal_mailbox.clone()),
             consensus_info.clone(),
         );
+        let light_client_rpc_state = LightClientRpcState::default();
         let relay_handles: Vec<_> = validator_config
             .relay_urls
             .iter()
@@ -1233,6 +1234,7 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
                 let private_key = relay_private_key.clone();
                 let light_client = light_client.clone();
                 let activity_tx = activity_tx.clone();
+                let rpc_state = light_client_rpc_state.clone();
                 ::tokio::spawn(async move {
                     let mut retry = Duration::from_secs(1);
                     loop {
@@ -1244,6 +1246,7 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
                             &private_key,
                             light_client.clone(),
                             activity_tx.clone(),
+                            rpc_state.clone(),
                         )
                         .await
                         {

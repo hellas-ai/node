@@ -246,13 +246,6 @@ where
     .map_err(reject)?;
 
     let earned_digest = certificate.digest(context.network());
-    if !verifier.verify_sig(
-        response.certificate_sig(),
-        edge.parties().maker(),
-        earned_digest,
-    ) {
-        return Err(reject(InvalidMoveReason::BadCertificateSignature));
-    }
     let digest = crate::work::response_digest(
         context.network(),
         input,
@@ -267,6 +260,13 @@ where
         digest,
     ) {
         return Err(reject(InvalidMoveReason::BadSignature));
+    }
+    if !verifier.verify_sig(
+        response.certificate_sig(),
+        edge.parties().maker(),
+        earned_digest,
+    ) {
+        return Err(reject(InvalidMoveReason::BadCertificateSignature));
     }
 
     Ok(record.responded_at(certificate.earned_cumulative()))

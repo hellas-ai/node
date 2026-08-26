@@ -160,7 +160,9 @@ where
                 included_bytes = next_bytes;
                 included.push(tx);
             }
-            Err((next, err)) if err.is_transient_for_mempool() => {
+            Err((next, err))
+                if err.is_transient_for_mempool() && !response_contest_was_removed(&tx, &err) =>
+            {
                 batches = next;
                 retained.push(tx);
             }
@@ -175,6 +177,20 @@ where
     }
 
     Ok((batches, included, retained))
+}
+
+fn response_contest_was_removed(transaction: &Transaction, error: &ExecutionError) -> bool {
+    let Transaction::Kernel(KernelTx::Move {
+        action: KernelMove::RespondPaymentClose(response),
+    }) = transaction
+    else {
+        return false;
+    };
+    matches!(
+        error,
+        ExecutionError::ObjectNotFound { id }
+            if *id == edge_object_id(response.payment_edge())
+    )
 }
 
 fn maybe_seed_genesis<E>(
@@ -1203,6 +1219,43 @@ mod tests {
                 }
                 .is_fatal_storage()
             );
+        });
+    }
+
+    #[test]
+    fn response_with_removed_payment_edge_is_dropped_from_proposals() {
+        use hellas_kernel::{
+            EarnedCertificate, Party, PaymentCloseResponse, Sig, StartId, TermsHash,
+        };
+
+        run_qmdb(|runtime| async move {
+            let database = database(runtime, "removed_response_edge").await;
+            let edge = EdgeId::from_bytes([0x41; EdgeId::LENGTH]);
+            let response = PaymentCloseResponse::new(
+                edge,
+                StartId::from_bytes([0x42; StartId::LENGTH]),
+                Party::Taker,
+                (
+                    EarnedCertificate::new(edge, TermsHash::from_bytes([0x43; 32]), 7),
+                    Sig::from_bytes([0x44; Sig::LENGTH]),
+                ),
+                Sig::from_bytes([0x45; Sig::LENGTH]),
+            );
+            let (_, included, retained) = execute_proposal(
+                context(1),
+                &ChainVerifier::new(),
+                vec![Transaction::Kernel(KernelTx::move_action(
+                    KernelMove::RespondPaymentClose(response),
+                ))],
+                &[],
+                MAX_TXS_PER_BLOCK,
+                usize::MAX,
+                database.new_batches().await,
+            )
+            .await
+            .expect("a removed response edge is a non-fatal drop");
+            assert!(included.is_empty());
+            assert!(retained.is_empty());
         });
     }
 

@@ -448,6 +448,8 @@ struct MethodPlan {
     connection_bound: bool,
     /// Whether this is the bounded general transaction submission method.
     bounded_submit_tx: bool,
+    /// Whether this is the separately bounded work-response method.
+    bounded_work_response: bool,
 }
 
 /// The RPC shapes the hellas wire protocol supports. Client-streaming
@@ -516,6 +518,9 @@ fn plan_service(service: &RpcService, index: &SchemaIndex) -> ServicePlan {
                 bounded_submit_tx: service.package == "hellas.chain.v1"
                     && service.proto_name == "LightClient"
                     && m.proto_name == "SubmitTx",
+                bounded_work_response: service.package == "hellas.chain.v1"
+                    && service.proto_name == "LightClient"
+                    && m.proto_name == "SubmitWorkResponse",
             }
         })
         .collect();
@@ -662,6 +667,19 @@ fn render_service_block(plan: &ServicePlan) -> TokenStream {
         "emits a terminal trailer. Streaming methods are routed".to_string(),
         "through the matching stream helper.".to_string(),
     ]);
+    let server_definition = if plan.fqn == "hellas.chain.v1.LightClient" {
+        quote! {
+            pub struct #server<H>(
+                pub H,
+                pub ::std::sync::Arc<crate::call::WorkResponseRoute>,
+                pub ::std::sync::Arc<crate::call::GeneralSubmitRoute>,
+            );
+        }
+    } else {
+        quote! {
+            pub struct #server<H>(pub H);
+        }
+    };
 
     quote! {
         #[cfg(feature = #feature)]
@@ -705,7 +723,7 @@ fn render_service_block(plan: &ServicePlan) -> TokenStream {
             }
 
             #server_doc
-            pub struct #server<H>(pub H);
+            #server_definition
 
             impl<T, H> ::hellas_wire::Dispatcher<T> for #server<H>
             where
@@ -743,7 +761,7 @@ fn handler_signature(m: &MethodPlan) -> TokenStream {
         Shape::BidiStreaming => boxed_stream(request),
         _ => quote! { #request },
     };
-    let context = if m.connection_bound && m.shape == Shape::Unary {
+    let context = if (m.connection_bound || m.bounded_submit_tx) && m.shape == Shape::Unary {
         quote! { , context: ::hellas_wire::TransportContext }
     } else {
         quote! {}
@@ -835,9 +853,27 @@ fn dispatch_arm(m: &MethodPlan) -> TokenStream {
         assert!(m.shape == Shape::Unary, "raw request limits are unary-only");
         return quote! {
             <#marker as ::hellas_wire::MethodMarker>::METHOD_ID => {
-                crate::call::dispatch_unary_bounded::<T, #marker, _, _, _>(
+                crate::call::dispatch_general_submit_bounded::<T, #marker, _, _, _>(
                     inbound,
+                    &self.2,
                     crate::MAX_SUBMIT_TX_PROTO_BYTES,
+                    |req, context| {
+                        let h = &self.0;
+                        async move { h.#fn_name(req, context).await }
+                    },
+                )
+                .await
+            }
+        };
+    }
+    if m.bounded_work_response {
+        assert!(m.shape == Shape::Unary, "raw request limits are unary-only");
+        return quote! {
+            <#marker as ::hellas_wire::MethodMarker>::METHOD_ID => {
+                crate::call::dispatch_work_response_bounded::<T, #marker, _, _, _>(
+                    inbound,
+                    &self.1,
+                    crate::MAX_SUBMIT_WORK_RESPONSE_PROTO_BYTES,
                     |req| {
                         let h = &self.0;
                         async move { h.#fn_name(req).await }

@@ -9,9 +9,11 @@
 
 use super::*;
 use hellas_kernel::{
-    BOND_LEASE_CHUNKS, BondLease, BondLeaseFault, PaymentContestCommitment, WebAuthnAssertion,
-    WorkPaymentTerms, WorkStakeBondTerms, bond_lease_slot, bond_lease_slots, check_response,
+    BOND_LEASE_CHUNKS, BondLease, BondLeaseFault, PaymentContestCommitment, SigVerifier,
+    WebAuthnAssertion, WorkPaymentTerms, WorkStakeBondTerms, bond_lease_slot, bond_lease_slots,
+    check_response,
 };
+use std::cell::Cell;
 
 /// A third key, party to nothing here.
 const OUTSIDER: Key = Key::from_bytes([9; Key::LENGTH]);
@@ -1736,6 +1738,42 @@ fn a_response_needs_both_of_its_signatures() {
         ))),
         InvalidMoveReason::BadSignature,
     );
+}
+
+/// Round 3 authenticated the certificate before the provider's action,
+/// letting a hostile client spend two checks on a response it alone made.
+/// Admission and execution share this predicate, so pin the short circuit
+/// here: a bad action is one verification, never two.
+#[test]
+fn round3_bad_action_signature_is_checked_first() {
+    struct CountingReject<'a>(&'a Cell<usize>);
+
+    impl SigVerifier for CountingReject<'_> {
+        fn verify_sig(&self, _sig: Sig, _party_key: Key, _hash: PayloadHash) -> bool {
+            self.0.set(self.0.get() + 1);
+            false
+        }
+    }
+
+    let (state, opened) = pending_response_state();
+    let mut validation_store = *state.store();
+    let batch = validation_store.begin();
+    let checks = Cell::new(0);
+    let error = check_response(
+        &response(opened.start_id(), 5),
+        at(2),
+        &CountingReject(&checks),
+        &batch,
+    )
+    .expect_err("the action signature is rejected");
+    assert_eq!(
+        error,
+        ApplyError::InvalidMove {
+            input: payment_edge_id(),
+            reason: InvalidMoveReason::BadSignature,
+        }
+    );
+    assert_eq!(checks.get(), 1, "certificate verification must not run");
 }
 
 /// The adjudicated close is the contest's result and nothing else: no

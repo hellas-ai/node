@@ -451,7 +451,7 @@ mod tests {
         /// Puts everything submitted since the last block into the next
         /// one, executes it, finalizes it, and indexes it.
         async fn seal(&mut self) -> HellasBlock {
-            let pending = self.mempool.snapshot().await;
+            let pending = self.mempool.test_transactions().await;
             let fresh = pending[self.sealed..].to_vec();
             self.sealed = pending.len();
             self.height += 1;
@@ -619,7 +619,7 @@ mod tests {
                 step(&blocks, &blocks, &mut client_store, floor_height).await,
                 SetupProgress::AwaitingCounterparty,
             );
-            assert!(chain.mempool.snapshot().await.is_empty());
+            assert!(chain.mempool.test_transactions().await.is_empty());
             drop(client_store);
 
             // The sink refuses. The marker must already be durable, and
@@ -644,7 +644,7 @@ mod tests {
                 provider_store.state().bond_submitted(),
                 "the bond submission was journaled before it was broadcast",
             );
-            assert!(chain.mempool.snapshot().await.is_empty());
+            assert!(chain.mempool.test_transactions().await.is_empty());
 
             // The retry submits the retained bytes. Nothing was signed
             // again: the journal holds one bundle and the transaction
@@ -811,7 +811,7 @@ mod tests {
                 "no stake was locked",
             );
             assert!(
-                chain.mempool.snapshot().await.is_empty(),
+                chain.mempool.test_transactions().await.is_empty(),
                 "and nothing was broadcast",
             );
             drop(provider_store);
@@ -857,7 +857,10 @@ mod tests {
                 .state()
                 .bond_open()
                 .expect("the completed handshake is an executable bond open");
-            chain.mempool.submit(Transaction::Kernel(bond_open)).await;
+            chain
+                .mempool
+                .test_submit(Transaction::Kernel(bond_open))
+                .await;
             let bond_block = chain.seal().await;
             assert_eq!(bond_block.txs().len(), 1);
 
@@ -866,7 +869,7 @@ mod tests {
                 SetupProgress::TimeoutBond,
             );
             assert_eq!(
-                chain.mempool.snapshot().await.len(),
+                chain.mempool.test_transactions().await.len(),
                 1,
                 "the driver sent nothing: the one entry is the bond above",
             );

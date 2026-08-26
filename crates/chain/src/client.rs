@@ -8,7 +8,10 @@ use crate::{
     FinalizedBlockQuery, LatestBlock, LightClient, OwnerCoins, OwnerEdges, QueryError,
 };
 use commonware_cryptography::{Hasher, Sha256};
-use hellas_kernel::{BOND_LEASE_CHUNKS, Decode as _, Edge, Encode as _, RegistryChunk};
+use hellas_kernel::{
+    BOND_LEASE_CHUNKS, Decode as _, Edge, Encode as _, Move as KernelMove, RegistryChunk,
+    Tx as KernelTx,
+};
 use hellas_rpc::{
     SubmitTxOutcome as DomainSubmitTxOutcome,
     call::StreamingCall,
@@ -232,6 +235,19 @@ impl LightClient for RemoteLightClient {
     ) -> impl Future<Output = Result<DomainSubmitTxOutcome, QueryError>> + Send {
         let client = self.client.clone();
         async move {
+            if let Transaction::Kernel(KernelTx::Move {
+                action: KernelMove::RespondPaymentClose(response),
+            }) = tx
+            {
+                let mut bytes = vec![0_u8; hellas_kernel::PaymentCloseResponse::MAX_ENCODED_SIZE];
+                let written = response.write_to(&mut bytes);
+                bytes.truncate(written);
+                let response = client
+                    .submit_work_response(SubmitWorkResponseRequest { response: bytes })
+                    .await
+                    .map_err(QueryError::from)?;
+                return submit_tx_outcome_from_proto(response.outcome);
+            }
             let req = transaction_to_proto(tx)?;
             let response = client.submit_tx(req).await.map_err(QueryError::from)?;
             submit_tx_outcome_from_proto(response.outcome)
