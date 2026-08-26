@@ -129,6 +129,12 @@ impl Secp256k1Verifier {
     pub const fn new() -> Self {
         Self
     }
+
+    /// Returns whether `party_key` encodes a valid compressed secp256k1 point.
+    #[must_use]
+    pub fn is_valid_key(party_key: Key) -> bool {
+        VerifyingKey::from_sec1_bytes(party_key.as_bytes()).is_ok()
+    }
 }
 
 impl SigVerifier for Secp256k1Verifier {

@@ -221,6 +221,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum IdentityCommand {
+    /// Create the local identity file if it does not exist
+    Init,
     /// Print the node ID (hex public key) derived from the identity file
     ShowNodeId,
 }
@@ -926,6 +928,7 @@ async fn main() {
             }
         }
         Commands::Identity { command } => match command {
+            IdentityCommand::Init => Ok(()),
             IdentityCommand::ShowNodeId => commands::identity::show_node_id(&secret_key),
         },
         Commands::ProducerKey { .. } => unreachable!("producer-key handled before identity load"),
@@ -955,6 +958,17 @@ fn command_owns_tracing(command: &Commands) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identity_init_has_an_explicit_dispatch_command() {
+        let cli = Cli::try_parse_from(["hellas", "identity", "init"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Identity {
+                command: IdentityCommand::Init,
+            }
+        ));
+    }
 
     #[cfg(feature = "evaluate")]
     #[test]

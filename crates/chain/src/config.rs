@@ -49,8 +49,10 @@ pub enum ConfigError {
         #[source]
         source: SettlementKeyError,
     },
-    #[error("genesis settlement key `{entry}` is not a valid P-256 address")]
-    InvalidGenesisP256SettlementKey { entry: String },
+    #[error(
+        "genesis settlement key `{entry}` is neither a valid P-256 point nor a valid secp256k1 point"
+    )]
+    InvalidGenesisSettlementPoint { entry: String },
     #[error("duplicate addresses in genesis allocations")]
     DuplicateGenesisAddresses,
     #[error("failed to read credential {path}: {source}")]
@@ -268,15 +270,20 @@ impl ValidatorConfig {
 }
 
 pub(crate) fn parse_genesis_settlement_key(entry: &str) -> Result<UserSettlementKey, ConfigError> {
-    let key = entry
-        .parse()
-        .map_err(|source| ConfigError::InvalidGenesisSettlementKey {
+    let key: UserSettlementKey =
+        entry
+            .parse()
+            .map_err(|source| ConfigError::InvalidGenesisSettlementKey {
+                entry: entry.to_string(),
+                source,
+            })?;
+    let valid_p256 = UserAddress::try_from(key).is_ok();
+    let valid_secp256k1 = hellas_kernel::Secp256k1Verifier::is_valid_key(key.into_kernel());
+    if !valid_p256 && !valid_secp256k1 {
+        return Err(ConfigError::InvalidGenesisSettlementPoint {
             entry: entry.to_string(),
-            source,
-        })?;
-    UserAddress::try_from(key).map_err(|_| ConfigError::InvalidGenesisP256SettlementKey {
-        entry: entry.to_string(),
-    })?;
+        });
+    }
     Ok(key)
 }
 
@@ -296,6 +303,17 @@ pub fn encode_threshold_polynomial(polynomial: &ThresholdPolynomial) -> String {
 mod tests {
     use super::*;
     use crate::domain::{SettlementKey, addr_from_signing_key, secp256r1_key_from_seed};
+    use hellas_kernel::Secp256k1Signer;
+
+    fn secp256k1_key_from_scalar(scalar: u8) -> SettlementKey {
+        let mut secret = [0_u8; 32];
+        secret[31] = scalar;
+        SettlementKey::from(
+            Secp256k1Signer::from_secret_scalar(secret)
+                .expect("small non-zero scalar")
+                .party_key(),
+        )
+    }
 
     fn config_with_genesis(address: String) -> ValidatorConfig {
         let private_key = ed25519::PrivateKey::from_seed(1);
@@ -324,26 +342,59 @@ mod tests {
     }
 
     #[test]
-    fn genesis_allocations_reject_non_p256_settlement_key() {
+    fn genesis_parser_rejects_bytes_valid_on_neither_curve() {
         let entry = SettlementKey::from_bytes([0xa5; SettlementKey::LENGTH]).to_string();
-        let err = config_with_genesis(entry.clone())
-            .genesis_allocations()
-            .expect_err("non-P-256 genesis owner");
+        let err = parse_genesis_settlement_key(&entry).expect_err("invalid point encoding");
         assert!(matches!(
             err,
-            ConfigError::InvalidGenesisP256SettlementKey { entry: actual } if actual == entry
+            ConfigError::InvalidGenesisSettlementPoint { entry: actual } if actual == entry
         ));
     }
 
     #[test]
-    fn genesis_allocations_accept_p256_settlement_key() {
+    fn genesis_parser_accepts_a_valid_p256_point() {
         let address = addr_from_signing_key(&secp256r1_key_from_seed(7));
         let key = SettlementKey::from(address);
         assert_eq!(
-            config_with_genesis(key.to_string())
-                .genesis_allocations()
-                .expect("valid P-256 genesis owner"),
-            vec![(key, 10)]
+            parse_genesis_settlement_key(&key.to_string()).expect("valid P-256 genesis owner"),
+            key
+        );
+    }
+
+    #[test]
+    fn genesis_parser_accepts_a_valid_secp256k1_point() {
+        let key = secp256k1_key_from_scalar(2);
+        assert_eq!(
+            parse_genesis_settlement_key(&key.to_string()).expect("valid secp256k1 genesis owner"),
+            key
+        );
+    }
+
+    #[test]
+    fn genesis_parser_accepts_secp256k1_scalar_3() {
+        let key = secp256k1_key_from_scalar(3);
+        assert!(
+            UserAddress::try_from(key).is_err(),
+            "scalar 3 must remain the vector that a P-256-only parser rejects"
+        );
+        assert_eq!(
+            parse_genesis_settlement_key(&key.to_string())
+                .expect("secp256k1 scalar 3 genesis owner"),
+            key
+        );
+    }
+
+    #[test]
+    fn genesis_parser_accepts_secp256k1_scalar_4() {
+        let key = secp256k1_key_from_scalar(4);
+        assert!(
+            UserAddress::try_from(key).is_ok(),
+            "scalar 4 must remain the old accidental cross-curve pass"
+        );
+        assert_eq!(
+            parse_genesis_settlement_key(&key.to_string())
+                .expect("secp256k1 scalar 4 genesis owner"),
+            key
         );
     }
 

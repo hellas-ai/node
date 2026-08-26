@@ -537,16 +537,18 @@ mod genesis_allocation_tests {
     use crate::domain::{SettlementKey, addr_from_signing_key, secp256r1_key_from_seed};
 
     #[test]
-    fn rejects_non_p256_settlement_key() {
+    fn rejects_settlement_key_valid_on_neither_curve() {
         let key = SettlementKey::from_bytes([0xa5; SettlementKey::LENGTH]);
         let err = match parse_genesis_allocation(&format!("{key}:10")) {
-            Ok(_) => panic!("non-P-256 genesis owner was accepted"),
+            Ok(_) => panic!("invalid genesis owner was accepted"),
             Err(err) => err,
         };
         assert!(matches!(
             err,
             ValidatorError::InvalidSetup(message)
-                if message.contains(&key.to_string()) && message.contains("P-256")
+                if message.contains(&key.to_string())
+                    && message.contains("P-256")
+                    && message.contains("secp256k1")
         ));
     }
 
