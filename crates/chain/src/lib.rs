@@ -43,7 +43,9 @@ pub mod work_view;
 pub const CONSENSUS_NAMESPACE: &[u8] = b"hellas";
 
 #[cfg(any(feature = "indexer", feature = "validator"))]
-pub use app::{ActivityReporter, Application, ApplicationConfig, Mempool};
+pub use app::{
+    ActivityReporter, Application, ApplicationConfig, GENERAL_MEMPOOL_CAPACITY, Mempool,
+};
 #[cfg(feature = "block-view")]
 pub use block::{HellasBlock, UtxoSyncTarget};
 #[cfg(feature = "block-view")]
@@ -54,6 +56,8 @@ pub use consensus::{ConsensusVerificationError, ConsensusVerifier, Finalization}
 pub use execution::store::{UtxoDb, utxo_db_config};
 #[cfg(feature = "validator")]
 pub use execution::{ChainVerifier, ExecutionError};
+#[cfg(any(feature = "client-core", feature = "server"))]
+pub use hellas_rpc::{MAX_CANONICAL_TRANSACTION_BYTES, MAX_SUBMIT_TX_PROTO_BYTES, SubmitTxOutcome};
 #[cfg(any(feature = "indexer", feature = "validator"))]
 pub use indexer::{
     BlockStore, ChainIndexer, FinalizationStore, IngestError, IngestOutcome, init_block_store,

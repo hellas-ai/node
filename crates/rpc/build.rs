@@ -446,6 +446,8 @@ struct MethodPlan {
     shape: Shape,
     /// Whether the handler is handed the connection's own context.
     connection_bound: bool,
+    /// Whether this is the bounded general transaction submission method.
+    bounded_submit_tx: bool,
 }
 
 /// The RPC shapes the hellas wire protocol supports. Client-streaming
@@ -511,6 +513,9 @@ fn plan_service(service: &RpcService, index: &SchemaIndex) -> ServicePlan {
                 response: rust_path(&m.response_proto_type),
                 shape,
                 connection_bound: connection_bound(&service.package),
+                bounded_submit_tx: service.package == "hellas.chain.v1"
+                    && service.proto_name == "LightClient"
+                    && m.proto_name == "SubmitTx",
             }
         })
         .collect();
@@ -820,6 +825,22 @@ fn dispatch_arm(m: &MethodPlan) -> TokenStream {
                     |req, context| {
                         let h = &self.0;
                         async move { h.#fn_name(req, context).await }
+                    },
+                )
+                .await
+            }
+        };
+    }
+    if m.bounded_submit_tx {
+        assert!(m.shape == Shape::Unary, "raw request limits are unary-only");
+        return quote! {
+            <#marker as ::hellas_wire::MethodMarker>::METHOD_ID => {
+                crate::call::dispatch_unary_bounded::<T, #marker, _, _, _>(
+                    inbound,
+                    crate::MAX_SUBMIT_TX_PROTO_BYTES,
+                    |req| {
+                        let h = &self.0;
+                        async move { h.#fn_name(req).await }
                     },
                 )
                 .await

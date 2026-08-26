@@ -13,7 +13,7 @@
 //! through two primitive crates.
 
 use hellas_chain::domain::{ObjectId, Transaction};
-use hellas_chain::{EdgeState, LightClient, QueryError};
+use hellas_chain::{EdgeState, LightClient, QueryError, SubmitTxOutcome};
 use hellas_kernel::{BlockHeight, Secp256k1Signer};
 use hellas_rpc::ProducerSigningKey;
 
@@ -38,7 +38,7 @@ pub trait ChainView: Send + Sync + 'static {
     async fn finalized_height(&self) -> Result<Option<BlockHeight>, QueryError>;
 
     /// Submits a transaction to the chain mempool.
-    async fn submit(&self, tx: Transaction) -> Result<(), QueryError>;
+    async fn submit(&self, tx: Transaction) -> Result<SubmitTxOutcome, QueryError>;
 
     /// Reads a live edge at the latest finalized state. `None` when no
     /// block is finalized yet or the edge does not exist there.
@@ -54,7 +54,7 @@ impl<L: LightClient> ChainView for L {
             .map(|block| BlockHeight::new(block.height)))
     }
 
-    async fn submit(&self, tx: Transaction) -> Result<(), QueryError> {
+    async fn submit(&self, tx: Transaction) -> Result<SubmitTxOutcome, QueryError> {
         self.submit_tx(tx).await
     }
 

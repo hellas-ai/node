@@ -171,6 +171,8 @@ pub enum SetupProgress {
     Submitted {
         /// Which of the two.
         step: SetupStep,
+        /// What the node did with the transaction.
+        outcome: crate::SubmitTxOutcome,
     },
     /// Nothing for this endpoint to do: the other party has not
     /// produced the next revision, or the transaction being waited on
@@ -375,8 +377,8 @@ where
         SetupStep::Payment => state.payment_open(),
     }
     .ok_or(SetupDriveError::NothingRetained { step })?;
-    sink.submit(tx).await?;
-    Ok(SetupProgress::Submitted { step })
+    let outcome = sink.submit(tx).await?;
+    Ok(SetupProgress::Submitted { step, outcome })
 }
 
 /// Finds the finalized block whose accepted transactions opened

@@ -532,8 +532,34 @@ where
     Fut: std::future::Future<Output = Result<RespOrTrailer, WireStatus>> + Send,
     RespOrTrailer: Into<WithTrailer<M::Response>>,
 {
-    dispatch_unary_with_context::<T, M, _, _, _>(inbound, |request, _context| handler(request))
-        .await
+    dispatch_unary_with_context_and_limit::<T, M, _, _, _>(inbound, None, |request, _context| {
+        handler(request)
+    })
+    .await
+}
+
+/// Server-side unary dispatch with a raw request-body limit checked before
+/// prost decoding.
+pub async fn dispatch_unary_bounded<T, M, F, Fut, RespOrTrailer>(
+    inbound: hellas_wire::transport::Inbound<T::Stream>,
+    max_request_bytes: usize,
+    handler: F,
+) -> Result<(), TransportError>
+where
+    T: StreamTransport,
+    M: MethodMarker,
+    M::Request: Message + Default,
+    M::Response: Message,
+    F: FnOnce(M::Request) -> Fut + Send,
+    Fut: std::future::Future<Output = Result<RespOrTrailer, WireStatus>> + Send,
+    RespOrTrailer: Into<WithTrailer<M::Response>>,
+{
+    dispatch_unary_with_context_and_limit::<T, M, _, _, _>(
+        inbound,
+        Some(max_request_bytes),
+        |request, _context| handler(request),
+    )
+    .await
 }
 
 /// Context-aware unary dispatch. This is used by connection-bound protocols
@@ -541,6 +567,33 @@ where
 /// never decoded from request bytes.
 pub async fn dispatch_unary_with_context<T, M, F, Fut, RespOrTrailer>(
     inbound: hellas_wire::transport::Inbound<T::Stream>,
+    handler: F,
+) -> Result<(), TransportError>
+where
+    T: StreamTransport,
+    M: MethodMarker,
+    M::Request: Message + Default,
+    M::Response: Message,
+    F: FnOnce(M::Request, hellas_wire::TransportContext) -> Fut + Send,
+    Fut: std::future::Future<Output = Result<RespOrTrailer, WireStatus>> + Send,
+    RespOrTrailer: Into<WithTrailer<M::Response>>,
+{
+    dispatch_unary_with_context_and_limit::<T, M, _, _, _>(inbound, None, handler).await
+}
+
+fn raw_request_limit_status(len: usize, max: Option<usize>) -> Option<WireStatus> {
+    let max = max?;
+    (len > max).then(|| {
+        WireStatus::new(
+            WireCode::InvalidArgument,
+            format!("raw unary request exceeds {max} bytes"),
+        )
+    })
+}
+
+async fn dispatch_unary_with_context_and_limit<T, M, F, Fut, RespOrTrailer>(
+    inbound: hellas_wire::transport::Inbound<T::Stream>,
+    max_request_bytes: Option<usize>,
     handler: F,
 ) -> Result<(), TransportError>
 where
@@ -560,6 +613,12 @@ where
         Some(Err(e)) => return Err(TransportError::Io(format!("recv: {e}"))),
         None => return Err(TransportError::Protocol("empty unary request".into())),
     };
+    if let Some(status) = raw_request_limit_status(req_bytes.len(), max_request_bytes) {
+        send.close_send(Some(status.into()))
+            .await
+            .map_err(|e| TransportError::Io(format!("close-with-status: {e}")))?;
+        return Ok(());
+    }
     let request = M::Request::decode(&req_bytes[..])
         .map_err(|e| TransportError::Protocol(format!("prost decode: {e}")))?;
 
@@ -949,5 +1008,13 @@ mod streaming_call_tests {
         assert_eq!(U32Msg::decode(&bodies[0][..]).unwrap().x, 34);
         assert!(state.close.lock().unwrap().is_some());
         assert!(state.reset.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn raw_unary_limit_is_inclusive_and_rejects_before_decode() {
+        assert!(raw_request_limit_status(65_540, Some(65_540)).is_none());
+        let status = raw_request_limit_status(65_541, Some(65_540))
+            .expect("one byte over the raw cap is rejected");
+        assert_eq!(status.code(), WireCode::InvalidArgument);
     }
 }

@@ -2159,7 +2159,10 @@ impl Mempool {
 }
 
 impl hellas_rpc::work_close::TxSink for Mempool {
-    async fn submit(&self, tx: hellas_kernel::Tx) -> Result<(), BlockSourceError> {
+    async fn submit(
+        &self,
+        tx: hellas_kernel::Tx,
+    ) -> Result<hellas_rpc::SubmitTxOutcome, BlockSourceError> {
         if self.refuse {
             return Err(BlockSourceError::new("this validator is not taking work"));
         }
@@ -2167,7 +2170,7 @@ impl hellas_rpc::work_close::TxSink for Mempool {
             Ok(mut taken) => taken.push(tx),
             Err(error) => panic!("the fixture mempool is writable: {error}"),
         }
-        Ok(())
+        Ok(hellas_rpc::SubmitTxOutcome::Enqueued)
     }
 }
 
@@ -2202,8 +2205,12 @@ async fn a_retained_start_is_resubmitted_until_a_block_carries_it() {
     };
     for round in 0..2 {
         match provider.advance_close(&quiet, &sink).await {
-            Ok(CloseProgress::Submitted { valid_through }) => {
+            Ok(CloseProgress::Submitted {
+                valid_through,
+                outcome,
+            }) => {
                 assert_eq!(valid_through, start.valid_through_height());
+                assert_eq!(outcome, hellas_rpc::SubmitTxOutcome::Enqueued);
             }
             other => panic!("round {round}: the start is submitted: {other:?}"),
         }
@@ -2332,8 +2339,12 @@ async fn a_client_closes_the_channel_its_provider_stopped_answering() {
         withheld: None,
     };
     match fixture.client.advance_close(&quiet, &sink).await {
-        Ok(CloseProgress::Submitted { valid_through }) => {
+        Ok(CloseProgress::Submitted {
+            valid_through,
+            outcome,
+        }) => {
             assert_eq!(valid_through, start.valid_through_height());
+            assert_eq!(outcome, hellas_rpc::SubmitTxOutcome::Enqueued);
         }
         other => panic!("the client's start is submitted: {other:?}"),
     }

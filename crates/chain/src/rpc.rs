@@ -19,6 +19,7 @@ use crate::{
 };
 use commonware_cryptography::sha256::Digest;
 use hellas_kernel::{NetworkId, bond_lease_slots, pending_payment_close_slot};
+use hellas_rpc::SubmitTxOutcome;
 
 /// In-process [`LightClient`] backed by the local application handle.
 #[derive(Clone)]
@@ -340,9 +341,16 @@ impl LightClient for LocalLightClient {
         self.chain_indexer.get_finalized_block(query).await
     }
 
-    async fn submit_tx(&self, tx: Transaction) -> Result<(), QueryError> {
-        self.mempool.submit(tx).await;
-        Ok(())
+    async fn submit_tx(&self, tx: Transaction) -> Result<SubmitTxOutcome, QueryError> {
+        if crate::light_client::canonical_submission_size(&tx)
+            > crate::MAX_CANONICAL_TRANSACTION_BYTES
+        {
+            return Err(QueryError::InvalidTransaction(format!(
+                "canonical transaction exceeds {} bytes",
+                crate::MAX_CANONICAL_TRANSACTION_BYTES,
+            )));
+        }
+        Ok(self.mempool.submit(tx).await)
     }
 
     async fn get_validators(&self) -> Result<Vec<String>, QueryError> {

@@ -22,7 +22,8 @@ use commonware_consensus::{
 };
 #[cfg(feature = "validator")]
 use commonware_cryptography::Digestible;
-use commonware_cryptography::sha256::Digest;
+use commonware_cryptography::Hasher;
+use commonware_cryptography::sha256::{Digest, Sha256};
 #[cfg(feature = "validator")]
 use commonware_glue::stateful::{
     Application as StatefulApplication, Proposed,
@@ -39,6 +40,7 @@ use commonware_utils::{SystemTimeExt, non_empty_range};
 #[cfg(feature = "validator")]
 use futures::{Stream, StreamExt};
 use hellas_kernel::NetworkId;
+use hellas_rpc::SubmitTxOutcome;
 #[cfg(feature = "validator")]
 use prometheus_client::metrics::gauge::Gauge;
 #[cfg(feature = "validator")]
@@ -66,14 +68,45 @@ impl Default for ApplicationConfig {
     }
 }
 
+/// Maximum number of general transactions resident in the mempool.
+pub const GENERAL_MEMPOOL_CAPACITY: usize = 120;
+
+#[derive(Clone)]
+struct MempoolEntry {
+    digest: Digest,
+    transaction: Transaction,
+}
+
+impl MempoolEntry {
+    fn new(transaction: Transaction) -> Self {
+        let digest = Sha256::hash(&transaction.encode());
+        Self {
+            digest,
+            transaction,
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct Mempool {
-    inner: Arc<Mutex<VecDeque<Transaction>>>,
+    inner: Arc<Mutex<VecDeque<MempoolEntry>>>,
 }
 
 impl Mempool {
-    pub async fn submit(&self, tx: Transaction) {
-        self.inner.lock().await.push_back(tx);
+    pub(crate) async fn submit(&self, tx: Transaction) -> SubmitTxOutcome {
+        let entry = MempoolEntry::new(tx);
+        let mut mempool = self.inner.lock().await;
+        if mempool
+            .iter()
+            .any(|resident| resident.digest == entry.digest)
+        {
+            return SubmitTxOutcome::Duplicate;
+        }
+        if mempool.len() >= GENERAL_MEMPOOL_CAPACITY {
+            return SubmitTxOutcome::Full;
+        }
+        mempool.push_back(entry);
+        SubmitTxOutcome::Enqueued
     }
 
     /// Proposal-time only. A follower accepts submissions (`submit`) so it
@@ -82,7 +115,12 @@ impl Mempool {
     /// `validator`-gated.
     #[cfg(feature = "validator")]
     pub(crate) async fn snapshot(&self) -> Vec<Transaction> {
-        self.inner.lock().await.iter().cloned().collect()
+        self.inner
+            .lock()
+            .await
+            .iter()
+            .map(|entry| entry.transaction.clone())
+            .collect()
     }
 
     #[cfg(feature = "validator")]
@@ -91,7 +129,7 @@ impl Mempool {
         let split_at = snapshot_len.min(mempool.len());
         let tail = mempool.split_off(split_at);
         mempool.clear();
-        mempool.extend(retained);
+        mempool.extend(retained.into_iter().map(MempoolEntry::new));
         mempool.extend(tail);
     }
 }

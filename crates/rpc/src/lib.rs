@@ -4,6 +4,39 @@ pub const GIT_REV: &str = match option_env!("GIT_REV") {
     None => "unknown",
 };
 
+/// Maximum canonical size of one submitted transaction.
+pub const MAX_CANONICAL_TRANSACTION_BYTES: usize = 65_536;
+/// Exact protobuf envelope size of a maximum-size `SubmitTx` kernel payload.
+pub const MAX_SUBMIT_TX_PROTO_BYTES: usize = 65_540;
+
+/// What happened when a transaction was submitted to a node.
+///
+/// This type deliberately has no unspecified variant. The protobuf zero value
+/// is a wire error, not an outcome an in-process caller can mistake for
+/// acceptance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubmitTxOutcome {
+    /// The transaction is resident locally, pending consensus inclusion.
+    Enqueued,
+    /// The same transaction digest is already resident locally.
+    Duplicate,
+    /// The bounded mempool had no room for the transaction.
+    Full,
+    /// Snapshot-local admission validation rejected the transaction.
+    ValidationRejected,
+}
+
+impl core::fmt::Display for SubmitTxOutcome {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str(match self {
+            Self::Enqueued => "enqueued, pending inclusion",
+            Self::Duplicate => "duplicate, pending inclusion",
+            Self::Full => "mempool full, not enqueued",
+            Self::ValidationRejected => "validation rejected, not enqueued",
+        })
+    }
+}
+
 pub mod call;
 #[cfg(feature = "evaluate")]
 pub mod evaluate;

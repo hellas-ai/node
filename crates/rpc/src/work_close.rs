@@ -135,7 +135,7 @@ pub trait TxSink {
     fn submit(
         &self,
         tx: Tx,
-    ) -> impl core::future::Future<Output = Result<(), BlockSourceError>> + Send;
+    ) -> impl core::future::Future<Output = Result<crate::SubmitTxOutcome, BlockSourceError>> + Send;
 }
 
 /// Where a watcher gets its finalized blocks.
@@ -244,6 +244,8 @@ pub enum CloseProgress {
     Submitted {
         /// Last height the submitted signature can be included at.
         valid_through: u64,
+        /// What the node did with the transaction.
+        outcome: crate::SubmitTxOutcome,
     },
     /// Nothing is retained that could still be included, and no contest
     /// opened. The channel is open again, and closing it needs a fresh
@@ -666,8 +668,11 @@ where
     };
     let valid_through = start.valid_through_height();
     let tx = Tx::move_action(hellas_kernel::Move::StartPaymentClose(start.clone()));
-    sink.submit(tx).await?;
-    Ok(CloseProgress::Submitted { valid_through })
+    let outcome = sink.submit(tx).await?;
+    Ok(CloseProgress::Submitted {
+        valid_through,
+        outcome,
+    })
 }
 
 pub async fn catch_up<S, V>(

@@ -175,7 +175,17 @@ message MergeCoinTx {
   WebAuthnSignature signature = 2;
 }
 
-message SubmitTxResponse {}
+enum SubmitTxOutcome {
+  SUBMIT_TX_OUTCOME_UNSPECIFIED = 0;
+  SUBMIT_TX_OUTCOME_ENQUEUED = 1;
+  SUBMIT_TX_OUTCOME_DUPLICATE = 2;
+  SUBMIT_TX_OUTCOME_FULL = 3;
+  SUBMIT_TX_OUTCOME_VALIDATION_REJECTED = 4;
+}
+
+message SubmitTxResponse {
+  SubmitTxOutcome outcome = 1;
+}
 
 enum ActivityEventKind {
   ACTIVITY_EVENT_KIND_UNSPECIFIED = 0;

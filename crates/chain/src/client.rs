@@ -10,6 +10,7 @@ use crate::{
 use commonware_cryptography::{Hasher, Sha256};
 use hellas_kernel::{BOND_LEASE_CHUNKS, Decode as _, Edge, Encode as _, RegistryChunk};
 use hellas_rpc::{
+    SubmitTxOutcome as DomainSubmitTxOutcome,
     call::StreamingCall,
     pb::{chain::*, services::light_client::LightClientClientImpl},
 };
@@ -225,12 +226,15 @@ impl LightClient for RemoteLightClient {
         }
     }
 
-    fn submit_tx(&self, tx: Transaction) -> impl Future<Output = Result<(), QueryError>> + Send {
+    fn submit_tx(
+        &self,
+        tx: Transaction,
+    ) -> impl Future<Output = Result<DomainSubmitTxOutcome, QueryError>> + Send {
         let client = self.client.clone();
         async move {
             let req = transaction_to_proto(tx)?;
-            client.submit_tx(req).await.map_err(QueryError::from)?;
-            Ok(())
+            let response = client.submit_tx(req).await.map_err(QueryError::from)?;
+            submit_tx_outcome_from_proto(response.outcome)
         }
     }
 
@@ -599,6 +603,14 @@ fn latest_block_from_proto(snapshot: FinalizedSnapshot) -> Result<LatestBlock, Q
 }
 
 fn transaction_to_proto(tx: Transaction) -> Result<SubmitTxRequest, QueryError> {
+    if crate::light_client::canonical_submission_size(&tx) > crate::MAX_CANONICAL_TRANSACTION_BYTES
+    {
+        return Err(QueryError::InvalidTransaction(format!(
+            "canonical transaction exceeds {} bytes",
+            crate::MAX_CANONICAL_TRANSACTION_BYTES,
+        )));
+    }
+
     let signature_to_der = |signature: &DomainWebAuthnSignature| {
         let raw = signature.signature.encode();
         let parsed = P256Signature::from_slice(raw.as_ref())
@@ -640,6 +652,21 @@ fn transaction_to_proto(tx: Transaction) -> Result<SubmitTxRequest, QueryError> 
         }
     };
     Ok(SubmitTxRequest { tx: Some(tx_oneof) })
+}
+
+fn submit_tx_outcome_from_proto(value: i32) -> Result<DomainSubmitTxOutcome, QueryError> {
+    match SubmitTxOutcome::try_from(value) {
+        Ok(SubmitTxOutcome::Enqueued) => Ok(DomainSubmitTxOutcome::Enqueued),
+        Ok(SubmitTxOutcome::Duplicate) => Ok(DomainSubmitTxOutcome::Duplicate),
+        Ok(SubmitTxOutcome::Full) => Ok(DomainSubmitTxOutcome::Full),
+        Ok(SubmitTxOutcome::ValidationRejected) => Ok(DomainSubmitTxOutcome::ValidationRejected),
+        Ok(SubmitTxOutcome::Unspecified) => Err(QueryError::Remote(
+            "submit response contained an unspecified outcome".to_string(),
+        )),
+        Err(_) => Err(QueryError::Remote(format!(
+            "submit response contained unknown outcome {value}",
+        ))),
+    }
 }
 
 #[cfg(test)]
@@ -722,6 +749,15 @@ mod tests {
             panic!("expected kernel transaction arm")
         };
         assert_eq!(hellas_kernel::Tx::decode_exact(&bytes), Ok(kernel));
+    }
+
+    #[test]
+    fn protobuf_zero_submit_outcome_is_an_error() {
+        assert!(matches!(
+            submit_tx_outcome_from_proto(SubmitTxOutcome::Unspecified as i32),
+            Err(QueryError::Remote(message))
+                if message == "submit response contained an unspecified outcome"
+        ));
     }
 
     #[test]

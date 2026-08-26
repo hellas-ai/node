@@ -46,6 +46,7 @@ use hellas_kernel::Tx;
 use hellas_rpc::work_close::{BlockSourceError, FinalizedBlocks, FinalizedWork, TxSink};
 use hellas_rpc::work_open::{FinalizedSetup, SetupQuery, SetupView};
 
+use crate::SubmitTxOutcome;
 use crate::block_view::FinalizedBlockView;
 use crate::domain::{Digest, Transaction};
 use crate::light_client::{FinalizedBlockQuery, LightClient};
@@ -109,7 +110,7 @@ impl<C: LightClient + FinalizedWorkView> SetupView for WorkBlocks<C> {
 }
 
 impl<C: LightClient> TxSink for WorkBlocks<C> {
-    async fn submit(&self, tx: Tx) -> Result<(), BlockSourceError> {
+    async fn submit(&self, tx: Tx) -> Result<SubmitTxOutcome, BlockSourceError> {
         self.0
             .submit_tx(Transaction::Kernel(tx))
             .await
@@ -365,7 +366,10 @@ mod tests {
     struct RefusingSink;
 
     impl TxSink for RefusingSink {
-        async fn submit(&self, _tx: hellas_kernel::Tx) -> Result<(), BlockSourceError> {
+        async fn submit(
+            &self,
+            _tx: hellas_kernel::Tx,
+        ) -> Result<SubmitTxOutcome, BlockSourceError> {
             Err(BlockSourceError::new("the sink refuses"))
         }
     }
@@ -648,7 +652,8 @@ mod tests {
             assert_eq!(
                 step(&blocks, &blocks, &mut provider_store, floor_height).await,
                 SetupProgress::Submitted {
-                    step: SetupStep::Bond
+                    step: SetupStep::Bond,
+                    outcome: SubmitTxOutcome::Enqueued,
                 },
             );
             let bond_block = chain.seal().await;
@@ -657,7 +662,8 @@ mod tests {
             assert_eq!(
                 step(&blocks, &blocks, &mut provider_store, floor_height).await,
                 SetupProgress::Submitted {
-                    step: SetupStep::Payment
+                    step: SetupStep::Payment,
+                    outcome: SubmitTxOutcome::Enqueued,
                 },
             );
             let origin_block = chain.seal().await;

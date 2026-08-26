@@ -6,10 +6,12 @@ use crate::domain::{
 use crate::work_view::{FinalizedWorkView, WorkChannelQuery, WorkChannelSnapshot};
 use crate::{
     ConsensusActivity, ConsensusInfo, EdgeLookup, EdgeState, FinalizedBlock, FinalizedBlockQuery,
-    LatestBlock, LightClient as LightClientApi, OwnerEdges, ProposalInfo,
+    LatestBlock, LightClient as LightClientApi, MAX_CANONICAL_TRANSACTION_BYTES, OwnerEdges,
+    ProposalInfo,
 };
 use futures_util::{Stream, StreamExt as _};
 use hellas_kernel::{Decode as _, EdgeId, Tx as KernelTx};
+use hellas_rpc::SubmitTxOutcome;
 use hellas_rpc::pb::{
     chain::{
         self as pb, ActivityEvent, CoinEntry, EdgeEntry, EdgeState as ProtoEdgeState,
@@ -19,8 +21,8 @@ use hellas_rpc::pb::{
         GetLatestBlockResponse, GetProofResponse, GetRelayInfoResponse, GetStateRootResponse,
         GetValidatorsResponse, GetWorkChannelSnapshotResponse, KernelFees, MergeCoinTx,
         NotarizationEvent, NotarizeEvent, NullificationEvent, NullifyEvent, RegistrySlot,
-        SubmitTxResponse, TransferTx, WebAuthnSignature as ProtoWebAuthnSignature, activity_event,
-        submit_tx_request,
+        SubmitTxOutcome as ProtoSubmitTxOutcome, SubmitTxResponse, TransferTx,
+        WebAuthnSignature as ProtoWebAuthnSignature, activity_event, submit_tx_request,
     },
     services::light_client::{LightClientHandler, LightClientServer},
 };
@@ -281,8 +283,19 @@ where
         let client = self.client.clone();
         async move {
             let tx = transaction_from_proto(request)?;
-            client.submit_tx(tx).await.map_err(WireStatus::from)?;
-            Ok(SubmitTxResponse {})
+            if crate::light_client::canonical_submission_size(&tx) > MAX_CANONICAL_TRANSACTION_BYTES
+            {
+                return Err(WireStatus::new(
+                    WireCode::InvalidArgument,
+                    format!(
+                        "canonical transaction exceeds {MAX_CANONICAL_TRANSACTION_BYTES} bytes"
+                    ),
+                ));
+            }
+            let outcome = client.submit_tx(tx).await.map_err(WireStatus::from)?;
+            Ok(SubmitTxResponse {
+                outcome: submit_tx_outcome_to_proto(outcome) as i32,
+            })
         }
     }
 
@@ -474,6 +487,15 @@ fn webauthn_signature_from_proto(
             "invalid WebAuthn signature payload",
         )
     })
+}
+
+fn submit_tx_outcome_to_proto(outcome: SubmitTxOutcome) -> ProtoSubmitTxOutcome {
+    match outcome {
+        SubmitTxOutcome::Enqueued => ProtoSubmitTxOutcome::Enqueued,
+        SubmitTxOutcome::Duplicate => ProtoSubmitTxOutcome::Duplicate,
+        SubmitTxOutcome::Full => ProtoSubmitTxOutcome::Full,
+        SubmitTxOutcome::ValidationRejected => ProtoSubmitTxOutcome::ValidationRejected,
+    }
 }
 
 fn transaction_from_proto(request: pb::SubmitTxRequest) -> Result<Transaction, WireStatus> {
@@ -873,9 +895,8 @@ mod tests {
             panic!("unused test method")
         }
 
-        async fn submit_tx(&self, tx: Transaction) -> Result<(), QueryError> {
-            self.mempool.submit(tx).await;
-            Ok(())
+        async fn submit_tx(&self, tx: Transaction) -> Result<SubmitTxOutcome, QueryError> {
+            Ok(self.mempool.submit(tx).await)
         }
 
         async fn get_validators(&self) -> Result<Vec<String>, QueryError> {
@@ -959,9 +980,10 @@ mod tests {
         let encoded_len = tx.write_to(&mut canonical);
         canonical.truncate(encoded_len);
 
-        LightClientHandler::submit_tx(&rpc, kernel_request(canonical.clone()))
+        let response = LightClientHandler::submit_tx(&rpc, kernel_request(canonical.clone()))
             .await
             .expect("canonical kernel transaction is accepted");
+        assert_eq!(response.outcome, ProtoSubmitTxOutcome::Enqueued as i32);
         let pending = mempool.snapshot().await;
         assert_eq!(pending.len(), 1);
         let Transaction::Kernel(pending_tx) = &pending[0] else {
@@ -982,6 +1004,41 @@ mod tests {
             assert_eq!(error.code(), WireCode::InvalidArgument);
         }
         assert_eq!(mempool.snapshot().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn round2_full_is_observable() {
+        use crate::execution::test_support::kernel_fixture_at;
+
+        let client = MempoolClient::default();
+        let mut first = None;
+        for index in 0..crate::GENERAL_MEMPOOL_CAPACITY {
+            let fixture = kernel_fixture_at(10, (index * 2) as u16, 7, 8)
+                .expect("distinct valid kernel fixture");
+            let tx = Transaction::Kernel(fixture.open);
+            first.get_or_insert_with(|| tx.clone());
+            assert_eq!(client.mempool.submit(tx).await, SubmitTxOutcome::Enqueued);
+        }
+        assert_eq!(
+            client
+                .mempool
+                .submit(first.expect("the capacity is non-zero"))
+                .await,
+            SubmitTxOutcome::Duplicate,
+            "a resident digest stays duplicate even when the mempool is full",
+        );
+
+        let (activity_tx, _activity_rx) = broadcast::channel(1);
+        let rpc = LightClientRpc::new(client, activity_tx);
+        let fixture = kernel_fixture_at(10, 400, 7, 8).expect("overflow fixture");
+        let mut canonical = vec![0; KernelTx::MAX_ENCODED_SIZE];
+        let encoded_len = fixture.open.write_to(&mut canonical);
+        canonical.truncate(encoded_len);
+
+        let response = LightClientHandler::submit_tx(&rpc, kernel_request(canonical))
+            .await
+            .expect("a full mempool is an observable submission outcome");
+        assert_eq!(response.outcome, ProtoSubmitTxOutcome::Full as i32);
     }
 
     #[cfg(feature = "client")]

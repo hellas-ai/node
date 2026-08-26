@@ -466,7 +466,8 @@ async fn run_open(args: OpenArgs) -> CliResult {
     if let Some(path) = args.terms_out {
         write_terms(&path, &terms)?;
     }
-    client.submit_tx(Transaction::Kernel(tx)).await?;
+    let outcome = client.submit_tx(Transaction::Kernel(tx)).await?;
+    println!("{outcome}");
 
     println!("edge_id {}", hex::encode(edge_id.to_bytes()));
     println!("terms_hash {}", hex::encode(terms.hash().to_bytes()));
@@ -529,9 +530,10 @@ async fn run_close(args: CloseArgs) -> CliResult {
     };
 
     let output_ids = Tx::close_output_ids(edge_id, &outputs);
-    client
+    let outcome = client
         .submit_tx(Transaction::Kernel(Tx::close(edge_id, proof, outputs)))
         .await?;
+    println!("{outcome}");
     println!("edge_id {}", hex::encode(edge_id.to_bytes()));
     for output_id in output_ids {
         println!("payout_id {}", hex::encode(output_id.to_bytes()));
