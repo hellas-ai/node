@@ -288,6 +288,10 @@ enum Commands {
         /// Persistent canonical artifact blob store path (default: $HOME/.hellas/artifacts)
         #[arg(long = "artifact-store-path")]
         artifact_store_path: Option<PathBuf>,
+        /// Paid-work configuration. Its presence serves WorkSetup and Work;
+        /// Work remains retryably not ready until the configured state mounts.
+        #[arg(long = "work-config")]
+        work_config_file: Option<PathBuf>,
         /// What `hellas store adopt` already hashed, so this node does not hash it again
         /// (default: $HELLAS_STORE_DIR/fastresume.bin, else $HOME/.hellas/store/fastresume.bin)
         ///
@@ -723,6 +727,7 @@ async fn main() {
             queue_size,
             preload_models,
             artifact_store_path,
+            work_config_file,
             #[cfg(feature = "evaluate")]
             store_records,
             metrics_port,
@@ -738,6 +743,7 @@ async fn main() {
                 queue_size,
                 preload_models,
                 artifact_store_path,
+                work_config_file,
                 #[cfg(feature = "evaluate")]
                 store_records,
                 metrics_port,
@@ -747,7 +753,6 @@ async fn main() {
                 fetch_max_in_flight,
                 fetch_queue_size,
                 secret_key,
-                open_identity: local_identity.open_identity(),
                 producer_key: local_identity.producer_key,
                 provider_genesis: local_identity.enrollment.canonical_bytes(),
                 assurance,
@@ -1473,6 +1478,22 @@ mod tests {
             } => assert_eq!(
                 artifact_store_path.as_deref(),
                 Some(std::path::Path::new("/tmp/hellas-artifacts"))
+            ),
+            _ => panic!("expected serve command"),
+        }
+    }
+
+    #[cfg(feature = "node")]
+    #[test]
+    fn serve_accepts_work_config() {
+        let cli =
+            Cli::try_parse_from(["hellas", "serve", "--work-config", "/tmp/work.json"]).unwrap();
+        match cli.command {
+            Commands::Serve {
+                work_config_file, ..
+            } => assert_eq!(
+                work_config_file.as_deref(),
+                Some(std::path::Path::new("/tmp/work.json"))
             ),
             _ => panic!("expected serve command"),
         }

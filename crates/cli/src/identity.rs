@@ -15,17 +15,7 @@ use hellas_rpc::{
     DagCborDecoder, Digest, PlatformCredential, ProducerSigningKey, ProviderGenesisStatement,
     PublicKey, RootKind, RootProof, SignedProviderGenesis,
 };
-#[cfg(feature = "node")]
-use hellas_rpc::{
-    OPEN_NONCE_LEN,
-    open::OpenHandler,
-    open_proof_binding,
-    pb::execute::{OpenRequest, OpenResponse, open_response},
-    run_ticket::signature_to_pb,
-};
 use hellas_rpc::{PlatformEnrollment, ProviderEnrollmentBundle};
-#[cfg(feature = "node")]
-use hellas_wire::{TransportContext, WireCode, WireStatus};
 use iroh::SecretKey;
 use std::fs;
 use std::io::{ErrorKind, Write};
@@ -156,15 +146,6 @@ pub(crate) struct LocalIdentity {
     pub(crate) genesis: SignedProviderGenesis,
     #[cfg(any(feature = "node", feature = "evaluate", test))]
     pub(crate) enrollment: ProviderEnrollmentBundle,
-    #[cfg(feature = "node")]
-    root: Arc<PlatformRoot>,
-}
-
-#[cfg(feature = "node")]
-pub(crate) struct ProviderOpenIdentity {
-    root: Arc<PlatformRoot>,
-    producer_key: ProducerSigningKey,
-    enrollment: ProviderEnrollmentBundle,
 }
 
 struct StoredIdentity {
@@ -218,95 +199,6 @@ impl PlatformRoot {
                 service.assertion(apple_client_data_hash)?,
             )),
         }
-    }
-
-    #[cfg(feature = "node")]
-    fn prove_open(&self, binding: Digest) -> anyhow::Result<RootProof> {
-        self.prove_prehashed(
-            binding,
-            #[cfg(all(target_os = "macos", feature = "apple-app-attest"))]
-            *binding.as_bytes(),
-        )
-    }
-}
-
-#[cfg(feature = "node")]
-impl ProviderOpenIdentity {
-    fn proof(&self, binding: Digest) -> anyhow::Result<RootProof> {
-        match self.root.as_ref() {
-            // Open is signed by the producer key recorded in genesis. The
-            // separate software root key only authenticates genesis itself.
-            PlatformRoot::Software(_) => {
-                PlatformRoot::Software(self.producer_key.clone()).prove_open(binding)
-            }
-            #[cfg(all(target_os = "macos", feature = "apple-app-attest"))]
-            PlatformRoot::AppleAppAttest { .. } => self.root.prove_open(binding),
-        }
-    }
-}
-
-#[cfg(feature = "node")]
-impl OpenHandler for ProviderOpenIdentity {
-    async fn open(
-        &self,
-        request: OpenRequest,
-        context: TransportContext,
-        alpn: &'static [u8],
-    ) -> Result<OpenResponse, WireStatus> {
-        let nonce: [u8; OPEN_NONCE_LEN] = request.nonce.try_into().map_err(|bytes: Vec<u8>| {
-            WireStatus::new(
-                WireCode::InvalidArgument,
-                format!(
-                    "confidential open nonce must be {OPEN_NONCE_LEN} bytes, got {}",
-                    bytes.len()
-                ),
-            )
-        })?;
-        let exporter = context.open_exporter.ok_or_else(|| {
-            WireStatus::new(
-                WireCode::FailedPrecondition,
-                "transport does not expose a confidential-open exporter",
-            )
-        })?;
-        let binding = open_proof_binding(
-            &exporter,
-            &nonce,
-            &self.enrollment.genesis.statement.producer_public_key,
-            self.enrollment.content_id(),
-            alpn,
-        );
-        let proof = match self
-            .proof(binding)
-            .map_err(|error| WireStatus::internal(format!("open proof failed: {error}")))?
-        {
-            RootProof::Software(signature) => {
-                open_response::Proof::ProducerSignature(signature_to_pb(&signature))
-            }
-            RootProof::AppleAppAttest(assertion) => {
-                open_response::Proof::AppleAppAttestAssertion(assertion)
-            }
-            RootProof::Tpm20(_) => {
-                return Err(WireStatus::new(
-                    WireCode::FailedPrecondition,
-                    "TPM confidential open is not implemented",
-                ));
-            }
-        };
-        Ok(OpenResponse {
-            provider_genesis: self.enrollment.canonical_bytes(),
-            proof: Some(proof),
-        })
-    }
-}
-
-#[cfg(feature = "node")]
-impl LocalIdentity {
-    pub(crate) fn open_identity(&self) -> Arc<ProviderOpenIdentity> {
-        Arc::new(ProviderOpenIdentity {
-            root: self.root.clone(),
-            producer_key: self.producer_key.clone(),
-            enrollment: self.enrollment.clone(),
-        })
     }
 }
 
@@ -443,8 +335,6 @@ fn create(path: &Path, software_root: bool) -> anyhow::Result<LocalIdentity> {
         genesis,
         #[cfg(any(feature = "node", feature = "evaluate", test))]
         enrollment,
-        #[cfg(feature = "node")]
-        root,
     };
     if !persist(path, &stored)? {
         return load_existing(Some(path));
@@ -551,8 +441,6 @@ fn materialize(stored: &StoredIdentity) -> anyhow::Result<LocalIdentity> {
         genesis,
         #[cfg(any(feature = "node", feature = "evaluate", test))]
         enrollment,
-        #[cfg(feature = "node")]
-        root,
     })
 }
 

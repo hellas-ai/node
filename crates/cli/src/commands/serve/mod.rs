@@ -21,7 +21,6 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::identity::ProviderOpenIdentity;
 use tokio::time::{Duration, timeout};
 use tracing::warn;
 
@@ -40,6 +39,7 @@ pub struct ServeOptions {
     pub queue_size: usize,
     pub preload_models: Vec<String>,
     pub artifact_store_path: Option<PathBuf>,
+    pub work_config_file: Option<PathBuf>,
     /// Read only by the fastresume load/save below, which go through
     /// `hellas-models` and so exist only on an `evaluate` build.
     #[cfg(feature = "evaluate")]
@@ -53,7 +53,6 @@ pub struct ServeOptions {
     pub secret_key: SecretKey,
     pub producer_key: ProducerSigningKey,
     pub provider_genesis: Vec<u8>,
-    pub open_identity: Arc<ProviderOpenIdentity>,
     pub assurance: Assurance,
 }
 
@@ -157,10 +156,10 @@ async fn run_with_store(
         fetch_routes,
         fetch_max_in_flight: options.fetch_max_in_flight,
         fetch_queue_size: options.fetch_queue_size,
+        work_configured: options.work_config_file.is_some(),
         secret_key: options.secret_key,
         producer_key: options.producer_key,
         provider_genesis: options.provider_genesis,
-        open_identity: options.open_identity,
         assurance: options.assurance,
         metrics: metrics.clone(),
         #[cfg(feature = "evaluate")]
@@ -189,17 +188,6 @@ async fn run_with_store(
         info!(
             "Models available for quoting: {}",
             preload_models.join(", ")
-        );
-    }
-
-    if matches!(options.execute_policy, ExecutePolicy::Skip) {
-        warn!(
-            "node is running in deny-by-default mode; pass an execute policy to serve remote work"
-        );
-    } else {
-        warn!(
-            execute_policy = %options.execute_policy,
-            "node is permitting remote execution; only run this on trusted networks"
         );
     }
 

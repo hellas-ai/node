@@ -74,6 +74,7 @@ hellas-store = { workspace = true }
 hellas-xet = { workspace = true }
 hellas-rpc = { workspace = true, default-features = false, features = [
     "all-protocols",
+    "work",
 ] }
 hellas-wire = { workspace = true, features = [
     "iroh",
