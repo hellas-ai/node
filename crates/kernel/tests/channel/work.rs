@@ -10,7 +10,7 @@
 use super::*;
 use hellas_kernel::{
     BOND_LEASE_CHUNKS, BondLease, BondLeaseFault, PaymentContestCommitment, WebAuthnAssertion,
-    WorkPaymentTerms, WorkStakeBondTerms, bond_lease_slot, bond_lease_slots,
+    WorkPaymentTerms, WorkStakeBondTerms, bond_lease_slot, bond_lease_slots, check_response,
 };
 
 /// A third key, party to nothing here.
@@ -588,13 +588,12 @@ fn response_body(
     )
 }
 
+fn response(start: StartId, amount: u64) -> PaymentCloseResponse {
+    response_body(start, Party::Taker, signed_certificate(amount), TAKER)
+}
+
 fn response_tx(start: StartId, amount: u64) -> Tx {
-    Tx::move_action(Move::RespondPaymentClose(response_body(
-        start,
-        Party::Taker,
-        signed_certificate(amount),
-        TAKER,
-    )))
+    Tx::move_action(Move::RespondPaymentClose(response(start, amount)))
 }
 
 fn adjudicated_tx(record: &PendingPaymentClose, provider: u64) -> Tx {
@@ -892,6 +891,220 @@ fn assert_close_rejected(
         }),
     );
     assert_eq!(*state.store(), store);
+}
+
+/// Runs the public read-only check over a real batch snapshot, then runs
+/// the same response through the kernel and compares the exact result.
+fn assert_response_corresponds<const C: usize, const E: usize, const R: usize>(
+    case: &str,
+    expected_result: Option<ApplyError>,
+    state: &mut State<FixedStore<C, E, R>>,
+    context: Context,
+    response: PaymentCloseResponse,
+) {
+    let mut validation_store = *state.store();
+    let checked = {
+        let batch = validation_store.begin();
+        check_response(&response, context, &FAKE_VERIFIER, &batch)
+    };
+    let before = *state.store();
+    let applied = state.apply(
+        context,
+        &FAKE_VERIFIER,
+        &Tx::move_action(Move::RespondPaymentClose(response)),
+    );
+
+    match (checked, applied) {
+        (Ok(checked_record), Ok(outcome)) => {
+            assert_eq!(expected_result, None, "{case}");
+            assert_eq!(outcome.registry().len(), 1, "{case}");
+            assert_ne!(
+                *state.store(),
+                before,
+                "{case}: acceptance must commit the response"
+            );
+            assert_eq!(pending_record(state), Some(checked_record), "{case}");
+        }
+        (Err(checked), Err(actual)) => {
+            assert_eq!(actual, checked, "{case}");
+            assert_eq!(Some(actual), expected_result, "{case}");
+            assert_eq!(*state.store(), before, "{case}: rejection must not commit");
+        }
+        (checked, applied) => {
+            panic!("{case}: response check and apply disagreed: {checked:?}, {applied:?}")
+        }
+    }
+}
+
+fn pending_response_state() -> (State<PaymentStore>, PendingPaymentClose) {
+    let mut state = open_payment_state();
+    apply_move(&mut state, CONTEXT, &start_tx(Party::Maker, Some(3)));
+    let Some(opened) = pending_record(&state) else {
+        panic!("the start wrote a contest");
+    };
+    (state, opened)
+}
+
+fn invalid_response(input: EdgeId, reason: InvalidMoveReason) -> Option<ApplyError> {
+    Some(ApplyError::InvalidMove { input, reason })
+}
+
+/// The extracted predicate is the apply path's predicate, not a second
+/// model of it. Every read-only rejection branch is compared against a
+/// real kernel execution, and acceptance is compared against the record
+/// that execution actually commits.
+#[test]
+fn response_check_corresponds_to_apply_for_every_predicate() {
+    // Missing edge.
+    let mut state = bonded_state();
+    assert_response_corresponds(
+        "missing edge",
+        Some(ApplyError::MissingEdge {
+            id: payment_edge_id(),
+        }),
+        &mut state,
+        at(2),
+        response(StartId::from_bytes([0; StartId::LENGTH]), 5),
+    );
+
+    // Live edge, but not a payment channel.
+    let mut state = open_work_bond_state();
+    let earned = EarnedCertificate::new(work_edge(), work_terms().hash(), 5);
+    assert_response_corresponds(
+        "not a payment channel",
+        invalid_response(work_edge(), InvalidMoveReason::NotAPaymentChannel),
+        &mut state,
+        at(2),
+        PaymentCloseResponse::new(
+            work_edge(),
+            StartId::from_bytes([0; StartId::LENGTH]),
+            Party::Taker,
+            signed_certificate_by(MAKER, earned),
+            Sig::from_bytes([0; Sig::LENGTH]),
+        ),
+    );
+
+    // Payment edge with no pending contest.
+    let mut state = open_payment_state();
+    assert_response_corresponds(
+        "pending contest missing",
+        invalid_response(payment_edge_id(), InvalidMoveReason::ClosePendingMissing),
+        &mut state,
+        at(2),
+        response(StartId::from_bytes([0; StartId::LENGTH]), 5),
+    );
+
+    // The one response has already been consumed.
+    let (mut state, opened) = pending_response_state();
+    apply_move(&mut state, at(2), &response_tx(opened.start_id(), 5));
+    assert_response_corresponds(
+        "already responded",
+        invalid_response(payment_edge_id(), InvalidMoveReason::AlreadyResponded),
+        &mut state,
+        at(3),
+        response(opened.start_id(), 6),
+    );
+
+    // Every remaining predicate starts from the same live, unanswered
+    // contest. Each case gets a fresh state; the final case is accepted.
+    let (_, opened) = pending_response_state();
+    let cases = [
+        (
+            "start id mismatch",
+            Some(InvalidMoveReason::StartIdMismatch),
+            at(2),
+            response(StartId::from_bytes([9; StartId::LENGTH]), 5),
+        ),
+        (
+            "responder is not beneficiary",
+            Some(InvalidMoveReason::ResponderNotBeneficiary),
+            at(2),
+            response_body(
+                opened.start_id(),
+                Party::Maker,
+                signed_certificate(5),
+                MAKER,
+            ),
+        ),
+        (
+            "response window closed",
+            Some(InvalidMoveReason::ResponseWindowClosed),
+            at(RESPONSE_DEADLINE),
+            response(opened.start_id(), 5),
+        ),
+        (
+            "certificate edge mismatch",
+            Some(InvalidMoveReason::CertificateNotBound),
+            at(2),
+            response_body(
+                opened.start_id(),
+                Party::Taker,
+                signed_certificate_by(
+                    MAKER,
+                    EarnedCertificate::new(
+                        EdgeId::from_bytes([0x77; EdgeId::LENGTH]),
+                        payment_terms_hash(),
+                        5,
+                    ),
+                ),
+                TAKER,
+            ),
+        ),
+        (
+            "certificate terms mismatch",
+            Some(InvalidMoveReason::CertificateNotBound),
+            at(2),
+            response_body(
+                opened.start_id(),
+                Party::Taker,
+                signed_certificate_by(MAKER, EarnedCertificate::new(payment_edge_id(), terms(), 5)),
+                TAKER,
+            ),
+        ),
+        (
+            "certificate not increasing",
+            Some(InvalidMoveReason::CertificateNotIncreasing),
+            at(2),
+            response(opened.start_id(), 3),
+        ),
+        (
+            "certificate over capacity",
+            Some(InvalidMoveReason::CertificateOverCapacity),
+            at(2),
+            response(opened.start_id(), PAYMENT_CAPACITY + 1),
+        ),
+        (
+            "bad certificate signature",
+            Some(InvalidMoveReason::BadCertificateSignature),
+            at(2),
+            response_body(
+                opened.start_id(),
+                Party::Taker,
+                signed_certificate_by(TAKER, certificate(5)),
+                TAKER,
+            ),
+        ),
+        (
+            "bad action signature",
+            Some(InvalidMoveReason::BadSignature),
+            at(2),
+            response_body(
+                opened.start_id(),
+                Party::Taker,
+                signed_certificate(5),
+                MAKER,
+            ),
+        ),
+        ("happy path", None, at(2), response(opened.start_id(), 5)),
+    ];
+    for (case, reason, context, response) in cases {
+        let (mut state, _) = pending_response_state();
+        let expected = reason.map(|reason| ApplyError::InvalidMove {
+            input: payment_edge_id(),
+            reason,
+        });
+        assert_response_corresponds(case, expected, &mut state, context, response);
+    }
 }
 
 /// A start binds to the edge's own terms and to a payment channel. The

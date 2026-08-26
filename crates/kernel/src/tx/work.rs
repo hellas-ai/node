@@ -176,13 +176,18 @@ where
     Ok(Change::private(&diff))
 }
 
-/// Applies a [`PaymentCloseResponse`].
-pub(super) fn apply_response<B, V>(
+/// Checks a [`PaymentCloseResponse`] without changing the batch.
+///
+/// # Errors
+///
+/// Returns the same [`ApplyError`] [`apply_response`] would return before
+/// writing the advanced contest record.
+pub fn check_response<B, V>(
     response: &PaymentCloseResponse,
     context: Context,
     verifier: &V,
     batch: &B,
-) -> KernelResult<Change>
+) -> KernelResult<PendingPaymentClose>
 where
     B: Batch,
     V: SigVerifier + ?Sized,
@@ -264,7 +269,23 @@ where
         return Err(reject(InvalidMoveReason::BadSignature));
     }
 
-    let advanced = record.responded_at(certificate.earned_cumulative());
+    Ok(record.responded_at(certificate.earned_cumulative()))
+}
+
+/// Applies a [`PaymentCloseResponse`].
+pub(super) fn apply_response<B, V>(
+    response: &PaymentCloseResponse,
+    context: Context,
+    verifier: &V,
+    batch: &B,
+) -> KernelResult<Change>
+where
+    B: Batch,
+    V: SigVerifier + ?Sized,
+{
+    let input = response.payment_edge();
+    let reject = |reason| ApplyError::InvalidMove { input, reason };
+    let advanced = check_response(response, context, verifier, batch)?;
     let chunk = advanced.to_chunk().ok_or_else(|| {
         reject(InvalidMoveReason::ClosePendingFault {
             fault: PendingCloseFault::Body,

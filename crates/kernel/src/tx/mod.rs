@@ -21,6 +21,7 @@ pub use self::{
     open::{OpenFunding, OpenProjection, open_projection},
     payout::Payout,
     proof::{CloseKind, CloseKindSet, PaymentContestCommitment, Proof},
+    work::check_response,
 };
 
 use self::open::{
