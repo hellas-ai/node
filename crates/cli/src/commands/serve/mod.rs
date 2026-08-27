@@ -149,6 +149,7 @@ async fn run_with_store(
     // journals and still answers a contest. That is why an artifact that
     // is absent or is not the pinned one is a warning here and not a
     // startup refusal.
+    let mut work_runner = None;
     if let Some(work) = options.work_config.as_ref() {
         info!(
             network = %work.chain.network,
@@ -168,6 +169,17 @@ async fn run_with_store(
         } else {
             warn!("{}", duties.summary());
         }
+        // The whole of what the clock is built from, decided here and
+        // carried there. The admission in particular is §4's answer and
+        // not a flag the runner re-derives.
+        work_runner = Some(node::WorkRunnerConfig {
+            network: work.chain.network,
+            journal_root: work.journal.root.clone(),
+            validators: work.validators.clone(),
+            poll: work.poll,
+            settlement_key: options.settlement_key.clone(),
+            admission: duties.payment_admission(),
+        });
     }
 
     let preload_models = dedupe_preload_models(options.preload_models);
@@ -203,7 +215,7 @@ async fn run_with_store(
         fetch_routes,
         fetch_max_in_flight: options.fetch_max_in_flight,
         fetch_queue_size: options.fetch_queue_size,
-        work_configured: options.work_config.is_some(),
+        work: work_runner,
         secret_key: options.secret_key,
         producer_key: options.producer_key,
         provider_genesis: options.provider_genesis,

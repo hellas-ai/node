@@ -18,8 +18,16 @@ apple-app-attest = []
 # threshold identity is decoded by consensus's own constructor, and the
 # settlement watcher reads finalized blocks. So `node` reaches
 # `hellas-chain` through the feature graph rather than through a second
-# dependency.
-node = ["chain", "dep:hellas-executor", "hellas-client/work"]
+# dependency. `work-watcher` is the adapter that pairs a light client
+# with the block source, the sink and the finalized read a paid endpoint
+# is driven from; without it the runner has a chain and no way to ask it
+# anything.
+node = [
+    "chain",
+    "dep:hellas-executor",
+    "hellas-chain/work-watcher",
+    "hellas-client/work",
+]
 # HTTP gateway front-end (OpenAI/Anthropic/plain APIs).
 gateway = ["dep:hellas-gateway"]
 evaluate = [
