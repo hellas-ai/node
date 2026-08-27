@@ -1,16 +1,16 @@
-//! What the independent check catches, and what it cannot.
+//! What the separate re-execution catches, and what it cannot.
 //!
 //! The honest result every test starts from is built the way a provider
 //! builds one: a real signed transcript, through
 //! `hellas_rpc::protocol::work::terminal_result`. Nothing here computes
-//! the expected digest with the function under test, so a derivation
-//! that drifted would show up as the oracle rejecting an honest result
+//! the expected digest with the function under test, so a derivation that
+//! drifted would show up as the re-execution refuting an honest result
 //! rather than as two wrongs agreeing.
 
 #![cfg(feature = "work")]
 
-use hellas_client::work::oracle::{
-    OracleFault, Reexecuted, Reexecution, ReexecutionRequest, plan, verify,
+use hellas_client::work::reproduce::{
+    ReproduceFault, Reproduced, Reproducer, Reproduction, ReproductionRequest, plan, reproduce,
 };
 use hellas_kernel::{
     BlockHeight, EdgeId, List, MAX_EDGE_OUTPUTS, NetworkId, Parties, Payout, Secp256k1Signer,
@@ -270,16 +270,16 @@ fn honest_result(answer: &[u32]) -> PaidJobResultV1 {
 // ── The engine double ─────────────────────────────────────────────────
 
 /// A deterministic engine that returns what it was told to, and records
-/// the question it was asked.
+/// the question the bundle it was handed asks.
 struct FixedEngine {
-    answer: Result<Reexecuted, OracleFault>,
-    asked: std::sync::Mutex<Vec<ReexecutionRequest>>,
+    answer: Result<Reproduced, ReproduceFault>,
+    asked: std::sync::Mutex<Vec<ReproductionRequest>>,
 }
 
 impl FixedEngine {
     fn answering(tokens: &[u32], stop_reason: EvaluateStopReason) -> Self {
         Self {
-            answer: Ok(Reexecuted {
+            answer: Ok(Reproduced {
                 output_token_ids: tokens.to_vec(),
                 stop_reason,
             }),
@@ -293,12 +293,12 @@ impl FixedEngine {
 
     fn failing(reason: &str) -> Self {
         Self {
-            answer: Err(OracleFault::Engine(reason.to_string())),
+            answer: Err(ReproduceFault::Engine(reason.to_string())),
             asked: std::sync::Mutex::new(Vec::new()),
         }
     }
 
-    fn questions(&self) -> Vec<ReexecutionRequest> {
+    fn questions(&self) -> Vec<ReproductionRequest> {
         match self.asked.lock() {
             Ok(asked) => asked.clone(),
             Err(error) => panic!("the engine's log is readable: {error}"),
@@ -306,28 +306,35 @@ impl FixedEngine {
     }
 }
 
-impl Reexecution for FixedEngine {
-    fn reexecute(&self, request: &ReexecutionRequest) -> Result<Reexecuted, OracleFault> {
+impl Reproducer for FixedEngine {
+    async fn reproduce(&self, bundle: &PreparedPaidInputV1) -> Result<Reproduced, ReproduceFault> {
+        // The engine records the derived question the bundle asks, so the
+        // tests can still assert it was handed the bundle's own prompt.
+        let request = plan(bundle)?;
         match self.asked.lock() {
-            Ok(mut asked) => asked.push(request.clone()),
+            Ok(mut asked) => asked.push(request),
             Err(error) => panic!("the engine's log is writable: {error}"),
         }
         self.answer.clone()
     }
 }
 
-fn check(engine: &FixedEngine, result: &PaidJobResultV1) -> Result<(), OracleFault> {
+async fn check(
+    engine: &FixedEngine,
+    result: &PaidJobResultV1,
+) -> Result<Reproduction, ReproduceFault> {
     let channel = channel();
-    verify(
+    reproduce(
         engine,
         channel.network(),
         work_id(&channel, &authorization()),
         &bundle(),
         result,
     )
+    .await
 }
 
-// ── The question the oracle asks ──────────────────────────────────────
+// ── The question the re-execution asks ────────────────────────────────
 
 /// The plan is derived from the accepted bundle, field by field.
 ///
@@ -350,7 +357,7 @@ fn the_question_comes_from_the_accepted_bundle() {
 }
 
 /// A job that resumes a previous output is not one this profile can
-/// reexecute, and says so rather than guessing an empty prompt.
+/// reproduce, and says so rather than guessing an empty prompt.
 #[test]
 fn a_job_that_resumes_an_output_is_refused() {
     let resumed = TextArtifact::output(
@@ -376,20 +383,23 @@ fn a_job_that_resumes_an_output_is_refused() {
     );
     assert_eq!(
         plan(&bundle),
-        Err(OracleFault::Unsupported {
+        Err(ReproduceFault::Unsupported {
             what: "input is a previous output rather than an identity",
         })
     );
 }
 
-// ── The verdict ───────────────────────────────────────────────────────
+// ── The outcome ───────────────────────────────────────────────────────
 
-/// An honest provider's result reproduces, and the engine was asked the
-/// bundle's own question.
-#[test]
-fn an_honest_answer_reproduces() {
+/// An honest provider's result reproduces and matches, and the engine was
+/// asked the bundle's own question.
+#[tokio::test]
+async fn an_honest_answer_matches() {
     let engine = FixedEngine::honest();
-    assert_eq!(check(&engine, &honest_result(&ANSWER)), Ok(()));
+    assert_eq!(
+        check(&engine, &honest_result(&ANSWER)).await,
+        Ok(Reproduction::Matched)
+    );
     let asked = engine.questions();
     assert_eq!(asked.len(), 1, "the engine is asked once");
     assert_eq!(
@@ -400,111 +410,138 @@ fn an_honest_answer_reproduces() {
     );
 }
 
-/// One token other, and the check fails — with the provider's signature
-/// over the altered result perfectly valid.
+/// One token other, and the re-execution refutes it — with the provider's
+/// signature over the altered result perfectly valid.
 ///
-/// This is the defect the whole phase exists to catch: a provider free
-/// to answer anything, signing honestly, and refused by arithmetic the
+/// This is the defect the whole phase exists to catch: a provider free to
+/// answer anything, signing honestly, and refuted by arithmetic the
 /// client did itself.
-#[test]
-fn one_token_other_is_a_different_answer() {
+#[tokio::test]
+async fn one_token_other_is_a_different_answer() {
     let mut altered = ANSWER;
     altered[1] = 999;
     let dishonest = honest_result(&altered);
     assert_ne!(
         dishonest.canonical_output_digest,
         honest_result(&ANSWER).canonical_output_digest,
-        "the two results differ, so the check below has something to find",
+        "the two results differ, so the re-execution below has something to find",
     );
 
     let engine = FixedEngine::honest();
-    assert_eq!(check(&engine, &dishonest), Err(OracleFault::Mismatch));
+    assert!(
+        matches!(
+            check(&engine, &dishonest).await,
+            Ok(Reproduction::Refuted { .. })
+        ),
+        "the honest engine refutes the altered result",
+    );
 
-    // The control: an engine that agrees with the altered answer
-    // accepts it. The oracle compares two computations; it does not
-    // know which is right.
+    // The control: an engine that agrees with the altered answer matches
+    // it. The re-execution compares two computations; it does not know
+    // which is right.
     let agreeing = FixedEngine::answering(&altered, EvaluateStopReason::END_OF_SEQUENCE);
-    assert_eq!(check(&agreeing, &dishonest), Ok(()));
+    assert_eq!(
+        check(&agreeing, &dishonest).await,
+        Ok(Reproduction::Matched)
+    );
 }
 
 /// A truncated or extended answer is a different answer, though every
 /// token it does carry is right.
-#[test]
-fn a_prefix_and_a_continuation_are_both_refused() {
+#[tokio::test]
+async fn a_prefix_and_a_continuation_are_both_refused() {
     let engine = FixedEngine::honest();
     for (name, answer) in [
         ("a prefix", &ANSWER[..2]),
         ("a continuation", &[101, 102, 103, 104][..]),
     ] {
-        assert_eq!(
-            check(&engine, &honest_result(answer)),
-            Err(OracleFault::Mismatch),
+        assert!(
+            matches!(
+                check(&engine, &honest_result(answer)).await,
+                Ok(Reproduction::Refuted { .. })
+            ),
             "{name} is not the answer",
         );
     }
 }
 
-/// The same tokens under a different stop reason are a different
-/// answer.
+/// The same tokens under a different stop reason are a different answer.
 ///
 /// The stop reason is signed and is not cosmetic: it is the difference
 /// between a job that finished and one that ran out of budget.
-#[test]
-fn the_stop_reason_is_part_of_the_answer() {
+#[tokio::test]
+async fn the_stop_reason_is_part_of_the_answer() {
     let honest = honest_result(&ANSWER);
     let other_reason = FixedEngine::answering(&ANSWER, EvaluateStopReason::MAX_OUTPUT);
-    assert_eq!(check(&other_reason, &honest), Err(OracleFault::Mismatch));
+    assert!(
+        matches!(
+            check(&other_reason, &honest).await,
+            Ok(Reproduction::Refuted { .. })
+        ),
+        "the same tokens under another stop reason are refuted",
+    );
 
     // The control: the same engine answering with the signed reason.
-    assert_eq!(check(&FixedEngine::honest(), &honest), Ok(()));
+    assert_eq!(
+        check(&FixedEngine::honest(), &honest).await,
+        Ok(Reproduction::Matched)
+    );
 }
 
-/// An engine that fails says the check did not happen, and does not say
-/// the provider was wrong.
-#[test]
-fn an_engine_fault_is_not_a_finding() {
+/// An engine that fails says the re-execution did not happen, and does
+/// not say the provider was wrong.
+#[tokio::test]
+async fn an_engine_fault_is_not_a_finding() {
     let engine = FixedEngine::failing("the weights did not load");
-    let fault = check(&engine, &honest_result(&ANSWER));
-    let Err(OracleFault::Engine(reason)) = fault else {
+    let fault = check(&engine, &honest_result(&ANSWER)).await;
+    let Err(ReproduceFault::Engine(reason)) = fault else {
         panic!("an engine fault is reported as one: {fault:?}");
     };
     assert!(reason.contains("the weights did not load"), "{reason}");
 }
 
-/// The verdict is bound to the job: the same answer under another
+/// The outcome is bound to the job: the same answer under another
 /// `work_id` does not reproduce.
 ///
-/// This is why the client takes the three from one journal record. The
-/// digest binds the job, so a caller that paired them wrongly gets a
-/// mismatch rather than a wrong pass.
-#[test]
-fn the_answer_is_bound_to_the_job_it_answers() {
+/// This is why the client takes the arguments from one journal record.
+/// The digest binds the job, so a caller that paired them wrongly gets a
+/// refutation rather than a wrong match.
+#[tokio::test]
+async fn the_answer_is_bound_to_the_job_it_answers() {
     let engine = FixedEngine::honest();
     let honest = honest_result(&ANSWER);
     let channel = channel();
-    assert_eq!(
-        verify(
-            &engine,
-            channel.network(),
-            Digest::from_bytes([0x99; 32]),
-            &bundle(),
-            &honest,
+    assert!(
+        matches!(
+            reproduce(
+                &engine,
+                channel.network(),
+                Digest::from_bytes([0x99; 32]),
+                &bundle(),
+                &honest,
+            )
+            .await,
+            Ok(Reproduction::Refuted { .. })
         ),
-        Err(OracleFault::Mismatch),
+        "another work id does not reproduce",
     );
 
     // And to the network, which the same digest also binds.
     let Some(elsewhere) = NetworkId::new("hellas-other") else {
         panic!("a short ascii id is a legal network id");
     };
-    assert_eq!(
-        verify(
-            &engine,
-            elsewhere,
-            work_id(&channel, &authorization()),
-            &bundle(),
-            &honest,
+    assert!(
+        matches!(
+            reproduce(
+                &engine,
+                elsewhere,
+                work_id(&channel, &authorization()),
+                &bundle(),
+                &honest,
+            )
+            .await,
+            Ok(Reproduction::Refuted { .. })
         ),
-        Err(OracleFault::Mismatch),
+        "another network does not reproduce",
     );
 }

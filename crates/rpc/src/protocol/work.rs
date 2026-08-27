@@ -72,8 +72,6 @@
 //! Every digest below binds the network and the channel, so a body
 //! lifted from one channel is not a body in another.
 
-use std::collections::BTreeSet;
-
 use hellas_kernel::{
     BufferWriter, EarnedCertificate, EdgeId, Encode, Key, NetworkId, PayloadHash, Terms, TermsHash,
     WorkPaymentSettlement, WorkPaymentTerms,
@@ -119,7 +117,7 @@ const PAYMENT_BINDING: &[u8] = b"hellas.work.payment-binding.v1";
 /// The client's request that one job's plaintext be released to it, on
 /// one connection.
 const DELIVERY_REQUEST: &[u8] = b"hellas.work.delivery-request.v1";
-/// The normalized Evaluate answer the client's oracle compares.
+/// The normalized Evaluate answer the client's re-execution compares.
 const EVALUATE_OUTPUT: &[u8] = b"hellas.work.evaluate-output.v1";
 
 // ── Envelope ──────────────────────────────────────────────────────────
@@ -239,12 +237,6 @@ pub enum PaidWorkError {
         cumulative: u64,
         /// Capacity the kernel will admit on this edge.
         capacity: u64,
-    },
-    /// One accepted job was paid for twice on this channel.
-    #[error("{field} has already been paid for on this channel")]
-    Duplicate {
-        /// Which identifier repeated.
-        field: &'static str,
     },
     /// The events offered as one job's terminal transcript are not one,
     /// or the bytes offered are not events at all.
@@ -551,7 +543,8 @@ pub struct PaidJobResultV1 {
     /// Event commitment of the one valid terminal envelope, exactly as
     /// the verified transcript produced it.
     pub terminal_transcript_commitment: EventCommitment,
-    /// Digest of the normalized answer the client's oracle compares.
+    /// Digest of the normalized answer the client's re-execution
+    /// compares.
     pub canonical_output_digest: Digest,
 }
 
@@ -1744,32 +1737,18 @@ pub fn next_payment(
     Ok((certificate, binding))
 }
 
-/// What one endpoint has already paid for on one channel.
+/// What one endpoint has already credited on one channel.
 ///
-/// Two values that only ever move together: the cumulative amount
-/// already credited, and the jobs already paid for. They are one value
-/// rather than two arguments because they are the whole of the
-/// cross-call state, and an endpoint that advanced one and forgot the
-/// other is an endpoint that pays for a job twice. Nothing but
-/// [`Self::credit_payment`] moves them, and it moves them only over a
-/// payment it has just accepted.
-///
-/// The cumulative alone would not do it. It is a high-water mark, and a
-/// second payment for a job already paid for is a perfectly monotone
-/// step: same price, next cumulative, a certificate the arithmetic
-/// accepts. What refuses it is the set below, and only the set below.
-/// That the job is closed by its own payment, that its proposal nonce
-/// can never be offered again — those are true, and they are facts
-/// about the journal and the nonce rule rather than about the money.
-/// This is the rule that is about the money.
-///
-/// The set grows by one digest per paid job, and a channel admits at
-/// most `capacity / price` of those, so it is bounded by the same edge
-/// that bounds the money.
+/// One value: the cumulative amount already credited. This channel
+/// admits one job for its whole life, so "paid for at most once" is a
+/// fact about the channel's permanent terminal — a second payment has no
+/// second job to pay for — rather than a set this ledger must carry. What
+/// this value is for is the arithmetic: the price a payment adds is
+/// credited on top of it, and the certificate must settle exactly the
+/// sum.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CreditLedger {
     credited_cumulative: u64,
-    paid_work_ids: BTreeSet<Digest>,
 }
 
 impl CreditLedger {
@@ -1784,12 +1763,6 @@ impl CreditLedger {
         self.credited_cumulative
     }
 
-    /// Returns whether this channel has already paid for `work_id`.
-    #[must_use]
-    pub fn has_paid_for(&self, work_id: Digest) -> bool {
-        self.paid_work_ids.contains(&work_id)
-    }
-
     /// Checks that a certificate and its binding pay for exactly this
     /// job, and credits it if they do.
     ///
@@ -1798,8 +1771,7 @@ impl CreditLedger {
     /// establishes that the certificate the client is about to sign —
     /// or that a provider is about to bank — settles this channel's
     /// credited total plus exactly one job's authorized price, for a
-    /// result the provider signed against exactly that job, and for a
-    /// job this ledger has not already paid for.
+    /// result the provider signed against exactly that job.
     ///
     /// What the caller still owns: keeping this ledger — one per
     /// channel, across restarts — and verifying the client's signatures
@@ -1808,11 +1780,9 @@ impl CreditLedger {
     ///
     /// # Errors
     ///
-    /// [`PaidWorkError::Duplicate`] when this job has been paid for
-    /// before, [`PaidWorkError::Mismatch`] when the binding or the
-    /// certificate is not the one this job at this ledger position
-    /// produces, and whatever [`next_payment`] refuses about the job
-    /// itself.
+    /// [`PaidWorkError::Mismatch`] when the binding or the certificate is
+    /// not the one this job at this ledger position produces, and
+    /// whatever [`next_payment`] refuses about the job itself.
     pub fn credit_payment(
         &mut self,
         channel: &PaidChannel,
@@ -1829,14 +1799,6 @@ impl CreditLedger {
             self.credited_cumulative,
             settlement,
         )?;
-
-        // One work id is one payment, here and in every earlier one. The
-        // result digest needs no rule of its own: the result body
-        // carries its work id, so two payments sharing a result digest
-        // share a work id and are refused by this one.
-        if self.paid_work_ids.contains(&expected_binding.work_id) {
-            return Err(PaidWorkError::Duplicate { field: "work_id" });
-        }
 
         // The certificate's three fields, each against what this channel
         // and this ledger position fix. All three together are the whole
@@ -1879,7 +1841,6 @@ impl CreditLedger {
         }
 
         self.credited_cumulative = expected_certificate.earned_cumulative();
-        self.paid_work_ids.insert(expected_binding.work_id);
         Ok(())
     }
 }

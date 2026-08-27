@@ -16,8 +16,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::Bytes;
-use hellas_client::work::oracle::{OracleFault, Reexecuted, Reexecution, ReexecutionRequest};
 use hellas_client::work::payment::pay_for_checked_result;
+use hellas_client::work::reproduce::{ReproduceFault, Reproduced, Reproducer};
 use hellas_client::work::{CheckedResult, CollectError, CollectOutcome, collect_checked_result};
 use hellas_kernel::{
     BlockHeight, Decode as _, Edge, EdgeId, EdgeValues, Fees, Key, LeaseSlots, List,
@@ -48,8 +48,10 @@ use hellas_rpc::work::{
     BackendFault, ClientEndpoint, PaidEvaluateBackend, ProviderEndpoint, RunOutcome, WorkService,
     run_accepted_work,
 };
-use hellas_rpc::work_close::{FinalizedWork, observe};
-use hellas_rpc::work_store::{ChannelRecord, ChannelStore, JobPhase, JobState, Role, SetupOrigin};
+use hellas_rpc::work_close::{BlockSourceError, FinalizedBlocks, FinalizedWork, observe};
+use hellas_rpc::work_store::{
+    ChannelRecord, ChannelStore, JobPhase, JobState, Role, SetupOrigin, TerminalOutcome,
+};
 use hellas_rpc::{
     Assurance, EvaluateProgramManifest, EvaluateRequest, OutputEventEnvelope, ProducerSigningKey,
     ProgramManifest, PublicKey,
@@ -437,7 +439,7 @@ fn transcript_for(request: &EvaluateRequest, answer: &[u32]) -> Vec<OutputEventE
     // The artifact a provider's own store records for this execution.
     // A placeholder would do for the tests that never reexecute; here
     // it would make an honest provider look wrong, because the answer
-    // digest binds this field and the oracle derives it.
+    // digest binds this field and the re-execution derives it.
     let text_artifact = completed_text(
         TextExecutionId::from_digest(request.text_execution),
         &PROMPT,
@@ -563,22 +565,22 @@ fn serve(transport: MuxTransport, service: WorkService) -> tokio::task::JoinHand
     })
 }
 
-// ── The reexecution engine double ─────────────────────────────────────
+// ── The re-execution engine double ────────────────────────────────────
 
 /// An engine that answers with fixed tokens, or refuses.
 ///
-/// It is handed a question derived from the accepted bundle and has no
-/// other input, which is the property that makes it stand in for an
-/// independent implementation at all: nothing it can see comes from the
-/// provider's answer.
+/// It is handed the client's own journal-held bundle and has no other
+/// input, which is the property that makes it stand in for a separate
+/// implementation at all: nothing it can see comes from the provider's
+/// answer.
 struct FixedEngine {
-    answer: Result<Reexecuted, OracleFault>,
+    answer: Result<Reproduced, ReproduceFault>,
 }
 
 impl FixedEngine {
     fn answering(tokens: &[u32]) -> Self {
         Self {
-            answer: Ok(Reexecuted {
+            answer: Ok(Reproduced {
                 output_token_ids: tokens.to_vec(),
                 stop_reason: EvaluateStopReason::END_OF_SEQUENCE,
             }),
@@ -591,14 +593,97 @@ impl FixedEngine {
 
     fn failing(reason: &str) -> Self {
         Self {
-            answer: Err(OracleFault::Engine(reason.to_string())),
+            answer: Err(ReproduceFault::Engine(reason.to_string())),
         }
     }
 }
 
-impl Reexecution for FixedEngine {
-    fn reexecute(&self, _request: &ReexecutionRequest) -> Result<Reexecuted, OracleFault> {
+impl Reproducer for FixedEngine {
+    async fn reproduce(&self, _bundle: &PreparedPaidInputV1) -> Result<Reproduced, ReproduceFault> {
         self.answer.clone()
+    }
+}
+
+/// A finalized-block source over the same synthetic empty chain the
+/// fixture's `advance` walks, up to `tip`.
+///
+/// The client's post-answer catch-up reads this. A `tip` at the fixture
+/// cursor makes the catch-up a no-op; a `tip` past a deadline is a
+/// reproduction that stalled while the chain moved on.
+struct Blocks {
+    tip: u64,
+}
+
+impl FinalizedBlocks for Blocks {
+    async fn latest_height(&self) -> Result<Option<u64>, BlockSourceError> {
+        Ok(Some(self.tip))
+    }
+
+    async fn block_at(&self, height: u64) -> Result<Option<FinalizedWork>, BlockSourceError> {
+        if height == 0 || height > self.tip {
+            return Ok(None);
+        }
+        Ok(Some(FinalizedWork {
+            height,
+            parent: payload_at(height.saturating_sub(1)),
+            payload: payload_at(height),
+            txs: Vec::new(),
+        }))
+    }
+}
+
+/// A source that yields no block past the fixture cursor, so the
+/// post-answer catch-up moves nothing.
+fn still() -> Blocks {
+    Blocks { tip: CURSOR }
+}
+
+/// The same synthetic chain, with a tip a [`LatchedEngine`] moves while
+/// it is being awaited.
+///
+/// This is what makes the barrier test a test of *order*: the tip is at
+/// the fixture cursor until the reproduction actually runs, so a
+/// catch-up moved in front of the reproduction reads a chain that has
+/// not moved yet.
+struct SharedBlocks {
+    tip: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl FinalizedBlocks for SharedBlocks {
+    async fn latest_height(&self) -> Result<Option<u64>, BlockSourceError> {
+        Ok(Some(self.tip.load(std::sync::atomic::Ordering::SeqCst)))
+    }
+
+    async fn block_at(&self, height: u64) -> Result<Option<FinalizedWork>, BlockSourceError> {
+        if height == 0 || height > self.tip.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(None);
+        }
+        Ok(Some(FinalizedWork {
+            height,
+            parent: payload_at(height.saturating_sub(1)),
+            payload: payload_at(height),
+            txs: Vec::new(),
+        }))
+    }
+}
+
+/// An engine that agrees with the provider's answer — and that is the
+/// latch: the moment it runs, the finalized tip it shares with
+/// [`SharedBlocks`] jumps to `advance_to`. A reproduction that stalls
+/// while the chain moves on, compressed into one call.
+struct LatchedEngine {
+    tip: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    advance_to: u64,
+}
+
+impl Reproducer for LatchedEngine {
+    async fn reproduce(&self, _bundle: &PreparedPaidInputV1) -> Result<Reproduced, ReproduceFault> {
+        self.tip
+            .store(self.advance_to, std::sync::atomic::Ordering::SeqCst);
+        Ok(Reproduced {
+            output_token_ids: ANSWER.to_vec(),
+            stop_reason: EvaluateStopReason::END_OF_SEQUENCE,
+        })
     }
 }
 
@@ -607,7 +692,7 @@ impl Reexecution for FixedEngine {
 /// One job, proposed and computed and delivered and checked, and a
 /// client journal that ends in the phase an invoice may be asked from.
 #[tokio::test]
-async fn a_checked_answer_is_the_only_thing_that_reaches_the_verified_phase() {
+async fn a_checked_answer_is_the_only_thing_that_reaches_the_matched_phase() {
     let client_root = temp();
     let provider_root = temp();
     let ready = ready();
@@ -632,7 +717,8 @@ async fn a_checked_answer_is_the_only_thing_that_reaches_the_verified_phase() {
     // a failure, and nothing is recorded.
     let (transport, server) = transport_pair();
     let serving = serve(server, service.clone());
-    let waiting = collect_checked_result(transport, &mut endpoint, &ready, &engine, id).await;
+    let waiting =
+        collect_checked_result(transport, &mut endpoint, &ready, &still(), &engine, id).await;
     serving.abort();
     assert!(
         matches!(waiting, Ok(CollectOutcome::NotReady { .. })),
@@ -647,7 +733,8 @@ async fn a_checked_answer_is_the_only_thing_that_reaches_the_verified_phase() {
 
     let (transport, server) = transport_pair();
     let serving = serve(server, service.clone());
-    let collected = collect_checked_result(transport, &mut endpoint, &ready, &engine, id).await;
+    let collected =
+        collect_checked_result(transport, &mut endpoint, &ready, &still(), &engine, id).await;
     serving.abort();
     let Ok(CollectOutcome::Checked(CheckedResult { result, transcript })) = collected else {
         panic!("the checked answer is collected: {collected:?}");
@@ -656,7 +743,7 @@ async fn a_checked_answer_is_the_only_thing_that_reaches_the_verified_phase() {
     assert!(!transcript.is_empty());
     assert_eq!(
         endpoint.state().job().map(JobState::phase),
-        Some(JobPhase::Verified),
+        Some(JobPhase::Matched),
     );
 
     // A second call is the same call: the provider answers from its
@@ -664,7 +751,8 @@ async fn a_checked_answer_is_the_only_thing_that_reaches_the_verified_phase() {
     // verdict.
     let (transport, server) = transport_pair();
     let serving = serve(server, service.clone());
-    let again = collect_checked_result(transport, &mut endpoint, &ready, &engine, id).await;
+    let again =
+        collect_checked_result(transport, &mut endpoint, &ready, &still(), &engine, id).await;
     serving.abort();
     assert!(
         matches!(again, Ok(CollectOutcome::Checked(_))),
@@ -674,7 +762,11 @@ async fn a_checked_answer_is_the_only_thing_that_reaches_the_verified_phase() {
         let Ok(provider) = service.endpoint() else {
             panic!("the endpoint is reachable");
         };
-        assert_eq!(provider.state().delivery_outstanding(), PRICE);
+        assert_eq!(
+            provider.state().job().map(JobState::phase),
+            Some(JobPhase::Delivered),
+            "the provider delivered the plaintext once",
+        );
     }
 
     // And it is on the disk: reopened from the files by a process that
@@ -685,7 +777,7 @@ async fn a_checked_answer_is_the_only_thing_that_reaches_the_verified_phase() {
     let Some(job) = recovered.state().job() else {
         panic!("the job is still open");
     };
-    assert_eq!(job.phase(), JobPhase::Verified);
+    assert_eq!(job.phase(), JobPhase::Matched);
     assert_eq!(job.result().map(|(result, _)| *result), Some(result));
 }
 
@@ -720,7 +812,8 @@ async fn a_checked_answer_becomes_a_payment_the_provider_admitted() {
 
     let (transport, server) = transport_pair();
     let serving = serve(server, service.clone());
-    let collected = collect_checked_result(transport, &mut endpoint, &ready, &engine, id).await;
+    let collected =
+        collect_checked_result(transport, &mut endpoint, &ready, &still(), &engine, id).await;
     serving.abort();
     assert!(
         matches!(collected, Ok(CollectOutcome::Checked(_))),
@@ -745,8 +838,6 @@ async fn a_checked_answer_becomes_a_payment_the_provider_admitted() {
         let state = provider.state();
         assert_eq!(state.ledger().credited_cumulative(), PRICE);
         assert_eq!(state.max_executable_certificate(), PRICE);
-        assert_eq!(state.compute_outstanding(), 0);
-        assert_eq!(state.delivery_outstanding(), 0);
         assert!(state.job().is_none(), "the job is closed by its payment");
     }
 
@@ -798,6 +889,7 @@ async fn a_payment_signed_before_a_crash_is_re_sent_after_it() {
         transport,
         &mut endpoint,
         &ready,
+        &still(),
         &FixedEngine::agreeing(),
         id,
     )
@@ -838,17 +930,17 @@ async fn a_payment_signed_before_a_crash_is_re_sent_after_it() {
         panic!("the endpoint is reachable");
     };
     assert_eq!(provider.state().ledger().credited_cumulative(), PRICE);
-    assert_eq!(provider.state().compute_outstanding(), 0);
-    assert_eq!(provider.state().delivery_outstanding(), 0);
 }
 
-/// An unchecked answer is not paid for, and asking to pay for one
-/// signs nothing.
+/// A refuted answer closes the job at a permanent refuted terminal and
+/// is not paid for.
 ///
-/// The verdict is the only thing varied: the same delivered result,
-/// refused before it and paid after it.
+/// The client's own engine ran and disagreed, so this is a refutation
+/// rather than a failed check — and the refutation is durable: the one
+/// job the channel admits is over, and asking to pay for it signs
+/// nothing.
 #[tokio::test]
-async fn an_unchecked_answer_is_not_paid_for() {
+async fn a_refuted_answer_closes_the_job_and_is_not_paid_for() {
     let client_root = temp();
     let provider_root = temp();
     let ready = ready();
@@ -869,40 +961,50 @@ async fn an_unchecked_answer_is_not_paid_for() {
     };
     run_to_result(&service, &ready, id).await;
 
-    // The result is fetched and journaled, and no oracle has run.
+    // The result is fetched and journaled, and the client's own engine
+    // reproduces a different answer.
     let (transport, server) = transport_pair();
     let serving = serve(server, service.clone());
-    // One token of the provider's answer, changed: the engine's verdict
-    // is the only thing this test varies.
+    // One token of the provider's answer, changed: the engine's answer is
+    // the only thing this test varies.
     let mut other = ANSWER;
     other[2] = 999;
     let refuted = collect_checked_result(
         transport,
         &mut endpoint,
         &ready,
+        &still(),
         &FixedEngine::answering(&other),
         id,
     )
     .await;
     serving.abort();
     assert!(
-        matches!(refuted, Err(CollectError::Refuted(_))),
-        "the engine refuses the answer: {refuted:?}",
+        matches!(refuted, Err(CollectError::Refuted { .. })),
+        "the engine refutes the answer: {refuted:?}",
     );
-    assert_eq!(
-        endpoint.state().job().map(JobState::phase),
-        Some(JobPhase::Ready),
-        "and the job is not in a phase a certificate may be signed from",
+    // The refutation is durable and permanent: the one job rests at a
+    // refuted terminal, so it is closed rather than merely unpaid.
+    assert!(
+        endpoint.state().job().is_none(),
+        "the refuted job is closed"
+    );
+    assert!(
+        matches!(
+            endpoint
+                .state()
+                .terminal()
+                .map(|terminal| &terminal.outcome),
+            Some(TerminalOutcome::Refuted { .. })
+        ),
+        "the job rests at a refuted terminal",
     );
 
     let (transport, server) = transport_pair();
     let serving = serve(server, service.clone());
     let paid = pay_for_checked_result(transport, &mut endpoint, id).await;
     serving.abort();
-    assert!(
-        paid.is_err(),
-        "an unchecked answer is not paid for: {paid:?}"
-    );
+    assert!(paid.is_err(), "a refuted answer is not paid for: {paid:?}");
     assert!(
         endpoint.state().last_payment().is_none(),
         "and nothing was signed",
@@ -913,39 +1015,19 @@ async fn an_unchecked_answer_is_not_paid_for() {
         };
         assert_eq!(provider.state().ledger().credited_cumulative(), 0);
     }
-
-    // The control: the same delivered result, checked, is paid for.
-    let (transport, server) = transport_pair();
-    let serving = serve(server, service.clone());
-    let checked = collect_checked_result(
-        transport,
-        &mut endpoint,
-        &ready,
-        &FixedEngine::agreeing(),
-        id,
-    )
-    .await;
-    serving.abort();
-    assert!(
-        matches!(checked, Ok(CollectOutcome::Checked(_))),
-        "the same answer, checked: {checked:?}",
-    );
-    let (transport, server) = transport_pair();
-    let serving = serve(server, service.clone());
-    let credited = pay_for_checked_result(transport, &mut endpoint, id).await;
-    serving.abort();
-    assert_eq!(credited.ok(), Some(PRICE));
 }
 
-/// An answer the client's own engine does not reproduce is refused, and
-/// stays refused across a restart.
+/// A refutation stays a refutation across a restart, and no engine that
+/// agrees afterwards can reopen it.
 ///
 /// The provider here is honest in every checkable way: its result is
 /// signed over its own transcript, its transcript is signed under the
 /// channel's provider key, and its delivery is timely. The only thing
-/// wrong with it is the answer, and nothing but reexecution can say so.
+/// wrong with it is the answer, and nothing but a re-execution can say
+/// so — and once the re-execution has said it, the one job is closed for
+/// good.
 #[tokio::test]
-async fn an_answer_the_engine_does_not_reproduce_never_becomes_payable() {
+async fn a_refutation_is_permanent_across_a_restart() {
     let client_root = temp();
     let provider_root = temp();
     let ready = ready();
@@ -974,49 +1056,62 @@ async fn an_answer_the_engine_does_not_reproduce_never_becomes_payable() {
 
     let (transport, server) = transport_pair();
     let serving = serve(server, service.clone());
-    let refused = collect_checked_result(transport, &mut endpoint, &ready, &engine, id).await;
+    let refused =
+        collect_checked_result(transport, &mut endpoint, &ready, &still(), &engine, id).await;
     serving.abort();
     assert!(
-        matches!(refused, Err(CollectError::Refuted(OracleFault::Mismatch))),
+        matches!(refused, Err(CollectError::Refuted { .. })),
         "unexpected outcome: {refused:?}",
     );
-
-    // The delivered result is kept as evidence, and is not checked.
-    assert_eq!(
-        endpoint.state().job().map(JobState::phase),
-        Some(JobPhase::Ready),
+    assert!(
+        endpoint.state().job().is_none(),
+        "the refuted job is closed"
     );
     drop(endpoint);
+
+    // Reopened by a process that saw none of this, the job is still
+    // refuted: the terminal is on the disk, and it is permanent.
     let recovered = store_at(client_root.path(), &ready, Role::Client, CURSOR);
-    assert_eq!(
-        recovered.state().job().map(JobState::phase),
-        Some(JobPhase::Ready),
-        "a restart does not turn an unchecked result into a checked one",
+    assert!(
+        matches!(
+            recovered
+                .state()
+                .terminal()
+                .map(|terminal| &terminal.outcome),
+            Some(TerminalOutcome::Refuted { .. })
+        ),
+        "a restart keeps the refutation",
+    );
+    assert!(
+        recovered.state().job().is_none(),
+        "and does not reopen the job",
     );
 
-    // The control: the same delivery, checked by an engine that agrees,
-    // reaches the verified phase. Only the engine's answer is varied.
+    // And an engine that agrees afterwards cannot reopen it: the channel
+    // admits one job for its whole life, and that job is over. Collecting
+    // again finds no job to collect.
     let Ok(mut endpoint) = ClientEndpoint::new(ready.clone(), recovered, client()) else {
         panic!("the client endpoint binds");
     };
     let (transport, server) = transport_pair();
     let serving = serve(server, service.clone());
-    let checked = collect_checked_result(
+    let again = collect_checked_result(
         transport,
         &mut endpoint,
         &ready,
+        &still(),
         &FixedEngine::agreeing(),
         id,
     )
     .await;
     serving.abort();
     assert!(
-        matches!(checked, Ok(CollectOutcome::Checked(_))),
-        "unexpected outcome: {checked:?}",
+        again.is_err(),
+        "a refuted job cannot be re-collected: {again:?}",
     );
-    assert_eq!(
-        endpoint.state().job().map(JobState::phase),
-        Some(JobPhase::Verified),
+    assert!(
+        endpoint.state().last_payment().is_none(),
+        "and it is still never paid for",
     );
 }
 
@@ -1047,10 +1142,11 @@ async fn an_engine_that_cannot_run_records_no_verdict() {
     let engine = FixedEngine::failing("the weights did not load");
     let (transport, server) = transport_pair();
     let serving = serve(server, service.clone());
-    let unchecked = collect_checked_result(transport, &mut endpoint, &ready, &engine, id).await;
+    let unchecked =
+        collect_checked_result(transport, &mut endpoint, &ready, &still(), &engine, id).await;
     serving.abort();
 
-    let Err(CollectError::Unchecked(OracleFault::Engine(reason))) = unchecked else {
+    let Err(CollectError::Unchecked(ReproduceFault::Engine(reason))) = unchecked else {
         panic!("an engine fault is reported as one: {unchecked:?}");
     };
     assert!(reason.contains("the weights did not load"), "{reason}");
@@ -1058,6 +1154,80 @@ async fn an_engine_that_cannot_run_records_no_verdict() {
         endpoint.state().job().map(JobState::phase),
         Some(JobPhase::Ready),
         "a check that did not happen is not a check that passed",
+    );
+}
+
+/// A reproduction that stalled past the payment deadline refuses to pay
+/// at the barrier.
+///
+/// The post-answer catch-up is the barrier. While the client's own
+/// re-execution runs, the finalized tip moves past the height the client
+/// signed to pay by; catching up before the durable step makes that the
+/// height the payment is judged against, so no certificate is signed.
+/// The tip moves *inside* the awaited reproduction — a latch, not a
+/// pre-set chain — so this fails against both mutations: remove the
+/// catch-up and the stale cursor lets the late payment through, and move
+/// the catch-up in front of the reproduction and it reads a chain that
+/// has not moved yet, with the same effect.
+#[tokio::test]
+async fn a_stalled_reproduction_refuses_to_pay_at_the_barrier() {
+    let client_root = temp();
+    let provider_root = temp();
+    let ready = ready();
+    let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR);
+    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
+    let (id, authorization) = accept(
+        &execution_policy(),
+        &mut [&mut client_store, &mut provider_store],
+        1,
+    );
+    let Ok(provider_endpoint) = ProviderEndpoint::new(ready.clone(), provider_store, provider())
+    else {
+        panic!("the provider endpoint binds");
+    };
+    let service = WorkService::new(provider_endpoint);
+    run_to_result(&service, &ready, id).await;
+    let Ok(mut endpoint) = ClientEndpoint::new(ready.clone(), client_store, client()) else {
+        panic!("the client endpoint binds");
+    };
+
+    // The finalized tip is at the fixture cursor until the reproduction
+    // is actually awaited; running it moves the tip one block past the
+    // payment deadline.
+    let tip = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(CURSOR));
+    let stalled = SharedBlocks { tip: tip.clone() };
+    let engine = LatchedEngine {
+        tip,
+        advance_to: authorization.payment_deadline.saturating_add(1),
+    };
+    let (transport, server) = transport_pair();
+    let serving = serve(server, service.clone());
+    let collected =
+        collect_checked_result(transport, &mut endpoint, &ready, &stalled, &engine, id).await;
+    serving.abort();
+    assert!(
+        matches!(collected, Ok(CollectOutcome::Checked(_))),
+        "the answer reproduces and matches: {collected:?}",
+    );
+    // The barrier ran: the cursor is past the deadline now.
+    assert!(
+        endpoint.state().cursor().0 > authorization.payment_deadline,
+        "the post-answer catch-up advanced the cursor past the deadline",
+    );
+
+    // So the payment is refused: a certificate signed now is one this
+    // client's own journal is past the height to sign it by.
+    let (transport, server) = transport_pair();
+    let serving = serve(server, service.clone());
+    let paid = pay_for_checked_result(transport, &mut endpoint, id).await;
+    serving.abort();
+    assert!(
+        paid.is_err(),
+        "a payment past its deadline is refused at the barrier: {paid:?}",
+    );
+    assert!(
+        endpoint.state().last_payment().is_none(),
+        "and nothing was signed",
     );
 }
 

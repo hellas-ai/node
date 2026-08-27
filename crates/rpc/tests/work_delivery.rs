@@ -647,7 +647,6 @@ async fn one_answer_crosses_the_wire_and_is_debited_once() {
         let Ok(provider) = service.endpoint() else {
             panic!("the endpoint is reachable");
         };
-        assert_eq!(provider.state().delivery_outstanding(), PRICE);
         assert_eq!(
             provider.state().job().map(JobState::phase),
             Some(JobPhase::Delivered)
@@ -667,15 +666,6 @@ async fn one_answer_crosses_the_wire_and_is_debited_once() {
         Err(error) => panic!("a replayed delivery completes: {error}"),
     };
     assert_eq!(again, delivered, "the same answer came back");
-    let Ok(provider) = service.endpoint() else {
-        panic!("the endpoint is reachable");
-    };
-    assert_eq!(
-        provider.state().delivery_outstanding(),
-        PRICE,
-        "a replay reuses the debit it already made",
-    );
-    drop(provider);
 
     assert_eq!(
         endpoint.state().job().map(JobState::phase),
@@ -737,7 +727,11 @@ async fn the_last_height_the_delivery_margin_fits_is_the_last_that_may_release()
             if let Err(error) = released {
                 panic!("at {height} the margin still fits: {error}");
             }
-            assert_eq!(endpoint.state().delivery_outstanding(), PRICE);
+            assert_eq!(
+                endpoint.state().job().map(JobState::phase),
+                Some(JobPhase::Delivered),
+                "the release marked the job delivered",
+            );
             continue;
         }
         let Err(DeliverError::Setup(WorkSetupError::DeliveryUnreachable { terminal, .. })) =
@@ -747,14 +741,9 @@ async fn the_last_height_the_delivery_margin_fits_is_the_last_that_may_release()
         };
         assert_eq!(terminal, deadlines().terminal);
         assert_eq!(
-            endpoint.state().delivery_outstanding(),
-            0,
-            "nothing left, so nothing was debited",
-        );
-        assert_eq!(
             endpoint.state().job().map(JobState::phase),
             Some(JobPhase::Ready),
-            "and nothing was marked released",
+            "nothing was marked released",
         );
     }
 }
@@ -787,13 +776,6 @@ async fn a_job_with_no_result_releases_nothing_yet() {
     };
     serving.abort();
     assert_eq!(refusal_code(&response), WorkRefusalCode::NotReady);
-
-    {
-        let Ok(endpoint) = service.endpoint() else {
-            panic!("the endpoint is reachable");
-        };
-        assert_eq!(endpoint.state().delivery_outstanding(), 0);
-    }
 
     // The control: the same request, once the job has a result.
     run_to_result(&service, &ready, id).await;
@@ -857,7 +839,11 @@ async fn a_release_past_the_deadline_is_expired_on_the_wire() {
     let Ok(endpoint) = service.endpoint() else {
         panic!("the endpoint is reachable");
     };
-    assert_eq!(endpoint.state().delivery_outstanding(), 0);
+    assert_eq!(
+        endpoint.state().job().map(JobState::phase),
+        Some(JobPhase::Ready),
+        "nothing was released",
+    );
 }
 
 /// A `work_id` that is not this channel's open job is refused, and a
@@ -909,7 +895,6 @@ async fn a_delivery_named_for_another_job_finds_nothing() {
     let Ok(endpoint) = service.endpoint() else {
         panic!("the endpoint is reachable");
     };
-    assert_eq!(endpoint.state().delivery_outstanding(), 0);
     assert_eq!(
         endpoint.state().job().map(JobState::phase),
         Some(JobPhase::Ready),
@@ -965,7 +950,6 @@ async fn a_provider_signs_no_result_the_frame_would_not_carry() {
         None,
         "and the job is over, at the provider's own cost",
     );
-    assert_eq!(endpoint.state().loss().compute, 0);
 }
 
 /// The client refuses a delivery larger than the frame it signed a
@@ -1367,11 +1351,6 @@ async fn a_work_id_alone_releases_nothing() {
             panic!("the endpoint is reachable");
         };
         assert_eq!(
-            endpoint.state().delivery_outstanding(),
-            0,
-            "{name} debits nothing",
-        );
-        assert_eq!(
             endpoint.state().job().map(JobState::phase),
             Some(JobPhase::Ready),
             "{name} leaves the answer where it was",
@@ -1459,5 +1438,9 @@ async fn a_transport_without_an_exporter_delivers_nothing() {
     let Ok(endpoint) = service.endpoint() else {
         panic!("the endpoint is reachable");
     };
-    assert_eq!(endpoint.state().delivery_outstanding(), 0);
+    assert_eq!(
+        endpoint.state().job().map(JobState::phase),
+        Some(JobPhase::Ready),
+        "nothing was released",
+    );
 }

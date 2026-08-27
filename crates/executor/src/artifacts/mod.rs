@@ -290,9 +290,9 @@ impl EvaluateArtifactStore {
     ///
     /// The ids are not computed here. [`completed_text`] is the one
     /// definition of what a finished execution produces, and it is
-    /// shared with the client-side oracle that has to arrive at the same
-    /// artifact id without this store; what is done here is storing the
-    /// bodies it derived.
+    /// shared with the client-side re-execution that has to arrive at the
+    /// same artifact id without this store; what is done here is storing
+    /// the bodies it derived.
     pub async fn record_completed_text(
         &mut self,
         evaluate_request: &EvaluateRequest,

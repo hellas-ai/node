@@ -21,16 +21,15 @@ use hellas_rpc::evaluate::{
     EvaluateOutputTranscriptBuilder, EvaluateStopReason, EvaluateTerminal, EvaluateUsage,
     input_commitment,
 };
-use hellas_rpc::pb::work::{AcceptWorkRequest, accept_work_response::Outcome};
 use hellas_rpc::protocol::artifacts::{
     BoundTermId, Canonical as _, InputAddressed as _, OutputAddressed as _, PreparedPaidInputV1,
     SourceRef, TextArtifact, TextExecution, TextPolicy, TokenIds,
 };
 use hellas_rpc::protocol::work::{
     JobDeadlines, PaidChannelPolicyV1, PaidExecutionPolicyV1, PaidJobAuthorizationV1,
-    PaidWorkError, PrivateRecord as _, canonical_output_digest, generation_policy_digest,
-    identity_source_digest, private_policy_commitment, propose_authorization, result_digest,
-    signing_hash, terminal_result, work_id,
+    PaidWorkError, canonical_output_digest, generation_policy_digest, identity_source_digest,
+    private_policy_commitment, propose_authorization, result_digest, signing_hash, terminal_result,
+    work_id,
 };
 use hellas_rpc::protocol::work_setup::{
     ObservedChannel, OmissionMeasurements, ReadyChannel, WorkChannelConfig, WorkChannelDescriptor,
@@ -44,7 +43,7 @@ use hellas_rpc::work::{
 use hellas_rpc::work_close::{FinalizedWork, observe};
 use hellas_rpc::work_store::{
     ChannelRecord, ChannelStateError, ChannelStore, JobPhase, JobState, Role, SetupOrigin,
-    WorkStoreError,
+    TerminalOutcome, WorkStoreError,
 };
 use hellas_rpc::{
     Assurance, EvaluateProgramManifest, EvaluateRequest, OutputEventEnvelope, ProducerSigningKey,
@@ -923,7 +922,7 @@ async fn a_restart_runs_the_job_that_was_accepted() {
     let dir = temp();
     let id = {
         let mut store = store_at(dir.path(), CURSOR);
-        accept(&mut store, 7)
+        accept(&mut store, 1)
     };
 
     let service = serving(store_at(dir.path(), CURSOR));
@@ -935,14 +934,6 @@ async fn a_restart_runs_the_job_that_was_accepted() {
     };
     assert_eq!(backend.calls(), 1);
     assert_eq!(result.work_id, id);
-
-    // And it is the job that was accepted: the answer is bound to the
-    // request commitment the authorization carries, which nonce 7 fixes.
-    let elsewhere = authorization(1);
-    assert_ne!(
-        authorization(7).request_commitment,
-        elsewhere.request_commitment
-    );
 }
 
 // ── The gate in front of the marker ───────────────────────────────────
@@ -1107,11 +1098,15 @@ async fn a_backend_fault_is_not_the_clients_debt() {
         panic!("the endpoint is reachable");
     };
     assert!(endpoint.state().job().is_none(), "the job was ended");
-    assert_eq!(endpoint.state().compute_outstanding(), 0);
-    assert_eq!(
-        endpoint.state().loss().compute,
-        0,
-        "the provider bears its own fault",
+    assert!(
+        matches!(
+            endpoint
+                .state()
+                .terminal()
+                .map(|terminal| &terminal.outcome),
+            Some(TerminalOutcome::Failed { .. })
+        ),
+        "the job rests at a failed terminal the provider bears itself",
     );
 }
 
@@ -1136,7 +1131,6 @@ async fn a_backend_that_answers_the_wrong_question_signs_nothing() {
             panic!("the endpoint is reachable");
         };
         assert!(endpoint.state().job().is_none(), "the job was ended");
-        assert_eq!(endpoint.state().loss().compute, 0);
 
         // Nothing was signed: reopening finds no result on the disk.
         drop(endpoint);
@@ -1146,68 +1140,7 @@ async fn a_backend_that_answers_the_wrong_question_signs_nothing() {
     }
 }
 
-/// A provider cannot exhaust a client by failing its work.
-///
-/// Four accepted jobs, each one faulted, is this channel's entire
-/// compute limit spent — if a fault were the client's debt. It is not,
-/// so the fifth proposal is co-signed like the first, and every one of
-/// them goes through the real acceptance exchange to get there.
-///
-/// This is the story, not the isolation. Every job here is failed while
-/// running, and the ledger's rule has two halves that both answer no at
-/// that phase; `a_provider_fault_is_not_the_clients_debt` in the store's
-/// own suite is what varies the reason alone.
-#[tokio::test]
-async fn a_provider_cannot_exhaust_a_client_by_failing_its_work() {
-    let dir = temp();
-    let service = serving(store_at(dir.path(), CURSOR));
-    let backend = CountingBackend::new(Answer::Fault("the weights did not load"));
-    assert_eq!(4 * PRICE, CREDIT_LIMIT, "four jobs is the whole limit");
-
-    for nonce in 1..=4 {
-        let id = co_sign(&service, nonce);
-        let outcome = run_accepted_work(&service, &ready(), &backend, id).await;
-        assert!(
-            matches!(outcome, Err(RunError::Backend(_))),
-            "unexpected outcome: {outcome:?}",
-        );
-    }
-    assert_eq!(backend.calls(), 4);
-
-    // The fifth is accepted, and its price is reserved: the ledger this
-    // client is judged by never moved.
-    let id = co_sign(&service, 5);
-    let Ok(endpoint) = service.endpoint() else {
-        panic!("the endpoint is reachable");
-    };
-    assert_eq!(endpoint.state().loss().compute, 0);
-    assert_eq!(endpoint.state().compute_outstanding(), PRICE);
-    let Some(job) = endpoint.state().job() else {
-        panic!("the fifth job is open");
-    };
-    assert_eq!(job.work_id(), id);
-}
-
 // ── Fixture plumbing ──────────────────────────────────────────────────
-
-/// Proposes and co-signs one job through the real acceptance exchange,
-/// and returns its `work_id`.
-fn co_sign(service: &WorkService, nonce: u8) -> Digest {
-    let authorization = authorization(nonce);
-    let id = work_id(ready().channel(), &authorization);
-    let request = AcceptWorkRequest {
-        authorization: authorization.encode(),
-        client_signature: client().sign(signing_hash(id)).as_bytes().to_vec(),
-        prepared_input: bundle_bytes(nonce),
-    };
-    let Ok(mut endpoint) = service.endpoint() else {
-        panic!("the endpoint is reachable");
-    };
-    match endpoint.accept(&request).outcome {
-        Some(Outcome::Accepted(_)) => id,
-        other => panic!("the fixture proposal is accepted, got {other:?}"),
-    }
-}
 
 fn expect_outcome(outcome: Result<RunOutcome, RunError>) -> RunOutcome {
     match outcome {

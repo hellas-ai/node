@@ -88,11 +88,16 @@ use crate::protocol::Digest;
 const MAGIC: &[u8] = b"hellas.work-journal.v1";
 /// Envelope version of the header and framing below.
 ///
-/// Version 1 journals are intentionally refused. They predate `ScanArmed`
-/// and `ArmedBundle`, so replay cannot prove that every authorization which
-/// escaped still has a recoverable observation floor and close descriptor.
-/// This is a pre-deployment reset, not a migratable format change.
-const FORMAT_VERSION: u8 = 2;
+/// Old versions are intentionally refused; each retirement is a
+/// pre-deployment reset, not a migratable format change. Version 1
+/// journals predate `ScanArmed` and `ArmedBundle`, so replay cannot
+/// prove that every authorization which escaped still has a recoverable
+/// observation floor and close descriptor. Version 2 journals predate
+/// the one-job terminal: channel tags 7–11 meant admitted-payment,
+/// ending, and three close records, and this binary reads those same
+/// bytes as the terminal and shifted close records — so a v2 file under
+/// the current header would mis-replay rather than fail.
+const FORMAT_VERSION: u8 = 3;
 /// Domain of the header digest every frame is bound to.
 const HEADER_DOMAIN: &[u8] = b"hellas.work.journal-header.v1";
 /// Domain of one frame's digest.
@@ -116,7 +121,7 @@ const FRAME_OVERHEAD: usize = 4 + Digest::LEN;
 /// record.
 pub const MAX_RECORD_BYTES: usize = 4 << 20;
 
-/// Which of the three journals a file is.
+/// Which of the two journals a file is.
 ///
 /// In the header, so a channel journal handed to the setup reader — or
 /// to the counterparty ledger — fails to open rather than replaying as
@@ -125,10 +130,8 @@ pub const MAX_RECORD_BYTES: usize = 4 << 20;
 pub enum JournalKind {
     /// The two-Open handshake and its recovery state.
     Setup,
-    /// One channel's jobs, credit, and certificates.
+    /// One channel's job, credit, and certificate.
     Channel,
-    /// One counterparty's unresolved compute and delivery loss.
-    CounterpartyLoss,
 }
 
 impl JournalKind {
@@ -136,7 +139,6 @@ impl JournalKind {
         match self {
             Self::Setup => 1,
             Self::Channel => 2,
-            Self::CounterpartyLoss => 3,
         }
     }
 }
@@ -336,10 +338,15 @@ impl Journal {
                     .get(MAGIC.len())
                     .is_some_and(|found| *found < FORMAT_VERSION)
             {
+                let found = bytes[MAGIC.len()];
                 return Err(JournalError::OldVersion {
-                    found: bytes[MAGIC.len()],
+                    found,
                     expected: FORMAT_VERSION,
-                    retirement: "pre-arming journals have no recoverable scan floor or close descriptor",
+                    retirement: if found < 2 {
+                        "pre-arming journals have no recoverable scan floor or close descriptor"
+                    } else {
+                        "pre-terminal channel journals reuse tags 7-11 with other meanings and would mis-replay"
+                    },
                 });
             }
             // A file that is a strict prefix of the header this journal

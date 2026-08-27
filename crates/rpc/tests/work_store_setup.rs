@@ -1479,7 +1479,10 @@ fn a_finalized_bond_timeout_reclaims_the_stake_cleanly() {
     let dir = temp();
     let verifier = Secp256k1Verifier::new();
     let mut journal = completed_store(dir.path());
-    for record in [SetupRecord::BondSubmitted, SetupRecord::BondTimeoutSubmitted] {
+    for record in [
+        SetupRecord::BondSubmitted,
+        SetupRecord::BondTimeoutSubmitted,
+    ] {
         if let Err(error) = journal.commit(record, &verifier) {
             panic!("the provider arms and times out its bond: {error}");
         }
@@ -1501,10 +1504,7 @@ fn a_finalized_bond_timeout_reclaims_the_stake_cleanly() {
 
     // History finalizes the bond Open and the deterministic Timeout Close
     // that consumed it.
-    let bond_open = journal
-        .state()
-        .bond_open()
-        .expect("the retained bond Open");
+    let bond_open = journal.state().bond_open().expect("the retained bond Open");
     let bond_close = Tx::timeout_close(bond_edge(), &Terms::work_stake_bond(bond_terms()))
         .expect("the bond has a deterministic timeout close");
     if let Err(error) = journal.commit(
@@ -1593,10 +1593,7 @@ async fn a_mount_replays_a_same_block_contest() {
     }
     struct NoSink;
     impl TxSink for NoSink {
-        async fn submit(
-            &self,
-            _tx: Tx,
-        ) -> Result<hellas_rpc::SubmitTxOutcome, BlockSourceError> {
+        async fn submit(&self, _tx: Tx) -> Result<hellas_rpc::SubmitTxOutcome, BlockSourceError> {
             panic!("mounting a close-only channel submits nothing");
         }
     }
@@ -1649,7 +1646,11 @@ async fn a_mount_replays_a_same_block_contest() {
         }
         other => panic!("a bond-timed-out payment mounts close-only: {other:?}"),
     };
-    assert_eq!(origin.height, scan().height + 1, "the origin is the payment Open block");
+    assert_eq!(
+        origin.height,
+        scan().height + 1,
+        "the origin is the payment Open block"
+    );
 
     // The mounted channel journal holds the contest: the Start ordered
     // after the Open in the origin block was replayed, not dropped with

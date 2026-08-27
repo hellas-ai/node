@@ -31,15 +31,12 @@
 //!   revisions, and the recovery decision that resumes it. Keyed by
 //!   `(network, bond edge)`, because the bond edge is the first thing
 //!   both parties can name.
-//! - [`channel::ChannelStore`] — one channel's one job, its credit
-//!   ledgers, and its certificates. Keyed by the channel id,
-//!   which binds the network, both edges, and both terms bodies.
-//! - [`channel::CounterpartyLoss`] — what one client owes across every
-//!   channel it has had. Keyed by `(network, client key)`, so a fresh
-//!   payment edge inherits it and a deleted channel does not clear it.
+//! - [`channel::ChannelStore`] — one channel's one job, its credit, and
+//!   its one certificate. Keyed by the channel id, which binds the
+//!   network, both edges, and both terms bodies.
 //!
-//! All three are the same append-only fsynced [`journal::Journal`],
-//! with one exclusive lock each and one replay each.
+//! Both are the same append-only fsynced [`journal::Journal`], with one
+//! exclusive lock each and one replay each.
 //!
 //! # Why here
 //!
@@ -72,8 +69,8 @@ pub mod setup;
 mod cursor;
 
 pub use channel::{
-    ChannelRecord, ChannelState, ChannelStateError, ChannelStore, CloseSettlement,
-    CounterpartyLoss, JobEnd, JobPhase, JobState, LossTotals, OpenContest, PaidCertificate,
+    ChannelRecord, ChannelState, ChannelStateError, ChannelStore, CloseSettlement, JobPhase,
+    JobState, JobTerminal, OpenContest, PaidCertificate, TerminalOutcome,
 };
 pub use journal::{JournalError, Role};
 pub use setup::{
@@ -112,7 +109,7 @@ pub(crate) fn put_u64(out: &mut Vec<u8>, value: u64) {
 
 /// Renders a journal key as the lowercase hex a file is named with.
 ///
-/// One spelling for all three journals: a key rendered two ways is two
+/// One spelling for both journals: a key rendered two ways is two
 /// file names for one journal, and the second one is a store with no
 /// history in it.
 pub(crate) fn hex(bytes: &[u8]) -> String {

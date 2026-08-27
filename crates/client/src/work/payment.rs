@@ -2,8 +2,8 @@
 //!
 //! # The order, and why it is this order
 //!
-//! 1. **Sign.** The client, holding the durable verdict its own oracle
-//!    reached, derives the amount itself — its own credited
+//! 1. **Sign.** The client, holding the durable match its own
+//!    re-execution reached, derives the amount itself — its own credited
 //!    total plus the price its own authorization fixed — and signs the
 //!    certificate and the binding that says what that certificate
 //!    bought. Both are fsynced, through the ledger that says this job

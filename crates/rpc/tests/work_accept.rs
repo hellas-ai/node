@@ -41,7 +41,7 @@ use hellas_rpc::work::{
 };
 use hellas_rpc::work_close::{BlockSourceError, FinalizedBlocks, FinalizedWork, observe};
 use hellas_rpc::work_store::{
-    ChannelRecord, ChannelState, ChannelStore, JobEnd, JobPhase, JobState, Role, SetupOrigin,
+    ChannelRecord, ChannelState, ChannelStore, JobPhase, JobState, Role, SetupOrigin,
 };
 use hellas_rpc::{
     Assurance, Evaluate, EvaluateProgramManifest, EvaluateRequest, ProgramManifest, PublicKey,
@@ -678,10 +678,6 @@ async fn an_accepted_exchange_leaves_both_signatures_on_both_disks() {
             "{side} holds the co-signature",
         );
     }
-    // The provider reserved this job's compute the moment it took the
-    // proposal, not when it dispatches.
-    assert_eq!(provider_store.state().compute_outstanding(), PRICE);
-    assert_eq!(client_store.state().next_proposal_nonce(), 2);
 }
 
 #[tokio::test]
@@ -778,7 +774,7 @@ fn a_client_journals_its_signature_before_the_request_leaves() {
 }
 
 #[test]
-fn a_proposal_refused_before_signing_spends_no_nonce() {
+fn a_proposal_refused_before_signing_leaves_no_job() {
     let root = temp();
     let mut endpoint = client_endpoint(root.path());
     // Terminal deadline inside the measured dispatch and delivery
@@ -796,7 +792,6 @@ fn a_proposal_refused_before_signing_spends_no_nonce() {
         matches!(refused, Err(ProposeError::Setup(_))),
         "an unreachable terminal deadline is refused, got {refused:?}",
     );
-    assert_eq!(endpoint.state().next_proposal_nonce(), 1);
     assert!(endpoint.state().job().is_none());
     drop(endpoint);
     assert!(store(root.path(), Role::Client).state().job().is_none());
@@ -809,16 +804,10 @@ fn a_repeat_proposal_returns_the_retained_request() {
     let Ok(first) = endpoint.propose(&proposal(1)) else {
         panic!("the first proposal is built");
     };
-    let before = endpoint.state().next_proposal_nonce();
     let Ok(second) = endpoint.propose(&proposal(1)) else {
         panic!("the same proposal is retained, not rebuilt");
     };
     assert_eq!(first, second, "the retained bytes come back unchanged");
-    assert_eq!(
-        endpoint.state().next_proposal_nonce(),
-        before,
-        "a retry spends no second nonce",
-    );
 }
 
 #[test]
@@ -984,7 +973,6 @@ fn nothing_is_journaled_for_a_proposal_that_is_refused() {
 
     assert_eq!(refusal_code(&response), WorkRefusalCode::Invalid);
     assert!(before && endpoint.state().job().is_none());
-    assert_eq!(endpoint.state().compute_outstanding(), 0);
     drop(endpoint);
     assert!(store(root.path(), Role::Provider).state().job().is_none());
 }
@@ -1014,7 +1002,6 @@ fn a_price_the_policy_does_not_fix_is_refused_before_anything_is_journaled() {
         refusal_text(&response),
     );
     assert!(endpoint.state().job().is_none());
-    assert_eq!(endpoint.state().compute_outstanding(), 0);
     drop(endpoint);
     assert!(store(root.path(), Role::Provider).state().job().is_none());
 }
@@ -1026,11 +1013,6 @@ fn a_retry_returns_the_retained_co_signature() {
     let first = accepted_signature(&endpoint.accept(&signed_request(1, 1)));
     let second = accepted_signature(&endpoint.accept(&signed_request(1, 1)));
     assert_eq!(first, second);
-    assert_eq!(
-        endpoint.state().compute_outstanding(),
-        PRICE,
-        "one job's credit, however many times it is asked for",
-    );
 }
 
 #[test]
@@ -1084,11 +1066,6 @@ fn a_crash_between_the_two_commits_co_signs_on_retry() {
     let response = endpoint.accept(&request(&authorization, signature, 1));
     assert_eq!(phase_of(endpoint.state()), Some(JobPhase::Accepted),);
     accepted_signature(&response);
-    assert_eq!(
-        endpoint.state().compute_outstanding(),
-        PRICE,
-        "the credit the first process reserved is not reserved again",
-    );
 }
 
 // ── The six refusals, one at a time ───────────────────────────────────
@@ -1372,45 +1349,8 @@ fn a_job_already_in_flight_declines_the_next_one() {
     let root = temp();
     let mut endpoint = provider_endpoint(root.path());
     accepted_signature(&endpoint.accept(&signed_request(1, 1)));
-    let response = endpoint.accept(&signed_request(2, 2));
-    assert_eq!(refusal_code(&response), WorkRefusalCode::Declined);
-    assert_eq!(
-        endpoint.state().compute_outstanding(),
-        PRICE,
-        "the refused job reserved nothing",
-    );
-}
-
-#[test]
-fn a_nonce_this_channel_has_already_seen_is_a_conflict() {
-    let root = temp();
-    let mut endpoint = provider_endpoint(root.path());
-    accepted_signature(&endpoint.accept(&signed_request(1, 1)));
-    drop(endpoint);
-
-    // The job ends unpaid, releasing its credit and never its nonce.
-    let mut ending = store(root.path(), Role::Provider);
-    if let Err(error) = ending.commit(
-        ChannelRecord::JobEnded {
-            reason: JobEnd::Expired,
-        },
-        &Secp256k1Verifier::new(),
-    ) {
-        panic!("the job ends: {error}");
-    }
-    drop(ending);
-
-    let mut endpoint = provider_endpoint(root.path());
-    assert_eq!(endpoint.state().compute_outstanding(), 0);
-    // A different job — a different bundle — at the nonce the ended job
-    // already spent.
     let response = endpoint.accept(&signed_request(2, 1));
-    assert_eq!(
-        refusal_code(&response),
-        WorkRefusalCode::Conflict,
-        "a burnt nonce stays burnt: {}",
-        refusal_text(&response),
-    );
+    assert_eq!(refusal_code(&response), WorkRefusalCode::Declined);
 }
 
 #[test]
@@ -1428,50 +1368,6 @@ fn a_poisoned_endpoint_is_unavailable() {
 }
 
 // ── Binding an endpoint to its own half of its own channel ────────────
-
-/// A nonce spent on a job that ended is not spent again.
-///
-/// The nonce and the proposal that carries it reach the disk in one
-/// record, so there is no window in which a nonce is spent and no job
-/// exists. What this covers is the other end: ending a job releases its
-/// credit and its capacity, and never its number.
-#[test]
-fn a_nonce_spent_on_an_ended_job_is_not_used_again() {
-    let root = temp();
-    let mut endpoint = client_endpoint(root.path());
-    let Ok(first) = endpoint.propose(&proposal(1)) else {
-        panic!("the first proposal is built");
-    };
-    let Ok(built) = PaidJobAuthorizationV1::decode(&first.authorization) else {
-        panic!("the request carries an authorization");
-    };
-    assert_eq!(built.proposal_nonce, 1, "a client's first nonce is one");
-    drop(endpoint);
-
-    // The job ends unpaid, and the process comes back.
-    let mut ending = store(root.path(), Role::Client);
-    if let Err(error) = ending.commit(
-        ChannelRecord::JobEnded {
-            reason: JobEnd::Failed,
-        },
-        &Secp256k1Verifier::new(),
-    ) {
-        panic!("the job ends: {error}");
-    }
-    drop(ending);
-
-    let mut endpoint = client_endpoint(root.path());
-    let Ok(request) = endpoint.propose(&proposal(1)) else {
-        panic!("the next proposal is built");
-    };
-    let Ok(built) = PaidJobAuthorizationV1::decode(&request.authorization) else {
-        panic!("the request carries an authorization");
-    };
-    assert_eq!(
-        built.proposal_nonce, 2,
-        "the spent nonce is not offered a second time",
-    );
-}
 
 #[test]
 fn an_endpoint_needs_its_own_store_settlement_role_and_key() {

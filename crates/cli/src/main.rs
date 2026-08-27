@@ -16,6 +16,8 @@ mod identity;
 mod metrics;
 #[cfg(feature = "node")]
 mod platform_hardening;
+#[cfg(feature = "node")]
+mod reproduce;
 mod tracing_config;
 
 #[cfg(any(feature = "node", feature = "gateway"))]

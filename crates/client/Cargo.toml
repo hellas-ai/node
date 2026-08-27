@@ -31,8 +31,9 @@ work = ["dep:hellas-kernel", "hellas-rpc/work"]
 async-stream = { version = "0.3", optional = true }
 futures = { workspace = true, optional = true }
 hellas-rpc = { workspace = true, features = ["execute", "fetch"] }
-# The oracle names the network its verdict is bound to, and that type is
-# the consensus kernel's. `work` is the only feature that reaches it.
+# The re-execution names the network its outcome is bound to, and that
+# type is the consensus kernel's. `work` is the only feature that reaches
+# it.
 hellas-kernel = { workspace = true, optional = true }
 hellas-attestation = { workspace = true, features = [
     "apple-app-attest",

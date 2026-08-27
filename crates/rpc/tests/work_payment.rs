@@ -700,11 +700,11 @@ async fn checked_job() -> Checked {
     if let Err(error) = delivered {
         panic!("the fixture delivery completes: {error}");
     }
-    // The oracle is `hellas-client`'s; what this file needs is the
-    // durable verdict it records, which is the only phase an honest
+    // The re-execution is `hellas-client`'s; what this file needs is the
+    // durable match it records, which is the only phase an honest
     // client's journal signs a certificate from.
-    if let Err(error) = client.verified(id) {
-        panic!("the fixture verdict records: {error}");
+    if let Err(error) = client.matched(id) {
+        panic!("the fixture match records: {error}");
     }
     Checked {
         client_root,
@@ -817,12 +817,10 @@ async fn one_certificate_pays_for_one_job() {
         assert!(state.job().is_none());
         assert_eq!(state.ledger().credited_cumulative(), PRICE);
         assert_eq!(state.max_executable_certificate(), PRICE);
-        assert_eq!(
-            state.compute_outstanding(),
-            0,
-            "the admitted certificate retires the compute credit",
+        assert!(
+            state.terminal().is_some(),
+            "the admitted certificate is this channel's one terminal",
         );
-        assert_eq!(state.delivery_outstanding(), 0, "and the delivery credit");
     }
 
     // The acknowledgement lost to a crash: the same bytes again, and
@@ -874,8 +872,6 @@ async fn one_certificate_pays_for_one_job() {
         assert_eq!(state.ledger().credited_cumulative(), PRICE);
         assert_eq!(state.max_executable_certificate(), PRICE);
     }
-    assert_eq!(provider_store.state().compute_outstanding(), 0);
-    assert_eq!(provider_store.state().delivery_outstanding(), 0);
     assert_eq!(
         client_store.state().last_payment().map(|p| p.work_id),
         Some(id)
@@ -1054,11 +1050,6 @@ async fn assert_nothing_credited(service: &WorkService, what: &str) {
         "{what} is not banked either",
     );
     assert_eq!(
-        state.delivery_outstanding(),
-        PRICE,
-        "{what} retires no credit",
-    );
-    assert_eq!(
         state.job().map(JobState::phase),
         Some(JobPhase::Delivered),
         "{what} leaves the job unpaid",
@@ -1228,16 +1219,16 @@ async fn a_payment_is_exactly_the_bytes_the_service_defines() {
 
 // ── Payment against default ───────────────────────────────────────────
 
-/// A job written off and a job paid for are the same job, and exactly
-/// one of the two happens.
+/// A defaulted job and a paid job are the same job, and exactly one of
+/// the two terminals is written.
 ///
-/// Both orders, over the one file that decides them. Ending first: the
-/// price is on this client's identity-wide loss ledger, which nothing
-/// takes back, so the payment is refused *and not banked* — a provider
-/// that kept both would charge the client twice for one job, and the
-/// cost of the race falls on the endpoint whose default caused it.
-/// Paying first: the payment closes the job, and there is nothing left
-/// to end.
+/// Both orders, over the one file that decides them. Expiring first: the
+/// provider's watcher reaches finalized blocks past the height this
+/// client signed to pay by, and the job rests at a permanent expired
+/// terminal — the provider bears whatever it spent, there being no
+/// client charge to move. A payment then is refused *and not banked*,
+/// because the one job is already over. Paying first: the payment rests
+/// the job at a certified terminal, and there is nothing left to expire.
 #[tokio::test]
 async fn a_defaulted_job_is_not_paid_for_as_well() {
     let mut fixture = checked_job().await;
@@ -1261,15 +1252,24 @@ async fn a_defaulted_job_is_not_paid_for_as_well() {
             }
             next += 1;
         }
-        assert_eq!(provider.state().loss().compute, PRICE);
-        assert_eq!(provider.state().loss().delivery, PRICE);
+        assert!(
+            provider.state().job().is_none(),
+            "the expired job is closed",
+        );
+        assert!(
+            matches!(
+                provider.state().terminal().map(|t| &t.outcome),
+                Some(hellas_rpc::work_store::TerminalOutcome::Expired { .. })
+            ),
+            "and rests at an expired terminal",
+        );
     }
 
     let paid = pay_over_wire(&fixture.service, &mut fixture.client, id).await;
     let Err(PaymentError::Refused { refusal, .. }) = paid else {
         panic!("a defaulted job takes no payment: {paid:?}");
     };
-    assert_eq!(refusal, WorkRefusal::Declined);
+    assert_eq!(refusal, WorkRefusal::Conflict);
     {
         let Ok(provider) = fixture.service.endpoint() else {
             panic!("the endpoint is reachable");
@@ -1279,9 +1279,8 @@ async fn a_defaulted_job_is_not_paid_for_as_well() {
         assert_eq!(
             state.max_executable_certificate(),
             0,
-            "a job already written off is not banked as well",
+            "a job already expired is not banked as well",
         );
-        assert_eq!(state.loss().compute, PRICE, "and the write-off stands");
     }
     assert_eq!(
         fixture.client.state().ledger().credited_cumulative(),
@@ -1304,6 +1303,5 @@ async fn a_defaulted_job_is_not_paid_for_as_well() {
         matches!(ended, Err(RunError::NoSuchJob)),
         "a paid job is closed: {ended:?}",
     );
-    assert_eq!(provider.state().loss().compute, 0, "and cost nothing");
     assert_eq!(provider.state().ledger().credited_cumulative(), PRICE);
 }

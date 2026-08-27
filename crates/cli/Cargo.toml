@@ -14,7 +14,7 @@ default = []
 # always present because remote confidential-open supports Apple providers.
 apple-app-attest = []
 
-node = ["dep:hellas-executor"]
+node = ["dep:hellas-executor", "hellas-client/work"]
 # HTTP gateway front-end (OpenAI/Anthropic/plain APIs).
 gateway = ["dep:hellas-gateway"]
 evaluate = [

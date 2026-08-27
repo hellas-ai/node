@@ -32,8 +32,7 @@ use hellas_rpc::evaluate::{
     input_commitment,
 };
 use hellas_rpc::pb::work::{
-    AcceptWorkRequest, AcceptWorkResponse, WorkRefusalCode,
-    accept_work_response::Outcome as AcceptOutcome,
+    AcceptWorkRequest, WorkRefusalCode, accept_work_response::Outcome as AcceptOutcome,
 };
 use hellas_rpc::protocol::artifacts::{
     BoundTermId, Canonical as _, InputAddressed as _, OutputAddressed as _, PreparedPaidInputV1,
@@ -60,6 +59,7 @@ use hellas_rpc::work_close::{
 };
 use hellas_rpc::work_store::{
     ChannelRecord, ChannelStore, CloseSettlement, JobPhase, JobState, Role, SetupOrigin,
+    TerminalOutcome,
 };
 use hellas_rpc::{
     Assurance, EvaluateProgramManifest, EvaluateRequest, OutputEventEnvelope, ProducerSigningKey,
@@ -708,7 +708,7 @@ async fn checked_job() -> Checked {
     // The oracle is `hellas-client`'s; what this file needs is the
     // durable verdict it records, which is the only phase an honest
     // client's journal signs a certificate from.
-    if let Err(error) = client.verified(id) {
+    if let Err(error) = client.matched(id) {
         panic!("the fixture verdict records: {error}");
     }
     Checked {
@@ -775,23 +775,6 @@ fn signed_request(nonce: u8, proposal_nonce: u64) -> AcceptWorkRequest {
             .as_bytes()
             .to_vec(),
         prepared_input,
-    }
-}
-
-fn accepted(response: &AcceptWorkResponse) -> Option<Vec<u8>> {
-    match response.outcome.as_ref() {
-        Some(AcceptOutcome::Accepted(accepted)) => Some(accepted.provider_signature.clone()),
-        _ => None,
-    }
-}
-
-fn refusal_code(response: &AcceptWorkResponse) -> WorkRefusalCode {
-    match response.outcome.as_ref() {
-        Some(AcceptOutcome::Refused(refused)) => match WorkRefusalCode::try_from(refused.code) {
-            Ok(code) => code,
-            Err(error) => panic!("the refusal code is one of the six: {error}"),
-        },
-        other => panic!("expected a refusal, got {other:?}"),
     }
 }
 
@@ -1157,51 +1140,6 @@ async fn a_close_settles_the_contest_this_endpoint_started() {
 }
 
 // ── The cutoff ────────────────────────────────────────────────────────
-
-/// Once the close is on the disk, the channel takes no more work.
-///
-/// The proposal refused afterwards is the same proposal the same
-/// endpoint accepted a moment earlier — same nonce, same bytes, same
-/// deadlines — so what refuses it is the cutoff and nothing else. A job
-/// admitted after the start was signed would be a job whose payment
-/// that start cannot carry.
-#[tokio::test]
-async fn a_job_after_the_cutoff_is_refused() {
-    let fixture = paid_job().await;
-    let second = signed_request(2, 2);
-
-    // The same request, against a provider that has not closed. This is
-    // what the refusal below is being distinguished from.
-    let open_channel = paid_job().await;
-    {
-        let Ok(mut provider) = open_channel.service.endpoint() else {
-            panic!("the endpoint is reachable");
-        };
-        let answered = provider.accept(&second);
-        assert!(
-            accepted(&answered).is_some(),
-            "a paid, idle channel takes the next job: {answered:?}",
-        );
-    }
-    drop(open_channel);
-
-    let Ok(mut provider) = fixture.service.endpoint() else {
-        panic!("the endpoint is reachable");
-    };
-    if let Err(error) = provider.prepare_close() {
-        panic!("a paid channel closes: {error}");
-    }
-    let refused = provider.accept(&second);
-    assert_eq!(
-        refusal_code(&refused),
-        WorkRefusalCode::Declined,
-        "a closing channel declines new work: {refused:?}",
-    );
-    assert!(
-        provider.state().job().is_none(),
-        "and nothing about it is journaled",
-    );
-}
 
 /// A start that can no longer be included is replaced, and one that
 /// can is offered again.
@@ -1636,14 +1574,8 @@ async fn restart_services_the_response_before_its_deadline() {
 
     // The client opens below what it has already signed for: a start of
     // the *client's* (Maker's), claiming nothing.
-    let understated = close_start(
-        ready.channel(),
-        Party::Maker,
-        CURSOR,
-        None,
-        &client(),
-    )
-    .expect("a client opens a close");
+    let understated = close_start(ready.channel(), Party::Maker, CURSOR, None, &client())
+        .expect("a client opens a close");
     let expected = contest_id(&ready, &understated, inclusion);
 
     // The provider journals the contest through real finalization, then
@@ -1664,12 +1596,15 @@ async fn restart_services_the_response_before_its_deadline() {
             )],
         ))
         .expect("the contest finalizes and journals CloseOpened");
-    assert_eq!(endpoint.state().close_opened(), Some((expected, Party::Maker)));
+    assert_eq!(
+        endpoint.state().close_opened(),
+        Some((expected, Party::Maker))
+    );
     drop(endpoint);
 
     let store = store_at(_provider_root.path(), &ready, Role::Provider, CURSOR);
-    let mut provider =
-        ProviderEndpoint::new(ready.clone(), store, provider()).expect("the reopened provider binds");
+    let mut provider = ProviderEndpoint::new(ready.clone(), store, provider())
+        .expect("the reopened provider binds");
     assert_eq!(
         provider.state().close_opened(),
         Some((expected, Party::Maker)),
@@ -1695,7 +1630,11 @@ async fn restart_services_the_response_before_its_deadline() {
     }
 
     let taken = sink.taken();
-    assert_eq!(taken.len(), 1, "advance_close itself submitted the response");
+    assert_eq!(
+        taken.len(),
+        1,
+        "advance_close itself submitted the response"
+    );
     let hellas_kernel::Tx::Move {
         action: hellas_kernel::Move::RespondPaymentClose(response),
     } = &taken[0]
@@ -1777,23 +1716,33 @@ async fn the_watcher_ends_a_job_its_payment_deadline_has_passed() {
         panic!("the block past the deadline applies: {error}");
     }
     assert!(provider.state().job().is_none(), "the job is over");
-    let loss = provider.state().loss();
-    assert_eq!(
-        (loss.compute, loss.delivery),
-        (PRICE, PRICE),
-        "a delivered, unpaid job is loss in both currencies",
+    assert!(
+        matches!(
+            provider
+                .state()
+                .terminal()
+                .map(|terminal| &terminal.outcome),
+            Some(TerminalOutcome::Expired { .. }),
+        ),
+        "a delivered, unpaid job rests at an expired terminal the provider bears",
     );
-    assert_eq!(provider.state().compute_outstanding(), 0);
-    assert_eq!(provider.state().delivery_outstanding(), 0);
 
-    // The next blocks charge it again to nobody.
+    // The next blocks change nothing: the terminal is permanent.
     for height in (payment_deadline + 2)..=(payment_deadline + 4) {
         if let Err(error) = provider.observe_finalized(&block(height, Vec::new())) {
             panic!("the block at {height} applies: {error}");
         }
     }
-    let after = provider.state().loss();
-    assert_eq!((after.compute, after.delivery), (PRICE, PRICE));
+    assert!(
+        matches!(
+            provider
+                .state()
+                .terminal()
+                .map(|terminal| &terminal.outcome),
+            Some(TerminalOutcome::Expired { .. }),
+        ),
+        "the expired terminal is permanent",
+    );
 
     // And now the channel can be closed, at nothing: the client never
     // signed a certificate, so there is none to carry.
@@ -2144,11 +2093,15 @@ async fn a_finalized_close_start_takes_the_answer_off_the_wire() {
             state.job().is_none(),
             "a job no payment can reach is not a job that is still open",
         );
-        // And the cost of it is this client's: it cut off a result it
-        // could still have taken and paid for.
-        assert_eq!(state.loss().compute, PRICE);
-        assert_eq!(state.loss().delivery, 0, "nothing was released");
-        assert_eq!(state.compute_outstanding(), 0);
+        // And it rests at an expired terminal: the provider bears the
+        // compute it spent on a job a close cut off.
+        assert!(
+            matches!(
+                state.terminal().map(|terminal| &terminal.outcome),
+                Some(TerminalOutcome::Expired { .. }),
+            ),
+            "the cut-off job rests at an expired terminal",
+        );
     }
 
     // The delivery call the exploit ends with.
@@ -2166,17 +2119,18 @@ async fn a_finalized_close_start_takes_the_answer_off_the_wire() {
         "and the client has no answer to check",
     );
 
-    // Nor is there a fresh job to take its place.
+    // Nor is there a fresh job to take its place: this channel's one job
+    // has reached its permanent terminal.
     let response = {
         let Ok(mut provider) = fixture.service.endpoint() else {
             panic!("the endpoint is reachable");
         };
-        provider.accept(&signed_request(NONCE + 1, 2))
+        provider.accept(&signed_request(NONCE, 1))
     };
     let Some(AcceptOutcome::Refused(refused)) = response.outcome else {
-        panic!("a closing channel takes no work: {response:?}");
+        panic!("a terminated channel takes no work: {response:?}");
     };
-    assert_eq!(refused.code, WorkRefusalCode::Declined as i32);
+    assert_eq!(refused.code, WorkRefusalCode::Conflict as i32);
 }
 
 /// A block out of order writes nothing before it is refused.
@@ -2441,12 +2395,11 @@ async fn a_start_that_never_landed_reopens_the_channel() {
         "a signature that reached no block does not shut a channel for good",
     );
 
-    // And the channel takes work again.
-    let response = provider.accept(&signed_request(NONCE + 1, 2));
-    assert!(
-        matches!(response.outcome, Some(AcceptOutcome::Accepted(_))),
-        "the reopened channel accepts: {response:?}",
-    );
+    // And so it may sign a fresh close: the one thing it needed was no
+    // longer forbidden.
+    if let Err(error) = provider.prepare_close() {
+        panic!("a channel not shut for good may still close: {error}");
+    }
 }
 
 /// The client closes its own channel, and it is the same step.
@@ -2505,20 +2458,19 @@ async fn a_client_closes_the_channel_its_provider_stopped_answering() {
 
 // ── Three deadlines, three answers ────────────────────────────────────
 
-/// Each deadline ends the job it is about, and says whose it was.
+/// Each deadline ends the job it is about, at its own height.
 ///
 /// One deadline used to do all three, and it did them at the wrong
-/// height and under the wrong name. A proposal the provider never
-/// co-signed held its reservation until the *payment* deadline; a job
-/// that produced no result in time held it just as long and was then
-/// written down as the client's expiry, though what failed was the
-/// provider's own side.
+/// height: a proposal the provider never co-signed held its reservation
+/// until the *payment* deadline, and a job that produced no result in
+/// time held it just as long.
 ///
 /// The three cases below are the three phases the height can find a job
-/// in, and the only thing varied is which deadline the block has
-/// passed.
+/// in, and the only thing varied is which deadline the block has passed.
+/// The provider bears whatever it spent — there is no counterparty ledger
+/// to move.
 #[tokio::test]
-async fn each_deadline_ends_its_own_job_and_names_its_own_fault() {
+async fn each_deadline_ends_its_own_job() {
     // A proposal with no co-signature, past the acceptance deadline.
     // Nobody produced anything, so nobody owes for it.
     {
@@ -2541,7 +2493,6 @@ async fn each_deadline_ends_its_own_job_and_names_its_own_fault() {
         let Ok(mut provider) = ProviderEndpoint::new(ready, store, provider()) else {
             panic!("the provider endpoint binds");
         };
-        assert_eq!(provider.state().compute_outstanding(), PRICE);
 
         for height in (CURSOR + 1)..=deadlines().acceptance {
             if let Err(error) = provider.observe_finalized(&block(height, Vec::new())) {
@@ -2558,9 +2509,16 @@ async fn each_deadline_ends_its_own_job_and_names_its_own_fault() {
             panic!("the block past acceptance applies: {error}");
         }
         assert!(provider.state().job().is_none(), "the proposal is over");
-        assert_eq!(provider.state().compute_outstanding(), 0, "and released");
-        let loss = provider.state().loss();
-        assert_eq!((loss.compute, loss.delivery), (0, 0), "and cost nobody");
+        assert!(
+            matches!(
+                provider
+                    .state()
+                    .terminal()
+                    .map(|terminal| &terminal.outcome),
+                Some(TerminalOutcome::Expired { .. }),
+            ),
+            "an un-co-signed proposal past acceptance rests at an expired terminal",
+        );
     }
 
     // An accepted job with no result, past the terminal deadline. The
@@ -2587,28 +2545,31 @@ async fn each_deadline_ends_its_own_job_and_names_its_own_fault() {
             panic!("the block past the terminal deadline applies: {error}");
         }
         assert!(provider.state().job().is_none(), "the job is over");
-        let loss = provider.state().loss();
-        assert_eq!(
-            (loss.compute, loss.delivery),
-            (0, 0),
-            "a provider that did not finish does not charge the client for it",
+        assert!(
+            matches!(
+                provider
+                    .state()
+                    .terminal()
+                    .map(|terminal| &terminal.outcome),
+                Some(TerminalOutcome::Expired { .. }),
+            ),
+            "a provider that did not finish bears it at an expired terminal",
         );
     }
 
     // A job whose result exists and was in time, past the payment
-    // deadline, is the one ending the client is charged for. That is
+    // deadline, also rests at an expired terminal. That is
     // `the_watcher_ends_a_job_its_payment_deadline_has_passed`'s.
 }
 
-/// Only the watcher can end a job at this client's expense.
+/// A local ending is the provider's own, and rests at a failed terminal.
 ///
-/// The ending that charges a counterparty is decided from finalized
-/// heights, and the local surface has no way to ask for it: `end_run`
-/// takes no reason, and the one it records charges nobody. A caller
-/// that could choose could exhaust a client's identity-wide credit by
-/// accepting jobs and defaulting them.
+/// The local surface can only end a job as the provider's own fault:
+/// `end_run` takes no reason, and the one it records is a failed
+/// terminal the provider bears. The ending that charges a client — an
+/// expiry decided from finalized heights — is the watcher's alone.
 #[tokio::test]
-async fn a_local_caller_cannot_charge_the_client_for_a_job() {
+async fn a_local_ending_is_the_providers_own_failed_terminal() {
     let fixture = checked_job().await;
     let id = fixture.id;
     let Ok(mut provider) = fixture.service.endpoint() else {
@@ -2618,10 +2579,14 @@ async fn a_local_caller_cannot_charge_the_client_for_a_job() {
         panic!("the local ending records: {error}");
     }
     assert!(provider.state().job().is_none(), "the job is over");
-    let loss = provider.state().loss();
-    assert_eq!(
-        (loss.compute, loss.delivery),
-        (0, 0),
-        "and a delivered job ended locally costs this client nothing",
+    assert!(
+        matches!(
+            provider
+                .state()
+                .terminal()
+                .map(|terminal| &terminal.outcome),
+            Some(TerminalOutcome::Failed { .. }),
+        ),
+        "a locally ended job rests at a failed terminal the provider bears",
     );
 }

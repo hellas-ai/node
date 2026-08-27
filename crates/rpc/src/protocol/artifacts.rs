@@ -620,8 +620,8 @@ pub struct CompletedText {
 /// This is the one definition, and it has two consumers who must not
 /// disagree: the provider, which records these bodies in its artifact
 /// store and signs the resulting artifact id inside a terminal event,
-/// and an independent oracle, which has neither that store nor those
-/// events and must arrive at the same id from the same inputs. Two
+/// and an independent re-execution, which has neither that store nor
+/// those events and must arrive at the same id from the same inputs. Two
 /// spellings of it would be two answers to "was this the right output",
 /// agreeing until one of them changed.
 ///

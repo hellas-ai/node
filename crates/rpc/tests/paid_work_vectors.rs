@@ -2231,61 +2231,6 @@ fn a_payment_does_not_cross_channels() {
     ));
 }
 
-/// A job this ledger has already paid for cannot be paid for again, at
-/// any later cumulative.
-///
-/// The second payment is truthful in every field the records bind to the
-/// job — the same `work_id`, the same `result_digest`, the same price
-/// implied by the same authorization — and differs only in the
-/// cumulative, which an honest second *job* would also have moved.
-/// Arithmetic alone accepts it, because it *is* the next legal
-/// transition; only a ledger that remembers the first refuses it.
-#[test]
-fn a_credited_job_cannot_be_paid_for_again_at_a_fresh_cumulative() {
-    let channel = channel();
-    let authorization = authorization();
-    let result = job_result(work_id(&channel, &authorization));
-
-    let (first, first_binding) =
-        next_payment(&channel, &authorization, &result, 0, capacity()).expect("a legal payment");
-    let (again, again_binding) = next_payment(&channel, &authorization, &result, 250, capacity())
-        .expect("the builder recomputes one job's identifiers");
-    assert_eq!(first_binding.work_id, again_binding.work_id);
-    assert_eq!(first_binding.result_digest, again_binding.result_digest);
-    assert_eq!(first.earned_cumulative(), 250);
-    assert_eq!(again.earned_cumulative(), 500);
-
-    let mut ledger = CreditLedger::new();
-    ledger
-        .credit_payment(
-            &channel,
-            &authorization,
-            &result,
-            &first_binding,
-            &first,
-            capacity(),
-        )
-        .expect("a legal payment");
-    assert_eq!(ledger.credited_cumulative(), 250);
-    assert!(ledger.has_paid_for(first_binding.work_id));
-
-    // MUTATION: the same job, paid again at the cumulative the ledger is
-    // now waiting for.
-    assert_eq!(
-        ledger.credit_payment(
-            &channel,
-            &authorization,
-            &result,
-            &again_binding,
-            &again,
-            capacity(),
-        ),
-        Err(PaidWorkError::Duplicate { field: "work_id" })
-    );
-    // The refusal credited nothing.
-    assert_eq!(ledger.credited_cumulative(), 250);
-}
-
 /// One payment continues the last one; it does not start wherever it
 /// likes.
 ///

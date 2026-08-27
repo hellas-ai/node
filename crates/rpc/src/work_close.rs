@@ -79,7 +79,7 @@ use hellas_kernel::{
 
 use crate::protocol::work::PaidChannel;
 use crate::work_store::{
-    Applied, ChannelRecord, ChannelStore, JobEnd, JobPhase, Role, WorkStoreError,
+    Applied, ChannelRecord, ChannelStore, JobPhase, Role, TerminalOutcome, WorkStoreError,
 };
 
 /// One finalized block, as a watcher must see it.
@@ -484,8 +484,8 @@ pub fn observe<V: SigVerifier>(
     {
         return Ok(());
     }
-    if let Some(ending) = expiry_at(store.state(), block.height) {
-        store.commit(ChannelRecord::JobEnded { reason: ending }, verifier)?;
+    if let Some(outcome) = expiry_at(store.state(), block.height, block.payload) {
+        store.commit(ChannelRecord::JobTerminated { outcome }, verifier)?;
     }
 
     apply_finalized_txs(store, block.height, block.payload, &block.txs, verifier)?;
@@ -526,20 +526,27 @@ pub(crate) fn apply_finalized_txs<V: SigVerifier>(
             Tx::Move {
                 action: hellas_kernel::Move::StartPaymentClose(start),
             } if start.payment_edge() == edge => {
-                // A contest on this edge is the cutoff, and the open
-                // job does not survive it: no payment will be credited
-                // after this record, so a job still in flight is a job
-                // that can no longer be paid for. Who bears it is the
-                // opener's to answer — a counterparty that cut this
-                // endpoint off owes for what it took, and an endpoint
-                // that cut itself off owes nobody anything.
-                if store.state().job().is_some() {
-                    let reason = if start.opener_role() == opposite(store.state().role()) {
-                        JobEnd::Expired
-                    } else {
-                        JobEnd::Failed
-                    };
-                    store.commit(ChannelRecord::JobEnded { reason }, verifier)?;
+                // A contest on this edge is the cutoff, and the open job
+                // does not survive it: no payment will be credited after
+                // this record, so a job still in flight is a job that can
+                // no longer be paid for. It rests at an expired terminal,
+                // and the provider bears whatever compute or delivery it
+                // already spent on it.
+                if let Some(deadline) = store
+                    .state()
+                    .job()
+                    .map(|job| job.authorization().payment_deadline)
+                {
+                    store.commit(
+                        ChannelRecord::JobTerminated {
+                            outcome: TerminalOutcome::Expired {
+                                deadline,
+                                height,
+                                payload,
+                            },
+                        },
+                        verifier,
+                    )?;
                 }
                 // The window and the claimed floor are fixed by the block
                 // that accepted this start, exactly as the kernel fixed
@@ -573,10 +580,18 @@ pub(crate) fn apply_finalized_txs<V: SigVerifier>(
                     .iter()
                     .find(|payout| payout.owner() == channel.provider_key())
                     .map_or(0, |payout| payout.value());
-                if store.state().job().is_some() {
+                if let Some(deadline) = store
+                    .state()
+                    .job()
+                    .map(|job| job.authorization().payment_deadline)
+                {
                     store.commit(
-                        ChannelRecord::JobEnded {
-                            reason: JobEnd::Expired,
+                        ChannelRecord::JobTerminated {
+                            outcome: TerminalOutcome::Expired {
+                                deadline,
+                                height,
+                                payload,
+                            },
                         },
                         verifier,
                     )?;
@@ -596,50 +611,50 @@ pub(crate) fn apply_finalized_txs<V: SigVerifier>(
     Ok(())
 }
 
-/// Returns the party on the other side of the channel from `role`.
-const fn opposite(role: Role) -> Party {
-    match role {
-        Role::Client => Party::Taker,
-        Role::Provider => Party::Maker,
-    }
-}
-
-/// Returns why the open job is over at `height`, if it is.
+/// Returns the expired terminal the open job has reached at `height`, if
+/// it has reached one.
 ///
-/// Three deadlines, and each says a different thing about who failed.
+/// Three deadlines, and each is a height past which the job can no longer
+/// be paid for.
 ///
 /// - **Acceptance.** A proposal the provider never co-signed cannot be
-///   co-signed now, so the job is over and its reservation goes back.
-///   Nobody produced anything and nobody owes for it.
+///   co-signed now, so the job is over. Nobody produced anything.
 /// - **Terminal.** Past it there is no result either party can use: the
 ///   client's own journal refuses a receipt, so a result signed now
-///   could never be paid for. A job that reached this height without
-///   one is the provider's own side not finishing, and
-///   [`JobEnd::Failed`] is what says the client is not charged for it.
+///   could never be paid for.
 /// - **Payment.** A result exists, it was in time, and the height the
-///   client signed to pay by has passed. That is the one ending this
-///   counterparty is charged for, and what it costs is
-///   `ChannelState::loss_of`'s to decide from how far the job got.
+///   client signed to pay by has passed.
 ///
-/// Only a provider applies them. A client's own journal has no loss
-/// ledger to move and no reservation to release, and ending a job it
-/// might still be paying for would be a client deciding against itself.
-fn expiry_at(state: &crate::work_store::ChannelState, height: u64) -> Option<JobEnd> {
+/// Each is an [`TerminalOutcome::Expired`] naming the deadline it crossed
+/// and the finalized block that crossed it. The provider bears whatever
+/// compute or delivery it already spent.
+///
+/// Only a provider applies them. A client ending a job it might still be
+/// paying for would be a client deciding against itself.
+fn expiry_at(
+    state: &crate::work_store::ChannelState,
+    height: u64,
+    payload: [u8; 32],
+) -> Option<TerminalOutcome> {
     if state.role() != Role::Provider {
         return None;
     }
     let job = state.job()?;
     let authorization = job.authorization();
-    if height > authorization.payment_deadline {
-        return Some(JobEnd::Expired);
-    }
-    if height > authorization.terminal_deadline && job.result().is_none() {
-        return Some(JobEnd::Failed);
-    }
-    if height > authorization.acceptance_deadline && job.phase() == JobPhase::HalfSigned {
-        return Some(JobEnd::Expired);
-    }
-    None
+    let deadline = if height > authorization.payment_deadline {
+        authorization.payment_deadline
+    } else if height > authorization.terminal_deadline && job.result().is_none() {
+        authorization.terminal_deadline
+    } else if height > authorization.acceptance_deadline && job.phase() == JobPhase::HalfSigned {
+        authorization.acceptance_deadline
+    } else {
+        return None;
+    };
+    Some(TerminalOutcome::Expired {
+        deadline,
+        height,
+        payload,
+    })
 }
 
 /// Reads every finalized block this journal has not seen, in order.

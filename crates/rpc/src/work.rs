@@ -152,8 +152,8 @@ use crate::work_close::{
 use crate::work_store::channel::encode_kernel;
 use crate::work_store::journal::MAX_RECORD_BYTES;
 use crate::work_store::{
-    ChannelRecord, ChannelState, ChannelStateError, ChannelStore, JobEnd, JobPhase, JobState,
-    PaidCertificate, Role, WorkStoreError,
+    ChannelRecord, ChannelState, ChannelStateError, ChannelStore, JobPhase, JobState,
+    PaidCertificate, Role, TerminalOutcome, WorkStoreError,
 };
 use crate::{EvaluateRequest, OutputEventEnvelope};
 
@@ -345,7 +345,7 @@ impl From<WorkStoreError> for Refusal {
 /// them.
 const fn channel_refusal(error: &ChannelStateError) -> WorkRefusal {
     match error {
-        ChannelStateError::Nonce { .. } | ChannelStateError::Conflict { .. } => {
+        ChannelStateError::Terminated { .. } | ChannelStateError::Conflict { .. } => {
             WorkRefusal::Conflict
         }
         ChannelStateError::WrongPhase { .. }
@@ -882,11 +882,13 @@ impl ProviderEndpoint {
             .ok_or(PaymentError::Malformed("certificate signature"))?;
 
         let state = self.store.commit(
-            ChannelRecord::CertificateAdmitted {
-                certificate,
-                binding,
-                binding_signature,
-                certificate_signature,
+            ChannelRecord::JobTerminated {
+                outcome: TerminalOutcome::Certified {
+                    certificate,
+                    binding,
+                    binding_signature,
+                    certificate_signature,
+                },
             },
             &Secp256k1Verifier::new(),
         )?;
@@ -915,14 +917,26 @@ impl ProviderEndpoint {
             return Err(RunError::NoSuchJob);
         }
         self.store.commit(
-            ChannelRecord::JobEnded {
-                reason: JobEnd::Failed,
+            ChannelRecord::JobTerminated {
+                outcome: TerminalOutcome::Failed {
+                    code: PROVIDER_FAULT_CODE,
+                },
             },
             &Secp256k1Verifier::new(),
         )?;
         Ok(())
     }
 }
+
+/// The failure code a provider records when it ends its own job — a
+/// backend fault or a transcript that is not this job's. There is one
+/// because [`ProviderEndpoint::end_run`] is the one provider-chosen
+/// ending, and it is always the provider's own side going wrong.
+const PROVIDER_FAULT_CODE: u32 = 1;
+
+/// The nonce the one authorization a channel admits carries. A channel
+/// opens one job for its whole life, so there is one nonce and it is one.
+const SOLE_PROPOSAL_NONCE: u64 = 1;
 
 // ── Settling on chain ─────────────────────────────────────────────────
 
@@ -2025,16 +2039,16 @@ impl ClientEndpoint {
             ));
         }
 
-        let nonce = self.state().next_proposal_nonce();
+        // The sole authorization this channel ever admits, and its nonce
+        // is one. There is no sequence to advance: the channel's permanent
+        // terminal is what stops a second job.
         let authorization = propose_authorization(
             self.ready.channel(),
             &policy,
             &proposal.prepared_input,
-            nonce,
+            SOLE_PROPOSAL_NONCE,
             proposal.deadlines,
         )?;
-        // Refused before the nonce is spent, so a proposal the provider
-        // would reject does not cost this channel a nonce.
         check_authorization(self.ready.channel(), &authorization, &policy, cursor_height)?;
         check_prepared_input(
             self.ready.channel(),
@@ -2185,8 +2199,8 @@ impl ClientEndpoint {
     /// here.
     ///
     /// What it does *not* establish is that the answer is right. That
-    /// is the oracle's, it runs on the bytes this returns, and its
-    /// verdict is a separate durable step.
+    /// is the re-execution's, it runs on the bytes this returns, and
+    /// its outcome is a separate durable step.
     ///
     /// # Errors
     ///
@@ -2277,25 +2291,63 @@ impl ClientEndpoint {
         })
     }
 
-    /// Records that this client's own oracle reproduced the answer.
+    /// Records that this client's own re-execution reproduced the answer
+    /// and it matched.
     ///
     /// It takes no verdict argument, and that is deliberate: a function
     /// that could be handed `false` would be a function some caller
-    /// could hand `true`. The only way to record a verdict is to have
-    /// one, and the caller that has one calls this.
+    /// could hand `true`. The only way to record a match is to have
+    /// reproduced one, and the caller that has calls this.
     ///
     /// # Errors
     ///
     /// [`DeliverError::NoSuchJob`] when no open job carries this
     /// `work_id`, and [`DeliverError::Store`] when the job has no
-    /// recorded result or the verdict cannot be made durable.
-    pub fn verified(&mut self, work_id: Digest) -> Result<(), DeliverError> {
+    /// recorded result or the match cannot be made durable.
+    pub fn matched(&mut self, work_id: Digest) -> Result<(), DeliverError> {
         let job = self.state().job().ok_or(DeliverError::NoSuchJob)?;
         if job.work_id() != work_id {
             return Err(DeliverError::NoSuchJob);
         }
         self.store
-            .commit(ChannelRecord::ResultVerified, &Secp256k1Verifier::new())?;
+            .commit(ChannelRecord::ResultMatched, &Secp256k1Verifier::new())?;
+        Ok(())
+    }
+
+    /// Records that this client's own re-execution did not reproduce the
+    /// answer, resting the job at a permanent refuted terminal.
+    ///
+    /// The refutation is durable for the same reason a match is: a job a
+    /// client's own engine refused must never afterwards be paid for,
+    /// even across a restart, and a second proposal of it must fail. The
+    /// signed result's digest is read off the job this journal recorded;
+    /// the reproduction digest is what the client's own engine produced.
+    ///
+    /// # Errors
+    ///
+    /// [`DeliverError::NoSuchJob`] when no open job carries this
+    /// `work_id`, and [`DeliverError::Store`] when the job has no
+    /// recorded result or the refutation cannot be made durable.
+    pub fn refuted(
+        &mut self,
+        work_id: Digest,
+        reproduction_digest: Digest,
+    ) -> Result<(), DeliverError> {
+        let job = self.state().job().ok_or(DeliverError::NoSuchJob)?;
+        if job.work_id() != work_id {
+            return Err(DeliverError::NoSuchJob);
+        }
+        let (result, _) = job.result().ok_or(DeliverError::NoSuchJob)?;
+        let result_digest = result_digest(self.ready.channel(), result);
+        self.store.commit(
+            ChannelRecord::JobTerminated {
+                outcome: TerminalOutcome::Refuted {
+                    result_digest,
+                    reproduction_digest,
+                },
+            },
+            &Secp256k1Verifier::new(),
+        )?;
         Ok(())
     }
 
@@ -2324,7 +2376,7 @@ impl ClientEndpoint {
     /// [`PaymentError::NoSuchJob`] when no open job carries this
     /// `work_id` and no retained payment does either,
     /// [`PaymentError::NotPayable`] before the result exists, and — from
-    /// the journal — before this client's own oracle verdict is durable,
+    /// the journal — before this client's own match is durable,
     /// [`PaymentError::Record`] when the payment would exceed what this
     /// edge can settle, and [`PaymentError::Store`] for every rule the
     /// journal applies — including a payment signed past its deadline.
@@ -2334,7 +2386,7 @@ impl ClientEndpoint {
             .last_payment()
             .filter(|payment| payment.work_id == work_id)
         {
-            return Ok(admit_request(retained));
+            return Ok(admit_request(&retained));
         }
         let job = self.state().job().ok_or(PaymentError::NoSuchJob)?;
         if job.work_id() != work_id {
@@ -2361,11 +2413,13 @@ impl ClientEndpoint {
             .sign(certificate.digest(self.ready.channel().network()));
 
         self.store.commit(
-            ChannelRecord::CertificateAdmitted {
-                certificate,
-                binding,
-                binding_signature,
-                certificate_signature,
+            ChannelRecord::JobTerminated {
+                outcome: TerminalOutcome::Certified {
+                    certificate,
+                    binding,
+                    binding_signature,
+                    certificate_signature,
+                },
             },
             &Secp256k1Verifier::new(),
         )?;
