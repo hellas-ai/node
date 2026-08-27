@@ -70,7 +70,7 @@ mod cursor;
 
 pub use channel::{
     ChannelRecord, ChannelState, ChannelStateError, ChannelStore, CloseSettlement, JobPhase,
-    JobState, JobTerminal, OpenContest, PaidCertificate, TerminalOutcome,
+    JobState, JobTerminal, OpenContest, PaidCertificate, RespondedContest, TerminalOutcome,
 };
 pub use journal::{JournalError, Role};
 pub use setup::{

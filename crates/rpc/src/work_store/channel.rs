@@ -41,7 +41,7 @@
 //!
 //! # What a record is
 //!
-//! Eleven tags, and every one of them is a boundary something else
+//! Twelve tags, and every one of them is a boundary something else
 //! cannot be read off. Four carry a signed artifact — the
 //! authorization, the co-signature, the result, and the certificate with
 //! its binding inside the certified terminal — and for each of those
@@ -62,10 +62,11 @@
 //! and nothing here pretends to check them against anything but the
 //! state they move. The terminal is one record with five outcomes:
 //! certified is the fourth signed artifact above, and the other four
-//! are the ways the job stops without a payment. The last four — the
-//! cursor and the three close records — are what this endpoint read
-//! out of finalized blocks, plus the one close signature it wrote
-//! ahead of sending.
+//! are the ways the job stops without a payment. The last five — the
+//! cursor and the four close records — are what this endpoint read
+//! out of finalized blocks, plus the two answers it fixed on its own
+//! disk before sending them: the start it opens a contest with, and
+//! the response it gives one.
 //!
 //! None of it defends the file against someone who can write it; see
 //! [`super::journal`].
@@ -82,8 +83,8 @@
 use std::path::Path;
 
 use hellas_kernel::{
-    Decode, EarnedCertificate, Encode, Key, NetworkId, Party, PaymentCloseStart, Sig, SigVerifier,
-    StartId, WorkPaymentSettlement,
+    Decode, EarnedCertificate, Encode, Key, NetworkId, Party, PayloadHash, PaymentCloseStart, Sig,
+    SigVerifier, StartId, WorkPaymentSettlement,
 };
 use hellas_xet::XetFileHasher;
 
@@ -527,6 +528,32 @@ pub enum ChannelRecord {
         /// exceed for an answer to exist.
         claimed: u64,
     },
+    /// This endpoint has fixed its answer to the contest on its payment
+    /// edge, and this is the digest that answer's signature covers.
+    ///
+    /// Written before the response leaves the process, like every other
+    /// signature here. What it says is that the answer is *chosen*, and
+    /// that is all it says: it is fsynced before the submission it
+    /// authorises, so a process that dies between the two leaves a
+    /// journal holding an answer consensus has never seen. Read as
+    /// "handed off" it would be a lie exactly then, which is why nothing
+    /// in the duty rule consults it — see
+    /// [`ChannelState::answerable_contest`], which decides what is owed
+    /// from the contest and the certificate alone.
+    ///
+    /// The digest rather than the bytes, because the bytes are derived
+    /// rather than kept: an answer is fixed by the contest it names and
+    /// the certificate this journal already holds, and neither can change
+    /// once a contest is open — the channel admits no work and credits no
+    /// certificate from [`Self::CloseOpened`] onwards. So a resubmission
+    /// re-derives the same answer, and this is what refuses a different
+    /// one.
+    CloseResponded {
+        /// Contest this answer names.
+        start_id: StartId,
+        /// Digest the responder signed, over the answer's own body.
+        response_digest: PayloadHash,
+    },
     /// A close consuming this channel's payment edge was finalized.
     CloseSettled {
         /// Height of the block that carried it.
@@ -550,6 +577,7 @@ mod tag {
     pub(super) const CLOSE_PREPARED: u8 = 8;
     pub(super) const CLOSE_OPENED: u8 = 9;
     pub(super) const CLOSE_SETTLED: u8 = 10;
+    pub(super) const CLOSE_RESPONDED: u8 = 11;
 }
 
 impl ChannelRecord {
@@ -667,6 +695,14 @@ impl ChannelRecord {
                 put_u64(&mut out, *response_deadline);
                 put_u64(&mut out, *claimed);
             }
+            Self::CloseResponded {
+                start_id,
+                response_digest,
+            } => {
+                out.push(tag::CLOSE_RESPONDED);
+                out.extend_from_slice(&start_id.to_bytes());
+                out.extend_from_slice(response_digest.as_bytes());
+            }
             Self::CloseSettled {
                 height,
                 payload,
@@ -750,6 +786,18 @@ impl ChannelRecord {
                 opener: party(cursor.byte().ok_or(ChannelStateError::Malformed)?)?,
                 response_deadline: cursor.u64().ok_or(ChannelStateError::Malformed)?,
                 claimed: cursor.u64().ok_or(ChannelStateError::Malformed)?,
+            },
+            tag::CLOSE_RESPONDED => Self::CloseResponded {
+                start_id: StartId::from_bytes(
+                    cursor
+                        .array::<{ StartId::LENGTH }>()
+                        .ok_or(ChannelStateError::Malformed)?,
+                ),
+                response_digest: PayloadHash::from_bytes(
+                    cursor
+                        .array::<{ PayloadHash::LENGTH }>()
+                        .ok_or(ChannelStateError::Malformed)?,
+                ),
             },
             tag::CLOSE_SETTLED => Self::CloseSettled {
                 height: cursor.u64().ok_or(ChannelStateError::Malformed)?,
@@ -943,6 +991,7 @@ pub struct ChannelState {
     indeterminate: bool,
     close_prepared: Option<PaymentCloseStart>,
     close_opened: Option<OpenContest>,
+    close_responded: Option<RespondedContest>,
     close_settled: Option<CloseSettlement>,
 }
 
@@ -966,6 +1015,26 @@ pub struct OpenContest {
     pub response_deadline: u64,
     /// Cumulative amount the opener's own start claimed.
     pub claimed: u64,
+}
+
+/// The one answer this endpoint has chosen for the contest on its
+/// payment edge.
+///
+/// Where [`OpenContest`] is what a block said, this is what this
+/// endpoint decided about it: while a contest is open and this is
+/// absent, no answer is fixed yet; once it is present, the answer is
+/// fixed and no other may be given. What it does not say is that the
+/// answer was sent, let alone received — it reaches the disk before the
+/// submission it authorises, so a duty may be owed with this record
+/// already written. The digest is the answer's own signed body, so a
+/// resubmission that re-derives the answer can be checked against what
+/// was already chosen rather than trusted to be the same.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RespondedContest {
+    /// Contest the answer names.
+    pub start_id: StartId,
+    /// Digest the responder signed, over the answer's own body.
+    pub response_digest: PayloadHash,
 }
 
 /// What a finalized close of this channel's payment edge paid, and
@@ -1003,6 +1072,7 @@ impl ChannelState {
             indeterminate: false,
             close_prepared: None,
             close_opened: None,
+            close_responded: None,
             close_settled: None,
         }
     }
@@ -1175,6 +1245,57 @@ impl ChannelState {
         self.close_opened
     }
 
+    /// Returns the answer this endpoint has already fixed for the
+    /// contest on this edge, if it has fixed one.
+    ///
+    /// Present says the answer is chosen, not that anyone has it: the
+    /// record is on the disk before the submission it authorises, so a
+    /// crash in between leaves this present and consensus empty. What it
+    /// is for is refusing a *different* answer to the same contest —
+    /// [`Self::answerable_contest`] is what says whether one is still
+    /// owed.
+    #[must_use]
+    pub const fn close_responded(&self) -> Option<RespondedContest> {
+        self.close_responded
+    }
+
+    /// Returns the contest this endpoint owes an answer to, with the
+    /// certificate that answers it.
+    ///
+    /// Five conditions, and every one of them is frozen the moment the
+    /// contest is journaled — which is why an endpoint that fails them
+    /// gains nothing by waiting, and must not stop reading blocks over
+    /// an answer it will never be able to give:
+    ///
+    /// - this journal is the provider's, because only a certificate's
+    ///   beneficiary may spend it;
+    /// - the edge has not already settled;
+    /// - the opener is the client, since a contest this endpoint opened
+    ///   is one it already put its own evidence into;
+    /// - the cursor is strictly inside the response window, the kernel's
+    ///   own rule for a late answer;
+    /// - and the certificate on this disk strictly exceeds what the
+    ///   contest claims, or the one answer the window admits would buy
+    ///   nothing.
+    ///
+    /// The certificate rides along because the answer is not a choice:
+    /// these two values determine it, so every caller that derives the
+    /// answer derives the same one.
+    #[must_use]
+    pub fn answerable_contest(&self) -> Option<(OpenContest, (EarnedCertificate, Sig))> {
+        if self.role != Role::Provider || self.close_settled.is_some() {
+            return None;
+        }
+        let contest = self.close_opened?;
+        if contest.opener != Party::Maker || self.cursor.0 >= contest.response_deadline {
+            return None;
+        }
+        let certificate = self
+            .executable_certificate()
+            .filter(|(certificate, _)| certificate.earned_cumulative() > contest.claimed)?;
+        Some((contest, certificate))
+    }
+
     /// Returns the finalized close of this channel's payment edge.
     #[must_use]
     pub const fn close_settled(&self) -> Option<CloseSettlement> {
@@ -1323,6 +1444,13 @@ impl ChannelState {
                 opener: *opener,
                 response_deadline: *response_deadline,
                 claimed: *claimed,
+            }),
+            ChannelRecord::CloseResponded {
+                start_id,
+                response_digest,
+            } => self.apply_close_responded(RespondedContest {
+                start_id: *start_id,
+                response_digest: *response_digest,
             }),
             ChannelRecord::CloseSettled {
                 height,
@@ -1502,6 +1630,69 @@ impl ChannelState {
         }
         self.refuse_open_job("opening a close contest")?;
         self.close_opened = Some(contest);
+        Ok(Applied::Changed)
+    }
+
+    /// Records the one answer this endpoint gives the open contest.
+    ///
+    /// The answer is checked, not taken on trust, and against the two
+    /// things that fix it: [`Self::answerable_contest`] must still owe
+    /// one — provider role, client opener, open window, a superior
+    /// certificate — and the digest must be the one those two derive.
+    /// An arbitrary digest accepted here would be worse than useless:
+    /// it would say this contest is answered while the answer that
+    /// actually spends the certificate is still unsent, and the journal
+    /// would then refuse that answer as a disagreement.
+    ///
+    /// The same answer again is the retry it is: an endpoint that died
+    /// between this write and the submission it authorises re-derives
+    /// the answer from the contest and the certificate — both of which
+    /// are frozen by [`Self::apply_close_opened`], which shuts the
+    /// channel to new work — and offers exactly these bytes again. A
+    /// *different* answer to the same contest is refused, because the
+    /// window admits one and a second would be this endpoint disagreeing
+    /// with itself about what it already sent.
+    fn apply_close_responded(
+        &mut self,
+        answer: RespondedContest,
+    ) -> Result<Applied, ChannelStateError> {
+        if self.close_responded == Some(answer) {
+            return Ok(Applied::Redundant);
+        }
+        if self.close_responded.is_some() {
+            return Err(ChannelStateError::Conflict {
+                what: "this contest's answer",
+            });
+        }
+        self.require_role("answering a close contest", Role::Provider)?;
+        if self.close_settled.is_some() {
+            return Err(ChannelStateError::Closing {
+                step: "answering a close contest",
+            });
+        }
+        let Some((contest, certificate)) = self.answerable_contest() else {
+            return Err(ChannelStateError::WrongPhase {
+                step: "answering a close contest",
+                phase: "owed no answer",
+            });
+        };
+        if contest.start_id != answer.start_id {
+            return Err(ChannelStateError::WrongChannel {
+                field: "close response start_id",
+            });
+        }
+        if answer.response_digest
+            != crate::work_close::response_body_digest(
+                &self.channel,
+                answer.start_id,
+                &certificate.0,
+            )
+        {
+            return Err(ChannelStateError::WrongChannel {
+                field: "close response digest",
+            });
+        }
+        self.close_responded = Some(answer);
         Ok(Applied::Changed)
     }
 

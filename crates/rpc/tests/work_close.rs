@@ -55,7 +55,7 @@ use hellas_rpc::work::{
 };
 use hellas_rpc::work_close::{
     BlockSourceError, CatchUpError, CloseError, CloseProgress, FinalizedBlocks, FinalizedWork,
-    close_start, observe, start_body_digest,
+    close_start, observe, response_body_digest, start_body_digest,
 };
 use hellas_rpc::work_store::{
     ChannelRecord, ChannelStore, CloseSettlement, JobPhase, JobState, Role, SetupOrigin,
@@ -1413,6 +1413,48 @@ impl FinalizedBlocks for Chain {
     }
 }
 
+/// The same history, counting every question the source was asked.
+///
+/// "Before the next block" is a claim about reads, and only a source
+/// that counts them can hold a caller to it. Both calls count, because
+/// asking for the tip is asking the chain something too: a duty
+/// serviced after the tip query but before the fetch would still pass a
+/// count that only watched [`FinalizedBlocks::block_at`], and the order
+/// this claims is *neither*.
+struct CountingChain {
+    blocks: Vec<FinalizedWork>,
+    reads: AtomicUsize,
+}
+
+impl CountingChain {
+    fn over(blocks: Vec<FinalizedWork>) -> Self {
+        Self {
+            blocks,
+            reads: AtomicUsize::new(0),
+        }
+    }
+
+    fn reads(&self) -> usize {
+        self.reads.load(Ordering::SeqCst)
+    }
+}
+
+impl FinalizedBlocks for CountingChain {
+    async fn latest_height(&self) -> Result<Option<u64>, BlockSourceError> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        Ok(self.blocks.last().map(|block| block.height))
+    }
+
+    async fn block_at(&self, height: u64) -> Result<Option<FinalizedWork>, BlockSourceError> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        Ok(self
+            .blocks
+            .iter()
+            .find(|block| block.height == height)
+            .cloned())
+    }
+}
+
 /// Every block is read, and a notification is not a substitute for
 /// reading them.
 ///
@@ -1499,61 +1541,41 @@ async fn a_catch_up_reads_every_block_between() {
 
 /// A duty found at the front of a restart backlog is surfaced before the
 /// watcher asks for the next finalized block.
+///
+/// The contest is the client's, opened below what this provider holds,
+/// because that is what makes it a duty: an answer is owed, and the
+/// backlog behind it is what must not get in the way of giving one.
 #[tokio::test]
 async fn catch_up_services_a_new_close_duty_before_the_next_block() {
-    struct CountingChain {
-        blocks: Vec<FinalizedWork>,
-        reads: std::sync::atomic::AtomicUsize,
-    }
-
-    impl FinalizedBlocks for CountingChain {
-        async fn latest_height(&self) -> Result<Option<u64>, BlockSourceError> {
-            Ok(self.blocks.last().map(|block| block.height))
-        }
-
-        async fn block_at(&self, height: u64) -> Result<Option<FinalizedWork>, BlockSourceError> {
-            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(self
-                .blocks
-                .iter()
-                .find(|block| block.height == height)
-                .cloned())
-        }
-    }
-
     let fixture = paid_job().await;
     let ready = fixture.ready.clone();
-    let mut watcher = restarted(fixture);
-    let start = watcher
-        .provider
-        .prepare_close()
-        .expect("the paid channel prepares a close");
     let inclusion = CURSOR + 1;
-    let chain = CountingChain {
-        blocks: vec![
-            block(
-                inclusion,
-                vec![hellas_kernel::Tx::move_action(
-                    hellas_kernel::Move::StartPaymentClose(start.clone()),
-                )],
-            ),
-            block(inclusion + 1, Vec::new()),
-        ],
-        reads: std::sync::atomic::AtomicUsize::new(0),
-    };
+    let understated = close_start(ready.channel(), Party::Maker, CURSOR, None, &client())
+        .expect("a client opens a close");
+    let expected = contest_id(&ready, &understated, inclusion);
+    let mut watcher = restarted(fixture);
+    let chain = CountingChain::over(vec![
+        block(
+            inclusion,
+            vec![hellas_kernel::Tx::move_action(
+                hellas_kernel::Move::StartPaymentClose(understated),
+            )],
+        ),
+        block(inclusion + 1, Vec::new()),
+    ]);
     let sink = Mempool::default();
 
-    let expected = contest_id(&ready, &start, inclusion);
     match watcher.provider.advance_close(&chain, &sink).await {
         Ok(CloseProgress::Opened { start_id }) => assert_eq!(start_id, expected),
         other => panic!("the first block's duty is surfaced: {other:?}"),
     }
     assert_eq!(
-        chain.reads.load(std::sync::atomic::Ordering::SeqCst),
-        1,
-        "the second backlog block was not fetched first",
+        chain.reads(),
+        2,
+        "the tip and the contest block, and not the block after it",
     );
     assert_eq!(watcher.provider.state().cursor().0, inclusion);
+    assert_eq!(sink.taken().len(), 1, "and the duty was serviced");
 }
 
 /// A restart that reads a journaled contest off its own disk submits the
@@ -1643,6 +1665,701 @@ async fn restart_services_the_response_before_its_deadline() {
     };
     assert_eq!(response.start_id(), expected);
     assert_eq!(response.certificate().earned_cumulative(), PRICE);
+}
+
+/// Driven twice: one answer, a cursor that moves past the contest, and
+/// the settlement the endpoint goes on to observe for itself.
+///
+/// One tick cannot see this. A tick that submits an answer and writes
+/// nothing about it looks exactly like a tick that discharged a duty —
+/// the difference is only visible on the *next* one, where the duty is
+/// either gone or still owed. While it was still owed the cursor stopped
+/// dead on the block that opened the contest: `advance_close` services a
+/// duty before fetching another block, so an undischarged duty is a
+/// watcher that never reads again. It would re-sign and re-send the same
+/// bytes forever at a frozen height, never see its own answer land,
+/// never see the close that ended the contest, and never reach
+/// `Settled` — which is what "fanout completion is observation, not
+/// acceptance" is about.
+#[tokio::test]
+async fn a_serviced_contest_advances_the_cursor_and_settles() {
+    let fixture = paid_job().await;
+    let ready = fixture.ready.clone();
+    let inclusion = CURSOR + 1;
+
+    // The client opens below what it has already signed for.
+    let understated = close_start(ready.channel(), Party::Maker, CURSOR, None, &client())
+        .expect("a client opens a close");
+    let expected = contest_id(&ready, &understated, inclusion);
+    let start_tx =
+        hellas_kernel::Tx::move_action(hellas_kernel::Move::StartPaymentClose(understated.clone()));
+
+    let mut watcher = restarted(fixture);
+    let sink = Mempool::default();
+
+    // Tick one: the contest is read, the answer is journaled, and the
+    // answer is submitted.
+    let opening = Chain {
+        blocks: vec![block(inclusion, vec![start_tx.clone()])],
+        withheld: None,
+    };
+    match watcher.provider.advance_close(&opening, &sink).await {
+        Ok(CloseProgress::Opened { start_id }) => assert_eq!(start_id, expected),
+        other => panic!("the contest is read and answered: {other:?}"),
+    }
+    let submitted = sink.taken();
+    assert_eq!(submitted.len(), 1, "one contest, one answer");
+    let hellas_kernel::Tx::Move {
+        action: hellas_kernel::Move::RespondPaymentClose(response),
+    } = &submitted[0]
+    else {
+        panic!("the submitted transaction is a response move");
+    };
+    assert_eq!(response.start_id(), expected);
+    assert_eq!(response.certificate().earned_cumulative(), PRICE);
+
+    // The journal says the answer exists, and says it by the digest the
+    // signature on the wire covers.
+    let responded = watcher
+        .provider
+        .state()
+        .close_responded()
+        .expect("the serviced duty is on the disk");
+    assert_eq!(responded.start_id, expected);
+    assert_eq!(
+        responded.response_digest,
+        response_body_digest(ready.channel(), expected, response.certificate()),
+        "the journaled digest is the one the submitted answer was signed over",
+    );
+    assert_eq!(
+        watcher.provider.state().cursor(),
+        (inclusion, payload_at(inclusion)),
+        "the cursor stopped on the contest to service it",
+    );
+
+    // Tick two: the same endpoint, over the blocks that carry its own
+    // answer and then the close that answer settled.
+    let payout = Payout::new(ready.channel().provider_key(), PRICE);
+    let close_tx = hellas_kernel::Tx::close(
+        payment_edge(),
+        hellas_kernel::Proof::adjudicated(hellas_kernel::PaymentContestCommitment::from_bytes(
+            [0x33; 32],
+        )),
+        List::take([payout; MAX_EDGE_OUTPUTS], 1),
+    );
+    let settling = Chain {
+        blocks: vec![
+            block(inclusion, vec![start_tx]),
+            block(inclusion + 1, vec![submitted[0].clone()]),
+            block(inclusion + 2, vec![close_tx]),
+        ],
+        withheld: None,
+    };
+    match watcher.provider.advance_close(&settling, &sink).await {
+        Ok(CloseProgress::Settled { provider_payout }) => assert_eq!(provider_payout, PRICE),
+        other => panic!("the answered contest settles: {other:?}"),
+    }
+    assert_eq!(
+        sink.taken().len(),
+        1,
+        "a discharged duty is not serviced twice",
+    );
+    assert_eq!(
+        watcher.provider.state().cursor(),
+        (inclusion + 2, payload_at(inclusion + 2)),
+        "and the cursor read every block between",
+    );
+    assert_eq!(
+        watcher
+            .provider
+            .state()
+            .close_settled()
+            .map(|settled| settled.provider_payout),
+        Some(PRICE),
+    );
+}
+
+/// A hand-off the sink refused leaves the answer on the disk, and the
+/// next pass sends those same bytes.
+///
+/// The record is written before the transaction leaves, so a failure
+/// after it is a journal that says an answer exists when consensus has
+/// never seen one. That is the safe half: the answer is fixed by the
+/// contest and the certificate, both frozen from the moment the contest
+/// was journaled, so re-deriving it produces the same bytes — and the
+/// journal refuses any other answer to the same contest, which is what
+/// makes the second send the first one rather than a second answer.
+#[tokio::test]
+async fn a_refused_hand_off_leaves_a_retryable_answer_on_the_disk() {
+    let fixture = paid_job().await;
+    let ready = fixture.ready.clone();
+    let inclusion = CURSOR + 1;
+
+    let understated = close_start(ready.channel(), Party::Maker, CURSOR, None, &client())
+        .expect("a client opens a close");
+    let expected = contest_id(&ready, &understated, inclusion);
+    let chain = Chain {
+        blocks: vec![block(
+            inclusion,
+            vec![hellas_kernel::Tx::move_action(
+                hellas_kernel::Move::StartPaymentClose(understated),
+            )],
+        )],
+        withheld: None,
+    };
+
+    let watcher = restarted(fixture);
+    let Watcher {
+        provider: mut endpoint,
+        _provider_root,
+        _client_root,
+    } = watcher;
+    let refusing = Mempool {
+        refuse: true,
+        ..Mempool::default()
+    };
+    let failed = endpoint.advance_close(&chain, &refusing).await;
+    assert!(
+        failed.is_err(),
+        "the sink refused, and the step says so: {failed:?}",
+    );
+    drop(endpoint);
+    let written = journal_bytes(_provider_root.path());
+
+    // The crash: the state the retry runs against is replayed from the
+    // file, and it holds the answer the refused hand-off never sent.
+    let store = store_at(_provider_root.path(), &ready, Role::Provider, CURSOR);
+    let mut endpoint = match ProviderEndpoint::new(ready.clone(), store, provider()) {
+        Ok(endpoint) => endpoint,
+        Err(error) => panic!("the reopened provider binds: {error}"),
+    };
+    let responded = endpoint
+        .state()
+        .close_responded()
+        .expect("the answer survived the crash");
+    assert_eq!(responded.start_id, expected);
+
+    let sink = Mempool::default();
+    match endpoint.advance_close(&chain, &sink).await {
+        Ok(CloseProgress::Opened { start_id }) => assert_eq!(start_id, expected),
+        other => panic!("the unanswered contest is retried: {other:?}"),
+    }
+    let taken = sink.taken();
+    assert_eq!(taken.len(), 1, "the retry sends one answer");
+    let hellas_kernel::Tx::Move {
+        action: hellas_kernel::Move::RespondPaymentClose(response),
+    } = &taken[0]
+    else {
+        panic!("the retried transaction is a response move");
+    };
+    assert_eq!(
+        response_body_digest(ready.channel(), expected, response.certificate()),
+        responded.response_digest,
+        "the retry is the same answer, not a second one",
+    );
+    assert_eq!(
+        endpoint.state().close_responded(),
+        Some(responded),
+        "and it is not counted twice",
+    );
+    drop(endpoint);
+    assert_eq!(
+        journal_bytes(_provider_root.path()),
+        written,
+        "the retry appended nothing the refused hand-off had not already written",
+    );
+}
+
+/// The answer a dead process fixed is offered again before one successor
+/// block is read, and lands with the window still open.
+///
+/// This is the crash the durable write exists for, and the reason that
+/// write may not double as a completion marker. The record is on the
+/// disk and consensus has nothing. If "responded" were read as "done",
+/// the restart would fall through to the ordinary backlog scan — and the
+/// backlog here runs past the response deadline, so by the time the
+/// cursor stopped there would be no answer left to give. Nothing about
+/// waiting would help: the contest, the role and the certificate were
+/// all frozen at the block that opened it.
+#[tokio::test]
+async fn a_crashed_answer_is_offered_before_any_successor_block() {
+    let fixture = paid_job().await;
+    let ready = fixture.ready.clone();
+    let inclusion = CURSOR + 1;
+    let deadline = inclusion + payment_terms().omit_response_blocks;
+
+    let understated = close_start(ready.channel(), Party::Maker, CURSOR, None, &client())
+        .expect("a client opens a close");
+    let expected = contest_id(&ready, &understated, inclusion);
+    let opening = Chain {
+        blocks: vec![block(
+            inclusion,
+            vec![hellas_kernel::Tx::move_action(
+                hellas_kernel::Move::StartPaymentClose(understated),
+            )],
+        )],
+        withheld: None,
+    };
+
+    // The crash: the answer reaches the disk, the hand-off does not, and
+    // the process is gone.
+    let Watcher {
+        provider: mut dying,
+        _provider_root,
+        _client_root,
+    } = restarted(fixture);
+    let refusing = Mempool {
+        refuse: true,
+        ..Mempool::default()
+    };
+    assert!(
+        dying.advance_close(&opening, &refusing).await.is_err(),
+        "the sink refused the answer this process fixed",
+    );
+    let fixed = dying
+        .state()
+        .close_responded()
+        .expect("the answer is on the disk");
+    drop(dying);
+
+    // The restart, against a backlog that runs past the deadline.
+    let store = store_at(_provider_root.path(), &ready, Role::Provider, CURSOR);
+    let mut provider = match ProviderEndpoint::new(ready.clone(), store, provider()) {
+        Ok(provider) => provider,
+        Err(error) => panic!("the reopened provider binds: {error}"),
+    };
+    assert_eq!(provider.state().cursor().0, inclusion);
+    let backlog = CountingChain::over(
+        ((inclusion + 1)..=(deadline + 1))
+            .map(|height| block(height, Vec::new()))
+            .collect(),
+    );
+    let sink = Mempool::default();
+    match provider.advance_close(&backlog, &sink).await {
+        Ok(CloseProgress::Opened { start_id }) => assert_eq!(start_id, expected),
+        other => panic!("the retained answer is the first thing done: {other:?}"),
+    }
+    assert_eq!(
+        backlog.reads(),
+        0,
+        "the chain was not asked anything at all ahead of the answer",
+    );
+
+    let taken = sink.taken();
+    assert_eq!(taken.len(), 1, "the retained answer was sent");
+    let hellas_kernel::Tx::Move {
+        action: hellas_kernel::Move::RespondPaymentClose(response),
+    } = &taken[0]
+    else {
+        panic!("the submitted transaction is a response move");
+    };
+    assert_eq!(
+        response_body_digest(ready.channel(), expected, response.certificate()),
+        fixed.response_digest,
+        "and it is the answer the dead process fixed, not a new one",
+    );
+    let (height, _) = provider.state().cursor();
+    assert!(
+        height < deadline,
+        "sent at {height}, inside a window that shuts at {deadline}",
+    );
+}
+
+/// A sink that did not enqueue the answer is asked again; a sink that
+/// did is not.
+///
+/// `Full` and `ValidationRejected` are successful results that mean *not
+/// enqueued* — the whole reason the outcome is an enum rather than a
+/// unit. Discarding it makes the two indistinguishable from acceptance,
+/// and an answer nobody holds is then never sent again. The other half
+/// is the same mistake mirrored: an answer a sink *has* taken must not
+/// be resent every pass for as long as the contest stays open.
+#[tokio::test]
+async fn an_unenqueued_answer_is_sent_again_and_an_enqueued_one_is_not() {
+    let fixture = paid_job().await;
+    let ready = fixture.ready.clone();
+    let inclusion = CURSOR + 1;
+
+    let understated = close_start(ready.channel(), Party::Maker, CURSOR, None, &client())
+        .expect("a client opens a close");
+    let expected = contest_id(&ready, &understated, inclusion);
+    let start_tx =
+        hellas_kernel::Tx::move_action(hellas_kernel::Move::StartPaymentClose(understated));
+    let chain = Chain {
+        blocks: vec![
+            block(inclusion, vec![start_tx]),
+            block(inclusion + 1, Vec::new()),
+        ],
+        withheld: None,
+    };
+    let mut watcher = restarted(fixture);
+
+    // Two passes against a mempool with no room. Each is a send, because
+    // neither was an enqueue.
+    let full = Mempool::answering(hellas_rpc::SubmitTxOutcome::Full);
+    for pass in 1..=2_u32 {
+        match watcher.provider.advance_close(&chain, &full).await {
+            Ok(CloseProgress::Opened { start_id }) => assert_eq!(start_id, expected),
+            other => panic!("pass {pass}: the contest is still open: {other:?}"),
+        }
+        assert_eq!(full.taken().len(), pass as usize, "pass {pass} sent again");
+    }
+    assert_eq!(
+        watcher.provider.state().cursor().0,
+        inclusion + 1,
+        "a refused answer does not stop this endpoint reading on",
+    );
+
+    // A rejection is the same answer: not enqueued, so ask again.
+    let rejected = Mempool::answering(hellas_rpc::SubmitTxOutcome::ValidationRejected);
+    match watcher.provider.advance_close(&chain, &rejected).await {
+        Ok(CloseProgress::Opened { start_id }) => assert_eq!(start_id, expected),
+        other => panic!("a rejected answer is still owed: {other:?}"),
+    }
+    assert_eq!(rejected.taken().len(), 1);
+
+    // And once a sink takes it, the contest is not answered at again.
+    let taking = Mempool::default();
+    match watcher.provider.advance_close(&chain, &taking).await {
+        Ok(CloseProgress::Opened { start_id }) => assert_eq!(start_id, expected),
+        other => panic!("the answer is enqueued: {other:?}"),
+    }
+    assert_eq!(taking.taken().len(), 1);
+    match watcher.provider.advance_close(&chain, &taking).await {
+        Ok(CloseProgress::Opened { start_id }) => assert_eq!(start_id, expected),
+        other => panic!("the contest is still open: {other:?}"),
+    }
+    assert_eq!(
+        taking.taken().len(),
+        1,
+        "an enqueued answer is not sent a second time",
+    );
+}
+
+/// An answer no sink took buys one successor block and is then owed
+/// again, so a backlog longer than the response window cannot swallow
+/// it.
+///
+/// This is the same rule as the crash test one step weaker, and it is
+/// the case a bare "already offered" flag gets wrong. `Full` means the
+/// answer is still owed, but reading on is exactly what tells this
+/// endpoint whether it was owed at all — so the read may not stop dead,
+/// and it may not run free either. Against a backlog that outlives the
+/// window, running free is the loss: the cursor arrives past the
+/// deadline, `answerable_contest` has become `None`, and there is no
+/// duty left to retry. The contest still settles — it settles on the
+/// understatement, at the claim this provider could have beaten and
+/// with the omission penalty unclaimed.
+#[tokio::test]
+async fn an_unenqueued_answer_outlives_a_backlog_past_the_deadline() {
+    let fixture = paid_job().await;
+    let ready = fixture.ready.clone();
+    let inclusion = CURSOR + 1;
+    let deadline = inclusion + payment_terms().omit_response_blocks;
+
+    let understated = close_start(ready.channel(), Party::Maker, CURSOR, None, &client())
+        .expect("a client opens a close");
+    let expected = contest_id(&ready, &understated, inclusion);
+    let start_tx =
+        hellas_kernel::Tx::move_action(hellas_kernel::Move::StartPaymentClose(understated));
+    let backlog = Chain {
+        blocks: std::iter::once(block(inclusion, vec![start_tx]))
+            .chain(((inclusion + 1)..=(deadline + 4)).map(|height| block(height, Vec::new())))
+            .collect(),
+        withheld: None,
+    };
+    let mut watcher = restarted(fixture);
+
+    // Tick one: the scan stops on the contest, and the mempool has no
+    // room for the answer.
+    let full = Mempool::answering(hellas_rpc::SubmitTxOutcome::Full);
+    match watcher.provider.advance_close(&backlog, &full).await {
+        Ok(CloseProgress::Opened { start_id }) => assert_eq!(start_id, expected),
+        other => panic!("the contest is read and answered: {other:?}"),
+    }
+    assert_eq!(full.taken().len(), 1, "the answer was offered once");
+    assert_eq!(watcher.provider.state().cursor().0, inclusion);
+    let fixed = watcher
+        .provider
+        .state()
+        .close_responded()
+        .expect("the answer is on the disk");
+
+    // Tick two: the same backlog, and a mempool that now has room. The
+    // unenqueued answer is owed again after one block, not after the
+    // ninety-odd this source would happily hand over.
+    let taking = Mempool::default();
+    match watcher.provider.advance_close(&backlog, &taking).await {
+        Ok(CloseProgress::Opened { start_id }) => assert_eq!(start_id, expected),
+        other => panic!("the unenqueued answer is still owed: {other:?}"),
+    }
+    let taken = taking.taken();
+    assert_eq!(taken.len(), 1, "the answer nobody held was offered again");
+    let (height, _) = watcher.provider.state().cursor();
+    assert_eq!(
+        height,
+        inclusion + 1,
+        "one successor block was read, not the backlog behind it",
+    );
+    assert!(
+        height < deadline,
+        "offered at {height}, inside a window that shuts at {deadline}",
+    );
+    let hellas_kernel::Tx::Move {
+        action: hellas_kernel::Move::RespondPaymentClose(response),
+    } = &taken[0]
+    else {
+        panic!("the retried transaction is a response move");
+    };
+    assert_eq!(
+        response_body_digest(ready.channel(), expected, response.certificate()),
+        fixed.response_digest,
+        "and it is the answer already fixed on the disk, not a second one",
+    );
+    assert_eq!(
+        response.certificate().earned_cumulative(),
+        PRICE,
+        "the answer spends the certificate the contest understated",
+    );
+
+    // Tick three: the block after the retry carries it, still inside the
+    // window. A sink holds the answer now, so the rest of the backlog is
+    // read in one pass and nothing is sent a second time.
+    let landing = inclusion + 2;
+    assert!(landing < deadline, "the answer had blocks left to land in");
+    let landed = Chain {
+        blocks: std::iter::once(block(landing, vec![taken[0].clone()]))
+            .chain(((landing + 1)..=(deadline + 4)).map(|height| block(height, Vec::new())))
+            .collect(),
+        withheld: None,
+    };
+    match watcher.provider.advance_close(&landed, &taking).await {
+        Ok(CloseProgress::Opened { start_id }) => assert_eq!(start_id, expected),
+        other => panic!("the contest runs to the tip: {other:?}"),
+    }
+    assert_eq!(
+        taking.taken().len(),
+        1,
+        "an answer a sink took is not offered again",
+    );
+    assert_eq!(
+        watcher.provider.state().cursor().0,
+        deadline + 4,
+        "and an answered contest is not what holds the cursor back",
+    );
+}
+
+// ── Contests that are nobody's duty ───────────────────────────────────
+
+/// A contest this provider opened itself is not an answer it owes, and
+/// the cursor does not wait for one.
+///
+/// The residual is not deferrable and that is the point: this endpoint
+/// answers a *client's* understatement, so a start of its own can never
+/// become a duty however long it waits. An endpoint that stopped for one
+/// would stop on the block that opened it, never read the close that
+/// ended it, and never learn what it was paid.
+#[tokio::test]
+async fn a_contest_this_provider_opened_does_not_pin_the_cursor() {
+    let fixture = paid_job().await;
+    let ready = fixture.ready.clone();
+    let mut watcher = restarted(fixture);
+    let start = match watcher.provider.prepare_close() {
+        Ok(start) => start,
+        Err(error) => panic!("a paid channel closes: {error}"),
+    };
+    assert_eq!(start.opener_role(), Party::Taker);
+    let inclusion = CURSOR + 1;
+    let expected = contest_id(&ready, &start, inclusion);
+    let start_tx = hellas_kernel::Tx::move_action(hellas_kernel::Move::StartPaymentClose(start));
+    let sink = Mempool::default();
+
+    // Tick one: the contest is read, and the block after it is too.
+    let opening = Chain {
+        blocks: vec![
+            block(inclusion, vec![start_tx.clone()]),
+            block(inclusion + 1, Vec::new()),
+        ],
+        withheld: None,
+    };
+    match watcher.provider.advance_close(&opening, &sink).await {
+        Ok(CloseProgress::Opened { start_id }) => assert_eq!(start_id, expected),
+        other => panic!("the contest is this endpoint's own: {other:?}"),
+    }
+    assert_eq!(
+        watcher.provider.state().cursor().0,
+        inclusion + 1,
+        "no answer is owed, so nothing stopped the read",
+    );
+    assert!(sink.taken().is_empty(), "and nothing was answered");
+
+    // Tick two: the close that ends it, which a stopped cursor could
+    // never have reached.
+    let settling = Chain {
+        blocks: vec![
+            block(inclusion, vec![start_tx]),
+            block(inclusion + 1, Vec::new()),
+            block(inclusion + 2, vec![adjudicated(&ready, PRICE)]),
+        ],
+        withheld: None,
+    };
+    match watcher.provider.advance_close(&settling, &sink).await {
+        Ok(CloseProgress::Settled { provider_payout }) => assert_eq!(provider_payout, PRICE),
+        other => panic!("the contest settles: {other:?}"),
+    }
+}
+
+/// A client watches its own contest through to settlement.
+///
+/// There is no client answer at all — only a certificate's beneficiary
+/// may spend it — so every contest is one a client can only watch. A
+/// duty rule that did not know that would leave the funded party
+/// frozen on the block that opened its own close.
+#[tokio::test]
+async fn a_client_watcher_does_not_stop_on_a_contest() {
+    let mut fixture = paid_job().await;
+    let ready = fixture.ready.clone();
+    let start = match fixture.client.prepare_close() {
+        Ok(start) => start,
+        Err(error) => panic!("a client closes its own channel: {error}"),
+    };
+    let inclusion = CURSOR + 1;
+    let expected = contest_id(&ready, &start, inclusion);
+    let start_tx = hellas_kernel::Tx::move_action(hellas_kernel::Move::StartPaymentClose(start));
+    let sink = Mempool::default();
+
+    let opening = Chain {
+        blocks: vec![
+            block(inclusion, vec![start_tx.clone()]),
+            block(inclusion + 1, Vec::new()),
+        ],
+        withheld: None,
+    };
+    match fixture.client.advance_close(&opening, &sink).await {
+        Ok(CloseProgress::Opened { start_id }) => assert_eq!(start_id, expected),
+        other => panic!("the client's contest is open: {other:?}"),
+    }
+    assert_eq!(
+        fixture.client.state().cursor().0,
+        inclusion + 1,
+        "a client owes no answer, so nothing stopped the read",
+    );
+
+    let settling = Chain {
+        blocks: vec![
+            block(inclusion, vec![start_tx]),
+            block(inclusion + 1, Vec::new()),
+            block(inclusion + 2, vec![adjudicated(&ready, PRICE)]),
+        ],
+        withheld: None,
+    };
+    match fixture.client.advance_close(&settling, &sink).await {
+        Ok(CloseProgress::Settled { provider_payout }) => assert_eq!(provider_payout, PRICE),
+        other => panic!("the client sees its own close settle: {other:?}"),
+    }
+    assert!(sink.taken().is_empty(), "and answered nothing");
+}
+
+/// A contest already at this provider's own high-water is not a duty
+/// either.
+///
+/// The client opened at exactly what it signed for, so the one answer
+/// the window admits would add nothing — and the certificate that could
+/// have beaten it is the one already on this disk, which no later block
+/// can improve. Stopping here would be waiting for evidence that cannot
+/// arrive.
+#[tokio::test]
+async fn a_provider_with_nothing_to_add_does_not_pin_the_cursor() {
+    let mut fixture = paid_job().await;
+    let ready = fixture.ready.clone();
+    let start = match fixture.client.prepare_close() {
+        Ok(start) => start,
+        Err(error) => panic!("a client closes at what it signed for: {error}"),
+    };
+    assert_eq!(
+        start
+            .certificate()
+            .map(|(certificate, _)| certificate.earned_cumulative()),
+        Some(PRICE),
+        "the contest already carries this provider's whole high-water",
+    );
+    let inclusion = CURSOR + 1;
+    let expected = contest_id(&ready, &start, inclusion);
+    let start_tx = hellas_kernel::Tx::move_action(hellas_kernel::Move::StartPaymentClose(start));
+    let mut watcher = restarted(fixture);
+    let sink = Mempool::default();
+
+    let opening = Chain {
+        blocks: vec![
+            block(inclusion, vec![start_tx.clone()]),
+            block(inclusion + 1, Vec::new()),
+        ],
+        withheld: None,
+    };
+    match watcher.provider.advance_close(&opening, &sink).await {
+        Ok(CloseProgress::Opened { start_id }) => assert_eq!(start_id, expected),
+        other => panic!("the levelled contest is open: {other:?}"),
+    }
+    assert_eq!(
+        watcher.provider.state().cursor().0,
+        inclusion + 1,
+        "nothing to add is not a duty, so nothing stopped the read",
+    );
+    assert!(sink.taken().is_empty(), "and the window was not spent");
+    assert_eq!(
+        watcher.provider.state().close_responded(),
+        None,
+        "no answer was fixed for a contest that has none",
+    );
+
+    let settling = Chain {
+        blocks: vec![
+            block(inclusion, vec![start_tx]),
+            block(inclusion + 1, Vec::new()),
+            block(inclusion + 2, vec![adjudicated(&ready, PRICE)]),
+        ],
+        withheld: None,
+    };
+    match watcher.provider.advance_close(&settling, &sink).await {
+        Ok(CloseProgress::Settled { provider_payout }) => assert_eq!(provider_payout, PRICE),
+        other => panic!("the levelled contest settles: {other:?}"),
+    }
+}
+
+/// The finalized close that pays the provider `payout`.
+fn adjudicated(ready: &ReadyChannel, payout: u64) -> hellas_kernel::Tx {
+    hellas_kernel::Tx::close(
+        payment_edge(),
+        hellas_kernel::Proof::adjudicated(hellas_kernel::PaymentContestCommitment::from_bytes(
+            [0x33; 32],
+        )),
+        List::take(
+            [Payout::new(ready.channel().provider_key(), payout); MAX_EDGE_OUTPUTS],
+            1,
+        ),
+    )
+}
+
+/// Bytes the one channel journal under `root` holds.
+///
+/// A record the state already holds is never appended, so the file is
+/// where a second write would have to show up — and the only place it
+/// could be counted from.
+fn journal_bytes(root: &std::path::Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        panic!("the journal directory reads");
+    };
+    let Some(path) = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.to_string_lossy().contains("channel-"))
+    else {
+        panic!("the channel journal exists");
+    };
+    match std::fs::metadata(&path) {
+        Ok(meta) => meta.len(),
+        Err(error) => panic!("the journal is measurable: {error}"),
+    }
 }
 
 /// A block the source cannot supply stops the scan where it is.
@@ -1973,6 +2690,22 @@ async fn the_provider_answers_an_understated_contest_exactly_once() {
     assert_eq!(response.responder_role(), hellas_kernel::Party::Taker);
     assert_eq!(response.certificate().earned_cumulative(), PRICE);
 
+    // The bytes are signed, so the disk holds them before the caller
+    // does. A caller handed an answer over a journal that never recorded
+    // it could put it on chain behind this endpoint's back, and the
+    // endpoint would go on owing — and then refusing — that same answer.
+    assert_eq!(
+        provider
+            .state()
+            .close_responded()
+            .map(|held| (held.start_id, held.response_digest)),
+        Some((
+            id,
+            response_body_digest(ready.channel(), id, response.certificate())
+        )),
+        "the answer this endpoint handed out is the answer it recorded",
+    );
+
     // At the deadline the kernel calls it late, and so does this.
     assert!(
         matches!(
@@ -2244,13 +2977,27 @@ async fn a_first_catch_up_cannot_skip_the_channels_own_history() {
 // ── Getting the close to a validator ──────────────────────────────────
 
 /// Every transaction one sink was handed, in order.
+///
+/// `outcome` is what the sink *answers*, which is not the same question
+/// as whether the call succeeded: `Full` and `ValidationRejected` are
+/// successful results meaning the transaction was not enqueued, and a
+/// caller that read them as acceptance would stop sending an answer
+/// nobody has.
 #[derive(Default)]
 struct Mempool {
     submitted: std::sync::Mutex<Vec<hellas_kernel::Tx>>,
     refuse: bool,
+    outcome: Option<hellas_rpc::SubmitTxOutcome>,
 }
 
 impl Mempool {
+    fn answering(outcome: hellas_rpc::SubmitTxOutcome) -> Self {
+        Self {
+            outcome: Some(outcome),
+            ..Self::default()
+        }
+    }
+
     fn taken(&self) -> Vec<hellas_kernel::Tx> {
         match self.submitted.lock() {
             Ok(taken) => taken.clone(),
@@ -2271,7 +3018,9 @@ impl hellas_rpc::work_close::TxSink for Mempool {
             Ok(mut taken) => taken.push(tx),
             Err(error) => panic!("the fixture mempool is writable: {error}"),
         }
-        Ok(hellas_rpc::SubmitTxOutcome::Enqueued)
+        Ok(self
+            .outcome
+            .unwrap_or(hellas_rpc::SubmitTxOutcome::Enqueued))
     }
 }
 

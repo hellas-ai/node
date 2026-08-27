@@ -279,6 +279,30 @@ fn completed_store(root: &std::path::Path) -> SetupStore {
     store
 }
 
+/// A client store that has durably retained the complete handshake.
+///
+/// The client arms its descriptor at revision 2 — after it has signed
+/// the payment Open and before the provider countersigns it — which is
+/// what makes revision 3 an import rather than a second arming.
+fn client_completed_store(root: &std::path::Path) -> SetupStore {
+    let mut store = store(root, Role::Client);
+    let verifier = Secp256k1Verifier::new();
+    let one = proposed();
+    let two = countersigned(one.clone());
+    let three = completed(two.clone());
+    for record in [
+        bundle_record(&one),
+        scan_record(),
+        armed_record(&two),
+        bundle_record(&three),
+    ] {
+        if let Err(error) = store.commit(record, &verifier) {
+            panic!("the fixture revision commits: {error}");
+        }
+    }
+    store
+}
+
 // ── Observed objects, written out ─────────────────────────────────────
 
 const FORMAT_VERSION: u8 = 1;
@@ -291,8 +315,12 @@ const WORK_PAYMENT_CLOSES: u8 = 0b0001_1000;
 const WORK_STAKE_CLOSES: u8 = 0b0000_0010;
 
 fn edge(terms: TermsHash, maker: Key, taker: Key, allowed: u8) -> Edge {
+    valued_edge(64, terms, maker, taker, allowed)
+}
+
+fn valued_edge(value: u64, terms: TermsHash, maker: Key, taker: Key, allowed: u8) -> Edge {
     let mut out = vec![FORMAT_VERSION, TAG_EDGE];
-    out.extend_from_slice(&64_u64.to_be_bytes()); // value
+    out.extend_from_slice(&value.to_be_bytes()); // value
     out.extend_from_slice(&0_u64.to_be_bytes()); // reserve
     out.extend_from_slice(&[FORMAT_VERSION, TAG_FEES]);
     for _ in 0..4 {
@@ -322,6 +350,23 @@ fn bond_object() -> Edge {
 
 fn payment_object() -> Edge {
     edge(
+        Terms::work_payment(payment_terms(bond_edge())).hash(),
+        client().party_key(),
+        provider().party_key(),
+        WORK_PAYMENT_CLOSES,
+    )
+}
+
+/// The payment edge as the client actually funded it: above the value
+/// the provider's configuration expected.
+///
+/// Reachable, and not a fixture convenience. An edge's id is a hash over
+/// the funding coins and the terms, never over what those coins are
+/// worth, so the client that names them decides the edge's value — and
+/// `provider_policy` merely expects 1,000.
+fn overfunded_payment_object() -> Edge {
+    valued_edge(
+        4_096,
         Terms::work_payment(payment_terms(bond_edge())).hash(),
         client().party_key(),
         provider().party_key(),
@@ -414,6 +459,79 @@ impl Observed {
             lease: self.lease,
             live_funding: &self.live,
         })
+    }
+}
+
+/// One coherent finalized read of a channel whose bond is gone and
+/// whose payment edge is still live.
+///
+/// The state a permissionless bond Timeout leaves behind, and the state
+/// a close-only mount has to settle against. It counts its reads,
+/// because "the mount consults it" is half of what these tests are
+/// about.
+struct SurvivingPayment {
+    payment: Edge,
+    height: u64,
+    reads: std::sync::atomic::AtomicUsize,
+}
+
+impl SurvivingPayment {
+    fn at(height: u64, payment: Edge) -> Self {
+        Self {
+            payment,
+            height,
+            reads: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn reads(&self) -> usize {
+        self.reads.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl SetupView for SurvivingPayment {
+    async fn finalized_setup(
+        &self,
+        _query: SetupQuery,
+    ) -> Result<Option<FinalizedSetup>, BlockSourceError> {
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(Some(FinalizedSetup {
+            height: self.height,
+            bond: None,
+            payment: Some(self.payment),
+            lease: LeaseSlots::Absent,
+            live_funding: BTreeSet::new(),
+        }))
+    }
+}
+
+/// Close-only recovery decides *what* to mount from journaled history
+/// and *what it settles* from one coherent read of the surviving edge.
+/// It hands nothing to consensus on either count.
+struct NoSink;
+
+impl TxSink for NoSink {
+    async fn submit(&self, _tx: Tx) -> Result<hellas_rpc::SubmitTxOutcome, BlockSourceError> {
+        panic!("mounting a close-only channel submits nothing");
+    }
+}
+
+/// A finalized history a test writes down.
+struct Blocks {
+    blocks: Vec<FinalizedWork>,
+}
+
+impl FinalizedBlocks for Blocks {
+    async fn latest_height(&self) -> Result<Option<u64>, BlockSourceError> {
+        Ok(self.blocks.last().map(|block| block.height))
+    }
+
+    async fn block_at(&self, height: u64) -> Result<Option<FinalizedWork>, BlockSourceError> {
+        Ok(self
+            .blocks
+            .iter()
+            .find(|block| block.height == height)
+            .cloned())
     }
 }
 
@@ -1565,39 +1683,6 @@ fn a_finalized_bond_timeout_reclaims_the_stake_cleanly() {
 /// — and the assertion is that the mounted channel journal holds it.
 #[tokio::test]
 async fn a_mount_replays_a_same_block_contest() {
-    struct Blocks {
-        blocks: Vec<FinalizedWork>,
-    }
-    impl FinalizedBlocks for Blocks {
-        async fn latest_height(&self) -> Result<Option<u64>, BlockSourceError> {
-            Ok(self.blocks.last().map(|block| block.height))
-        }
-        async fn block_at(&self, height: u64) -> Result<Option<FinalizedWork>, BlockSourceError> {
-            Ok(self
-                .blocks
-                .iter()
-                .find(|block| block.height == height)
-                .cloned())
-        }
-    }
-    // Close-only recovery decides from journaled history, so neither the
-    // fresh setup read nor the sink is consulted on this path.
-    struct NoView;
-    impl SetupView for NoView {
-        async fn finalized_setup(
-            &self,
-            _query: SetupQuery,
-        ) -> Result<Option<FinalizedSetup>, BlockSourceError> {
-            panic!("close-only recovery reads history, not a fresh setup snapshot");
-        }
-    }
-    struct NoSink;
-    impl TxSink for NoSink {
-        async fn submit(&self, _tx: Tx) -> Result<hellas_rpc::SubmitTxOutcome, BlockSourceError> {
-            panic!("mounting a close-only channel submits nothing");
-        }
-    }
-
     let dir = temp();
     let verifier = Secp256k1Verifier::new();
     let mut journal = completed_store(dir.path());
@@ -1635,11 +1720,12 @@ async fn a_mount_replays_a_same_block_contest() {
 
     // The history batch is fetched and journaled first, and the mount
     // runs on the next step.
-    match advance_setup(&NoView, &blocks, &NoSink, &mut journal, &verifier).await {
+    let view = SurvivingPayment::at(scan().height + 2, payment_object());
+    match advance_setup(&view, &blocks, &NoSink, &mut journal, &verifier).await {
         Ok(SetupProgress::HistoryAdvanced { through }) => assert_eq!(through, scan().height + 2),
         other => panic!("the history batch is fetched first: {other:?}"),
     }
-    let origin = match advance_setup(&NoView, &blocks, &NoSink, &mut journal, &verifier).await {
+    let origin = match advance_setup(&view, &blocks, &NoSink, &mut journal, &verifier).await {
         Ok(SetupProgress::CloseOnly { origin, settled }) => {
             assert!(!settled, "the payment edge is contested, not closed");
             origin
@@ -1661,8 +1747,8 @@ async fn a_mount_replays_a_same_block_contest() {
         .expect("the armed close descriptor");
     let channel = descriptor.channel().clone();
     let settlement = descriptor
-        .expected_settlement()
-        .expect("the expected settlement");
+        .funded_settlement(&payment_object())
+        .expect("the settlement of the edge that survived");
     let mounted = ChannelStore::open(
         journal.root(),
         channel,
@@ -1675,6 +1761,186 @@ async fn a_mount_replays_a_same_block_contest() {
     assert!(
         mounted.state().close_opened().is_some(),
         "the same-block contest is journaled on the mounted channel",
+    );
+}
+
+/// A client's contiguous history crosses the bond Timeout that anyone
+/// could have sent, and its cursor keeps moving.
+///
+/// A leased bond may be permissionlessly timed out at its horizon while
+/// the payment edge survives, so every client will eventually fetch a
+/// block carrying that Close. A batch is applied whole, and a client may
+/// not record bond Close evidence — so a batch that carried it would be
+/// refused, and refused again on every retry, with the cursor stuck
+/// below the block it landed in for good. The Close is left out and the
+/// header is not.
+#[tokio::test]
+async fn a_client_history_crosses_a_permissionless_bond_timeout() {
+    let dir = temp();
+    let verifier = Secp256k1Verifier::new();
+    let mut journal = client_completed_store(dir.path());
+
+    let bundle = completed(countersigned(proposed()));
+    let payment_open = bundle.payment_open().expect("the executable payment Open");
+    let bond_close = Tx::timeout_close(bond_edge(), &Terms::work_stake_bond(bond_terms()))
+        .expect("the bond has a deterministic timeout close");
+
+    let origin_payload = [0x81; 32];
+    let timeout_payload = [0x82; 32];
+    let blocks = Blocks {
+        blocks: vec![
+            FinalizedWork {
+                height: scan().height + 1,
+                parent: scan().payload,
+                payload: origin_payload,
+                txs: vec![payment_open],
+            },
+            FinalizedWork {
+                height: scan().height + 2,
+                parent: origin_payload,
+                payload: timeout_payload,
+                txs: vec![bond_close],
+            },
+        ],
+    };
+    let view = SurvivingPayment::at(scan().height + 2, payment_object());
+
+    match advance_setup(&view, &blocks, &NoSink, &mut journal, &verifier).await {
+        Ok(SetupProgress::HistoryAdvanced { through }) => assert_eq!(through, scan().height + 2),
+        other => panic!("the client's history crosses the bond Timeout: {other:?}"),
+    }
+    assert_eq!(
+        journal.state().history_cursor().map(|scan| scan.height),
+        Some(scan().height + 2),
+        "the cursor moved past the block the bond died in",
+    );
+    let crossed = journal
+        .state()
+        .history()
+        .iter()
+        .find(|block| block.height == scan().height + 2)
+        .expect("that block's header is retained");
+    assert_eq!(
+        crossed.parent, origin_payload,
+        "the header is what keeps the history one chain",
+    );
+    assert!(
+        crossed.txs.is_empty(),
+        "and a client records no bond Close evidence: {:?}",
+        crossed.txs,
+    );
+
+    // The client is not stuck: the surviving payment edge mounts, and
+    // its origin is the block its own Open landed in.
+    match advance_setup(&view, &blocks, &NoSink, &mut journal, &verifier).await {
+        Ok(SetupProgress::CloseOnly { origin, settled }) => {
+            assert!(!settled, "the payment edge outlived the bond");
+            assert_eq!(origin.height, scan().height + 1);
+        }
+        other => panic!("the client mounts the surviving payment edge: {other:?}"),
+    }
+}
+
+/// A payment edge that outlived its bond settles at what it holds, not
+/// at what the provider's configuration expected it to hold.
+///
+/// An edge's id is a hash over its funding coins and its terms, never
+/// over what those coins are worth, so the client that names them
+/// decides the value and an overfunded edge is this same channel. The
+/// mount therefore has to read the edge, and it has to read it before it
+/// fixes the number every close it builds must distribute: 4,096 is what
+/// consensus will make an adjudicated close hand out, and 1,200 — the
+/// configured expectation — is a close consensus refuses.
+#[tokio::test]
+async fn an_overfunded_close_only_channel_settles_at_the_edge_it_holds() {
+    let dir = temp();
+    let verifier = Secp256k1Verifier::new();
+    let mut journal = completed_store(dir.path());
+
+    let bundle = completed(countersigned(proposed()));
+    let payment_open = bundle.payment_open().expect("the executable payment Open");
+    let bond_close = Tx::timeout_close(bond_edge(), &Terms::work_stake_bond(bond_terms()))
+        .expect("the bond has a deterministic timeout close");
+
+    let origin_payload = [0x91; 32];
+    let blocks = Blocks {
+        blocks: vec![
+            FinalizedWork {
+                height: scan().height + 1,
+                parent: scan().payload,
+                payload: origin_payload,
+                txs: vec![payment_open],
+            },
+            FinalizedWork {
+                height: scan().height + 2,
+                parent: origin_payload,
+                payload: [0x92; 32],
+                txs: vec![bond_close],
+            },
+        ],
+    };
+    let view = SurvivingPayment::at(scan().height + 2, overfunded_payment_object());
+
+    match advance_setup(&view, &blocks, &NoSink, &mut journal, &verifier).await {
+        Ok(SetupProgress::HistoryAdvanced { through }) => assert_eq!(through, scan().height + 2),
+        other => panic!("the history batch is fetched first: {other:?}"),
+    }
+    assert!(
+        journal.state().close_only_recovery(),
+        "the provider's own history proves this channel is close-only",
+    );
+
+    // The first mount, on the journal-only route: it still reads.
+    let origin = match advance_setup(&view, &blocks, &NoSink, &mut journal, &verifier).await {
+        Ok(SetupProgress::CloseOnly { origin, settled }) => {
+            assert!(!settled, "the payment edge outlived the bond");
+            origin
+        }
+        other => panic!("a bond-timed-out payment mounts close-only: {other:?}"),
+    };
+    assert_eq!(
+        view.reads(),
+        1,
+        "the mount settled against a coherent read of the edge",
+    );
+
+    // The restart: the same journal reopened over its own files takes
+    // the same step to the same answer.
+    drop(journal);
+    let mut restarted = store(dir.path(), Role::Provider);
+    match advance_setup(&view, &blocks, &NoSink, &mut restarted, &verifier).await {
+        Ok(SetupProgress::CloseOnly {
+            origin: again,
+            settled,
+        }) => {
+            assert!(!settled);
+            assert_eq!(again, origin, "the restart mounts the same channel");
+        }
+        other => panic!("the restart mounts close-only: {other:?}"),
+    }
+    assert_eq!(view.reads(), 2, "and it read the edge again to do it");
+
+    // And what both mounts settled against is what an adjudicated close
+    // has to distribute. The expectation is not: a close built on it
+    // would hand out 1,200 from an edge holding 4,096, and consensus
+    // takes a close whose outputs sum to exactly what the edge
+    // distributes or none at all.
+    let descriptor = restarted
+        .state()
+        .close_descriptor()
+        .expect("the armed close descriptor");
+    let funded = descriptor
+        .funded_settlement(&overfunded_payment_object())
+        .expect("the surviving edge settles");
+    let expected = descriptor
+        .expected_settlement()
+        .expect("the configured expectation settles");
+    assert_eq!(funded.adjudicated_total(), 4_096);
+    assert_eq!(funded.capacity(), 4_092);
+    assert_eq!(
+        expected.adjudicated_total(),
+        1_200,
+        "the expectation is a different close from the one this edge can pay",
     );
 }
 

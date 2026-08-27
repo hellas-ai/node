@@ -148,6 +148,7 @@ use crate::services::work::{WorkClientImpl, WorkHandler};
 use crate::work_close::{
     CatchUpError, CloseError, CloseProgress, FinalizedBlocks, FinalizedWork, TxSink,
     adjudicated_close, advance_close, catch_up, close_response, close_start, observe,
+    response_body_digest,
 };
 use crate::work_store::channel::encode_kernel;
 use crate::work_store::journal::MAX_RECORD_BYTES;
@@ -155,7 +156,7 @@ use crate::work_store::{
     ChannelRecord, ChannelState, ChannelStateError, ChannelStore, JobPhase, JobState,
     PaidCertificate, Role, TerminalOutcome, WorkStoreError,
 };
-use crate::{EvaluateRequest, OutputEventEnvelope};
+use crate::{EvaluateRequest, OutputEventEnvelope, SubmitTxOutcome};
 
 // ── Refusals ──────────────────────────────────────────────────────────
 
@@ -460,6 +461,33 @@ pub struct ProviderEndpoint {
     ready: ReadyChannel,
     store: ChannelStore,
     signer: Secp256k1Signer,
+    close_handoff: Option<(StartId, Handoff)>,
+}
+
+/// How far this process has got with the answer to a live contest.
+///
+/// Not journaled, and that is the whole point of it. A durable "handed
+/// off" would be a claim about a submission that outlives the process
+/// making it: the record would have to be written before the send, and a
+/// crash in between would leave a disk saying consensus has an answer it
+/// never received. What survives a restart is the answer itself —
+/// `ChannelRecord::CloseResponded` — and a restarted endpoint offers it
+/// again before it reads anything.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Handoff {
+    /// A sink took the call and did not enqueue it: [`SubmitTxOutcome::Full`]
+    /// or [`SubmitTxOutcome::ValidationRejected`], both of which are
+    /// successful `Result`s meaning *not enqueued*. The answer is still
+    /// owed and is sent again on the next pass — over one further block
+    /// and no more. A rejection can equally mean the answer is already on
+    /// chain and only reading on can tell, so the cursor is not frozen;
+    /// but a backlog read to its end would reach the deadline with the
+    /// answer still unsent, which is the one thing this must not do.
+    Offered,
+    /// A sink holds the answer for inclusion: [`SubmitTxOutcome::Enqueued`]
+    /// or [`SubmitTxOutcome::Duplicate`]. Nothing further is sent for
+    /// this contest; what ends it now is the contest ending.
+    Accepted,
 }
 
 impl ProviderEndpoint {
@@ -479,6 +507,7 @@ impl ProviderEndpoint {
             ready,
             store,
             signer,
+            close_handoff: None,
         })
     }
 
@@ -1009,8 +1038,20 @@ impl ProviderEndpoint {
         Ok(start)
     }
 
-    /// Reads to the tip and resubmits this endpoint's retained close
-    /// start if it has not landed.
+    /// Reads to the tip, resubmits this endpoint's retained close start
+    /// if it has not landed, and answers a contest opened below what it
+    /// holds.
+    ///
+    /// The order is the one a crash has to survive. The read stops on
+    /// the block that opens a contest — or, after a restart, before any
+    /// block at all — so the answer is fixed on the disk and offered
+    /// before this endpoint reads a successor. What ends the answering
+    /// is not that write: a sink that *took* the answer
+    /// ([`SubmitTxOutcome::Enqueued`] or [`SubmitTxOutcome::Duplicate`])
+    /// ends it, a sink that did not ([`SubmitTxOutcome::Full`],
+    /// [`SubmitTxOutcome::ValidationRejected`]) leaves it owed for the
+    /// next pass — which reads one successor block and then owes it
+    /// again — and the contest running out ends it either way.
     ///
     /// # Errors
     ///
@@ -1026,45 +1067,72 @@ impl ProviderEndpoint {
         S: FinalizedBlocks + ?Sized,
         T: TxSink + ?Sized,
     {
-        let progress =
-            advance_close(source, sink, &mut self.store, &Secp256k1Verifier::new()).await?;
-        if let CloseProgress::Opened { start_id } = progress {
-            if let Some(response) = self.close_response_due(start_id) {
-                sink.submit(response).await?;
-            }
+        let progress = advance_close(
+            source,
+            sink,
+            &mut self.store,
+            &Secp256k1Verifier::new(),
+            self.close_handoff,
+        )
+        .await?;
+        if let CloseProgress::Opened { start_id } = progress
+            && let Some((responded, response)) = self.close_duty(start_id)
+        {
+            // Durable before broadcast: the record is what refuses a
+            // second, different answer to this contest, and a record the
+            // state already holds is not written twice — so a
+            // resubmission after a failed hand-off costs no fsync and
+            // sends the same bytes.
+            self.store.commit(responded, &Secp256k1Verifier::new())?;
+            let handoff = match sink.submit(response).await? {
+                SubmitTxOutcome::Enqueued | SubmitTxOutcome::Duplicate => Handoff::Accepted,
+                SubmitTxOutcome::Full | SubmitTxOutcome::ValidationRejected => Handoff::Offered,
+            };
+            self.close_handoff = Some((start_id, handoff));
         }
         Ok(progress)
     }
 
-    /// Builds this provider's answer to a journaled contest, or `None`
-    /// when no answer is open.
+    /// Builds this provider's answer to a journaled contest, and the
+    /// record that must reach the disk before it is sent — or `None`
+    /// when this endpoint owes no answer.
     ///
-    /// The same three conditions [`Self::respond_to_close`] applies to a
-    /// finalized snapshot, applied instead to the contest the watcher
-    /// already journaled: the client is the opener, the response window is
+    /// Whether one is owed is
+    /// [`ChannelState::answerable_contest`]'s judgement and no second
+    /// spelling of it: the client is the opener, the response window is
     /// still open at the cursor, and this endpoint's certificate strictly
-    /// exceeds the opener's claim. Nothing is journaled — the certificate
-    /// it spends is already durable, and the `CloseOpened` that shut this
-    /// channel was fsynced before this could be built from it.
-    fn close_response_due(&self, start_id: StartId) -> Option<Tx> {
-        let contest = self.state().open_contest()?;
-        if contest.start_id != start_id || contest.opener != Party::Maker {
+    /// exceeds the opener's claim. A contest failing any of those is not
+    /// a duty this endpoint is waiting to discharge — all three were
+    /// frozen by the block that recorded the contest — so nothing is
+    /// built and nothing stops the cursor.
+    ///
+    /// It builds the same answer again while the answer is already
+    /// journaled, and that is deliberate: the bytes are retained by
+    /// being derivable from those same two frozen values, so an endpoint
+    /// whose submission was refused offers them again, and the journal's
+    /// own rule — one answer per contest — is what makes the second
+    /// offer the first one rather than a new decision. What it will not
+    /// do is offer them to a sink that already took them.
+    fn close_duty(&self, start_id: StartId) -> Option<(ChannelRecord, Tx)> {
+        if self.close_handoff == Some((start_id, Handoff::Accepted)) {
             return None;
         }
-        let (cursor_height, _) = self.state().cursor();
-        if cursor_height >= contest.response_deadline {
+        let (contest, certificate) = self.state().answerable_contest()?;
+        if contest.start_id != start_id {
             return None;
         }
-        let certificate = self
-            .state()
-            .executable_certificate()
-            .filter(|(certificate, _)| certificate.earned_cumulative() > contest.claimed)?;
-        Some(Tx::move_action(Move::RespondPaymentClose(close_response(
-            self.ready.channel(),
-            start_id,
-            certificate,
-            &self.signer,
-        ))))
+        let response = close_response(self.ready.channel(), start_id, certificate, &self.signer);
+        Some((
+            ChannelRecord::CloseResponded {
+                start_id,
+                response_digest: response_body_digest(
+                    self.ready.channel(),
+                    start_id,
+                    &certificate.0,
+                ),
+            },
+            Tx::move_action(Move::RespondPaymentClose(response)),
+        ))
     }
 
     /// Builds the close that ends this endpoint's contest.
@@ -1113,10 +1181,12 @@ impl ProviderEndpoint {
     /// the certificate's beneficiary may answer, which is why there is
     /// no client counterpart to this.
     ///
-    /// Nothing durable is written. The certificate it spends is already
-    /// on this endpoint's disk, and the record that shut this channel
-    /// to new work — the watcher's `CloseOpened` — was fsynced before
-    /// anything here could be built from it.
+    /// The answer is fixed on this endpoint's own disk before the bytes
+    /// are returned, exactly as [`Self::advance_close`] fixes it before
+    /// it sends them. That is not decoration: a caller given signed
+    /// bytes over a journal that never recorded them could put an answer
+    /// on chain this endpoint has no record of giving, and the journal
+    /// would then owe — and refuse — that same answer.
     ///
     /// # Errors
     ///
@@ -1125,8 +1195,10 @@ impl ProviderEndpoint {
     /// landed, [`CloseError::ResponseWindowClosed`] at or after the
     /// deadline — the kernel refuses an answer exactly there — and
     /// [`CloseError::NothingToAdd`] when this endpoint holds nothing
-    /// the contest does not already settle.
-    pub fn respond_to_close(&self, observed: &ObservedChannel<'_>) -> Result<Tx, CloseError> {
+    /// the contest does not already settle. [`CloseError::Store`] when
+    /// the journal refuses the answer, which is where the contest and
+    /// the certificate the answer is derived from are re-checked.
+    pub fn respond_to_close(&mut self, observed: &ObservedChannel<'_>) -> Result<Tx, CloseError> {
         let (held, _) = self.state().close_opened().ok_or(CloseError::NoContest)?;
         let PendingSlot::Present(record) = observed.pending else {
             return Err(CloseError::NoContest);
@@ -1153,12 +1225,15 @@ impl ProviderEndpoint {
                 held: self.state().max_executable_certificate(),
                 settled: record.final_cumulative(),
             })?;
-        Ok(Tx::move_action(Move::RespondPaymentClose(close_response(
-            self.ready.channel(),
-            held,
-            certificate,
-            &self.signer,
-        ))))
+        let response = close_response(self.ready.channel(), held, certificate, &self.signer);
+        self.store.commit(
+            ChannelRecord::CloseResponded {
+                start_id: held,
+                response_digest: response_body_digest(self.ready.channel(), held, &certificate.0),
+            },
+            &Secp256k1Verifier::new(),
+        )?;
+        Ok(Tx::move_action(Move::RespondPaymentClose(response)))
     }
 }
 
@@ -2183,7 +2258,17 @@ impl ClientEndpoint {
         S: FinalizedBlocks + ?Sized,
         T: TxSink + ?Sized,
     {
-        advance_close(source, sink, &mut self.store, &Secp256k1Verifier::new()).await
+        // No contest is ever this endpoint's to answer — only a
+        // certificate's beneficiary may spend it — so a client never
+        // holds one back, and never stops reading over one.
+        advance_close(
+            source,
+            sink,
+            &mut self.store,
+            &Secp256k1Verifier::new(),
+            None,
+        )
+        .await
     }
 
     /// Takes one delivered answer, and makes it durable before it is

@@ -96,8 +96,14 @@ const MAGIC: &[u8] = b"hellas.work-journal.v1";
 /// the one-job terminal: channel tags 7–11 meant admitted-payment,
 /// ending, and three close records, and this binary reads those same
 /// bytes as the terminal and shifted close records — so a v2 file under
-/// the current header would mis-replay rather than fail.
-const FORMAT_VERSION: u8 = 3;
+/// the current header would mis-replay rather than fail. Version 3 is a
+/// different reason: its tags did not move, they ran out. It has no
+/// twelfth tag, so an answer to a contest is a thing that journal cannot
+/// say, and a channel whose answer was fixed replays as one that never
+/// fixed it — free to fix a different one. The reset is pre-deployment,
+/// like the two before it: no journal written by a deployed node is
+/// being retired here.
+const FORMAT_VERSION: u8 = 4;
 /// Domain of the header digest every frame is bound to.
 const HEADER_DOMAIN: &[u8] = b"hellas.work.journal-header.v1";
 /// Domain of one frame's digest.
@@ -342,10 +348,16 @@ impl Journal {
                 return Err(JournalError::OldVersion {
                     found,
                     expected: FORMAT_VERSION,
-                    retirement: if found < 2 {
-                        "pre-arming journals have no recoverable scan floor or close descriptor"
-                    } else {
-                        "pre-terminal channel journals reuse tags 7-11 with other meanings and would mis-replay"
+                    retirement: match found {
+                        0 | 1 => {
+                            "pre-arming journals have no recoverable scan floor or close descriptor"
+                        }
+                        2 => {
+                            "pre-terminal channel journals reuse tags 7-11 with other meanings and would mis-replay"
+                        }
+                        _ => {
+                            "pre-response channel journals cannot record an answered contest, so a fixed answer replays as one never given"
+                        }
                     },
                 });
             }

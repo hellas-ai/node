@@ -68,6 +68,7 @@ use hellas_kernel::{CoinId, Edge, EdgeId, LeaseSlots, SigVerifier, Tx};
 use crate::work_close::{
     BlockSourceError, FinalizedBlocks, FinalizedWork, TxSink, apply_finalized_txs, observe,
 };
+use crate::work_store::setup::touches_setup;
 use crate::work_store::{
     ChannelStore, ObservedSetup, SetupAbort, SetupDecision, SetupEnd, SetupFault,
     SetupHistoryBatch, SetupHistoryBlock, SetupOrigin, SetupRecord, SetupScan, SetupState,
@@ -338,13 +339,20 @@ where
         return Ok(SetupProgress::HistoryAdvanced { through });
     }
 
-    if store.state().close_only_recovery() {
-        return mount_close_only(store, verifier, None);
-    }
     let payment_edge = query.payment_edge;
     let Some(finalized) = view.finalized_setup(query).await? else {
         return Ok(SetupProgress::AwaitingFinalizedState);
     };
+
+    // After the read, never before it. History proves this channel can
+    // no longer be admitted; what it cannot prove is what the surviving
+    // payment edge holds, and that is the number every close this mount
+    // will build has to distribute. Mounting first would fix the
+    // configured expectation as the answer, and the expectation is what
+    // admission hoped for rather than what the client funded.
+    if store.state().close_only_recovery() {
+        return mount_close_only(store, verifier, finalized.payment.as_ref());
+    }
 
     match store.state().decide(&finalized.observed()) {
         SetupDecision::SubmitBond => submit(store, sink, verifier, SetupStep::Bond).await,
@@ -428,6 +436,7 @@ where
         .state()
         .payment_edge()
         .ok_or(SetupDriveError::CloseNotArmed)?;
+    let role = store.role();
     let through = tip.min(scan.height.saturating_add(256));
     let mut history = Vec::with_capacity((through - scan.height) as usize);
     for height in scan.height.saturating_add(1)..=through {
@@ -442,7 +451,7 @@ where
             txs: block
                 .txs
                 .into_iter()
-                .filter(|tx| touches(tx, bond_edge, payment_edge))
+                .filter(|tx| touches_setup(tx, role, bond_edge, payment_edge))
                 .collect(),
         });
     }
@@ -476,23 +485,17 @@ fn mount_close_only<V: SigVerifier>(
         .ok_or(SetupDriveError::CloseNotArmed)?;
     let to_store =
         |error| WorkStoreError::Setup(crate::work_store::SetupStateError::Descriptor(error));
-    // A never-settled payment edge distributes exactly what admission
-    // expected: the edge id is a hash over the funding, so a live edge
-    // under these terms and parties funds `expected_settlement` and
-    // nothing else. When the funded read is in hand the two are computed
-    // and checked against each other rather than one being trusted; the
-    // closed-edge path has only the expectation to go on.
+    // A surviving edge settles what it holds. The edge id is a hash over
+    // the funding *coins* and the terms, not over their values, so the
+    // client that named those coins decides the number and the
+    // provider's configured expectation is only ever what it hoped for:
+    // an edge funded above or below it is this same channel, and a close
+    // built on the expectation would name a total the edge does not
+    // distribute. The expectation is the fallback for a consumed edge
+    // alone, where there is no longer anything coherent to read it from.
     let settlement = match payment {
         None => descriptor.expected_settlement().map_err(to_store)?,
-        Some(payment) => {
-            let funded = descriptor.funded_settlement(payment).map_err(to_store)?;
-            let expected = descriptor.expected_settlement().map_err(to_store)?;
-            debug_assert_eq!(
-                expected, funded,
-                "a never-settled payment edge funds exactly what admission expected",
-            );
-            funded
-        }
+        Some(payment) => descriptor.funded_settlement(payment).map_err(to_store)?,
     };
     let mut channel = ChannelStore::open(
         store.root(),
@@ -540,22 +543,6 @@ fn mount_close_only<V: SigVerifier>(
         origin,
         settled: channel.state().close_settled().is_some(),
     })
-}
-
-fn touches(tx: &Tx, bond_edge: EdgeId, payment_edge: EdgeId) -> bool {
-    match tx {
-        Tx::Open { funding, terms, .. } => {
-            let edge = Tx::edge_id_of(funding, terms);
-            edge == bond_edge || edge == payment_edge
-        }
-        Tx::Close { input, .. } => *input == bond_edge || *input == payment_edge,
-        Tx::Move { action } => match action {
-            hellas_kernel::Move::StartPaymentClose(start) => start.payment_edge() == payment_edge,
-            hellas_kernel::Move::RespondPaymentClose(response) => {
-                response.payment_edge() == payment_edge
-            }
-        },
-    }
 }
 
 /// Returns what to read for this setup, once it names a payment edge.

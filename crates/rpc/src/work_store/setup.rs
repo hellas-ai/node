@@ -1100,15 +1100,19 @@ impl SetupState {
                 return Err(SetupStateError::Malformed);
             }
             for tx in &block.txs {
-                if !touches_setup(tx, self.bond_edge, payment_edge) {
-                    return Err(SetupStateError::Malformed);
-                }
+                // Named before the filter below, so a client batch
+                // carrying the one transaction the filter drops is
+                // refused as the role error it is rather than as
+                // malformed bytes.
                 if self.role == Role::Client
                     && matches!(tx, Tx::Close { input, .. } if *input == self.bond_edge)
                 {
                     return Err(SetupStateError::WrongRole {
                         step: "recording bond Close evidence",
                     });
+                }
+                if !touches_setup(tx, self.role, self.bond_edge, payment_edge) {
+                    return Err(SetupStateError::Malformed);
                 }
                 match tx {
                     Tx::Open { funding, terms, .. } => {
@@ -1210,13 +1214,26 @@ fn funding_live(tx: &Tx, live: &BTreeSet<CoinId>) -> bool {
         .all(|coin| live.contains(coin))
 }
 
-fn touches_setup(tx: &Tx, bond_edge: EdgeId, payment_edge: EdgeId) -> bool {
+/// Whether this transaction belongs in `role`'s history of this setup.
+///
+/// Role-aware in one place, and it is the bond's Close: §7 gives bond
+/// Timeout and bond Close evidence to the provider alone, and either
+/// role may record payment history. A bond Timeout is permissionless, so
+/// a client's contiguous history *will* cross one — and a batch is
+/// applied whole, so a client that carried that Close would have every
+/// batch containing it refused and its cursor stuck below the block it
+/// landed in, for good. The header stays and the transaction does not:
+/// contiguity is what the cursor is, and the Close is evidence the
+/// client is not the one to record.
+pub(crate) fn touches_setup(tx: &Tx, role: Role, bond_edge: EdgeId, payment_edge: EdgeId) -> bool {
     match tx {
         Tx::Open { funding, terms, .. } => {
             let edge = Tx::edge_id_of(funding, terms);
             edge == bond_edge || edge == payment_edge
         }
-        Tx::Close { input, .. } => *input == bond_edge || *input == payment_edge,
+        Tx::Close { input, .. } => {
+            *input == payment_edge || (*input == bond_edge && role == Role::Provider)
+        }
         Tx::Move { action } => match action {
             hellas_kernel::Move::StartPaymentClose(start) => start.payment_edge() == payment_edge,
             hellas_kernel::Move::RespondPaymentClose(response) => {

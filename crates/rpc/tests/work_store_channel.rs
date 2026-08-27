@@ -2046,6 +2046,34 @@ fn the_record_codec_is_exact_and_ordered() {
         Err(ChannelStateError::Malformed)
     );
 
+    // tag || contest id || response digest. Two digests, and only their
+    // order tells them apart: a round trip would pass with them
+    // transposed, and a journal written that way would refuse the very
+    // answer it holds.
+    let responded = ChannelRecord::CloseResponded {
+        start_id: hellas_kernel::StartId::from_bytes([0xcd; 32]),
+        response_digest: PayloadHash::from_bytes([0xce; 32]),
+    };
+    let bytes = responded.encode();
+    let mut expected = vec![11_u8];
+    expected.extend_from_slice(&[0xcd; 32]);
+    expected.extend_from_slice(&[0xce; 32]);
+    assert_eq!(bytes, expected);
+    assert_eq!(ChannelRecord::decode(&bytes), Ok(responded));
+
+    // And it is exactly that long: a byte short and a byte over are both
+    // malformed, so a truncated tail cannot read as an answer.
+    assert_eq!(
+        ChannelRecord::decode(&bytes[..bytes.len() - 1]),
+        Err(ChannelStateError::Malformed)
+    );
+    let mut over = bytes;
+    over.push(0);
+    assert_eq!(
+        ChannelRecord::decode(&over),
+        Err(ChannelStateError::Malformed)
+    );
+
     let settled = ChannelRecord::CloseSettled {
         height: 0x1112_1314_1516_1718,
         payload: [0xef; 32],
@@ -2666,5 +2694,201 @@ fn a_whole_job_opens_no_counterparty_loss_file() {
     assert!(
         !names.iter().any(|name| name.starts_with("counterparty")),
         "and no counterparty-loss journal was ever opened: {names:?}",
+    );
+}
+
+/// One contest admits one answer, and it is the answer the contest and
+/// the certificate derive.
+///
+/// The record is written before the answer leaves the process, so the
+/// journal cannot check that it was sent — which is exactly why it must
+/// check that it is the right one. An arbitrary digest taken on trust
+/// would be the worst of both: this contest would read as answered while
+/// the answer that actually spends the certificate was still unsent, and
+/// the journal would then refuse *that* answer as a disagreement.
+///
+/// The rest is what a written answer has to survive. The same answer
+/// again is the retry it is and costs no write; a different one to the
+/// same contest is this endpoint contradicting what it may already have
+/// sent. And an answer to a contest nothing is owed on — none open, one
+/// this endpoint opened itself, one already at its own high-water, or a
+/// client's journal, which has nothing to spend — is not a step this
+/// state can take at all.
+#[test]
+fn one_contest_admits_one_answer() {
+    let dir = temp();
+    let verifier = Secp256k1Verifier::new();
+    let channel = channel();
+    let job = job_at(&channel, 1, 0);
+    let mut store = open(dir.path(), Role::Provider);
+    let start_id = hellas_kernel::StartId::from_bytes([0x7c; 32]);
+    let arbitrary = ChannelRecord::CloseResponded {
+        start_id,
+        response_digest: PayloadHash::from_bytes([0x7d; 32]),
+    };
+
+    // There is nothing to answer yet.
+    let early = store.commit(arbitrary.clone(), &verifier);
+    assert!(
+        matches!(
+            early,
+            Err(WorkStoreError::Channel(
+                ChannelStateError::WrongPhase { .. }
+            ))
+        ),
+        "an answer names a contest this journal has read: {early:?}",
+    );
+
+    commit_all(&mut store, &provider_sequence(&channel, &job));
+    commit_all(
+        &mut store,
+        &[ChannelRecord::CloseOpened {
+            start_id,
+            opener: Party::Maker,
+            response_deadline: RECEIPT_HEIGHT + 16,
+            claimed: 0,
+        }],
+    );
+
+    // A digest this contest and this certificate do not derive is not
+    // this endpoint's answer, whatever wrote it down.
+    let invented = store.commit(arbitrary, &verifier);
+    assert!(
+        matches!(
+            invented,
+            Err(WorkStoreError::Channel(ChannelStateError::WrongChannel {
+                field: "close response digest"
+            }))
+        ),
+        "an invented answer is refused: {invented:?}",
+    );
+    assert_eq!(
+        store.state().close_responded(),
+        None,
+        "and left nothing behind to suppress the real one",
+    );
+
+    // The one answer those two derive.
+    let answer = ChannelRecord::CloseResponded {
+        start_id,
+        response_digest: hellas_rpc::work_close::response_body_digest(
+            &channel,
+            start_id,
+            &job.certificate,
+        ),
+    };
+    commit_all(&mut store, std::slice::from_ref(&answer));
+    assert_eq!(
+        store.state().close_responded().map(|held| held.start_id),
+        Some(start_id),
+    );
+
+    // The retry writes nothing.
+    let before = store.len();
+    commit_all(&mut store, &[answer]);
+    assert_eq!(store.len(), before, "the same answer is not written twice");
+
+    // A second, different answer to that same contest is not a retry.
+    let disagreement = store.commit(
+        ChannelRecord::CloseResponded {
+            start_id,
+            response_digest: PayloadHash::from_bytes([0x7e; 32]),
+        },
+        &verifier,
+    );
+    assert!(
+        matches!(
+            disagreement,
+            Err(WorkStoreError::Channel(ChannelStateError::Conflict { .. }))
+        ),
+        "one window, one answer: {disagreement:?}",
+    );
+
+    // Nor is an answer to some other contest.
+    let elsewhere = store.commit(
+        ChannelRecord::CloseResponded {
+            start_id: hellas_kernel::StartId::from_bytes([0x7f; 32]),
+            response_digest: PayloadHash::from_bytes([0x7d; 32]),
+        },
+        &verifier,
+    );
+    assert!(
+        matches!(
+            elsewhere,
+            Err(WorkStoreError::Channel(ChannelStateError::Conflict { .. }))
+        ),
+        "the answer this journal holds is the answer to its own contest: {elsewhere:?}",
+    );
+
+    // A contest this provider opened itself is not one it answers, and
+    // neither is one already at its own high-water. Both are frozen the
+    // moment they are journaled, so neither becomes answerable later.
+    for (opener, claimed, what) in [
+        (Party::Taker, 0, "a contest this endpoint opened"),
+        (
+            Party::Maker,
+            PRICE,
+            "a contest at this endpoint's high-water",
+        ),
+    ] {
+        let unowed = temp();
+        let mut store = open(unowed.path(), Role::Provider);
+        commit_all(&mut store, &provider_sequence(&channel, &job));
+        commit_all(
+            &mut store,
+            &[ChannelRecord::CloseOpened {
+                start_id,
+                opener,
+                response_deadline: RECEIPT_HEIGHT + 16,
+                claimed,
+            }],
+        );
+        let refused = store.commit(
+            ChannelRecord::CloseResponded {
+                start_id,
+                response_digest: hellas_rpc::work_close::response_body_digest(
+                    &channel,
+                    start_id,
+                    &job.certificate,
+                ),
+            },
+            &verifier,
+        );
+        assert!(
+            matches!(
+                refused,
+                Err(WorkStoreError::Channel(
+                    ChannelStateError::WrongPhase { .. }
+                ))
+            ),
+            "{what} is owed no answer: {refused:?}",
+        );
+    }
+
+    // And a client has nothing to answer with.
+    let other = temp();
+    let mut client_store = open(other.path(), Role::Client);
+    commit_all(
+        &mut client_store,
+        &[ChannelRecord::CloseOpened {
+            start_id,
+            opener: Party::Maker,
+            response_deadline: RECEIPT_HEIGHT + 16,
+            claimed: 0,
+        }],
+    );
+    let wrong_role = client_store.commit(
+        ChannelRecord::CloseResponded {
+            start_id,
+            response_digest: PayloadHash::from_bytes([0x7d; 32]),
+        },
+        &verifier,
+    );
+    assert!(
+        matches!(
+            wrong_role,
+            Err(WorkStoreError::Channel(ChannelStateError::WrongRole { .. }))
+        ),
+        "only the certificate's beneficiary answers: {wrong_role:?}",
     );
 }

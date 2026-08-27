@@ -78,6 +78,7 @@ use hellas_kernel::{
 };
 
 use crate::protocol::work::PaidChannel;
+use crate::work::Handoff;
 use crate::work_store::{
     Applied, ChannelRecord, ChannelStore, JobPhase, Role, TerminalOutcome, WorkStoreError,
 };
@@ -358,15 +359,42 @@ pub fn close_start(
     ))
 }
 
+/// Returns the digest a responder signs to answer `start_id` with
+/// `certificate`.
+///
+/// One spelling, for [`start_body_digest`]'s reason and one more: the
+/// answer's digest is what [`ChannelRecord::CloseResponded`] records, so
+/// a second speller of it would let the journal say a different answer
+/// was given than the one that was sent.
+#[must_use]
+pub fn response_body_digest(
+    channel: &PaidChannel,
+    start_id: StartId,
+    certificate: &EarnedCertificate,
+) -> PayloadHash {
+    hellas_kernel::response_digest(
+        channel.network(),
+        channel.payment_edge(),
+        channel.payment_terms_hash(),
+        start_id,
+        Party::Taker,
+        certificate.digest(channel.network()),
+    )
+}
+
 /// Builds the provider's one answer to a contest opened below what it
 /// holds.
 ///
 /// The certificate is the client's own, already on this endpoint's disk
 /// — an answer reveals no new evidence, it spends evidence the client
-/// signed and the opener left out. That is why nothing is journaled
-/// before it: the write-ahead step this answer needs is the watcher's
-/// [`ChannelRecord::CloseOpened`], which is on the disk before anything
-/// can be built from it and is what shuts this channel to new work.
+/// signed and the opener left out. What is journaled before it is not
+/// the evidence but the answer itself:
+/// [`ChannelRecord::CloseResponded`] carries the digest below, written
+/// before these bytes leave the process, and it is what *fixes* which
+/// answer the duty the watcher's [`ChannelRecord::CloseOpened`] created
+/// is answered by. It says nothing about the duty being done: it is
+/// written before the send, so it stands over a consensus that may have
+/// received nothing at all.
 #[must_use]
 pub fn close_response(
     channel: &PaidChannel,
@@ -374,15 +402,7 @@ pub fn close_response(
     certificate: (EarnedCertificate, Sig),
     signer: &Secp256k1Signer,
 ) -> PaymentCloseResponse {
-    let earned = certificate.0.digest(channel.network());
-    let digest = hellas_kernel::response_digest(
-        channel.network(),
-        channel.payment_edge(),
-        channel.payment_terms_hash(),
-        start_id,
-        Party::Taker,
-        earned,
-    );
+    let digest = response_body_digest(channel, start_id, &certificate.0);
     PaymentCloseResponse::new(
         channel.payment_edge(),
         start_id,
@@ -702,13 +722,14 @@ pub async fn advance_close<S, T, V>(
     sink: &T,
     store: &mut ChannelStore,
     verifier: &V,
+    handoff: Option<(StartId, Handoff)>,
 ) -> Result<CloseProgress, CatchUpError>
 where
     S: FinalizedBlocks + ?Sized,
     T: TxSink + ?Sized,
     V: SigVerifier,
 {
-    let height = catch_up_until_duty(source, store, verifier).await?;
+    let height = catch_up_until_duty(source, store, verifier, handoff).await?;
     let state = store.state();
     if let Some(settled) = state.close_settled() {
         return Ok(CloseProgress::Settled {
@@ -736,16 +757,34 @@ where
 /// for another block. This is the backlog rule: a restart ten thousand
 /// blocks behind cannot discover a response, close, or reclaim obligation in
 /// block one and postpone it behind the remaining 9,999 fetches.
+///
+/// A duty already on the disk when this is entered is returned before
+/// [`FinalizedBlocks::latest_height`] is even called, which is the case
+/// a restart is: the answer a dead process fixed and never sent is
+/// offered again before one successor block is read, so a backlog that
+/// runs past the response deadline cannot be what loses it.
+///
+/// `handoff` is what this caller's last send got back, and its two
+/// answers buy different amounts of reading. [`Handoff::Accepted`]
+/// suppresses the duty for as long as the contest lasts: a sink holds
+/// the answer, and there is nothing left to do but watch.
+/// [`Handoff::Offered`] suppresses it for **one** block and then lets it
+/// reappear, which is the same backlog rule one step weaker — an answer
+/// nobody took must be offered again before the block after next, or a
+/// backlog longer than the window swallows every retry and the contest
+/// ends unanswered on the claim this endpoint could have beaten.
 async fn catch_up_until_duty<S, V>(
     source: &S,
     store: &mut ChannelStore,
     verifier: &V,
+    handoff: Option<(StartId, Handoff)>,
 ) -> Result<u64, CatchUpError>
 where
     S: FinalizedBlocks + ?Sized,
     V: SigVerifier,
 {
-    if close_duty_present(store.state()) {
+    let mut suppressed = handoff.map(|(start_id, _)| start_id);
+    if close_duty_present(store.state(), suppressed) {
         return Ok(store.state().cursor().0);
     }
     let Some(latest) = source.latest_height().await? else {
@@ -758,8 +797,12 @@ where
             .await?
             .ok_or(CatchUpError::Missing { height: next })?;
         observe(store, &block, verifier)?;
+        if handoff.is_some_and(|(_, state)| state == Handoff::Offered) {
+            // The one block a still-owed answer paid for is spent.
+            suppressed = None;
+        }
         let state = store.state();
-        if close_duty_present(state) {
+        if close_duty_present(state, suppressed) {
             return Ok(state.cursor().0);
         }
         next = next.saturating_add(1);
@@ -767,8 +810,46 @@ where
     Ok(store.state().cursor().0)
 }
 
-fn close_duty_present(state: &crate::work_store::ChannelState) -> bool {
-    state.close_settled().is_some() || state.close_opened().is_some()
+/// Whether this journal holds a close duty its caller must service
+/// before another block is fetched.
+///
+/// A finalized close is one: it is terminal, and there is nothing after
+/// it to read.
+///
+/// A contest is one while
+/// [`ChannelState::answerable_contest`](crate::work_store::ChannelState::answerable_contest)
+/// says an answer is owed and `suppressed` is not that contest. Two things
+/// are deliberately not consulted here.
+///
+/// The journal's own
+/// [`ChannelRecord::CloseResponded`](crate::work_store::ChannelRecord::CloseResponded)
+/// is not, because it is fsynced *before* the submission it authorises:
+/// a crash between the two leaves a record saying "answered" over a
+/// consensus that received nothing, and a scan floor built on it would
+/// read the whole successor backlog past the deadline with the answer
+/// still on the disk.
+///
+/// Eligibility is, because an unanswerable contest is not a duty
+/// deferred, it is a duty that does not exist — the opener, the role and
+/// the held certificate are frozen at the block that recorded the
+/// contest, so an endpoint that cannot answer now can never answer, and
+/// stopping for it would freeze the cursor on the contest block forever.
+///
+/// `suppressed` is the contest whose answer the caller's hand-off state
+/// currently excuses it from — for good when a sink took the answer, for
+/// one block when a sink did not. It is what lets the cursor move on: a
+/// sink that refused the answer may have refused it because the answer
+/// is already on chain, and only reading further blocks can tell.
+/// Retrying is a separate question, and its answer is in
+/// [`crate::work::ProviderEndpoint::advance_close`].
+fn close_duty_present(
+    state: &crate::work_store::ChannelState,
+    suppressed: Option<StartId>,
+) -> bool {
+    state.close_settled().is_some()
+        || state
+            .answerable_contest()
+            .is_some_and(|(contest, _)| Some(contest.start_id) != suppressed)
 }
 
 pub async fn catch_up<S, V>(
