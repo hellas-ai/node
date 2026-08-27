@@ -256,6 +256,10 @@ pub enum CloseProgress {
 /// Why a catch-up did not finish.
 #[derive(Debug, thiserror::Error)]
 pub enum CatchUpError {
+    /// Another bounded catch-up owns this job; ordinary brief journal
+    /// operations remain independent of that ownership.
+    #[error("another catch-up already owns this job")]
+    Busy,
     /// The block source failed.
     #[error(transparent)]
     Source(#[from] BlockSourceError),
@@ -480,14 +484,44 @@ pub fn observe<V: SigVerifier>(
     {
         return Ok(());
     }
-    let channel = store.state().channel().clone();
-    let edge = channel.payment_edge();
-
     if let Some(ending) = expiry_at(store.state(), block.height) {
         store.commit(ChannelRecord::JobEnded { reason: ending }, verifier)?;
     }
 
-    for tx in &block.txs {
+    apply_finalized_txs(store, block.height, block.payload, &block.txs, verifier)?;
+
+    store.commit(
+        ChannelRecord::CursorAdvanced {
+            height: block.height,
+            parent: block.parent,
+            payload: block.payload,
+        },
+        verifier,
+    )?;
+    Ok(())
+}
+
+/// Records every contest and settlement a finalized block carries on this
+/// channel's payment edge, in block order.
+///
+/// Split out of [`observe`] because one block is read twice by two
+/// different rules. [`observe`] reads a *new* block, after checking the
+/// cursor may advance onto it. Mounting a close-only channel replays the
+/// origin block's own post-Open moves — the cursor already sits on that
+/// block, so it is not a new one, but a `StartPaymentClose` ordered after
+/// the Open in it is still a contest this endpoint must see. Both go
+/// through here, so a same-block contest is recognised exactly as a
+/// later-block one is. The Open itself matches neither arm and is ignored.
+pub(crate) fn apply_finalized_txs<V: SigVerifier>(
+    store: &mut ChannelStore,
+    height: u64,
+    payload: [u8; 32],
+    txs: &[Tx],
+    verifier: &V,
+) -> Result<(), WorkStoreError> {
+    let channel = store.state().channel().clone();
+    let edge = channel.payment_edge();
+    for tx in txs {
         match tx {
             Tx::Move {
                 action: hellas_kernel::Move::StartPaymentClose(start),
@@ -507,13 +541,28 @@ pub fn observe<V: SigVerifier>(
                     };
                     store.commit(ChannelRecord::JobEnded { reason }, verifier)?;
                 }
+                // The window and the claimed floor are fixed by the block
+                // that accepted this start, exactly as the kernel fixed
+                // them: the response deadline is the inclusion height plus
+                // the terms' omission window, and the claim is what the
+                // start's own certificate carried. Journaled here, a
+                // provider that restarts holding only this record can
+                // still decide whether an answer is open and what it must
+                // beat — without a second finalized snapshot.
+                let response_deadline =
+                    height.saturating_add(channel.payment_terms().omit_response_blocks);
+                let claimed = start
+                    .certificate()
+                    .map_or(0, |(certificate, _)| certificate.earned_cumulative());
                 store.commit(
                     ChannelRecord::CloseOpened {
                         start_id: hellas_kernel::start_id(
                             start_body_digest(&channel, start),
-                            block.height,
+                            height,
                         ),
                         opener: start.opener_role(),
+                        response_deadline,
+                        claimed,
                     },
                     verifier,
                 )?;
@@ -534,8 +583,8 @@ pub fn observe<V: SigVerifier>(
                 }
                 store.commit(
                     ChannelRecord::CloseSettled {
-                        height: block.height,
-                        payload: block.payload,
+                        height,
+                        payload,
                         provider_payout,
                     },
                     verifier,
@@ -544,15 +593,6 @@ pub fn observe<V: SigVerifier>(
             _ => {}
         }
     }
-
-    store.commit(
-        ChannelRecord::CursorAdvanced {
-            height: block.height,
-            parent: block.parent,
-            payload: block.payload,
-        },
-        verifier,
-    )?;
     Ok(())
 }
 
@@ -653,7 +693,7 @@ where
     T: TxSink + ?Sized,
     V: SigVerifier,
 {
-    let height = catch_up(source, store, verifier).await?;
+    let height = catch_up_until_duty(source, store, verifier).await?;
     let state = store.state();
     if let Some(settled) = state.close_settled() {
         return Ok(CloseProgress::Settled {
@@ -673,6 +713,47 @@ where
         valid_through,
         outcome,
     })
+}
+
+/// Reads contiguously only until one newly observed block creates a duty.
+///
+/// `advance_close` services the returned duty before it can ask the source
+/// for another block. This is the backlog rule: a restart ten thousand
+/// blocks behind cannot discover a response, close, or reclaim obligation in
+/// block one and postpone it behind the remaining 9,999 fetches.
+async fn catch_up_until_duty<S, V>(
+    source: &S,
+    store: &mut ChannelStore,
+    verifier: &V,
+) -> Result<u64, CatchUpError>
+where
+    S: FinalizedBlocks + ?Sized,
+    V: SigVerifier,
+{
+    if close_duty_present(store.state()) {
+        return Ok(store.state().cursor().0);
+    }
+    let Some(latest) = source.latest_height().await? else {
+        return Ok(store.state().cursor().0);
+    };
+    let mut next = store.state().cursor().0.saturating_add(1);
+    while next <= latest {
+        let block = source
+            .block_at(next)
+            .await?
+            .ok_or(CatchUpError::Missing { height: next })?;
+        observe(store, &block, verifier)?;
+        let state = store.state();
+        if close_duty_present(state) {
+            return Ok(state.cursor().0);
+        }
+        next = next.saturating_add(1);
+    }
+    Ok(store.state().cursor().0)
+}
+
+fn close_duty_present(state: &crate::work_store::ChannelState) -> bool {
+    state.close_settled().is_some() || state.close_opened().is_some()
 }
 
 pub async fn catch_up<S, V>(

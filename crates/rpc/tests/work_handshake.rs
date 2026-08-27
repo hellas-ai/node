@@ -31,13 +31,28 @@ use hellas_rpc::protocol::work_setup::{OmissionMeasurements, ProviderChannelPoli
 use hellas_rpc::protocol::{ContentId, Digest};
 use hellas_rpc::services::work_setup::{WorkSetup, WorkSetupClientImpl, WorkSetupServer};
 use hellas_rpc::work_handshake::{
-    PaymentAdmission, SetupEndpoint, SetupExchangeError, SetupService, exchange_setup,
+    PaymentAdmission, SetupEndpoint, SetupExchangeError, SetupService, apply_setup_exchange,
+    prepare_setup_exchange, send_setup_exchange,
 };
-use hellas_rpc::work_store::{Role, SetupStore};
+use hellas_rpc::work_store::{Role, SetupScan, SetupStore};
 use hellas_wire::mux::{MessagePipe, MuxConfig, MuxTransport, Role as MuxRole};
 use hellas_wire::{DefaultClock, Dispatcher, ServiceMarker, StreamTransport};
 use prost::Message as _;
 use tokio::sync::mpsc;
+
+async fn exchange_setup<T>(
+    transport: T,
+    endpoint: &mut SetupEndpoint,
+) -> Result<(), SetupExchangeError>
+where
+    T: StreamTransport + Sync,
+    T::Error: std::error::Error + Send + Sync + 'static,
+    T::Stream: 'static,
+{
+    let request = prepare_setup_exchange(endpoint);
+    let response = send_setup_exchange(transport, request).await?;
+    apply_setup_exchange(endpoint, response)
+}
 
 // ── Fixture ───────────────────────────────────────────────────────────
 
@@ -139,6 +154,13 @@ fn channel_policy() -> PaidChannelPolicyV1 {
     }
 }
 
+fn other_channel_policy() -> PaidChannelPolicyV1 {
+    PaidChannelPolicyV1 {
+        compute_credit_limit: 39,
+        delivery_credit_limit: 40,
+    }
+}
+
 fn execution_policy() -> PaidExecutionPolicyV1 {
     PaidExecutionPolicyV1 {
         allowed_environment: ContentId::from_bytes([0x31; 32]),
@@ -181,6 +203,23 @@ fn admits() -> PaymentAdmission {
     PaymentAdmission::Admits(Box::new(provider_policy()))
 }
 
+fn proposes() -> PaymentAdmission {
+    PaymentAdmission::Proposes(Box::new(provider_policy()))
+}
+
+fn scan() -> SetupScan {
+    SetupScan {
+        height: 7,
+        payload: [0x47; 32],
+    }
+}
+
+fn arm(endpoint: &mut SetupEndpoint) {
+    if let Err(error) = endpoint.arm_scan(scan()) {
+        panic!("the fixture arms its immutable history floor: {error}");
+    }
+}
+
 fn bond_edge() -> EdgeId {
     Tx::edge_id_of(&bond_funding(), &Terms::work_stake_bond(bond_terms()))
 }
@@ -210,10 +249,33 @@ fn endpoint(
 /// in.
 fn proposing_provider(root: &std::path::Path) -> SetupEndpoint {
     let mut endpoint = endpoint(root, Role::Provider, provider(), admits());
+    arm(&mut endpoint);
     if let Err(error) = endpoint.propose_bond(network(), bond_funding(), bond_terms()) {
         panic!("the fixture provider proposes its bond: {error}");
     }
     endpoint
+}
+
+#[test]
+fn no_export_path_can_return_unjournaled_revision_bytes() {
+    let root = tempfile::tempdir().expect("a temp dir");
+    let mut provider_endpoint = endpoint(root.path(), Role::Provider, provider(), admits());
+    let error = provider_endpoint
+        .propose_bond(network(), bond_funding(), bond_terms())
+        .expect_err("the export path cannot sign past a missing ScanArmed");
+    assert!(matches!(error, SetupExchangeError::Store(_)));
+    assert!(
+        provider_endpoint.state().bundle_bytes().is_none(),
+        "no bytes exist for a caller to export when the durable guard refuses",
+    );
+    drop(provider_endpoint);
+    assert!(
+        reopen(root.path(), Role::Provider)
+            .state()
+            .bundle_bytes()
+            .is_none(),
+        "the refusal is also the recovered state",
+    );
 }
 
 // ── An in-memory pipe pair, so the wire is a real wire ────────────────
@@ -329,12 +391,7 @@ async fn two_endpoints_that_have_never_met_open_a_channel() {
     let provider_root = tempfile::tempdir().expect("a temp dir");
     let client_root = tempfile::tempdir().expect("a temp dir");
     let service = SetupService::new(proposing_provider(provider_root.path()));
-    let mut caller = endpoint(
-        client_root.path(),
-        Role::Client,
-        client(),
-        PaymentAdmission::Proposes,
-    );
+    let mut caller = endpoint(client_root.path(), Role::Client, client(), proposes());
 
     let (dialer, listener) = transport_pair();
     let serving = serve(listener, service.clone());
@@ -344,6 +401,7 @@ async fn two_endpoints_that_have_never_met_open_a_channel() {
     if let Err(error) = exchange_setup(dialer.clone(), &mut caller).await {
         panic!("the first exchange completes: {error}");
     }
+    arm(&mut caller);
     assert_eq!(
         caller.state().revision(),
         Some(1),
@@ -418,7 +476,11 @@ async fn a_provider_does_not_countersign_terms_its_own_policy_refuses() {
         (
             "a credit policy that is not this provider's",
             WorkPaymentTerms {
-                private_policy_commitment: [0x25; 32],
+                private_policy_commitment: private_policy_commitment(
+                    network(),
+                    &SALT,
+                    &other_channel_policy(),
+                ),
                 ..base.clone()
             },
         ),
@@ -442,11 +504,15 @@ async fn a_provider_does_not_countersign_terms_its_own_policy_refuses() {
         let provider_root = tempfile::tempdir().expect("a temp dir");
         let client_root = tempfile::tempdir().expect("a temp dir");
         let service = SetupService::new(proposing_provider(provider_root.path()));
+        let mut proposing_policy = provider_policy();
+        if terms.private_policy_commitment != base.private_policy_commitment {
+            proposing_policy.channel_policy = other_channel_policy();
+        }
         let mut caller = endpoint(
             client_root.path(),
             Role::Client,
             client(),
-            PaymentAdmission::Proposes,
+            PaymentAdmission::Proposes(Box::new(proposing_policy)),
         );
         let (dialer, listener) = transport_pair();
         let serving = serve(listener, service.clone());
@@ -454,6 +520,7 @@ async fn a_provider_does_not_countersign_terms_its_own_policy_refuses() {
         if let Err(error) = exchange_setup(dialer.clone(), &mut caller).await {
             panic!("the first exchange completes: {error}");
         }
+        arm(&mut caller);
         if let Err(error) = caller.propose_payment(payment_funding(), terms) {
             panic!("the client is free to propose {what}: {error}");
         }
@@ -491,12 +558,7 @@ async fn a_provider_does_not_countersign_terms_its_own_policy_refuses() {
     let provider_root = tempfile::tempdir().expect("a temp dir");
     let client_root = tempfile::tempdir().expect("a temp dir");
     let service = SetupService::new(proposing_provider(provider_root.path()));
-    let mut caller = endpoint(
-        client_root.path(),
-        Role::Client,
-        client(),
-        PaymentAdmission::Proposes,
-    );
+    let mut caller = endpoint(client_root.path(), Role::Client, client(), proposes());
     let (dialer, listener) = transport_pair();
     let serving = serve(listener, service.clone());
     complete(&dialer, &mut caller).await;
@@ -512,30 +574,22 @@ async fn a_provider_does_not_countersign_terms_its_own_policy_refuses() {
 #[tokio::test]
 async fn a_proposing_endpoint_declines_to_countersign_admissible_terms() {
     let root = tempfile::tempdir().expect("a temp dir");
-    let mut proposer = endpoint(
-        root.path(),
-        Role::Provider,
-        provider(),
-        PaymentAdmission::Proposes,
-    );
+    let mut proposer = endpoint(root.path(), Role::Provider, provider(), proposes());
+    arm(&mut proposer);
     if let Err(error) = proposer.propose_bond(network(), bond_funding(), bond_terms()) {
         panic!("the fixture provider proposes its bond: {error}");
     }
     let service = SetupService::new(proposer);
 
     let client_root = tempfile::tempdir().expect("a temp dir");
-    let mut caller = endpoint(
-        client_root.path(),
-        Role::Client,
-        client(),
-        PaymentAdmission::Proposes,
-    );
+    let mut caller = endpoint(client_root.path(), Role::Client, client(), proposes());
     let (dialer, listener) = transport_pair();
     let serving = serve(listener, service.clone());
 
     if let Err(error) = exchange_setup(dialer.clone(), &mut caller).await {
         panic!("the first exchange completes: {error}");
     }
+    arm(&mut caller);
     if let Err(error) = caller.propose_payment(payment_funding(), payment_terms(bond_edge())) {
         panic!("the client proposes its payment: {error}");
     }
@@ -565,12 +619,7 @@ async fn the_answer_is_signed_over_this_payment_open_and_no_other_hash() {
     let provider_root = tempfile::tempdir().expect("a temp dir");
     let client_root = tempfile::tempdir().expect("a temp dir");
     let service = SetupService::new(proposing_provider(provider_root.path()));
-    let mut caller = endpoint(
-        client_root.path(),
-        Role::Client,
-        client(),
-        PaymentAdmission::Proposes,
-    );
+    let mut caller = endpoint(client_root.path(), Role::Client, client(), proposes());
     let (dialer, listener) = transport_pair();
     let serving = serve(listener, service.clone());
 
@@ -625,12 +674,7 @@ async fn every_revision_is_durable_before_its_signature_leaves() {
     let provider_root = tempfile::tempdir().expect("a temp dir");
     let client_root = tempfile::tempdir().expect("a temp dir");
     let service = SetupService::new(proposing_provider(provider_root.path()));
-    let mut caller = endpoint(
-        client_root.path(),
-        Role::Client,
-        client(),
-        PaymentAdmission::Proposes,
-    );
+    let mut caller = endpoint(client_root.path(), Role::Client, client(), proposes());
     let (dialer, listener) = transport_pair();
     let serving = serve(listener, service.clone());
 
@@ -681,12 +725,7 @@ async fn a_replay_is_answered_the_same_and_writes_nothing() {
     let provider_root = tempfile::tempdir().expect("a temp dir");
     let client_root = tempfile::tempdir().expect("a temp dir");
     let service = SetupService::new(proposing_provider(provider_root.path()));
-    let mut caller = endpoint(
-        client_root.path(),
-        Role::Client,
-        client(),
-        PaymentAdmission::Proposes,
-    );
+    let mut caller = endpoint(client_root.path(), Role::Client, client(), proposes());
     let (dialer, listener) = transport_pair();
     let serving = serve(listener, service.clone());
 
@@ -717,7 +756,7 @@ async fn a_replay_is_answered_the_same_and_writes_nothing() {
     let provider = reopen(provider_root.path(), Role::Provider);
     assert_eq!(
         provider.len(),
-        3,
+        4,
         "the journal holds one record per revision and nothing for the replay",
     );
     assert_eq!(provider.state().bundle_bytes(), Some(first.as_slice()));
@@ -767,12 +806,7 @@ async fn a_stranger_cannot_make_the_provider_countersign() {
     let provider_root = tempfile::tempdir().expect("a temp dir");
     let stranger_root = tempfile::tempdir().expect("a temp dir");
     let service = SetupService::new(proposing_provider(provider_root.path()));
-    let mut interloper = endpoint(
-        stranger_root.path(),
-        Role::Client,
-        stranger(),
-        PaymentAdmission::Proposes,
-    );
+    let mut interloper = endpoint(stranger_root.path(), Role::Client, stranger(), proposes());
     let (dialer, listener) = transport_pair();
     let serving = serve(listener, service.clone());
 
@@ -781,6 +815,7 @@ async fn a_stranger_cannot_make_the_provider_countersign() {
     if let Err(error) = exchange_setup(dialer.clone(), &mut interloper).await {
         panic!("the proposal is public: {error}");
     }
+    arm(&mut interloper);
     assert_eq!(interloper.state().revision(), Some(1));
 
     // And cannot journal a revision 2 over it, because its own store
@@ -885,7 +920,7 @@ async fn refused_by_a_proposing_provider(bundle: Vec<u8>) -> (ExchangeSetupRespo
     );
     assert_eq!(
         provider.len(),
-        1,
+        2,
         "and wrote nothing for the revision it refused",
     );
     let reason = match response.outcome.as_ref() {
@@ -967,6 +1002,7 @@ async fn complete(dialer: &MuxTransport, caller: &mut SetupEndpoint) {
     if let Err(error) = exchange_setup(dialer.clone(), caller).await {
         panic!("the first exchange completes: {error}");
     }
+    arm(caller);
     if let Err(error) = caller.propose_payment(payment_funding(), payment_terms(bond_edge())) {
         panic!("the client proposes its payment: {error}");
     }

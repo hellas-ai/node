@@ -18,8 +18,8 @@ use hellas_rpc::protocol::work::{
     PaidChannelPolicyV1, PaidExecutionPolicyV1, PaidWorkError, private_policy_commitment,
 };
 use hellas_rpc::protocol::work_setup::{
-    LeaseState, OMISSION_PROBABILITY_SCALE, ObservedChannel, OmissionError, OmissionMeasurements,
-    PendingState, WorkChannelConfig, WorkChannelDescriptor, WorkSetupError,
+    CloseDescriptor, LeaseState, OMISSION_PROBABILITY_SCALE, ObservedChannel, OmissionError,
+    OmissionMeasurements, PendingState, WorkChannelConfig, WorkChannelDescriptor, WorkSetupError,
     check_omission_economics, payment_terms_hash,
 };
 use hellas_rpc::protocol::{ContentId, Digest};
@@ -935,5 +935,35 @@ fn signing_measures_the_margins_from_the_cursor_not_the_readiness_height() {
             HORIZON - 1 + margins + grace,
         ),
         Ok(()),
+    );
+}
+
+#[test]
+fn close_descriptor_round_trips_without_new_work_policy() {
+    let armed = descriptor().close_descriptor();
+    let bytes = armed.encode();
+    assert_eq!(CloseDescriptor::decode(&bytes), Ok(armed.clone()));
+    assert_eq!(
+        armed
+            .expected_settlement()
+            .expect("the admitted expected funding settles")
+            .capacity(),
+        PAYMENT_VALUE + PAYMENT_RESERVE - OMISSION_BOND,
+    );
+
+    let funded = payment_object();
+    assert_eq!(
+        armed
+            .funded_settlement(&funded)
+            .expect("funded recovery uses the edge")
+            .capacity(),
+        PAYMENT_VALUE + PAYMENT_RESERVE - OMISSION_BOND,
+    );
+
+    let mut trailing = bytes;
+    trailing.push(0);
+    assert_eq!(
+        CloseDescriptor::decode(&trailing),
+        Err(WorkSetupError::DescriptorMalformed),
     );
 }

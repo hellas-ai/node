@@ -102,10 +102,12 @@ use crate::pb::work::{
     exchange_setup_response::Outcome,
 };
 use crate::protocol::work_bundle::WorkChannelSetupBundleV1;
-use crate::protocol::work_setup::ProviderChannelPolicy;
+use crate::protocol::work_setup::{CloseDescriptor, ProviderChannelPolicy, WorkChannelDescriptor};
 use crate::services::work_setup::{WorkSetupClientImpl, WorkSetupHandler};
 use crate::work::{Refusal, WorkRefusal};
-use crate::work_store::{SetupRecord, SetupState, SetupStateError, SetupStore, WorkStoreError};
+use crate::work_store::{
+    SetupRecord, SetupScan, SetupState, SetupStateError, SetupStore, WorkStoreError,
+};
 
 // ── Refusals ──────────────────────────────────────────────────────────
 
@@ -172,8 +174,10 @@ pub enum SetupExchangeError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PaymentAdmission {
     /// This endpoint proposes payment terms and never countersigns
-    /// them. Asked to, it declines.
-    Proposes,
+    /// them. The policy is the client's copy of the channel configuration;
+    /// it is opened before revision 2 is signed so the close state for the
+    /// authorization it exports is durable even if the provider declines it.
+    Proposes(Box<ProviderChannelPolicy>),
     /// This endpoint countersigns a payment only over terms its own
     /// configuration admits.
     Admits(Box<ProviderChannelPolicy>),
@@ -212,6 +216,23 @@ impl SetupEndpoint {
     #[must_use]
     pub const fn state(&self) -> &SetupState {
         self.store.state()
+    }
+
+    /// Fsyncs this endpoint's immutable history floor at the only role/stage
+    /// where it is legal.
+    ///
+    /// A provider calls this before building revision 1. A client calls it
+    /// after importing revision 1 and before building revision 2. The setup
+    /// store refuses every other stage and writes an identical retry zero
+    /// times, so each journal contains exactly one scan arm.
+    pub fn arm_scan(&mut self, scan: SetupScan) -> Result<&SetupState, SetupExchangeError> {
+        Ok(self.store.commit(
+            SetupRecord::ScanArmed {
+                height: scan.height,
+                payload: scan.payload,
+            },
+            &Secp256k1Verifier::new(),
+        )?)
     }
 
     /// Signs the bond this endpoint will stake, and journals it before
@@ -280,6 +301,13 @@ impl SetupEndpoint {
             .bundle()
             .ok_or(SetupExchangeError::NothingHeld)?
             .clone();
+        let descriptor = self.proposal_descriptor(
+            Tx::edge_id_of(
+                &payment_funding,
+                &Terms::work_payment(payment_terms.clone()),
+            ),
+            payment_terms.clone(),
+        )?;
         let payment_hash = Tx::open_hash(
             held.network(),
             &payment_funding,
@@ -294,7 +322,7 @@ impl SetupEndpoint {
                 Auth::native(self.signer.sign(payment_hash)),
             )
             .map_err(|error| WorkStoreError::Setup(SetupStateError::Bundle(error)))?;
-        self.commit(&bundle)
+        self.commit_armed(&bundle, descriptor)
     }
 
     /// Takes one revision a peer answered with.
@@ -360,17 +388,18 @@ impl SetupEndpoint {
             // Before the signature, and that order is the whole of it: a
             // refusal here is a refusal this endpoint made with nothing
             // signed and nothing written.
-            self.admit(payment_edge, terms)?;
+            let descriptor = self.admit(payment_edge, terms)?;
             // `countersign_payment` refuses every stage but the second,
             // and the filter above is that stage. Mapped so the match
             // is total; no test reaches it, and none claims to.
             let next = bundle
                 .countersign_payment(Auth::native(self.signer.sign(hash)))
                 .map_err(|error| Refusal::new(WorkRefusal::Invalid, error.to_string()))?;
-            self.commit(&next).map_err(|error| match error {
-                SetupExchangeError::Store(store) => refuse(&store),
-                other => Refusal::new(WorkRefusal::Unavailable, other.to_string()),
-            })?;
+            self.commit_armed(&next, descriptor.close_descriptor())
+                .map_err(|error| match error {
+                    SetupExchangeError::Store(store) => refuse(&store),
+                    other => Refusal::new(WorkRefusal::Unavailable, other.to_string()),
+                })?;
         }
 
         self.state()
@@ -387,23 +416,42 @@ impl SetupEndpoint {
     /// Decides whether this endpoint will work over the channel a
     /// client has proposed.
     ///
-    /// The descriptor `admit` returns is dropped. What is wanted here is
-    /// the judgement, not the value: nothing in the handshake acts on a
-    /// descriptor, and the endpoint that eventually mounts this channel
-    /// builds its own from the same configuration against the *funded*
-    /// edge. Keeping this one would be a second copy of a decision that
-    /// has to be retaken there anyway.
-    fn admit(&self, payment_edge: EdgeId, terms: WorkPaymentTerms) -> Result<(), Refusal> {
+    /// The descriptor `admit` returns is load-bearing recovery state. The
+    /// caller commits it in the revision-3 `ArmedBundle` before returning
+    /// the countersignature; funded recovery later reprices settlement from
+    /// coherent edge state without repeating this new-work admission.
+    fn admit(
+        &self,
+        payment_edge: EdgeId,
+        terms: WorkPaymentTerms,
+    ) -> Result<WorkChannelDescriptor, Refusal> {
         match &self.admission {
-            PaymentAdmission::Proposes => Err(Refusal::new(
+            PaymentAdmission::Proposes(_) => Err(Refusal::new(
                 WorkRefusal::Declined,
                 "this endpoint proposes payment terms and does not countersign them",
             )),
             PaymentAdmission::Admits(policy) => match policy.admit(payment_edge, terms) {
-                Ok(_descriptor) => Ok(()),
+                Ok(descriptor) => Ok(descriptor),
                 Err(error) => Err(Refusal::new(WorkRefusal::Declined, error.to_string())),
             },
         }
+    }
+
+    fn proposal_descriptor(
+        &self,
+        payment_edge: EdgeId,
+        terms: WorkPaymentTerms,
+    ) -> Result<CloseDescriptor, SetupExchangeError> {
+        let PaymentAdmission::Proposes(policy) = &self.admission else {
+            return Err(SetupExchangeError::Store(WorkStoreError::Setup(
+                SetupStateError::WrongRole {
+                    step: "proposing payment terms",
+                },
+            )));
+        };
+        policy.describe_close(payment_edge, terms).map_err(|error| {
+            SetupExchangeError::Store(WorkStoreError::Setup(SetupStateError::Descriptor(error)))
+        })
     }
 
     /// Journals one revision this endpoint built.
@@ -417,6 +465,22 @@ impl SetupEndpoint {
         Ok(self.store.commit(
             SetupRecord::Bundle {
                 bundle: bundle.encode(),
+            },
+            &Secp256k1Verifier::new(),
+        )?)
+    }
+
+    /// Journals an executable revision and its close-only recovery data in
+    /// one fsynced record.
+    fn commit_armed(
+        &mut self,
+        bundle: &WorkChannelSetupBundleV1,
+        close_descriptor: CloseDescriptor,
+    ) -> Result<&SetupState, SetupExchangeError> {
+        Ok(self.store.commit(
+            SetupRecord::ArmedBundle {
+                bundle: bundle.encode(),
+                close_descriptor: Box::new(close_descriptor),
             },
             &Secp256k1Verifier::new(),
         )?)
@@ -505,25 +569,38 @@ impl WorkSetupHandler for SetupService {
 /// [`SetupExchangeError::Refused`] for a refusal,
 /// [`SetupExchangeError::Malformed`] for a response this service does
 /// not define, and whatever [`SetupEndpoint::import`] raises.
-pub async fn exchange_setup<T>(
-    transport: T,
-    endpoint: &mut SetupEndpoint,
-) -> Result<(), SetupExchangeError>
-where
-    T: StreamTransport + Sync,
-    T::Error: std::error::Error + Send + Sync + 'static,
-    T::Stream: 'static,
-{
-    let request = ExchangeSetupRequest {
+/// Builds the request under a brief immutable endpoint borrow.
+#[must_use]
+pub fn prepare_setup_exchange(endpoint: &SetupEndpoint) -> ExchangeSetupRequest {
+    ExchangeSetupRequest {
         bundle: endpoint
             .state()
             .bundle_bytes()
             .map(<[u8]>::to_vec)
             .unwrap_or_default(),
-    };
-    let response = WorkSetupClientImpl::new(transport)
+    }
+}
+
+/// Performs only the network phase; it owns no endpoint or store borrow.
+pub async fn send_setup_exchange<T>(
+    transport: T,
+    request: ExchangeSetupRequest,
+) -> Result<ExchangeSetupResponse, SetupExchangeError>
+where
+    T: StreamTransport + Sync,
+    T::Error: std::error::Error + Send + Sync + 'static,
+    T::Stream: 'static,
+{
+    Ok(WorkSetupClientImpl::new(transport)
         .exchange_setup(request)
-        .await?;
+        .await?)
+}
+
+/// Applies one network answer after the endpoint has been reacquired.
+pub fn apply_setup_exchange(
+    endpoint: &mut SetupEndpoint,
+    response: ExchangeSetupResponse,
+) -> Result<(), SetupExchangeError> {
     let bundle = match response.outcome {
         Some(Outcome::Advanced(advanced)) => advanced.bundle,
         Some(Outcome::Refused(refused)) => {

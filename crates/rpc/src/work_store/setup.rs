@@ -31,13 +31,14 @@
 //! one supplied height.
 
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use hellas_kernel::{CoinId, Edge, EdgeId, LeaseSlots, NetworkId, SigVerifier, Tx};
+use hellas_kernel::{CoinId, Decode, Edge, EdgeId, Encode, LeaseSlots, NetworkId, SigVerifier, Tx};
 use hellas_xet::XetFileHasher;
 
 use crate::protocol::Digest;
 use crate::protocol::work_bundle::{SetupBundleError, WorkChannelSetupBundleV1};
+use crate::protocol::work_setup::{CloseDescriptor, WorkSetupError};
 use crate::work_store::journal::{Journal, JournalId, JournalKind, Role};
 use crate::work_store::{Applied, WorkStoreError, cursor::Cursor, hex, put_u64};
 
@@ -86,6 +87,16 @@ pub enum SetupStateError {
     /// A record's bytes were not canonical.
     #[error("setup record is not canonical")]
     Malformed,
+    /// An armed descriptor is not for the bundle stored beside it.
+    #[error("the armed close descriptor does not describe its setup bundle")]
+    DescriptorMismatch,
+    /// The persisted or proposed close descriptor failed its structural
+    /// policy checks.
+    #[error(transparent)]
+    Descriptor(#[from] WorkSetupError),
+    /// An abort or fault cannot discard an Open that may still finalize.
+    #[error("setup cannot end while a submitted Open is unresolved")]
+    SubmittedOpenUnresolved,
 }
 
 /// How setup ended.
@@ -117,6 +128,13 @@ pub enum SetupAbort {
     /// funded.
     #[error("a coin funding the payment open was spent before the bond was posted")]
     PaymentFundingSpent,
+    /// The provider's own finalized bond Timeout consumed the stake and
+    /// returned it. Contiguous history holds the bond Open and the Close
+    /// that spent it, so the absent bond and spent funding are this
+    /// endpoint's own reclaim rather than a theft: there is no channel and
+    /// nothing to reconcile.
+    #[error("the provider's own bond timeout reclaimed the stake")]
+    BondReclaimed,
 }
 
 /// Why setup cannot continue without reconciliation.
@@ -145,6 +163,9 @@ pub enum SetupFault {
 pub enum SetupDecision {
     /// Both edges and this channel's lease are live: record completion.
     Complete,
+    /// A payment Open finalized, so close recovery must be mounted even
+    /// though the admission bond or payment edge is no longer live.
+    CloseOnly,
     /// Nothing to do here: the other party has not produced the next
     /// revision, or the transaction this endpoint is waiting on is not
     /// its own to send.
@@ -187,6 +208,34 @@ pub struct ObservedSetup<'a> {
     pub live_funding: &'a BTreeSet<CoinId>,
 }
 
+/// The immutable finalized observation floor retained before an executable
+/// authorization can leave an endpoint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SetupScan {
+    /// Finalized height already observed when the setup was armed.
+    pub height: u64,
+    /// Payload digest at `height`; the first history block must name it as
+    /// parent.
+    pub payload: [u8; 32],
+}
+
+/// One finalized header and the accepted kernel transactions in it which
+/// touch this setup's named edges.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SetupHistoryBlock {
+    pub height: u64,
+    pub parent: [u8; 32],
+    pub payload: [u8; 32],
+    pub txs: Vec<Tx>,
+}
+
+/// One bounded atomic setup-history transition.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SetupHistoryBatch {
+    /// Between one and 256 contiguous finalized blocks.
+    pub blocks: Vec<SetupHistoryBlock>,
+}
+
 /// One durable step of the handshake.
 ///
 /// Deliberately small. The two submission markers carry no transaction
@@ -200,6 +249,26 @@ pub enum SetupRecord {
         /// The revision's exact canonical bytes.
         bundle: Vec<u8>,
     },
+    /// The immutable observation floor, written once before revision 1 (the
+    /// provider) or revision 2 (the client) can be exported.
+    ScanArmed {
+        /// Finalized height already observed.
+        height: u64,
+        /// Payload digest at `height`.
+        payload: [u8; 32],
+    },
+    /// An executable revision and everything close-only recovery needs,
+    /// fsynced together before that revision is returned to the peer.
+    ArmedBundle {
+        /// The revision's exact canonical bytes.
+        bundle: Vec<u8>,
+        /// The admitted descriptor recovered without operator configuration.
+        close_descriptor: Box<CloseDescriptor>,
+    },
+    /// A bounded contiguous finalized-history transition.
+    SetupHistoryBatch(SetupHistoryBatch),
+    /// The provider is about to submit the deterministic bond Timeout.
+    BondTimeoutSubmitted,
     /// The retained bond Open is about to be broadcast.
     BondSubmitted,
     /// The retained payment Open is about to be broadcast.
@@ -229,6 +298,10 @@ mod tag {
     pub(super) const PAYMENT_SUBMITTED: u8 = 2;
     pub(super) const COMPLETE: u8 = 3;
     pub(super) const ENDED: u8 = 4;
+    pub(super) const SCAN_ARMED: u8 = 5;
+    pub(super) const ARMED_BUNDLE: u8 = 6;
+    pub(super) const SETUP_HISTORY_BATCH: u8 = 7;
+    pub(super) const BOND_TIMEOUT_SUBMITTED: u8 = 8;
 }
 
 mod end_code {
@@ -239,6 +312,7 @@ mod end_code {
     pub(super) const FAULT_LEASE_MALFORMED: u8 = 4;
     pub(super) const FAULT_LEASED_ELSEWHERE: u8 = 5;
     pub(super) const FAULT_UNEXPLAINED: u8 = 6;
+    pub(super) const ABORT_BOND_RECLAIMED: u8 = 7;
 }
 
 const fn end_to_code(end: SetupEnd) -> u8 {
@@ -250,6 +324,7 @@ const fn end_to_code(end: SetupEnd) -> u8 {
         SetupEnd::Faulted(SetupFault::LeaseMalformed) => end_code::FAULT_LEASE_MALFORMED,
         SetupEnd::Faulted(SetupFault::LeasedElsewhere) => end_code::FAULT_LEASED_ELSEWHERE,
         SetupEnd::Faulted(SetupFault::UnexplainedState) => end_code::FAULT_UNEXPLAINED,
+        SetupEnd::Aborted(SetupAbort::BondReclaimed) => end_code::ABORT_BOND_RECLAIMED,
     }
 }
 
@@ -262,6 +337,7 @@ const fn end_from_code(code: u8) -> Option<SetupEnd> {
         end_code::FAULT_LEASE_MALFORMED => SetupEnd::Faulted(SetupFault::LeaseMalformed),
         end_code::FAULT_LEASED_ELSEWHERE => SetupEnd::Faulted(SetupFault::LeasedElsewhere),
         end_code::FAULT_UNEXPLAINED => SetupEnd::Faulted(SetupFault::UnexplainedState),
+        end_code::ABORT_BOND_RECLAIMED => SetupEnd::Aborted(SetupAbort::BondReclaimed),
         _ => return None,
     })
 }
@@ -279,6 +355,37 @@ impl SetupRecord {
                 // second length here could disagree with it.
                 out.extend_from_slice(bundle);
             }
+            Self::ScanArmed { height, payload } => {
+                out.push(tag::SCAN_ARMED);
+                put_u64(&mut out, *height);
+                out.extend_from_slice(payload);
+            }
+            Self::ArmedBundle {
+                bundle,
+                close_descriptor,
+            } => {
+                out.push(tag::ARMED_BUNDLE);
+                put_u64(&mut out, u64::try_from(bundle.len()).unwrap_or(u64::MAX));
+                out.extend_from_slice(bundle);
+                out.extend_from_slice(&close_descriptor.encode());
+            }
+            Self::SetupHistoryBatch(batch) => {
+                out.push(tag::SETUP_HISTORY_BATCH);
+                out.extend_from_slice(&(batch.blocks.len() as u16).to_be_bytes());
+                for block in &batch.blocks {
+                    put_u64(&mut out, block.height);
+                    out.extend_from_slice(&block.parent);
+                    out.extend_from_slice(&block.payload);
+                    out.extend_from_slice(&(block.txs.len() as u16).to_be_bytes());
+                    for tx in &block.txs {
+                        let mut bytes = vec![0_u8; Tx::MAX_ENCODED_SIZE];
+                        let written = tx.write_to(&mut bytes);
+                        out.extend_from_slice(&(written as u32).to_be_bytes());
+                        out.extend_from_slice(&bytes[..written]);
+                    }
+                }
+            }
+            Self::BondTimeoutSubmitted => out.push(tag::BOND_TIMEOUT_SUBMITTED),
             Self::BondSubmitted => out.push(tag::BOND_SUBMITTED),
             Self::PaymentSubmitted => out.push(tag::PAYMENT_SUBMITTED),
             Self::Complete {
@@ -313,6 +420,60 @@ impl SetupRecord {
             tag::BUNDLE => Self::Bundle {
                 bundle: cursor.rest().to_vec(),
             },
+            tag::SCAN_ARMED => Self::ScanArmed {
+                height: cursor.u64().ok_or(SetupStateError::Malformed)?,
+                payload: cursor.array::<32>().ok_or(SetupStateError::Malformed)?,
+            },
+            tag::ARMED_BUNDLE => {
+                let bundle_len = usize::try_from(cursor.u64().ok_or(SetupStateError::Malformed)?)
+                    .map_err(|_| SetupStateError::Malformed)?;
+                let bundle = cursor
+                    .take(bundle_len)
+                    .ok_or(SetupStateError::Malformed)?
+                    .to_vec();
+                let close_descriptor = CloseDescriptor::decode(cursor.rest())
+                    .map_err(|_| SetupStateError::Malformed)?;
+                Self::ArmedBundle {
+                    bundle,
+                    close_descriptor: Box::new(close_descriptor),
+                }
+            }
+            tag::SETUP_HISTORY_BATCH => {
+                let count = usize::from(u16::from_be_bytes(
+                    cursor.array::<2>().ok_or(SetupStateError::Malformed)?,
+                ));
+                let mut blocks = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let height = cursor.u64().ok_or(SetupStateError::Malformed)?;
+                    let parent = cursor.array::<32>().ok_or(SetupStateError::Malformed)?;
+                    let payload = cursor.array::<32>().ok_or(SetupStateError::Malformed)?;
+                    let tx_count = usize::from(u16::from_be_bytes(
+                        cursor.array::<2>().ok_or(SetupStateError::Malformed)?,
+                    ));
+                    let mut txs = Vec::with_capacity(tx_count);
+                    for _ in 0..tx_count {
+                        let len = usize::try_from(u32::from_be_bytes(
+                            cursor.array::<4>().ok_or(SetupStateError::Malformed)?,
+                        ))
+                        .map_err(|_| SetupStateError::Malformed)?;
+                        let bytes = cursor.take(len).ok_or(SetupStateError::Malformed)?;
+                        let (tx, consumed) =
+                            Tx::decode(bytes).map_err(|_| SetupStateError::Malformed)?;
+                        if consumed != len {
+                            return Err(SetupStateError::Malformed);
+                        }
+                        txs.push(tx);
+                    }
+                    blocks.push(SetupHistoryBlock {
+                        height,
+                        parent,
+                        payload,
+                        txs,
+                    });
+                }
+                Self::SetupHistoryBatch(SetupHistoryBatch { blocks })
+            }
+            tag::BOND_TIMEOUT_SUBMITTED => Self::BondTimeoutSubmitted,
             tag::BOND_SUBMITTED => Self::BondSubmitted,
             tag::PAYMENT_SUBMITTED => Self::PaymentSubmitted,
             tag::COMPLETE => Self::Complete {
@@ -358,8 +519,17 @@ pub struct SetupState {
     role: Role,
     bundle: Option<WorkChannelSetupBundleV1>,
     bundle_bytes: Vec<u8>,
-    bond_submitted: bool,
-    payment_submitted: bool,
+    scan_armed: Option<SetupScan>,
+    close_descriptor: Option<CloseDescriptor>,
+    unresolved_bond_open: bool,
+    unresolved_payment_open: bool,
+    history_cursor: Option<SetupScan>,
+    history: Vec<SetupHistoryBlock>,
+    bond_finalized: bool,
+    payment_finalized: bool,
+    bond_closed: bool,
+    payment_closed: bool,
+    bond_timeout_submitted: bool,
     origin: Option<SetupOrigin>,
     end: Option<SetupEnd>,
 }
@@ -372,8 +542,17 @@ impl SetupState {
             role,
             bundle: None,
             bundle_bytes: Vec::new(),
-            bond_submitted: false,
-            payment_submitted: false,
+            scan_armed: None,
+            close_descriptor: None,
+            unresolved_bond_open: false,
+            unresolved_payment_open: false,
+            history_cursor: None,
+            history: Vec::new(),
+            bond_finalized: false,
+            payment_finalized: false,
+            bond_closed: false,
+            payment_closed: false,
+            bond_timeout_submitted: false,
             origin: None,
             end: None,
         }
@@ -410,6 +589,19 @@ impl SetupState {
         self.bundle.as_ref().map(|_| self.bundle_bytes.as_slice())
     }
 
+    /// Returns the immutable observation floor once this endpoint is armed.
+    #[must_use]
+    pub const fn scan_armed(&self) -> Option<SetupScan> {
+        self.scan_armed
+    }
+
+    /// Returns the close-only descriptor retained beside this role's
+    /// executable setup revision.
+    #[must_use]
+    pub const fn close_descriptor(&self) -> Option<&CloseDescriptor> {
+        self.close_descriptor.as_ref()
+    }
+
     /// Returns the bond edge this journal is keyed to.
     #[must_use]
     pub const fn bond_edge(&self) -> EdgeId {
@@ -428,14 +620,40 @@ impl SetupState {
     /// Returns whether the bond Open has been journaled as submitted.
     #[must_use]
     pub const fn bond_submitted(&self) -> bool {
-        self.bond_submitted
+        self.unresolved_bond_open
     }
 
     /// Returns whether the payment Open has been journaled as
     /// submitted.
     #[must_use]
     pub const fn payment_submitted(&self) -> bool {
-        self.payment_submitted
+        self.unresolved_payment_open
+    }
+
+    /// Returns the last contiguous finalized setup header held.
+    #[must_use]
+    pub const fn history_cursor(&self) -> Option<SetupScan> {
+        self.history_cursor
+    }
+
+    /// Returns retained relevant history for mounting a channel watcher.
+    #[must_use]
+    pub fn history(&self) -> &[SetupHistoryBlock] {
+        &self.history
+    }
+
+    /// Returns whether finalized history proves that a once-funded payment
+    /// channel can no longer be admitted as a live leased channel but still
+    /// needs its close history mounted.
+    #[must_use]
+    pub const fn close_only_recovery(&self) -> bool {
+        self.origin.is_some() && (self.bond_closed || self.payment_closed)
+    }
+
+    /// Returns whether any submitted Open remains unresolved.
+    #[must_use]
+    pub const fn submitted_open_unresolved(&self) -> bool {
+        self.unresolved_bond_open || self.unresolved_payment_open
     }
 
     /// Returns where the channel was finalized, once setup completed.
@@ -560,9 +778,10 @@ impl SetupState {
                 Leased::Faulty => SetupDecision::Fault(SetupFault::LeaseMalformed),
                 Leased::Here => SetupDecision::Fault(SetupFault::UnexplainedState),
             },
-            // A payment edge whose bond is gone is not a channel and
-            // not a state this handshake produces.
-            (false, true) => SetupDecision::Fault(SetupFault::UnexplainedState),
+            // A leased bond may be permissionlessly timed out at its
+            // horizon while the payment edge survives. Admission is over,
+            // but the payment edge still carries a close duty.
+            (false, true) => SetupDecision::CloseOnly,
             (false, false) => self.decide_absent_bond(observed),
         }
     }
@@ -599,6 +818,21 @@ impl SetupState {
             return SetupDecision::AwaitingCounterparty;
         }
         if !funding_live(&bond, observed.live_funding) {
+            if self.bond_closed {
+                // The bond finalized and contiguous history holds the
+                // Close that spent it. For a provider that is the only
+                // party to record bond Close evidence, that Close is its
+                // own Timeout: the stake input is gone because the stake
+                // came back, and the reclaim is clean rather than a fault.
+                return SetupDecision::Abort(SetupAbort::BondReclaimed);
+            }
+            if self.bond_timeout_submitted {
+                // This endpoint submitted the deterministic Timeout that
+                // is spending the stake. History has not yet caught the
+                // finalized Close, so its own reclaim in flight must not
+                // be journaled as a theft: it waits for the Close.
+                return SetupDecision::AwaitingCounterparty;
+            }
             // The stake input is gone and no bond exists to explain it.
             // Nothing here can tell a duplicate submission from a theft,
             // so this stops rather than guessing.
@@ -635,28 +869,70 @@ impl SetupState {
         }
         match record {
             SetupRecord::Bundle { bundle } => self.apply_bundle(bundle),
+            SetupRecord::ScanArmed { height, payload } => {
+                let scan = SetupScan {
+                    height: *height,
+                    payload: *payload,
+                };
+                if self.scan_armed == Some(scan) {
+                    return Ok(Applied::Redundant);
+                }
+                if self.scan_armed.is_some() {
+                    return Err(SetupStateError::WrongStage {
+                        step: "arming a second scan floor",
+                        revision: self.revision(),
+                    });
+                }
+                let stage_is_right = match self.role {
+                    Role::Provider => self.revision().is_none(),
+                    Role::Client => self.revision() == Some(1),
+                };
+                if !stage_is_right {
+                    return Err(SetupStateError::WrongStage {
+                        step: "arming the history scan",
+                        revision: self.revision(),
+                    });
+                }
+                self.scan_armed = Some(scan);
+                self.history_cursor = Some(scan);
+                Ok(Applied::Changed)
+            }
+            SetupRecord::ArmedBundle {
+                bundle,
+                close_descriptor,
+            } => self.apply_armed_bundle(bundle, close_descriptor),
+            SetupRecord::SetupHistoryBatch(batch) => self.apply_history_batch(batch),
+            SetupRecord::BondTimeoutSubmitted => {
+                self.require_provider("bond Timeout submission")?;
+                self.require_executable("bond Timeout submission")?;
+                if self.bond_timeout_submitted {
+                    return Ok(Applied::Redundant);
+                }
+                self.bond_timeout_submitted = true;
+                Ok(Applied::Changed)
+            }
             SetupRecord::BondSubmitted => {
                 self.require_provider("bond submission")?;
                 self.require_executable("bond submission")?;
-                if self.bond_submitted {
+                if self.unresolved_bond_open {
                     return Ok(Applied::Redundant);
                 }
-                self.bond_submitted = true;
+                self.unresolved_bond_open = true;
                 Ok(Applied::Changed)
             }
             SetupRecord::PaymentSubmitted => {
                 self.require_provider("payment submission")?;
                 self.require_executable("payment submission")?;
-                if !self.bond_submitted {
+                if !self.bond_finalized && !self.unresolved_bond_open {
                     return Err(SetupStateError::WrongStage {
                         step: "payment submission before the bond was submitted",
                         revision: self.revision(),
                     });
                 }
-                if self.payment_submitted {
+                if self.unresolved_payment_open {
                     return Ok(Applied::Redundant);
                 }
-                self.payment_submitted = true;
+                self.unresolved_payment_open = true;
                 Ok(Applied::Changed)
             }
             SetupRecord::Complete {
@@ -688,6 +964,9 @@ impl SetupState {
                     // would leave a watcher with no cursor.
                     return Err(SetupStateError::Malformed);
                 }
+                if self.submitted_open_unresolved() {
+                    return Err(SetupStateError::SubmittedOpenUnresolved);
+                }
                 self.end = Some(*outcome);
                 Ok(Applied::Changed)
             }
@@ -696,6 +975,79 @@ impl SetupState {
 
     fn apply_bundle(&mut self, bytes: &[u8]) -> Result<Applied, SetupStateError> {
         let bundle = WorkChannelSetupBundleV1::decode(bytes)?;
+        if self.bundle.as_ref() == Some(&bundle) {
+            return Ok(Applied::Redundant);
+        }
+        if bundle.network() != self.network {
+            return Err(SetupStateError::WrongChannel { field: "network" });
+        }
+        if bundle.bond_edge() != self.bond_edge {
+            return Err(SetupStateError::WrongChannel { field: "bond edge" });
+        }
+        if let Some(held) = &self.bundle {
+            bundle.check_extends(held)?;
+        }
+        if matches!(
+            (self.role, bundle.revision()),
+            (Role::Client, 2) | (Role::Provider, 3)
+        ) {
+            return Err(SetupStateError::WrongStage {
+                step: "recording an executable revision without its close descriptor",
+                revision: self.revision(),
+            });
+        }
+        if self.role == Role::Provider && bundle.revision() == 1 && self.scan_armed.is_none() {
+            return Err(SetupStateError::WrongStage {
+                step: "recording revision 1 before arming its scan floor",
+                revision: self.revision(),
+            });
+        }
+        self.apply_decoded_bundle(bytes, bundle)
+    }
+
+    fn apply_armed_bundle(
+        &mut self,
+        bytes: &[u8],
+        close_descriptor: &CloseDescriptor,
+    ) -> Result<Applied, SetupStateError> {
+        let bundle = WorkChannelSetupBundleV1::decode(bytes)?;
+        let expected_revision = match self.role {
+            Role::Client => 2,
+            Role::Provider => 3,
+        };
+        if bundle.revision() != expected_revision || self.scan_armed.is_none() {
+            return Err(SetupStateError::WrongStage {
+                step: "arming an executable setup bundle",
+                revision: self.revision(),
+            });
+        }
+        if self.bundle.as_ref() == Some(&bundle) {
+            if self.close_descriptor.as_ref() == Some(close_descriptor) {
+                return Ok(Applied::Redundant);
+            }
+            return Err(SetupStateError::DescriptorMismatch);
+        }
+        let Some(payment_edge) = bundle.payment_edge() else {
+            return Err(SetupStateError::DescriptorMismatch);
+        };
+        if close_descriptor.channel().network() != bundle.network()
+            || close_descriptor.channel().payment_edge() != payment_edge
+            || bundle.payment_terms() != Some(close_descriptor.channel().payment_terms())
+            || close_descriptor.bond_edge() != bundle.bond_edge()
+        {
+            return Err(SetupStateError::DescriptorMismatch);
+        }
+        let applied = self.apply_decoded_bundle(bytes, bundle)?;
+        debug_assert_eq!(applied, Applied::Changed);
+        self.close_descriptor = Some(close_descriptor.clone());
+        Ok(Applied::Changed)
+    }
+
+    fn apply_decoded_bundle(
+        &mut self,
+        bytes: &[u8],
+        bundle: WorkChannelSetupBundleV1,
+    ) -> Result<Applied, SetupStateError> {
         if bundle.network() != self.network {
             return Err(SetupStateError::WrongChannel { field: "network" });
         }
@@ -717,6 +1069,105 @@ impl SetupState {
         self.bundle = Some(bundle);
         self.bundle_bytes = bytes.to_vec();
         Ok(Applied::Changed)
+    }
+
+    fn apply_history_batch(
+        &mut self,
+        batch: &SetupHistoryBatch,
+    ) -> Result<Applied, SetupStateError> {
+        if batch.blocks.is_empty() || batch.blocks.len() > 256 {
+            return Err(SetupStateError::Malformed);
+        }
+        let Some(mut held) = self.history_cursor else {
+            return Err(SetupStateError::WrongStage {
+                step: "recording history before arming its scan floor",
+                revision: self.revision(),
+            });
+        };
+        if batch
+            .blocks
+            .last()
+            .is_some_and(|last| last.height <= held.height)
+        {
+            return Ok(Applied::Redundant);
+        }
+        let payment_edge = self.payment_edge().ok_or(SetupStateError::WrongStage {
+            step: "recording history before the payment edge is named",
+            revision: self.revision(),
+        })?;
+        for block in &batch.blocks {
+            if block.height != held.height.saturating_add(1) || block.parent != held.payload {
+                return Err(SetupStateError::Malformed);
+            }
+            for tx in &block.txs {
+                if !touches_setup(tx, self.bond_edge, payment_edge) {
+                    return Err(SetupStateError::Malformed);
+                }
+                if self.role == Role::Client
+                    && matches!(tx, Tx::Close { input, .. } if *input == self.bond_edge)
+                {
+                    return Err(SetupStateError::WrongRole {
+                        step: "recording bond Close evidence",
+                    });
+                }
+                match tx {
+                    Tx::Open { funding, terms, .. } => {
+                        let edge = Tx::edge_id_of(funding, terms);
+                        if edge == self.bond_edge {
+                            self.bond_finalized = true;
+                            self.bond_closed = false;
+                            self.unresolved_bond_open = false;
+                        } else if edge == payment_edge {
+                            self.payment_finalized = true;
+                            self.payment_closed = false;
+                            self.unresolved_payment_open = false;
+                            if self.origin.is_none() {
+                                self.origin = Some(SetupOrigin {
+                                    payment_edge,
+                                    height: block.height,
+                                    payload: block.payload,
+                                    parent: block.parent,
+                                });
+                            }
+                        }
+                    }
+                    Tx::Close { input, .. } if *input == self.bond_edge => {
+                        self.bond_closed = true;
+                    }
+                    Tx::Close { input, .. } if *input == payment_edge => {
+                        self.payment_closed = true;
+                    }
+                    _ => {}
+                }
+            }
+            held = SetupScan {
+                height: block.height,
+                payload: block.payload,
+            };
+        }
+        self.history_cursor = Some(held);
+        if self.unresolved_bond_open && held.height > self.open_horizon(true).unwrap_or(u64::MAX) {
+            self.unresolved_bond_open = false;
+        }
+        if self.unresolved_payment_open
+            && held.height > self.open_horizon(false).unwrap_or(u64::MAX)
+        {
+            self.unresolved_payment_open = false;
+        }
+        self.history.extend(batch.blocks.iter().cloned());
+        Ok(Applied::Changed)
+    }
+
+    fn open_horizon(&self, bond: bool) -> Option<u64> {
+        let tx = if bond {
+            self.bond_open()
+        } else {
+            self.payment_open()
+        }?;
+        let Tx::Open { terms, .. } = tx else {
+            return None;
+        };
+        Some(terms.timeout().get())
     }
 
     fn require_provider(&self, step: &'static str) -> Result<(), SetupStateError> {
@@ -759,10 +1210,27 @@ fn funding_live(tx: &Tx, live: &BTreeSet<CoinId>) -> bool {
         .all(|coin| live.contains(coin))
 }
 
+fn touches_setup(tx: &Tx, bond_edge: EdgeId, payment_edge: EdgeId) -> bool {
+    match tx {
+        Tx::Open { funding, terms, .. } => {
+            let edge = Tx::edge_id_of(funding, terms);
+            edge == bond_edge || edge == payment_edge
+        }
+        Tx::Close { input, .. } => *input == bond_edge || *input == payment_edge,
+        Tx::Move { action } => match action {
+            hellas_kernel::Move::StartPaymentClose(start) => start.payment_edge() == payment_edge,
+            hellas_kernel::Move::RespondPaymentClose(response) => {
+                response.payment_edge() == payment_edge
+            }
+        },
+    }
+}
+
 /// The durable setup journal: the state above, plus the file it is
 /// replayed from.
 #[derive(Debug)]
 pub struct SetupStore {
+    root: PathBuf,
     journal: Journal,
     state: SetupState,
     torn_tail: bool,
@@ -803,6 +1271,7 @@ impl SetupStore {
             state.apply(&record)?;
         }
         Ok(Self {
+            root: root.to_path_buf(),
             journal,
             state,
             torn_tail: replay.truncated_tail,
@@ -825,6 +1294,18 @@ impl SetupStore {
     #[must_use]
     pub const fn state(&self) -> &SetupState {
         &self.state
+    }
+
+    /// Returns the root under which recovered channel journals are mounted.
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Returns which endpoint owns this setup journal.
+    #[must_use]
+    pub const fn role(&self) -> Role {
+        self.state.role
     }
 
     /// Journals one step, and returns only once it is on the disk.
@@ -877,8 +1358,9 @@ fn check_signatures<V: SigVerifier>(
     record: &SetupRecord,
     verifier: &V,
 ) -> Result<(), SetupStateError> {
-    let SetupRecord::Bundle { bundle } = record else {
-        return Ok(());
+    let bundle = match record {
+        SetupRecord::Bundle { bundle } | SetupRecord::ArmedBundle { bundle, .. } => bundle,
+        _ => return Ok(()),
     };
     let decoded = WorkChannelSetupBundleV1::decode(bundle)?;
     decoded.check(verifier)?;

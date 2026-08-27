@@ -50,12 +50,14 @@
 //! its own deadlines, and it is [`ReadyChannel::check_signable`].
 
 use hellas_kernel::{
-    BlockHeight, Edge, EdgeId, EdgeValues, LeaseSlots, NetworkId, PendingSlot, Terms, TermsHash,
-    WorkPaymentSettlement, WorkPaymentTerms, work_payment_settlement,
+    BlockHeight, Decode, DecodeError, Edge, EdgeId, EdgeValues, Encode, Fees, LeaseSlots,
+    NetworkId, PendingSlot, Terms, TermsHash, TermsProfile, WorkPaymentSettlement,
+    WorkPaymentTerms, work_payment_settlement,
 };
 
 use crate::protocol::work::{
-    PaidChannel, PaidChannelPolicyV1, PaidExecutionPolicyV1, PaidWorkError, check_execution_policy,
+    PaidChannel, PaidChannelPolicyV1, PaidExecutionPolicyV1, PaidWorkError, PrivateRecord,
+    check_execution_policy,
 };
 
 /// Denominator of the omission-contest probability `q`.
@@ -176,6 +178,9 @@ pub enum WorkSetupError {
         /// Blocks the policy measured as necessary.
         grace: u64,
     },
+    /// A persisted close descriptor was not its one canonical encoding.
+    #[error("the close descriptor is not canonical")]
+    DescriptorMalformed,
 }
 
 /// What the bond's two lease slots held, without the record itself.
@@ -351,6 +356,46 @@ pub struct ProviderChannelPolicy {
 }
 
 impl ProviderChannelPolicy {
+    /// Builds the close-only descriptor a client must arm before exporting
+    /// revision 2.
+    ///
+    /// This checks the committed policy body, execution-policy shape, and
+    /// expected settleability because recovery needs those values to be
+    /// coherent. It deliberately does not run omission economics: those are
+    /// the provider's new-work admission judgement, made before revision 3,
+    /// and a client must retain recovery data even when the provider later
+    /// refuses its proposed terms.
+    pub fn describe_close(
+        &self,
+        payment_edge: EdgeId,
+        payment_terms: WorkPaymentTerms,
+    ) -> Result<CloseDescriptor, WorkSetupError> {
+        let bond_edge = payment_terms.bond_edge;
+        let channel = PaidChannel::new(
+            self.network,
+            payment_edge,
+            payment_terms,
+            &self.policy_salt,
+            self.channel_policy,
+        )?;
+        check_execution_policy(&self.execution_policy)?;
+        if work_payment_settlement(
+            self.expected_payment_values,
+            channel.payment_terms().omission_bond,
+        )
+        .is_none()
+        {
+            return Err(WorkSetupError::Unsettleable);
+        }
+        Ok(CloseDescriptor {
+            channel,
+            bond_edge,
+            policy_salt: self.policy_salt,
+            execution_policy: self.execution_policy,
+            expected_payment_values: self.expected_payment_values,
+        })
+    }
+
     /// Opens the descriptor for terms a client has proposed, or says why
     /// this provider will not work over them.
     ///
@@ -396,7 +441,9 @@ pub struct WorkChannelDescriptor {
     channel: PaidChannel,
     bond_edge: EdgeId,
     bond_terms_hash: TermsHash,
+    policy_salt: [u8; 32],
     execution_policy: PaidExecutionPolicyV1,
+    expected_payment_values: EdgeValues,
     omission: OmissionMeasurements,
 }
 
@@ -450,7 +497,9 @@ impl WorkChannelDescriptor {
             channel,
             bond_edge,
             bond_terms_hash,
+            policy_salt: config.policy_salt,
             execution_policy: config.execution_policy,
+            expected_payment_values: config.expected_payment_values,
             omission: config.omission,
         })
     }
@@ -473,6 +522,19 @@ impl WorkChannelDescriptor {
     /// Returns the height at and after which the channel admits no work.
     pub const fn admission_horizon(&self) -> BlockHeight {
         self.channel.payment_terms().admission_horizon()
+    }
+
+    /// Returns the self-contained descriptor recovery needs after an
+    /// executable setup revision has escaped this process.
+    #[must_use]
+    pub fn close_descriptor(&self) -> CloseDescriptor {
+        CloseDescriptor {
+            channel: self.channel.clone(),
+            bond_edge: self.bond_edge,
+            policy_salt: self.policy_salt,
+            execution_policy: self.execution_policy,
+            expected_payment_values: self.expected_payment_values,
+        }
     }
 
     /// Decides whether this configured channel is the channel on chain.
@@ -596,6 +658,222 @@ impl WorkChannelDescriptor {
             finalized_height: observed.height,
             admission_horizon: horizon,
         })
+    }
+}
+
+/// Everything close-only recovery cannot reconstruct after configuration
+/// loss.
+///
+/// The complete payment terms inside [`PaidChannel`] also carry the complete
+/// bond terms and the private-policy commitment.  The opened policy body and
+/// its salt travel beside them, as do the execution policy and expected
+/// payment funding.  The latter has one interpretation, exposed by
+/// [`Self::expected_settlement`].
+///
+/// The provider's revision-3 value comes from a [`WorkChannelDescriptor`]
+/// whose new-work admission gates passed. The client's revision-2 value is
+/// armed earlier, after its policy commitment, execution-policy shape, and
+/// expected settleability have been checked but before the provider decides
+/// omission economics. Funded recovery deliberately does not run those gates
+/// again: [`Self::funded_settlement`] checks the coherent payment edge and
+/// derives the settlement consensus will use directly from that edge.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CloseDescriptor {
+    channel: PaidChannel,
+    bond_edge: EdgeId,
+    policy_salt: [u8; 32],
+    execution_policy: PaidExecutionPolicyV1,
+    expected_payment_values: EdgeValues,
+}
+
+/// First byte of the close descriptor stored in an armed setup record.
+const CLOSE_DESCRIPTOR_VERSION: u8 = 1;
+
+impl CloseDescriptor {
+    /// Returns the payment channel, including both complete terms bodies and
+    /// the opened private credit-policy body.
+    #[must_use]
+    pub const fn channel(&self) -> &PaidChannel {
+        &self.channel
+    }
+
+    /// Returns the bond edge the payment terms insure through.
+    #[must_use]
+    pub const fn bond_edge(&self) -> EdgeId {
+        self.bond_edge
+    }
+
+    /// Returns the execution policy the armed endpoint accepted.
+    #[must_use]
+    pub const fn execution_policy(&self) -> &PaidExecutionPolicyV1 {
+        &self.execution_policy
+    }
+
+    /// Returns what the provider expected the configured payment funding to
+    /// settle when it admitted the setup.
+    pub fn expected_settlement(&self) -> Result<WorkPaymentSettlement, WorkSetupError> {
+        work_payment_settlement(
+            self.expected_payment_values,
+            self.channel.payment_terms().omission_bond,
+        )
+        .ok_or(WorkSetupError::Unsettleable)
+    }
+
+    /// Derives the actual close settlement from one funded payment edge.
+    ///
+    /// This is the recovery path.  It checks only that the coherent edge is
+    /// this descriptor's edge under these terms and parties, then runs the
+    /// kernel's settlement arithmetic over the edge values.  It does not
+    /// rerun policy commitment, execution-envelope, horizon, or omission
+    /// admission gates: those decide new work, not whether already-exported
+    /// Opens must be closed.
+    pub fn funded_settlement(
+        &self,
+        payment: &Edge,
+    ) -> Result<WorkPaymentSettlement, WorkSetupError> {
+        if payment.terms() != self.channel.payment_terms_hash() {
+            return Err(WorkSetupError::TermsMismatch {
+                object: "the armed payment edge",
+            });
+        }
+        if payment.parties() != self.channel.payment_terms().parties() {
+            return Err(WorkSetupError::PartiesMismatch {
+                object: "the armed payment edge",
+            });
+        }
+        work_payment_settlement(payment.values(), self.channel.payment_terms().omission_bond)
+            .ok_or(WorkSetupError::Unsettleable)
+    }
+
+    /// Returns the descriptor's canonical journal bytes.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = vec![CLOSE_DESCRIPTOR_VERSION];
+        push_kernel(&mut out, &self.channel.network());
+        push_kernel(&mut out, &self.channel.payment_edge());
+        push_kernel(
+            &mut out,
+            &Terms::work_payment(self.channel.payment_terms().clone()),
+        );
+        out.extend_from_slice(&self.policy_salt);
+        out.extend_from_slice(&self.channel.channel_policy().encode());
+        out.extend_from_slice(&self.execution_policy.encode());
+        out.extend_from_slice(&self.expected_payment_values.value().to_be_bytes());
+        out.extend_from_slice(&self.expected_payment_values.reserve().to_be_bytes());
+        push_kernel(&mut out, &self.expected_payment_values.close_fees());
+        out
+    }
+
+    /// Reads one descriptor from exactly its canonical journal bytes.
+    ///
+    /// The policy commitment and execution policy are checked while the
+    /// value is rebuilt.  Omission economics and readiness are intentionally
+    /// absent: they are new-work decisions and funded recovery must not
+    /// rerun them.
+    pub fn decode(bytes: &[u8]) -> Result<Self, WorkSetupError> {
+        let mut cursor = CloseCursor { bytes };
+        if cursor.byte()? != CLOSE_DESCRIPTOR_VERSION {
+            return Err(WorkSetupError::DescriptorMalformed);
+        }
+        let network = cursor.network()?;
+        let payment_edge: EdgeId = cursor.field()?;
+        let payment_terms = match cursor.field::<Terms>()?.profile() {
+            TermsProfile::WorkPayment(terms) => terms.clone(),
+            _ => return Err(WorkSetupError::DescriptorMalformed),
+        };
+        let policy_salt = cursor.array::<32>()?;
+        let channel_policy =
+            PaidChannelPolicyV1::decode(cursor.take(PaidChannelPolicyV1::ENCODED_SIZE)?)
+                .map_err(|_| WorkSetupError::DescriptorMalformed)?;
+        let execution_policy =
+            PaidExecutionPolicyV1::decode(cursor.take(PaidExecutionPolicyV1::ENCODED_SIZE)?)
+                .map_err(|_| WorkSetupError::DescriptorMalformed)?;
+        let expected_payment_values =
+            EdgeValues::new(cursor.u64()?, cursor.u64()?, cursor.field::<Fees>()?);
+        if !cursor.bytes.is_empty() {
+            return Err(WorkSetupError::DescriptorMalformed);
+        }
+
+        let channel = PaidChannel::new(
+            network,
+            payment_edge,
+            payment_terms,
+            &policy_salt,
+            channel_policy,
+        )?;
+        check_execution_policy(&execution_policy)?;
+        if work_payment_settlement(
+            expected_payment_values,
+            channel.payment_terms().omission_bond,
+        )
+        .is_none()
+        {
+            return Err(WorkSetupError::Unsettleable);
+        }
+        Ok(Self {
+            bond_edge: channel.payment_terms().bond_edge,
+            channel,
+            policy_salt,
+            execution_policy,
+            expected_payment_values,
+        })
+    }
+}
+
+fn push_kernel<E: Encode>(out: &mut Vec<u8>, value: &E) {
+    let mut bytes = vec![0_u8; E::MAX_ENCODED_SIZE];
+    let written = value.write_to(&mut bytes);
+    out.extend_from_slice(&bytes[..written]);
+}
+
+struct CloseCursor<'a> {
+    bytes: &'a [u8],
+}
+
+impl CloseCursor<'_> {
+    fn byte(&mut self) -> Result<u8, WorkSetupError> {
+        let (byte, rest) = self
+            .bytes
+            .split_first()
+            .ok_or(WorkSetupError::DescriptorMalformed)?;
+        self.bytes = rest;
+        Ok(*byte)
+    }
+
+    fn take(&mut self, len: usize) -> Result<&[u8], WorkSetupError> {
+        let (value, rest) = self
+            .bytes
+            .split_at_checked(len)
+            .ok_or(WorkSetupError::DescriptorMalformed)?;
+        self.bytes = rest;
+        Ok(value)
+    }
+
+    fn array<const N: usize>(&mut self) -> Result<[u8; N], WorkSetupError> {
+        self.take(N)?
+            .try_into()
+            .map_err(|_| WorkSetupError::DescriptorMalformed)
+    }
+
+    fn u64(&mut self) -> Result<u64, WorkSetupError> {
+        self.array::<8>().map(u64::from_be_bytes)
+    }
+
+    fn network(&mut self) -> Result<NetworkId, WorkSetupError> {
+        let len = usize::from(self.byte()?);
+        let bytes = self.take(len)?;
+        let id = core::str::from_utf8(bytes).map_err(|_| WorkSetupError::DescriptorMalformed)?;
+        NetworkId::new(id).ok_or(WorkSetupError::DescriptorMalformed)
+    }
+
+    fn field<T: Decode>(&mut self) -> Result<T, WorkSetupError> {
+        let (value, consumed) =
+            T::decode(self.bytes).map_err(|_: DecodeError| WorkSetupError::DescriptorMalformed)?;
+        self.bytes = self
+            .bytes
+            .get(consumed..)
+            .ok_or(WorkSetupError::DescriptorMalformed)?;
+        Ok(value)
     }
 }
 

@@ -175,6 +175,27 @@ pub enum ChannelStateError {
     /// cannot know the outcome of.
     #[error("the job's invocation is indeterminate after a restart; a result now would be a guess")]
     Indeterminate,
+    /// A provider co-signature was applied after its authorization's
+    /// acceptance deadline.
+    #[error(
+        "a job accepted at finalized height {height} is past the acceptance deadline {deadline}"
+    )]
+    AcceptanceLate {
+        /// Finalized cursor consumed by the durable apply.
+        height: u64,
+        /// Deadline the authorization carries.
+        deadline: u64,
+    },
+    /// Backend dispatch was durably applied after the terminal deadline.
+    #[error(
+        "a job dispatched at finalized height {height} is past the terminal deadline {deadline}"
+    )]
+    DispatchLate {
+        /// Finalized cursor consumed by the durable apply.
+        height: u64,
+        /// Deadline the authorization carries.
+        deadline: u64,
+    },
     /// A result reached the client after the height it was owed by.
     ///
     /// Late plaintext earns nothing: the provider signed a terminal
@@ -450,6 +471,17 @@ pub enum ChannelRecord {
         start_id: StartId,
         /// Which party opened it.
         opener: Party,
+        /// Height at which the response window shuts. The block that
+        /// accepted the start fixed it, and recovery reads it here rather
+        /// than from a second finalized snapshot: a provider that
+        /// restarts with this record must know whether the window it may
+        /// answer in is still open.
+        response_deadline: u64,
+        /// The cumulative amount the opener's own start claimed. A
+        /// provider answers only a contest opened below what it already
+        /// holds, so this is the floor its own certificate must strictly
+        /// exceed for an answer to exist.
+        claimed: u64,
     },
     /// A close consuming this channel's payment edge was finalized.
     CloseSettled {
@@ -558,10 +590,17 @@ impl ChannelRecord {
                 // length.
                 out.extend_from_slice(&encode_kernel(start.as_ref()));
             }
-            Self::CloseOpened { start_id, opener } => {
+            Self::CloseOpened {
+                start_id,
+                opener,
+                response_deadline,
+                claimed,
+            } => {
                 out.push(tag::CLOSE_OPENED);
                 out.extend_from_slice(&start_id.to_bytes());
                 out.push(party_code(*opener));
+                put_u64(&mut out, *response_deadline);
+                put_u64(&mut out, *claimed);
             }
             Self::CloseSettled {
                 height,
@@ -632,6 +671,8 @@ impl ChannelRecord {
                         .ok_or(ChannelStateError::Malformed)?,
                 ),
                 opener: party(cursor.byte().ok_or(ChannelStateError::Malformed)?)?,
+                response_deadline: cursor.u64().ok_or(ChannelStateError::Malformed)?,
+                claimed: cursor.u64().ok_or(ChannelStateError::Malformed)?,
             },
             tag::CLOSE_SETTLED => Self::CloseSettled {
                 height: cursor.u64().ok_or(ChannelStateError::Malformed)?,
@@ -881,8 +922,30 @@ pub struct ChannelState {
     cursor: (u64, [u8; 32]),
     indeterminate: bool,
     close_prepared: Option<PaymentCloseStart>,
-    close_opened: Option<(StartId, Party)>,
+    close_opened: Option<OpenContest>,
     close_settled: Option<CloseSettlement>,
+}
+
+/// A finalized close contest on this channel's payment edge, and
+/// everything a recovering provider needs to answer it without a second
+/// finalized snapshot.
+///
+/// The [`Self::start_id`] and [`Self::opener`] are what the watcher can
+/// read nowhere but from the block that accepted the start. The
+/// [`Self::response_deadline`] and [`Self::claimed`] ride with them
+/// because an answer exists only while the window is open and only for a
+/// contest opened below what this endpoint already holds, and a restart
+/// that kept only the identifier could decide neither.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OpenContest {
+    /// Contest a later response or close must name.
+    pub start_id: StartId,
+    /// Which party opened it.
+    pub opener: Party,
+    /// Height at which the response window shuts.
+    pub response_deadline: u64,
+    /// Cumulative amount the opener's own start claimed.
+    pub claimed: u64,
 }
 
 /// What a finalized close of this channel's payment edge paid, and
@@ -1089,6 +1152,20 @@ impl ChannelState {
     /// and the party that opened it.
     #[must_use]
     pub const fn close_opened(&self) -> Option<(StartId, Party)> {
+        match self.close_opened {
+            Some(contest) => Some((contest.start_id, contest.opener)),
+            None => None,
+        }
+    }
+
+    /// Returns the finalized contest in full, including the window and
+    /// the amount an answer must strictly exceed.
+    ///
+    /// Where [`Self::close_opened`] answers "is there a contest, and
+    /// whose", this answers "may this endpoint still answer it, and with
+    /// what floor" — the two facts a restart services the response from.
+    #[must_use]
+    pub const fn open_contest(&self) -> Option<OpenContest> {
         self.close_opened
     }
 
@@ -1224,9 +1301,17 @@ impl ChannelState {
             ),
             ChannelRecord::JobEnded { reason } => self.apply_ended(*reason),
             ChannelRecord::ClosePrepared { start } => self.apply_close_prepared(start),
-            ChannelRecord::CloseOpened { start_id, opener } => {
-                self.apply_close_opened(*start_id, *opener)
-            }
+            ChannelRecord::CloseOpened {
+                start_id,
+                opener,
+                response_deadline,
+                claimed,
+            } => self.apply_close_opened(OpenContest {
+                start_id: *start_id,
+                opener: *opener,
+                response_deadline: *response_deadline,
+                claimed: *claimed,
+            }),
             ChannelRecord::CloseSettled {
                 height,
                 payload,
@@ -1389,12 +1474,8 @@ impl ChannelState {
     /// first — see `work_close::observe` — and this refusal is what
     /// makes that the only order a journal can be written or replayed
     /// in.
-    fn apply_close_opened(
-        &mut self,
-        start_id: StartId,
-        opener: Party,
-    ) -> Result<Applied, ChannelStateError> {
-        if self.close_opened == Some((start_id, opener)) {
+    fn apply_close_opened(&mut self, contest: OpenContest) -> Result<Applied, ChannelStateError> {
+        if self.close_opened == Some(contest) {
             return Ok(Applied::Redundant);
         }
         if self.close_settled.is_some() {
@@ -1408,7 +1489,7 @@ impl ChannelState {
             });
         }
         self.refuse_open_job("opening a close contest")?;
-        self.close_opened = Some((start_id, opener));
+        self.close_opened = Some(contest);
         Ok(Applied::Changed)
     }
 
@@ -1576,6 +1657,13 @@ impl ChannelState {
                 phase: job.phase.name(),
             });
         }
+        let (height, _) = self.cursor;
+        if height > job.authorization.acceptance_deadline {
+            return Err(ChannelStateError::AcceptanceLate {
+                height,
+                deadline: job.authorization.acceptance_deadline,
+            });
+        }
         if !verifier.verify_sig(
             provider_signature,
             self.provider_key(),
@@ -1604,6 +1692,13 @@ impl ChannelState {
                     phase: phase.name(),
                 });
             }
+        }
+        let (height, _) = self.cursor;
+        if height > job.authorization.terminal_deadline {
+            return Err(ChannelStateError::DispatchLate {
+                height,
+                deadline: job.authorization.terminal_deadline,
+            });
         }
         job.phase = JobPhase::Running;
         self.job = Some(job);

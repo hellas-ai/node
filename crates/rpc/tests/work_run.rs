@@ -957,8 +957,12 @@ async fn a_restart_runs_the_job_that_was_accepted() {
 async fn the_last_height_the_margins_fit_is_the_last_that_may_run() {
     for (height, may_run) in [(LAST_DISPATCH, true), (LAST_DISPATCH + 1, false)] {
         let dir = temp();
-        let mut store = store_at(dir.path(), height);
+        // Acceptance happened at the earlier phase boundary. Only after
+        // that durable signature exists does the watcher catch the journal
+        // up to the dispatch boundary under test.
+        let mut store = store_at(dir.path(), CURSOR);
         let id = accept(&mut store, 1);
+        advance(&mut store, height);
         let service = serving(store);
         let backend = CountingBackend::new(Answer::Transcript);
         let outcome = run_accepted_work(&service, &ready_at(height), &backend, id).await;

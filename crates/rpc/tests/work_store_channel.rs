@@ -342,7 +342,7 @@ fn authorization_for(channel: &PaidChannel, nonce: u64) -> PaidJobAuthorizationV
             Err(error) => panic!("the fixture bundle hashes: {error}"),
         },
         proposal_nonce: nonce,
-        acceptance_deadline: 100,
+        acceptance_deadline: 160,
         request_commitment: Evaluate::commit_request(&evaluate_request(nonce)),
         environment_commitment: manifest().content_id(),
         price: PRICE,
@@ -636,8 +636,8 @@ fn the_terminal_deadline_is_the_last_height_a_receipt_may_be_recorded_at() {
     for (height, timely) in [(deadline, true), (deadline + 1, false)] {
         let dir = temp();
         let mut store = open(dir.path(), Role::Client);
-        advance(&mut store, height);
         commit_all(&mut store, &[job.proposed(), job.accepted()]);
+        advance(&mut store, height);
         let recorded = store.commit(job.result_record(&channel), &Secp256k1Verifier::new());
         if timely {
             if let Err(error) = recorded {
@@ -658,6 +658,72 @@ fn the_terminal_deadline_is_the_last_height_a_receipt_may_be_recorded_at() {
             ),
             "unexpected error: {error}"
         );
+    }
+}
+
+/// Acceptance and dispatch consume the cursor held after their phase
+/// boundary. The same cursor state `PaymentLate` reads is therefore part of
+/// the durable apply, while an idempotent already-committed co-signature is
+/// returned without a second deadline decision.
+#[test]
+fn round3_transition_consumes_post_boundary_cursor() {
+    let channel = channel();
+    let job = job_at(&channel, 1, 0);
+    let verifier = Secp256k1Verifier::new();
+
+    for (height, timely) in [
+        (job.authorization.acceptance_deadline, true),
+        (job.authorization.acceptance_deadline + 1, false),
+    ] {
+        let dir = temp();
+        let mut store = open(dir.path(), Role::Provider);
+        advance(&mut store, height);
+        commit_all(&mut store, &[job.proposed()]);
+        let accepted = store.commit(job.accepted(), &verifier);
+        if timely {
+            if let Err(error) = accepted {
+                panic!("acceptance at its deadline is durable: {error}");
+            }
+            // Once committed, the same signature is idempotent even after
+            // the deadline: the endpoint does not re-decide an escaped
+            // authorization.
+            advance(&mut store, height + 1);
+            if let Err(error) = store.commit(job.accepted(), &verifier) {
+                panic!("a retained co-signature is not re-decided: {error}");
+            }
+        } else {
+            assert!(matches!(
+                accepted,
+                Err(WorkStoreError::Channel(ChannelStateError::AcceptanceLate {
+                    height: found,
+                    deadline,
+                })) if found == height && deadline == job.authorization.acceptance_deadline
+            ));
+        }
+    }
+
+    for (height, timely) in [
+        (job.authorization.terminal_deadline, true),
+        (job.authorization.terminal_deadline + 1, false),
+    ] {
+        let dir = temp();
+        let mut store = open(dir.path(), Role::Provider);
+        commit_all(&mut store, &[job.proposed(), job.accepted()]);
+        advance(&mut store, height);
+        let running = store.commit(ChannelRecord::JobRunning, &verifier);
+        if timely {
+            if let Err(error) = running {
+                panic!("dispatch at the terminal deadline is durable: {error}");
+            }
+        } else {
+            assert!(matches!(
+                running,
+                Err(WorkStoreError::Channel(ChannelStateError::DispatchLate {
+                    height: found,
+                    deadline,
+                })) if found == height && deadline == job.authorization.terminal_deadline
+            ));
+        }
     }
 }
 
@@ -2868,27 +2934,37 @@ fn the_record_codec_is_exact_and_ordered() {
     assert_eq!(bytes, expected);
     assert_eq!(ChannelRecord::decode(&bytes), Ok(prepared));
 
-    // tag || contest id || opener. The opener is one byte after the
-    // digest, and a round trip would pass with the two exchanged.
+    // tag || contest id || opener || response deadline || claimed. The
+    // opener is one byte after the digest, and the two big-endian `u64`s
+    // follow it; a round trip would pass with any of them exchanged, and
+    // these bytes would not.
     let opened = ChannelRecord::CloseOpened {
         start_id: hellas_kernel::StartId::from_bytes([0xcd; 32]),
         opener: Party::Maker,
+        response_deadline: 0x3132_3334_3536_3738,
+        claimed: 0x4142_4344_4546_4748,
     };
     let bytes = opened.encode();
     let mut expected = vec![10_u8];
     expected.extend_from_slice(&[0xcd; 32]);
     expected.push(0);
+    expected.extend_from_slice(&0x3132_3334_3536_3738_u64.to_be_bytes());
+    expected.extend_from_slice(&0x4142_4344_4546_4748_u64.to_be_bytes());
     assert_eq!(bytes, expected);
     assert_eq!(ChannelRecord::decode(&bytes), Ok(opened));
 
     let opened = ChannelRecord::CloseOpened {
         start_id: hellas_kernel::StartId::from_bytes([0xcd; 32]),
         opener: Party::Taker,
+        response_deadline: 0,
+        claimed: 0,
     };
     let bytes = opened.encode();
     let mut expected = vec![10_u8];
     expected.extend_from_slice(&[0xcd; 32]);
     expected.push(1);
+    expected.extend_from_slice(&0_u64.to_be_bytes());
+    expected.extend_from_slice(&0_u64.to_be_bytes());
     assert_eq!(bytes, expected);
     assert_eq!(ChannelRecord::decode(&bytes), Ok(opened));
 

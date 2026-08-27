@@ -117,11 +117,12 @@
 //! What neither endpoint does here is wait. `advance_close` is one
 //! step, and the caller that owns a clock is the one that repeats it.
 
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use hellas_kernel::{
     Decode as _, EarnedCertificate, Move, Party, PaymentCloseStart, PendingSlot, Secp256k1Signer,
-    Secp256k1Verifier, Sig, SigVerifier as _, Tx,
+    Secp256k1Verifier, Sig, SigVerifier as _, StartId, Tx,
 };
 use hellas_wire::{StreamTransport, TransportContext, WireStatus};
 
@@ -351,9 +352,10 @@ const fn channel_refusal(error: &ChannelStateError) -> WorkRefusal {
         | ChannelStateError::OverCredit { .. }
         | ChannelStateError::Closing { .. }
         | ChannelStateError::Indeterminate => WorkRefusal::Declined,
-        ChannelStateError::ReceiptLate { .. } | ChannelStateError::PaymentLate { .. } => {
-            WorkRefusal::Expired
-        }
+        ChannelStateError::AcceptanceLate { .. }
+        | ChannelStateError::DispatchLate { .. }
+        | ChannelStateError::ReceiptLate { .. }
+        | ChannelStateError::PaymentLate { .. } => WorkRefusal::Expired,
         ChannelStateError::Record(_)
         | ChannelStateError::BadSignature { .. }
         | ChannelStateError::WrongRole { .. }
@@ -394,6 +396,9 @@ pub enum EndpointError {
     /// A handler panicked while holding the endpoint.
     #[error("the endpoint lock is poisoned")]
     Poisoned,
+    /// Another lifecycle step currently owns this endpoint.
+    #[error("another lifecycle step is still catching this endpoint up")]
+    CatchingUp,
 }
 
 const fn role_name(role: Role) -> &'static str {
@@ -1007,7 +1012,45 @@ impl ProviderEndpoint {
         S: FinalizedBlocks + ?Sized,
         T: TxSink + ?Sized,
     {
-        advance_close(source, sink, &mut self.store, &Secp256k1Verifier::new()).await
+        let progress =
+            advance_close(source, sink, &mut self.store, &Secp256k1Verifier::new()).await?;
+        if let CloseProgress::Opened { start_id } = progress {
+            if let Some(response) = self.close_response_due(start_id) {
+                sink.submit(response).await?;
+            }
+        }
+        Ok(progress)
+    }
+
+    /// Builds this provider's answer to a journaled contest, or `None`
+    /// when no answer is open.
+    ///
+    /// The same three conditions [`Self::respond_to_close`] applies to a
+    /// finalized snapshot, applied instead to the contest the watcher
+    /// already journaled: the client is the opener, the response window is
+    /// still open at the cursor, and this endpoint's certificate strictly
+    /// exceeds the opener's claim. Nothing is journaled — the certificate
+    /// it spends is already durable, and the `CloseOpened` that shut this
+    /// channel was fsynced before this could be built from it.
+    fn close_response_due(&self, start_id: StartId) -> Option<Tx> {
+        let contest = self.state().open_contest()?;
+        if contest.start_id != start_id || contest.opener != Party::Maker {
+            return None;
+        }
+        let (cursor_height, _) = self.state().cursor();
+        if cursor_height >= contest.response_deadline {
+            return None;
+        }
+        let certificate = self
+            .state()
+            .executable_certificate()
+            .filter(|(certificate, _)| certificate.earned_cumulative() > contest.claimed)?;
+        Some(Tx::move_action(Move::RespondPaymentClose(close_response(
+            self.ready.channel(),
+            start_id,
+            certificate,
+            &self.signer,
+        ))))
     }
 
     /// Builds the close that ends this endpoint's contest.
@@ -1233,6 +1276,9 @@ pub enum RunOutcome {
 /// Why one run of an accepted job did not produce a result.
 #[derive(Debug, thiserror::Error)]
 pub enum RunError {
+    /// The phase-boundary finalized-history catch-up did not complete.
+    #[error("dispatch catch-up failed: {0}")]
+    CatchUp(String),
     /// No open job on this channel carries this `work_id`.
     #[error("no open job on this channel carries this work id")]
     NoSuchJob,
@@ -1320,7 +1366,7 @@ where
     };
 
     let recorded = {
-        let mut endpoint = service.endpoint()?;
+        let mut endpoint = service.endpoint_wait()?;
         endpoint.record_result(work_id, &transcript)
     };
     match recorded {
@@ -1335,6 +1381,27 @@ where
         }
         Err(error) => Err(error),
     }
+}
+
+/// Dispatch workflow with the post-boundary cursor rule: the endpoint is
+/// released while finalized blocks are fetched, caught up contiguously, and
+/// only then reacquired for `JobRunning`.
+pub async fn run_accepted_work_after_catch_up<S, B>(
+    service: &WorkService,
+    source: &S,
+    ready: &ReadyChannel,
+    backend: &B,
+    work_id: Digest,
+) -> Result<RunOutcome, RunError>
+where
+    S: FinalizedBlocks + ?Sized,
+    B: PaidEvaluateBackend + Sync,
+{
+    service
+        .catch_up_job(source, work_id)
+        .await
+        .map_err(|error| RunError::CatchUp(error.to_string()))?;
+    run_accepted_work(service, ready, backend, work_id).await
 }
 
 // ── Delivering the answer ─────────────────────────────────────────────
@@ -1538,7 +1605,7 @@ fn admit_request(payment: &PaidCertificate) -> AdmitCertificateRequest {
 /// Ends the job as failed, and returns `fault` if that ending was
 /// recorded.
 fn end_failed(service: &WorkService, work_id: Digest, fault: RunError) -> RunError {
-    let mut endpoint = match service.endpoint() {
+    let mut endpoint = match service.endpoint_wait() {
         Ok(endpoint) => endpoint,
         Err(error) => return RunError::Endpoint(error),
     };
@@ -1559,13 +1626,34 @@ fn end_failed(service: &WorkService, work_id: Digest, fault: RunError) -> RunErr
 /// deciding a proposal — hashing, verifying, and two synchronous journal
 /// appends — never awaits.
 #[derive(Clone, Debug)]
-pub struct WorkService(Arc<Mutex<ProviderEndpoint>>);
+pub struct WorkService {
+    endpoint: Arc<Mutex<ProviderEndpoint>>,
+    catch_up_jobs: Arc<Mutex<BTreeSet<Digest>>>,
+}
+
+/// RAII ownership of one job's bounded catch-up waiter.
+#[derive(Debug)]
+pub struct JobCatchUpGuard {
+    held: Arc<Mutex<BTreeSet<Digest>>>,
+    work_id: Digest,
+}
+
+impl Drop for JobCatchUpGuard {
+    fn drop(&mut self) {
+        if let Ok(mut held) = self.held.lock() {
+            held.remove(&self.work_id);
+        }
+    }
+}
 
 impl WorkService {
     /// Wraps one provider endpoint as a dispatchable service.
     #[must_use]
     pub fn new(endpoint: ProviderEndpoint) -> Self {
-        Self(Arc::new(Mutex::new(endpoint)))
+        Self {
+            endpoint: Arc::new(Mutex::new(endpoint)),
+            catch_up_jobs: Arc::new(Mutex::new(BTreeSet::new())),
+        }
     }
 
     /// Borrows the endpoint.
@@ -1576,7 +1664,87 @@ impl WorkService {
     /// holding it. The state is not recovered, because a panic mid-
     /// commit is a bug whose durable effect this type cannot know.
     pub fn endpoint(&self) -> Result<MutexGuard<'_, ProviderEndpoint>, EndpointError> {
-        self.0.lock().map_err(|_| EndpointError::Poisoned)
+        self.endpoint.lock().map_err(|_| EndpointError::Poisoned)
+    }
+
+    fn endpoint_wait(&self) -> Result<MutexGuard<'_, ProviderEndpoint>, EndpointError> {
+        self.endpoint.lock().map_err(|_| EndpointError::Poisoned)
+    }
+
+    /// Acquires the one bounded catch-up slot for `work_id`. Ordinary brief
+    /// journal operations do not contend on this guard, so a completed
+    /// backend transcript waits for the endpoint lock and is never dropped
+    /// merely because an unrelated watcher poll is running.
+    pub fn begin_job_catch_up(&self, work_id: Digest) -> Result<JobCatchUpGuard, EndpointError> {
+        let mut held = self
+            .catch_up_jobs
+            .lock()
+            .map_err(|_| EndpointError::Poisoned)?;
+        if !held.insert(work_id) {
+            return Err(EndpointError::CatchingUp);
+        }
+        Ok(JobCatchUpGuard {
+            held: Arc::clone(&self.catch_up_jobs),
+            work_id,
+        })
+    }
+
+    /// Advances one job's cursor without holding the endpoint across a
+    /// chain await. A second catch-up is refused per job; proposal handlers
+    /// and completed backend transcripts use only the brief endpoint lock.
+    pub async fn catch_up_job<S: FinalizedBlocks + ?Sized>(
+        &self,
+        source: &S,
+        work_id: Digest,
+    ) -> Result<u64, CatchUpError> {
+        let _guard = self
+            .begin_job_catch_up(work_id)
+            .map_err(|_| CatchUpError::Busy)?;
+        let Some(latest) = source.latest_height().await? else {
+            return self
+                .endpoint_wait()
+                .map(|endpoint| endpoint.state().cursor().0)
+                .map_err(|_| CatchUpError::Busy);
+        };
+        loop {
+            let next = self
+                .endpoint_wait()
+                .map_err(|_| CatchUpError::Busy)?
+                .state()
+                .cursor()
+                .0
+                .saturating_add(1);
+            if next > latest {
+                return Ok(next.saturating_sub(1));
+            }
+            let block = source
+                .block_at(next)
+                .await?
+                .ok_or(CatchUpError::Missing { height: next })?;
+            self.endpoint_wait()
+                .map_err(|_| CatchUpError::Busy)?
+                .observe_finalized(&block)?;
+        }
+    }
+
+    /// Workflow phase boundary for provider acceptance: catch up with short
+    /// borrows, reacquire by this channel service, then let the durable
+    /// acceptance transition compare against that same cursor.
+    pub async fn accept_after_catch_up<S: FinalizedBlocks + ?Sized>(
+        &self,
+        source: &S,
+        request: &AcceptWorkRequest,
+    ) -> Result<AcceptWorkResponse, CatchUpError> {
+        let work_id = {
+            let endpoint = self.endpoint_wait().map_err(|_| CatchUpError::Busy)?;
+            PaidJobAuthorizationV1::decode(&request.authorization)
+                .ok()
+                .map(|authorization| work_id(endpoint.ready.channel(), &authorization))
+        };
+        if let Some(work_id) = work_id {
+            self.catch_up_job(source, work_id).await?;
+        }
+        Ok(self.answer(request))
     }
 
     /// Answers one proposal, or says the endpoint is unreachable.
@@ -1589,7 +1757,7 @@ impl WorkService {
             Ok(mut endpoint) => endpoint.accept(request),
             Err(error) => AcceptWorkResponse {
                 outcome: Some(Outcome::Refused(WorkRefused {
-                    code: WorkRefusalCode::Unavailable as i32,
+                    code: endpoint_refusal(error).code() as i32,
                     reason: error.to_string(),
                 })),
             },
@@ -1622,7 +1790,7 @@ impl WorkService {
                     .map_err(Refusal::from)
             }
             (Ok(_), None) => Err(Refusal::from(DeliverError::Unbindable)),
-            (Err(error), _) => Err(Refusal::new(WorkRefusal::Unavailable, error.to_string())),
+            (Err(error), _) => Err(Refusal::new(endpoint_refusal(error), error.to_string())),
         };
         DeliverResultResponse {
             outcome: Some(match outcome {
@@ -1647,7 +1815,7 @@ impl WorkService {
     fn credit(&self, request: &AdmitCertificateRequest) -> AdmitCertificateResponse {
         let outcome = match self.endpoint() {
             Ok(mut endpoint) => endpoint.admit(request).map_err(Refusal::from),
-            Err(error) => Err(Refusal::new(WorkRefusal::Unavailable, error.to_string())),
+            Err(error) => Err(Refusal::new(endpoint_refusal(error), error.to_string())),
         };
         AdmitCertificateResponse {
             outcome: Some(match outcome {
@@ -1660,6 +1828,13 @@ impl WorkService {
                 }),
             }),
         }
+    }
+}
+
+const fn endpoint_refusal(error: EndpointError) -> WorkRefusal {
+    match error {
+        EndpointError::CatchingUp => WorkRefusal::NotReady,
+        _ => WorkRefusal::Unavailable,
     }
 }
 

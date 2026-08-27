@@ -1559,6 +1559,153 @@ async fn a_catch_up_reads_every_block_between() {
     assert_eq!(provider.state().cursor(), before);
 }
 
+/// A duty found at the front of a restart backlog is surfaced before the
+/// watcher asks for the next finalized block.
+#[tokio::test]
+async fn catch_up_services_a_new_close_duty_before_the_next_block() {
+    struct CountingChain {
+        blocks: Vec<FinalizedWork>,
+        reads: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FinalizedBlocks for CountingChain {
+        async fn latest_height(&self) -> Result<Option<u64>, BlockSourceError> {
+            Ok(self.blocks.last().map(|block| block.height))
+        }
+
+        async fn block_at(&self, height: u64) -> Result<Option<FinalizedWork>, BlockSourceError> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self
+                .blocks
+                .iter()
+                .find(|block| block.height == height)
+                .cloned())
+        }
+    }
+
+    let fixture = paid_job().await;
+    let ready = fixture.ready.clone();
+    let mut watcher = restarted(fixture);
+    let start = watcher
+        .provider
+        .prepare_close()
+        .expect("the paid channel prepares a close");
+    let inclusion = CURSOR + 1;
+    let chain = CountingChain {
+        blocks: vec![
+            block(
+                inclusion,
+                vec![hellas_kernel::Tx::move_action(
+                    hellas_kernel::Move::StartPaymentClose(start.clone()),
+                )],
+            ),
+            block(inclusion + 1, Vec::new()),
+        ],
+        reads: std::sync::atomic::AtomicUsize::new(0),
+    };
+    let sink = Mempool::default();
+
+    let expected = contest_id(&ready, &start, inclusion);
+    match watcher.provider.advance_close(&chain, &sink).await {
+        Ok(CloseProgress::Opened { start_id }) => assert_eq!(start_id, expected),
+        other => panic!("the first block's duty is surfaced: {other:?}"),
+    }
+    assert_eq!(
+        chain.reads.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the second backlog block was not fetched first",
+    );
+    assert_eq!(watcher.provider.state().cursor().0, inclusion);
+}
+
+/// A restart that reads a journaled contest off its own disk submits the
+/// answer, before the deadline, without a fabricated snapshot.
+///
+/// The client opens a close at nothing while this provider holds a
+/// certificate for `PRICE`; the contest is finalized, journaled, and the
+/// store is dropped and reopened over its own files. The production
+/// `advance_close` — the pure clock wrapper a node runner will call — is
+/// the only thing that runs afterwards, and it is what puts the response
+/// in the sink. Against the old `return Opened` the sink stays empty, so
+/// this is the test that fails before the fix and passes after it.
+#[tokio::test]
+async fn restart_services_the_response_before_its_deadline() {
+    let fixture = paid_job().await;
+    let ready = fixture.ready.clone();
+    let inclusion = CURSOR + 1;
+
+    // The client opens below what it has already signed for: a start of
+    // the *client's* (Maker's), claiming nothing.
+    let understated = close_start(
+        ready.channel(),
+        Party::Maker,
+        CURSOR,
+        None,
+        &client(),
+    )
+    .expect("a client opens a close");
+    let expected = contest_id(&ready, &understated, inclusion);
+
+    // The provider journals the contest through real finalization, then
+    // the store is dropped and reopened. The response window and the
+    // claimed floor must survive that reopen, or the reopened provider
+    // could not decide either.
+    let watcher = restarted(fixture);
+    let Watcher {
+        provider: mut endpoint,
+        _provider_root,
+        _client_root,
+    } = watcher;
+    endpoint
+        .observe_finalized(&block(
+            inclusion,
+            vec![hellas_kernel::Tx::move_action(
+                hellas_kernel::Move::StartPaymentClose(understated),
+            )],
+        ))
+        .expect("the contest finalizes and journals CloseOpened");
+    assert_eq!(endpoint.state().close_opened(), Some((expected, Party::Maker)));
+    drop(endpoint);
+
+    let store = store_at(_provider_root.path(), &ready, Role::Provider, CURSOR);
+    let mut provider =
+        ProviderEndpoint::new(ready.clone(), store, provider()).expect("the reopened provider binds");
+    assert_eq!(
+        provider.state().close_opened(),
+        Some((expected, Party::Maker)),
+        "the reopened journal still holds the contest",
+    );
+    let (cursor_height, _) = provider.state().cursor();
+    let deadline = inclusion + payment_terms().omit_response_blocks;
+    assert!(
+        cursor_height < deadline,
+        "the reopened cursor is inside the response window",
+    );
+
+    // The whole of what a node runner does: read to the tip, and let the
+    // library service whatever duty the read surfaced.
+    let chain = Chain {
+        blocks: Vec::new(),
+        withheld: None,
+    };
+    let sink = Mempool::default();
+    match provider.advance_close(&chain, &sink).await {
+        Ok(CloseProgress::Opened { start_id }) => assert_eq!(start_id, expected),
+        other => panic!("the contest is open and its answer in flight: {other:?}"),
+    }
+
+    let taken = sink.taken();
+    assert_eq!(taken.len(), 1, "advance_close itself submitted the response");
+    let hellas_kernel::Tx::Move {
+        action: hellas_kernel::Move::RespondPaymentClose(response),
+    } = &taken[0]
+    else {
+        panic!("the submitted transaction is a response move");
+    };
+    assert_eq!(response.start_id(), expected);
+    assert_eq!(response.certificate().earned_cumulative(), PRICE);
+}
+
 /// A block the source cannot supply stops the scan where it is.
 ///
 /// It does not skip ahead, and it does not pretend to be caught up.

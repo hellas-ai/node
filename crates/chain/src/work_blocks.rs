@@ -185,9 +185,9 @@ mod tests {
     use commonware_runtime::{Handle, Supervisor as _};
     use hellas_kernel::{
         BlockHash, BlockHeight, CoinId, Context as KernelContext, EdgeId, EdgeValues, Fees,
-        Funding, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Parties, Payout, Secp256k1Signer,
-        Secp256k1Verifier, Terms as KernelTerms, Tx as KernelTx, WorkPaymentTerms,
-        WorkStakeBondTerms,
+        Funding, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Move, Parties, Party, Payout,
+        PendingSlot, Secp256k1Signer, Secp256k1Verifier, Terms as KernelTerms, Tx as KernelTx,
+        WorkPaymentTerms, WorkStakeBondTerms,
     };
     use hellas_rpc::call::WithTrailer;
     use hellas_rpc::pb::work::{ExchangeSetupRequest, exchange_setup_response::Outcome};
@@ -199,10 +199,13 @@ mod tests {
     };
     use hellas_rpc::protocol::{ContentId, Digest as ProtocolDigest};
     use hellas_rpc::services::work_setup::WorkSetupHandler;
-    use hellas_rpc::work_close::BlockSourceError;
+    use hellas_rpc::work_close::{BlockSourceError, adjudicated_close, close_start};
     use hellas_rpc::work_handshake::{PaymentAdmission, SetupEndpoint, SetupService};
-    use hellas_rpc::work_open::{SetupDriveError, SetupProgress, SetupStep, advance_setup};
-    use hellas_rpc::work_store::{Role, SetupAbort, SetupEnd, SetupOrigin, SetupStore};
+    use hellas_rpc::work_open::{SetupProgress, SetupStep, advance_setup};
+    use hellas_rpc::work_store::{
+        Role, SetupAbort, SetupEnd, SetupOrigin, SetupRecord, SetupScan, SetupStateError,
+        SetupStore, WorkStoreError,
+    };
     use hellas_wire::TransportContext;
 
     use crate::HellasBlock;
@@ -501,12 +504,14 @@ mod tests {
         provider_root: &std::path::Path,
         client_root: &std::path::Path,
         payment_funding: Funding,
+        scan: SetupScan,
     ) {
         let mut proposer = SetupEndpoint::new(
             open_store(provider_root, Role::Provider),
             provider(),
             PaymentAdmission::Admits(Box::new(provider_policy())),
         );
+        proposer.arm_scan(scan).expect("the provider arms its scan");
         if let Err(error) = proposer.propose_bond(TEST_NETWORK, bond_funding(), bond_terms()) {
             panic!("the provider proposes its bond: {error}");
         }
@@ -514,13 +519,14 @@ mod tests {
         let mut caller = SetupEndpoint::new(
             open_store(client_root, Role::Client),
             client(),
-            PaymentAdmission::Proposes,
+            PaymentAdmission::Proposes(Box::new(provider_policy())),
         );
 
         let proposal = exchange(&service, Vec::new()).await;
         if let Err(error) = caller.import(&proposal) {
             panic!("the client imports the bond proposal: {error}");
         }
+        caller.arm_scan(scan).expect("the client arms its scan");
         if let Err(error) = caller.propose_payment(payment_funding, payment_terms()) {
             panic!("the client proposes its payment: {error}");
         }
@@ -570,6 +576,13 @@ mod tests {
         }
     }
 
+    fn scan_at(block: &HellasBlock) -> SetupScan {
+        SetupScan {
+            height: commonware_consensus::Heightable::height(block).get(),
+            payload: block.digest().into(),
+        }
+    }
+
     /// A handshake, two Opens, two finalized blocks, and two journals
     /// that agree on where the channel began.
     ///
@@ -592,31 +605,28 @@ mod tests {
             let client_root = tempfile::tempdir().expect("a temp dir");
             let payment_funding = Funding::new(one_coin(client_coin()), no_coins());
             let payment_edge = payment_edge_of(&payment_funding);
-            shake_hands(provider_root.path(), client_root.path(), payment_funding).await;
-
             let mut chain = Chain::start(runtime, "work_setup_e2e").await;
             let blocks = WorkBlocks::new(chain.light_client());
             let verifier = Secp256k1Verifier::new();
 
-            // Nothing is finalized yet, so there is no state to decide
-            // from — which is not the same answer as "this is not a
-            // channel".
-            let mut provider_store = open_store(provider_root.path(), Role::Provider);
-            assert_eq!(
-                step(&blocks, &blocks, &mut provider_store, 0).await,
-                SetupProgress::AwaitingFinalizedState,
-            );
-
-            // One empty block, so the owner index has a cursor.
+            // The finalized block is the observation floor durably armed
+            // before either executable Open can leave the handshake.
             let floor = chain.seal().await;
-            let floor_height = commonware_consensus::Heightable::height(&floor).get();
+            shake_hands(
+                provider_root.path(),
+                client_root.path(),
+                payment_funding,
+                scan_at(&floor),
+            )
+            .await;
+            let mut provider_store = open_store(provider_root.path(), Role::Provider);
 
             // The client, at the same state, has nothing to do. Both
             // submissions are the provider's, and the client's journal
             // says so rather than trying to make one.
             let mut client_store = open_store(client_root.path(), Role::Client);
             assert_eq!(
-                step(&blocks, &blocks, &mut client_store, floor_height).await,
+                step(&blocks, &blocks, &mut client_store).await,
                 SetupProgress::AwaitingCounterparty,
             );
             assert!(chain.mempool.test_transactions().await.is_empty());
@@ -631,7 +641,6 @@ mod tests {
                 &RefusingSink,
                 &mut provider_store,
                 &verifier,
-                floor_height,
             )
             .await;
             assert!(
@@ -650,7 +659,7 @@ mod tests {
             // again: the journal holds one bundle and the transaction
             // comes out of it.
             assert_eq!(
-                step(&blocks, &blocks, &mut provider_store, floor_height).await,
+                step(&blocks, &blocks, &mut provider_store).await,
                 SetupProgress::Submitted {
                     step: SetupStep::Bond,
                     outcome: SubmitTxOutcome::Enqueued,
@@ -660,43 +669,16 @@ mod tests {
             assert_eq!(bond_block.txs().len(), 1, "one bond open, not two");
 
             assert_eq!(
-                step(&blocks, &blocks, &mut provider_store, floor_height).await,
+                step(&blocks, &blocks, &mut provider_store).await,
                 SetupProgress::Submitted {
                     step: SetupStep::Payment,
                     outcome: SubmitTxOutcome::Enqueued,
                 },
             );
             let origin_block = chain.seal().await;
-            let tip = commonware_consensus::Heightable::height(&origin_block).get();
-
-            // A floor above the block that carried the payment open
-            // finds nothing, and refuses. The scan's starting height is
-            // a cost and not a premise precisely because of this: too
-            // low is slow, and too high does not record a cursor it
-            // guessed.
-            let missed = advance_setup(
-                &blocks,
-                &blocks,
-                &blocks,
-                &mut provider_store,
-                &verifier,
-                tip,
-            )
-            .await;
-            assert!(
-                matches!(missed, Err(SetupDriveError::OriginNotFound { .. })),
-                "a floor past the origin refuses, got {missed:?}",
-            );
-            assert_eq!(
-                provider_store.state().origin(),
-                None,
-                "and nothing was recorded",
-            );
-
             // Both edges are live and the bond is leased to this payment
             // channel, so the driver records where that happened.
-            let SetupProgress::Complete(origin) =
-                step(&blocks, &blocks, &mut provider_store, floor_height).await
+            let SetupProgress::Complete(origin) = step(&blocks, &blocks, &mut provider_store).await
             else {
                 panic!("the provider completes its setup");
             };
@@ -716,7 +698,7 @@ mod tests {
             // above was the provider's.
             let mut client_store = open_store(client_root.path(), Role::Client);
             assert_eq!(
-                step(&blocks, &blocks, &mut client_store, floor_height).await,
+                step(&blocks, &blocks, &mut client_store).await,
                 SetupProgress::Complete(origin),
             );
 
@@ -756,6 +738,16 @@ mod tests {
                 expected_values(),
                 "the funded edge is the one the provider's policy expected",
             );
+            let recovered = open_store(provider_root.path(), Role::Provider);
+            let armed = recovered
+                .state()
+                .close_descriptor()
+                .expect("the crash-recovered journal mounts close-only state");
+            let funded = armed
+                .funded_settlement(payment)
+                .expect("recovery settles from the coherent funded edge");
+            assert_eq!(funded.capacity(), FUNDING - OMISSION_BOND);
+            drop(recovered);
             let descriptor = match WorkChannelDescriptor::open(WorkChannelConfig {
                 network: TEST_NETWORK,
                 payment_edge,
@@ -778,6 +770,186 @@ mod tests {
         });
     }
 
+    /// Revision 3 is a portable authorization, not merely a getter: after
+    /// the exporting provider crashes, the counterparty can land both Opens
+    /// and permissionlessly retire the leased bond, and the provider still
+    /// mounts the surviving payment edge from journal history alone.
+    #[test]
+    fn round4_exported_authorization_recovers() {
+        run_qmdb(|runtime| async move {
+            let provider_root = tempfile::tempdir().expect("a temp dir");
+            let client_root = tempfile::tempdir().expect("a temp dir");
+            let payment_funding = Funding::new(one_coin(client_coin()), no_coins());
+            let mut chain = Chain::start(runtime, "work_setup_journal_recovery").await;
+            let blocks = WorkBlocks::new(chain.light_client());
+            let floor = chain.seal().await;
+            shake_hands(
+                provider_root.path(),
+                client_root.path(),
+                payment_funding,
+                scan_at(&floor),
+            )
+            .await;
+
+            // Crash after the real handshake export. The only values kept
+            // outside the dead process are the portable Opens the peer got.
+            let (bond_open, payment_open) = {
+                let recovered = open_store(provider_root.path(), Role::Provider);
+                (
+                    recovered.state().bond_open().expect("portable bond Open"),
+                    recovered
+                        .state()
+                        .payment_open()
+                        .expect("portable payment Open"),
+                )
+            };
+            chain
+                .mempool
+                .test_submit(Transaction::Kernel(bond_open))
+                .await;
+            chain
+                .mempool
+                .test_submit(Transaction::Kernel(payment_open))
+                .await;
+            chain.seal().await;
+
+            let payment_edge = payment_edge_of(&Funding::new(one_coin(client_coin()), no_coins()));
+            let descriptor = provider_policy()
+                .admit(payment_edge, payment_terms())
+                .expect("the exported policy admitted this channel");
+            let start = close_start(
+                descriptor.channel(),
+                Party::Maker,
+                chain.height,
+                None,
+                &client(),
+            )
+            .expect("the counterparty builds a real close Start");
+            chain
+                .mempool
+                .test_submit(Transaction::Kernel(KernelTx::move_action(
+                    Move::StartPaymentClose(start),
+                )))
+                .await;
+            chain.seal().await;
+
+            let snapshot = chain
+                .light_client()
+                .work_channel_snapshot(WorkChannelQuery {
+                    bond_edge: bond_edge(),
+                    payment_edge,
+                    funding: BTreeSet::new(),
+                })
+                .await
+                .expect("the contest snapshot reads")
+                .expect("finalized contest state exists");
+            let PendingSlot::Present(pending) = snapshot.pending() else {
+                panic!("the real Start created a pending close");
+            };
+            while chain.height < pending.response_deadline() {
+                chain.seal().await;
+            }
+            let close = adjudicated_close(
+                descriptor.channel(),
+                descriptor
+                    .close_descriptor()
+                    .expected_settlement()
+                    .expect("settlement"),
+                &pending,
+            )
+            .expect("the finalized contest determines its close");
+            chain.mempool.test_submit(Transaction::Kernel(close)).await;
+            let close_block = chain.seal().await;
+            assert!(
+                close_block.txs().iter().any(|tx| {
+                    matches!(tx, Transaction::Kernel(KernelTx::Close { input, .. }) if *input == payment_edge)
+                }),
+                "the real finalized history contains the adjudicated payment Close",
+            );
+
+            let mut restarted = open_store(provider_root.path(), Role::Provider);
+            let mounted = step(&blocks, &blocks, &mut restarted).await;
+            assert!(
+                matches!(mounted, SetupProgress::CloseOnly { settled: true, .. }),
+                "journal-only recovery mounts CloseOnly: {mounted:?}",
+            );
+        });
+    }
+
+    #[test]
+    fn round6_submitted_open_delays_end() {
+        run_qmdb(|runtime| async move {
+            let provider_root = tempfile::tempdir().expect("a temp dir");
+            let client_root = tempfile::tempdir().expect("a temp dir");
+            let payment_funding = Funding::new(one_coin(client_coin()), no_coins());
+            let mut chain = Chain::start(runtime, "work_setup_open_obligation").await;
+            let blocks = WorkBlocks::new(chain.light_client());
+            let floor = chain.seal().await;
+            shake_hands(
+                provider_root.path(),
+                client_root.path(),
+                payment_funding,
+                scan_at(&floor),
+            )
+            .await;
+
+            let verifier = Secp256k1Verifier::new();
+            let bond_open = {
+                let mut provider_store = open_store(provider_root.path(), Role::Provider);
+                let retained = provider_store.state().bond_open().expect("retained Open");
+                let refused = advance_setup(
+                    &blocks,
+                    &blocks,
+                    &RefusingSink,
+                    &mut provider_store,
+                    &verifier,
+                )
+                .await;
+                assert!(refused.is_err(), "the marker survives the failed broadcast");
+                retained
+            };
+
+            let mut restarted = open_store(provider_root.path(), Role::Provider);
+            let blocked = restarted.commit(
+                SetupRecord::Ended {
+                    outcome: SetupEnd::Aborted(SetupAbort::PaymentFundingSpent),
+                },
+                &verifier,
+            );
+            assert!(matches!(
+                blocked,
+                Err(WorkStoreError::Setup(
+                    SetupStateError::SubmittedOpenUnresolved
+                ))
+            ));
+            drop(restarted);
+
+            chain
+                .mempool
+                .test_submit(Transaction::Kernel(bond_open))
+                .await;
+            chain.seal().await;
+
+            let mut restarted = open_store(provider_root.path(), Role::Provider);
+            assert!(matches!(
+                advance_setup(&blocks, &blocks, &blocks, &mut restarted, &verifier).await,
+                Ok(SetupProgress::HistoryAdvanced { .. })
+            ));
+            assert!(
+                !restarted.state().bond_submitted(),
+                "the finalized Open discharges the journal obligation",
+            );
+            restarted
+                .commit(
+                    SetupRecord::Ended {
+                        outcome: SetupEnd::Aborted(SetupAbort::PaymentFundingSpent),
+                    },
+                    &verifier,
+                )
+                .expect("the resolved Open no longer blocks an end");
+        });
+    }
+
     /// The provider does not stake on a channel the client cannot fund.
     ///
     /// One thing moves from the test above: the coin the client names as
@@ -794,16 +966,20 @@ mod tests {
                 one_coin(CoinId::from_bytes(genesis_object_id(9).into())),
                 no_coins(),
             );
-            shake_hands(provider_root.path(), client_root.path(), payment_funding).await;
-
             let mut chain = Chain::start(runtime, "work_setup_unfunded").await;
             let blocks = WorkBlocks::new(chain.light_client());
             let floor = chain.seal().await;
-            let floor_height = commonware_consensus::Heightable::height(&floor).get();
+            shake_hands(
+                provider_root.path(),
+                client_root.path(),
+                payment_funding,
+                scan_at(&floor),
+            )
+            .await;
 
             let mut provider_store = open_store(provider_root.path(), Role::Provider);
             assert_eq!(
-                step(&blocks, &blocks, &mut provider_store, floor_height).await,
+                step(&blocks, &blocks, &mut provider_store).await,
                 SetupProgress::Aborted(SetupAbort::PaymentFundingSpent),
             );
             assert!(
@@ -844,12 +1020,16 @@ mod tests {
                 one_coin(CoinId::from_bytes(genesis_object_id(9).into())),
                 no_coins(),
             );
-            shake_hands(provider_root.path(), client_root.path(), payment_funding).await;
-
             let mut chain = Chain::start(runtime, "work_setup_stranded").await;
             let blocks = WorkBlocks::new(chain.light_client());
             let floor = chain.seal().await;
-            let floor_height = commonware_consensus::Heightable::height(&floor).get();
+            shake_hands(
+                provider_root.path(),
+                client_root.path(),
+                payment_funding,
+                scan_at(&floor),
+            )
+            .await;
 
             // The bond, posted by something that is not this driver.
             let mut provider_store = open_store(provider_root.path(), Role::Provider);
@@ -865,13 +1045,15 @@ mod tests {
             assert_eq!(bond_block.txs().len(), 1);
 
             assert_eq!(
-                step(&blocks, &blocks, &mut provider_store, floor_height).await,
-                SetupProgress::TimeoutBond,
+                step(&blocks, &blocks, &mut provider_store).await,
+                SetupProgress::BondTimeoutSubmitted {
+                    outcome: SubmitTxOutcome::Enqueued,
+                },
             );
             assert_eq!(
                 chain.mempool.test_transactions().await.len(),
-                1,
-                "the driver sent nothing: the one entry is the bond above",
+                2,
+                "the driver records and submits the deterministic Timeout",
             );
             assert_eq!(
                 provider_store.state().end(),
@@ -887,14 +1069,16 @@ mod tests {
         view: &WorkBlocks<C>,
         blocks: &WorkBlocks<C>,
         store: &mut SetupStore,
-        floor: u64,
     ) -> SetupProgress
     where
         C: LightClient + FinalizedWorkView,
     {
-        match advance_setup(view, blocks, view, store, &Secp256k1Verifier::new(), floor).await {
-            Ok(progress) => progress,
-            Err(error) => panic!("the driver takes a step: {error}"),
+        loop {
+            match advance_setup(view, blocks, view, store, &Secp256k1Verifier::new()).await {
+                Ok(SetupProgress::HistoryAdvanced { .. }) => continue,
+                Ok(progress) => return progress,
+                Err(error) => panic!("the driver takes a step: {error}"),
+            }
         }
     }
 }

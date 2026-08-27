@@ -87,7 +87,12 @@ use crate::protocol::Digest;
 /// First bytes of every journal file.
 const MAGIC: &[u8] = b"hellas.work-journal.v1";
 /// Envelope version of the header and framing below.
-const FORMAT_VERSION: u8 = 1;
+///
+/// Version 1 journals are intentionally refused. They predate `ScanArmed`
+/// and `ArmedBundle`, so replay cannot prove that every authorization which
+/// escaped still has a recoverable observation floor and close descriptor.
+/// This is a pre-deployment reset, not a migratable format change.
+const FORMAT_VERSION: u8 = 2;
 /// Domain of the header digest every frame is bound to.
 const HEADER_DOMAIN: &[u8] = b"hellas.work.journal-header.v1";
 /// Domain of one frame's digest.
@@ -208,6 +213,17 @@ pub enum JournalError {
         /// File that is already locked.
         path: PathBuf,
     },
+    /// The file is a recognized journal envelope whose recovery contract has
+    /// been retired.
+    #[error("journal format {found} is retired; expected {expected}: {retirement}")]
+    OldVersion {
+        /// Version byte found after the journal magic.
+        found: u8,
+        /// Version this binary writes and reads.
+        expected: u8,
+        /// Operator-facing reason this version cannot be migrated safely.
+        retirement: &'static str,
+    },
     /// The file exists and is not a journal of this kind, role, and key.
     #[error("the file at {path} is not this endpoint's {kind:?} journal")]
     HeaderMismatch {
@@ -315,6 +331,17 @@ impl Journal {
 
         let expected = id.header_bytes();
         if !bytes.starts_with(&expected) {
+            if bytes.starts_with(MAGIC)
+                && bytes
+                    .get(MAGIC.len())
+                    .is_some_and(|found| *found < FORMAT_VERSION)
+            {
+                return Err(JournalError::OldVersion {
+                    found: bytes[MAGIC.len()],
+                    expected: FORMAT_VERSION,
+                    retirement: "pre-arming journals have no recoverable scan floor or close descriptor",
+                });
+            }
             // A file that is a strict prefix of the header this journal
             // would write is the creation that was interrupted. No frame
             // can have been recorded under it — there is not even a

@@ -73,12 +73,13 @@ mod cursor;
 
 pub use channel::{
     ChannelRecord, ChannelState, ChannelStateError, ChannelStore, CloseSettlement,
-    CounterpartyLoss, JobEnd, JobPhase, JobState, LossTotals, PaidCertificate,
+    CounterpartyLoss, JobEnd, JobPhase, JobState, LossTotals, OpenContest, PaidCertificate,
 };
 pub use journal::{JournalError, Role};
 pub use setup::{
-    ObservedSetup, SetupAbort, SetupDecision, SetupEnd, SetupFault, SetupOrigin, SetupRecord,
-    SetupState, SetupStateError, SetupStore,
+    ObservedSetup, SetupAbort, SetupDecision, SetupEnd, SetupFault, SetupHistoryBatch,
+    SetupHistoryBlock, SetupOrigin, SetupRecord, SetupScan, SetupState, SetupStateError,
+    SetupStore,
 };
 
 /// Why a durable step could not be taken.

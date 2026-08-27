@@ -39,7 +39,7 @@ use hellas_rpc::work::{
     ClientEndpoint, EndpointError, JobProposal, ProposeError, ProviderEndpoint, WorkRefusal,
     WorkService, propose_work,
 };
-use hellas_rpc::work_close::{FinalizedWork, observe};
+use hellas_rpc::work_close::{BlockSourceError, FinalizedBlocks, FinalizedWork, observe};
 use hellas_rpc::work_store::{
     ChannelRecord, ChannelState, ChannelStore, JobEnd, JobPhase, JobState, Role, SetupOrigin,
 };
@@ -710,6 +710,30 @@ async fn the_service_answers_a_refusal_over_the_same_wire() {
 }
 
 #[test]
+fn a_second_catch_up_waiter_for_the_job_is_not_ready() {
+    let root = temp();
+    let service = WorkService::new(provider_endpoint(root.path()));
+    let id = Digest::from_bytes([0x55; 32]);
+    let held = service
+        .begin_job_catch_up(id)
+        .expect("the first bounded catch-up enters");
+    assert!(matches!(
+        service.begin_job_catch_up(id),
+        Err(EndpointError::CatchingUp)
+    ));
+    let other = service
+        .begin_job_catch_up(Digest::from_bytes([0x56; 32]))
+        .expect("an unrelated job has an independent catch-up guard");
+    assert!(
+        service.endpoint().is_ok(),
+        "the per-job catch-up guard does not strand brief journal work",
+    );
+    drop(held);
+    drop(other);
+    assert!(service.begin_job_catch_up(id).is_ok());
+}
+
+#[test]
 fn the_service_catalogue_names_the_work_service_and_nothing_settled() {
     let names: Vec<&str> = hellas_rpc::services::KNOWN_SERVICES
         .iter()
@@ -1095,6 +1119,46 @@ fn an_authorization_past_its_acceptance_deadline_expires() {
     let response = endpoint.accept(&signed_request(1, 1));
     assert_eq!(refusal_code(&response), WorkRefusalCode::Expired);
     assert!(!WorkRefusal::Expired.is_retryable());
+}
+
+#[tokio::test]
+async fn acceptance_workflow_catches_up_before_committing_the_signature() {
+    struct Chain(Vec<FinalizedWork>);
+    impl FinalizedBlocks for Chain {
+        async fn latest_height(&self) -> Result<Option<u64>, BlockSourceError> {
+            Ok(self.0.last().map(|block| block.height))
+        }
+        async fn block_at(&self, height: u64) -> Result<Option<FinalizedWork>, BlockSourceError> {
+            Ok(self.0.iter().find(|block| block.height == height).cloned())
+        }
+    }
+
+    let root = temp();
+    let service = WorkService::new(provider_endpoint(root.path()));
+    let deadline = deadlines().acceptance;
+    let chain = Chain(
+        ((CURSOR + 1)..=(deadline + 1))
+            .map(|height| FinalizedWork {
+                height,
+                parent: payload_at(height - 1),
+                payload: payload_at(height),
+                txs: Vec::new(),
+            })
+            .collect(),
+    );
+    let response = service
+        .accept_after_catch_up(&chain, &signed_request(1, 1))
+        .await
+        .expect("the phase-boundary catch-up completes");
+    assert_eq!(refusal_code(&response), WorkRefusalCode::Expired);
+    assert!(
+        service
+            .endpoint()
+            .expect("the endpoint is readable")
+            .state()
+            .job()
+            .is_none()
+    );
 }
 
 #[test]

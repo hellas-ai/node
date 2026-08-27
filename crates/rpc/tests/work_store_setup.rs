@@ -10,17 +10,26 @@
 use std::collections::BTreeSet;
 
 use hellas_kernel::{
-    Auth, BlockHeight, CoinId, Decode as _, Edge, EdgeId, Funding, Key, LeaseSlots, List,
-    MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, NetworkId, Parties, Payout, RegistryChunk,
-    RegistryNamespace, RegistryRecordTag, Secp256k1Signer, Secp256k1Verifier, Terms, TermsHash, Tx,
-    WorkPaymentTerms, WorkStakeBondTerms,
+    Auth, BlockHeight, CoinId, Decode as _, Edge, EdgeId, EdgeValues, Fees, Funding, Key,
+    LeaseSlots, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Move, NetworkId, Parties, Party,
+    PaymentCloseStart, Payout, RegistryChunk, RegistryNamespace, RegistryRecordTag,
+    Secp256k1Signer, Secp256k1Verifier, Sig, Terms, TermsHash, Tx, WorkPaymentTerms,
+    WorkStakeBondTerms,
+};
+use hellas_rpc::protocol::work::{
+    PaidChannelPolicyV1, PaidExecutionPolicyV1, private_policy_commitment,
 };
 use hellas_rpc::protocol::work_bundle::WorkChannelSetupBundleV1;
+use hellas_rpc::protocol::work_setup::{OmissionMeasurements, ProviderChannelPolicy};
+use hellas_rpc::protocol::{ContentId, Digest};
+use hellas_rpc::work_close::{BlockSourceError, FinalizedBlocks, FinalizedWork, TxSink};
+use hellas_rpc::work_open::{FinalizedSetup, SetupProgress, SetupQuery, SetupView, advance_setup};
 use hellas_rpc::work_store::journal::JournalError;
 use hellas_rpc::work_store::setup::setup_key;
 use hellas_rpc::work_store::{
-    ObservedSetup, Role, SetupAbort, SetupDecision, SetupEnd, SetupFault, SetupRecord, SetupState,
-    SetupStateError, SetupStore, WorkStoreError,
+    ChannelStore, ObservedSetup, Role, SetupAbort, SetupDecision, SetupEnd, SetupFault,
+    SetupHistoryBatch, SetupHistoryBlock, SetupRecord, SetupScan, SetupState, SetupStateError,
+    SetupStore, WorkStoreError,
 };
 
 // ── Fixture ───────────────────────────────────────────────────────────
@@ -29,6 +38,7 @@ const HORIZON: u64 = 500;
 const STAKE: u64 = 64;
 const BOND_COIN: u8 = 0xa1;
 const PAYMENT_COIN: u8 = 0xb1;
+const SALT: [u8; 32] = [0x5a; 32];
 
 fn network() -> NetworkId {
     let Some(network) = NetworkId::new("hellas-test") else {
@@ -94,10 +104,50 @@ fn payment_terms(bond_edge: EdgeId) -> WorkPaymentTerms {
     WorkPaymentTerms {
         bond_edge,
         bond_terms: bond_terms(),
-        private_policy_commitment: [0x25; 32],
+        private_policy_commitment: private_policy_commitment(network(), &SALT, &channel_policy()),
         omit_response_blocks: hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
         start_validity_blocks: 8,
         omission_bond: 4,
+    }
+}
+
+fn channel_policy() -> PaidChannelPolicyV1 {
+    PaidChannelPolicyV1 {
+        compute_credit_limit: 40,
+        delivery_credit_limit: 40,
+    }
+}
+
+fn execution_policy() -> PaidExecutionPolicyV1 {
+    PaidExecutionPolicyV1 {
+        allowed_environment: ContentId::from_bytes([0x31; 32]),
+        generation_policy_digest: Digest::from_bytes([0x32; 32]),
+        identity_source_digest: Digest::from_bytes([0x33; 32]),
+        max_prompt_tokens: 512,
+        max_new_tokens: 128,
+        max_stop_token_ids: 4,
+        max_spool_bytes: 1_048_576,
+        max_encoded_result_frame: 262_144,
+        max_encoded_quote_response: 1_048_576,
+        dispatch_margin_blocks: 4,
+        delivery_margin_blocks: 2,
+        oracle_grace_blocks: 6,
+        fixed_price: 10,
+    }
+}
+
+fn provider_policy() -> ProviderChannelPolicy {
+    ProviderChannelPolicy {
+        network: network(),
+        policy_salt: SALT,
+        channel_policy: channel_policy(),
+        execution_policy: execution_policy(),
+        expected_payment_values: EdgeValues::new(1_000, 200, Fees::ZERO),
+        omission: OmissionMeasurements {
+            response_probability: 999_000,
+            response_blocks: hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
+            response_cost_cap: 1,
+        },
     }
 }
 
@@ -153,6 +203,38 @@ fn bundle_record(bundle: &WorkChannelSetupBundleV1) -> SetupRecord {
     }
 }
 
+fn scan() -> SetupScan {
+    SetupScan {
+        height: 7,
+        payload: [0x47; 32],
+    }
+}
+
+fn scan_record() -> SetupRecord {
+    let scan = scan();
+    SetupRecord::ScanArmed {
+        height: scan.height,
+        payload: scan.payload,
+    }
+}
+
+fn armed_record(bundle: &WorkChannelSetupBundleV1) -> SetupRecord {
+    let payment_edge = bundle
+        .payment_edge()
+        .expect("an armed revision has a payment edge");
+    let terms = bundle
+        .payment_terms()
+        .expect("an armed revision has payment terms")
+        .clone();
+    let descriptor = provider_policy()
+        .describe_close(payment_edge, terms)
+        .expect("the fixture close descriptor opens");
+    SetupRecord::ArmedBundle {
+        bundle: bundle.encode(),
+        close_descriptor: Box::new(descriptor),
+    }
+}
+
 fn bond_edge() -> EdgeId {
     proposed().bond_edge()
 }
@@ -184,8 +266,13 @@ fn completed_store(root: &std::path::Path) -> SetupStore {
     let one = proposed();
     let two = countersigned(one.clone());
     let three = completed(two.clone());
-    for bundle in [&one, &two, &three] {
-        if let Err(error) = store.commit(bundle_record(bundle), &verifier) {
+    for record in [
+        scan_record(),
+        bundle_record(&one),
+        bundle_record(&two),
+        armed_record(&three),
+    ] {
+        if let Err(error) = store.commit(record, &verifier) {
             panic!("the fixture revision commits: {error}");
         }
     }
@@ -355,7 +442,10 @@ fn a_retained_revision_is_re_exported_byte_for_byte() {
         if let Err(error) = client_store.commit(bundle_record(&proposed()), &verifier) {
             panic!("revision 1 commits: {error}");
         }
-        if let Err(error) = client_store.commit(bundle_record(&two), &verifier) {
+        if let Err(error) = client_store.commit(scan_record(), &verifier) {
+            panic!("the scan arm commits: {error}");
+        }
+        if let Err(error) = client_store.commit(armed_record(&two), &verifier) {
             panic!("revision 2 commits: {error}");
         }
     }
@@ -366,7 +456,46 @@ fn a_retained_revision_is_re_exported_byte_for_byte() {
         recovered.state().bundle_bytes(),
         Some(two.encode().as_slice())
     );
-    assert_eq!(recovered.len(), 2);
+    assert_eq!(recovered.len(), 3);
+}
+
+#[test]
+fn applying_an_exportable_bundle_without_scan_arming_is_refused() {
+    let dir = temp();
+    let verifier = Secp256k1Verifier::new();
+    let mut provider_store = store(dir.path(), Role::Provider);
+    let error = provider_store
+        .commit(bundle_record(&proposed()), &verifier)
+        .expect_err("revision 1 cannot become exportable before ScanArmed");
+    assert!(matches!(
+        error,
+        WorkStoreError::Setup(SetupStateError::WrongStage { .. })
+    ));
+    assert!(provider_store.state().bundle_bytes().is_none());
+}
+
+#[test]
+fn a_second_distinct_scan_arm_is_refused() {
+    let dir = temp();
+    let verifier = Secp256k1Verifier::new();
+    let mut provider_store = store(dir.path(), Role::Provider);
+    provider_store
+        .commit(scan_record(), &verifier)
+        .expect("the first arm commits");
+    let error = provider_store
+        .commit(
+            SetupRecord::ScanArmed {
+                height: scan().height + 1,
+                payload: [0x99; 32],
+            },
+            &verifier,
+        )
+        .expect_err("a distinct scan floor cannot replace the held one");
+    assert!(matches!(
+        error,
+        WorkStoreError::Setup(SetupStateError::WrongStage { .. })
+    ));
+    assert_eq!(provider_store.state().scan_armed(), Some(scan()));
 }
 
 /// The three revisions go in order, and nothing else does.
@@ -395,8 +524,13 @@ fn revisions_extend_and_never_rewind() {
     drop(skipping);
 
     let mut ordered = store(dir.path(), Role::Provider);
-    for bundle in [&one, &two, &three] {
-        if let Err(error) = ordered.commit(bundle_record(bundle), &verifier) {
+    for record in [
+        scan_record(),
+        bundle_record(&one),
+        bundle_record(&two),
+        armed_record(&three),
+    ] {
+        if let Err(error) = ordered.commit(record, &verifier) {
             panic!("the revision commits: {error}");
         }
     }
@@ -411,7 +545,7 @@ fn revisions_extend_and_never_rewind() {
         "unexpected error: {error}"
     );
     assert_eq!(ordered.state().revision(), Some(3));
-    assert_eq!(ordered.len(), 3);
+    assert_eq!(ordered.len(), 4);
 }
 
 /// A revision whose signatures do not check never reaches the file —
@@ -718,7 +852,7 @@ fn the_recovery_decision_covers_every_finalized_shape() {
                 payment: Some(payment),
                 ..Observed::before_anything()
             },
-            SetupDecision::Fault(SetupFault::UnexplainedState),
+            SetupDecision::CloseOnly,
         ),
         (
             "a live unleased bond",
@@ -786,6 +920,17 @@ fn the_recovery_decision_covers_every_finalized_shape() {
     }
 }
 
+#[test]
+fn round7_payment_live_without_bond_mounts_close() {
+    let dir = temp();
+    let held = completed_store(dir.path());
+    let observed = Observed {
+        payment: Some(payment_object()),
+        ..Observed::before_anything()
+    };
+    assert_eq!(observed.decide(held.state()), SetupDecision::CloseOnly);
+}
+
 /// A client holds no countersigned payment Open. It never decides to
 /// submit or to time anything out, whatever the chain looks like.
 #[test]
@@ -795,8 +940,8 @@ fn a_client_never_submits_the_providers_transactions() {
     let mut client_store = store(dir.path(), Role::Client);
     let one = proposed();
     let two = countersigned(one.clone());
-    for bundle in [&one, &two] {
-        if let Err(error) = client_store.commit(bundle_record(bundle), &verifier) {
+    for record in [bundle_record(&one), scan_record(), armed_record(&two)] {
+        if let Err(error) = client_store.commit(record, &verifier) {
             panic!("the revision commits: {error}");
         }
     }
@@ -834,6 +979,9 @@ fn a_proposal_alone_decides_nothing() {
     let dir = temp();
     let verifier = Secp256k1Verifier::new();
     let mut journal = store(dir.path(), Role::Provider);
+    if let Err(error) = journal.commit(scan_record(), &verifier) {
+        panic!("the scan arm commits: {error}");
+    }
     if let Err(error) = journal.commit(bundle_record(&proposed()), &verifier) {
         panic!("revision 1 commits: {error}");
     }
@@ -850,6 +998,9 @@ fn submission_markers_follow_the_transactions_they_are_about() {
     let dir = temp();
     let verifier = Secp256k1Verifier::new();
     let mut journal = store(dir.path(), Role::Provider);
+    if let Err(error) = journal.commit(scan_record(), &verifier) {
+        panic!("the scan arm commits: {error}");
+    }
     if let Err(error) = journal.commit(bundle_record(&proposed()), &verifier) {
         panic!("revision 1 commits: {error}");
     }
@@ -869,8 +1020,8 @@ fn submission_markers_follow_the_transactions_they_are_about() {
 
     let two = countersigned(proposed());
     let three = completed(two.clone());
-    for bundle in [&two, &three] {
-        if let Err(error) = journal.commit(bundle_record(bundle), &verifier) {
+    for record in [bundle_record(&two), armed_record(&three)] {
+        if let Err(error) = journal.commit(record, &verifier) {
             panic!("the revision commits: {error}");
         }
     }
@@ -905,8 +1056,13 @@ fn submission_markers_follow_the_transactions_they_are_about() {
     // A client cannot record having broadcast what it does not hold.
     let other = temp();
     let mut client_store = store(other.path(), Role::Client);
-    for bundle in [&proposed(), &two, &three] {
-        if let Err(error) = client_store.commit(bundle_record(bundle), &verifier) {
+    for record in [
+        bundle_record(&proposed()),
+        scan_record(),
+        armed_record(&two),
+        bundle_record(&three),
+    ] {
+        if let Err(error) = client_store.commit(record, &verifier) {
             panic!("the revision commits: {error}");
         }
     }
@@ -1061,6 +1217,18 @@ fn the_funding_coins_come_from_the_retained_transactions() {
 /// trailing byte are all refused.
 #[test]
 fn the_record_codec_is_exact() {
+    let scan_arm = scan_record();
+    let scan_bytes = scan_arm.encode();
+    assert_eq!(SetupRecord::decode(&scan_bytes), Ok(scan_arm));
+
+    let armed = armed_record(&countersigned(proposed()));
+    let armed_bytes = armed.encode();
+    assert_eq!(SetupRecord::decode(&armed_bytes), Ok(armed));
+    assert_eq!(
+        SetupRecord::decode(&armed_bytes[..armed_bytes.len() - 1]),
+        Err(SetupStateError::Malformed),
+    );
+
     let complete = SetupRecord::Complete {
         payment_edge: payment_edge(),
         origin_height: 44,
@@ -1098,12 +1266,421 @@ fn the_record_codec_is_exact() {
     };
     assert_eq!(origin_payload, [0x01; 32]);
     assert_eq!(origin_parent, [0x02; 32]);
+
+    let history = SetupRecord::SetupHistoryBatch(SetupHistoryBatch {
+        blocks: vec![SetupHistoryBlock {
+            height: scan().height + 1,
+            parent: scan().payload,
+            payload: [0x48; 32],
+            txs: vec![
+                completed(countersigned(proposed()))
+                    .payment_open()
+                    .expect("an executable payment Open"),
+            ],
+        }],
+    });
+    assert_eq!(SetupRecord::decode(&history.encode()), Ok(history));
+}
+
+#[test]
+fn setup_history_replay_checks_first_and_internal_links_atomically() {
+    let dir = temp();
+    let verifier = Secp256k1Verifier::new();
+    let mut journal = completed_store(dir.path());
+    let before = journal.len();
+    let error = journal
+        .commit(
+            SetupRecord::SetupHistoryBatch(SetupHistoryBatch {
+                blocks: vec![
+                    SetupHistoryBlock {
+                        height: scan().height + 1,
+                        parent: [0xff; 32],
+                        payload: [0x48; 32],
+                        txs: Vec::new(),
+                    },
+                    SetupHistoryBlock {
+                        height: scan().height + 2,
+                        parent: [0xee; 32],
+                        payload: [0x49; 32],
+                        txs: Vec::new(),
+                    },
+                ],
+            }),
+            &verifier,
+        )
+        .expect_err("a batch not extending ScanArmed is refused as one transition");
+    assert!(matches!(
+        error,
+        WorkStoreError::Setup(SetupStateError::Malformed)
+    ));
+    assert_eq!(journal.len(), before);
+    assert_eq!(journal.state().history_cursor(), Some(scan()));
+}
+
+/// Every signature-bearing setup export leaves enough state to recover the
+/// portable Open and, once payment is funded, mount close-only settlement
+/// without operator configuration.
+#[test]
+fn round4_exported_authorization_recovers() {
+    let verifier = Secp256k1Verifier::new();
+    let one = proposed();
+    let two = countersigned(one.clone());
+    let three = completed(two.clone());
+
+    // Crash after provider revision 1 export.
+    let provider_one = temp();
+    {
+        let mut journal = store(provider_one.path(), Role::Provider);
+        for record in [scan_record(), bundle_record(&one)] {
+            if let Err(error) = journal.commit(record, &verifier) {
+                panic!("provider revision 1 arms before export: {error}");
+            }
+        }
+    }
+    let recovered_one = store(provider_one.path(), Role::Provider);
+    assert_eq!(recovered_one.state().scan_armed(), Some(scan()));
+    assert_eq!(
+        recovered_one.state().bundle_bytes(),
+        Some(one.encode().as_slice())
+    );
+    drop(recovered_one);
+
+    // Crash after client revision 2 export. The countersigned bond is a
+    // portable executable Open, and the same record retains the close
+    // descriptor before those bytes can leave.
+    let client_two = temp();
+    {
+        let mut journal = store(client_two.path(), Role::Client);
+        for record in [bundle_record(&one), scan_record(), armed_record(&two)] {
+            if let Err(error) = journal.commit(record, &verifier) {
+                panic!("client revision 2 arms before export: {error}");
+            }
+        }
+    }
+    let recovered_two = store(client_two.path(), Role::Client);
+    assert!(recovered_two.state().bond_open().is_some());
+    assert!(recovered_two.state().close_descriptor().is_some());
+    drop(recovered_two);
+
+    // Crash after provider revision 3 export. A counterparty may now submit
+    // either executable Open; recovery still derives the funded settlement
+    // from the observed edge rather than from the lost configuration.
+    let provider_three = temp();
+    {
+        let mut journal = store(provider_three.path(), Role::Provider);
+        for record in [
+            scan_record(),
+            bundle_record(&one),
+            bundle_record(&two),
+            armed_record(&three),
+        ] {
+            if let Err(error) = journal.commit(record, &verifier) {
+                panic!("provider revision 3 arms before export: {error}");
+            }
+        }
+    }
+    let recovered_three = store(provider_three.path(), Role::Provider);
+    assert!(recovered_three.state().bond_open().is_some());
+    assert!(recovered_three.state().payment_open().is_some());
+    let descriptor = recovered_three
+        .state()
+        .close_descriptor()
+        .expect("revision 3 retained its close descriptor");
+    let settlement = descriptor
+        .funded_settlement(&payment_object())
+        .expect("funded recovery derives settlement from the edge");
+    assert_eq!(settlement.capacity(), 60);
+}
+
+/// A marker-before-broadcast crash cannot be turned into an early terminal
+/// setup record: the portable Open may still finalize after the snapshot that
+/// suggested abort or fault.
+#[test]
+fn round6_submitted_open_delays_end() {
+    let dir = temp();
+    let verifier = Secp256k1Verifier::new();
+    let mut journal = completed_store(dir.path());
+    if let Err(error) = journal.commit(SetupRecord::BondSubmitted, &verifier) {
+        panic!("the bond submission arms its unresolved Open: {error}");
+    }
+    for outcome in [
+        SetupEnd::Aborted(SetupAbort::PaymentFundingSpent),
+        SetupEnd::Faulted(SetupFault::BondFundingSpent),
+    ] {
+        let error = journal
+            .commit(SetupRecord::Ended { outcome }, &verifier)
+            .expect_err("an in-flight Open prevents setup end");
+        assert!(
+            matches!(
+                error,
+                WorkStoreError::Setup(SetupStateError::SubmittedOpenUnresolved)
+            ),
+            "unexpected error: {error}",
+        );
+        assert_eq!(journal.state().end(), None);
+    }
+
+    let bond_open = journal
+        .state()
+        .bond_open()
+        .expect("the retained submitted Open");
+    if let Err(error) = journal.commit(
+        SetupRecord::SetupHistoryBatch(SetupHistoryBatch {
+            blocks: vec![
+                SetupHistoryBlock {
+                    height: scan().height + 1,
+                    parent: scan().payload,
+                    payload: [0x48; 32],
+                    txs: Vec::new(),
+                },
+                SetupHistoryBlock {
+                    height: scan().height + 2,
+                    parent: [0x48; 32],
+                    payload: [0x49; 32],
+                    txs: vec![bond_open],
+                },
+            ],
+        }),
+        &verifier,
+    ) {
+        panic!("contiguous history finalizes the retained Open: {error}");
+    }
+    assert!(
+        !journal.state().bond_submitted(),
+        "the finalized Open discharges its submission obligation",
+    );
+    if let Err(error) = journal.commit(
+        SetupRecord::Ended {
+            outcome: SetupEnd::Aborted(SetupAbort::PaymentFundingSpent),
+        },
+        &verifier,
+    ) {
+        panic!("history resolution permits the end: {error}");
+    }
+    drop(journal);
+    assert_eq!(
+        store(dir.path(), Role::Provider).state().end(),
+        Some(SetupEnd::Aborted(SetupAbort::PaymentFundingSpent)),
+    );
+}
+
+/// A provider's own finalized bond Timeout ends the setup cleanly, not
+/// in the fault the spent stake would otherwise be read as.
+///
+/// The provider submits the bond and then the deterministic Timeout.
+/// While that Timeout is only submitted, the absent bond over a spent
+/// stake is its own reclaim in flight and no fault is decided. Once
+/// contiguous history holds the bond Open and the Close that spent it,
+/// the same read is a clean reclaim — the stake came back — and the end
+/// is `Abort(BondReclaimed)`, which a genuinely unexplained spend
+/// (`the_recovery_decision_covers_every_finalized_shape`) still is not.
+#[test]
+fn a_finalized_bond_timeout_reclaims_the_stake_cleanly() {
+    let dir = temp();
+    let verifier = Secp256k1Verifier::new();
+    let mut journal = completed_store(dir.path());
+    for record in [SetupRecord::BondSubmitted, SetupRecord::BondTimeoutSubmitted] {
+        if let Err(error) = journal.commit(record, &verifier) {
+            panic!("the provider arms and times out its bond: {error}");
+        }
+    }
+
+    let spent_stake = || Observed {
+        live: without(BOND_COIN),
+        ..Observed::before_anything()
+    };
+
+    // The Timeout is submitted but its Close is not yet in history: this
+    // endpoint's own reclaim is in flight, so it waits rather than
+    // journaling a theft it caused.
+    assert_eq!(
+        spent_stake().decide(journal.state()),
+        SetupDecision::AwaitingCounterparty,
+        "a submitted timeout waits for its finalized close",
+    );
+
+    // History finalizes the bond Open and the deterministic Timeout Close
+    // that consumed it.
+    let bond_open = journal
+        .state()
+        .bond_open()
+        .expect("the retained bond Open");
+    let bond_close = Tx::timeout_close(bond_edge(), &Terms::work_stake_bond(bond_terms()))
+        .expect("the bond has a deterministic timeout close");
+    if let Err(error) = journal.commit(
+        SetupRecord::SetupHistoryBatch(SetupHistoryBatch {
+            blocks: vec![
+                SetupHistoryBlock {
+                    height: scan().height + 1,
+                    parent: scan().payload,
+                    payload: [0x51; 32],
+                    txs: vec![bond_open],
+                },
+                SetupHistoryBlock {
+                    height: scan().height + 2,
+                    parent: [0x51; 32],
+                    payload: [0x52; 32],
+                    txs: vec![bond_close],
+                },
+            ],
+        }),
+        &verifier,
+    ) {
+        panic!("history finalizes the bond and its timeout close: {error}");
+    }
+
+    // The absent bond over spent stake is now explained by this
+    // endpoint's own finalized reclaim.
+    assert_eq!(
+        spent_stake().decide(journal.state()),
+        SetupDecision::Abort(SetupAbort::BondReclaimed),
+        "the finalized timeout close ends the setup cleanly",
+    );
+
+    // And that clean end journals where a fault could not have.
+    if let Err(error) = journal.commit(
+        SetupRecord::Ended {
+            outcome: SetupEnd::Aborted(SetupAbort::BondReclaimed),
+        },
+        &verifier,
+    ) {
+        panic!("the reclaim end journals: {error}");
+    }
+    drop(journal);
+    assert_eq!(
+        store(dir.path(), Role::Provider).state().end(),
+        Some(SetupEnd::Aborted(SetupAbort::BondReclaimed)),
+    );
+}
+
+/// A close ordered after the payment Open in the origin block itself is
+/// seen when the channel is mounted, not lost with the block that opened
+/// it.
+///
+/// The origin block carries the payment Open and, after it, a client's
+/// `StartPaymentClose` on that very edge. A later block times the bond
+/// out, which is what puts this setup on the close-only recovery path.
+/// The mount opens with its cursor already on the origin block, so a
+/// same-block contest is exactly the one an inclusive-observe would drop
+/// — and the assertion is that the mounted channel journal holds it.
+#[tokio::test]
+async fn a_mount_replays_a_same_block_contest() {
+    struct Blocks {
+        blocks: Vec<FinalizedWork>,
+    }
+    impl FinalizedBlocks for Blocks {
+        async fn latest_height(&self) -> Result<Option<u64>, BlockSourceError> {
+            Ok(self.blocks.last().map(|block| block.height))
+        }
+        async fn block_at(&self, height: u64) -> Result<Option<FinalizedWork>, BlockSourceError> {
+            Ok(self
+                .blocks
+                .iter()
+                .find(|block| block.height == height)
+                .cloned())
+        }
+    }
+    // Close-only recovery decides from journaled history, so neither the
+    // fresh setup read nor the sink is consulted on this path.
+    struct NoView;
+    impl SetupView for NoView {
+        async fn finalized_setup(
+            &self,
+            _query: SetupQuery,
+        ) -> Result<Option<FinalizedSetup>, BlockSourceError> {
+            panic!("close-only recovery reads history, not a fresh setup snapshot");
+        }
+    }
+    struct NoSink;
+    impl TxSink for NoSink {
+        async fn submit(
+            &self,
+            _tx: Tx,
+        ) -> Result<hellas_rpc::SubmitTxOutcome, BlockSourceError> {
+            panic!("mounting a close-only channel submits nothing");
+        }
+    }
+
+    let dir = temp();
+    let verifier = Secp256k1Verifier::new();
+    let mut journal = completed_store(dir.path());
+
+    let bundle = completed(countersigned(proposed()));
+    let payment_open = bundle.payment_open().expect("the executable payment Open");
+    let contest = Tx::move_action(Move::StartPaymentClose(PaymentCloseStart::new(
+        payment_edge(),
+        Terms::work_payment(payment_terms(bond_edge())),
+        Party::Maker,
+        (scan().height + 2, scan().height + 9),
+        None,
+        Sig::from_bytes([0_u8; Sig::LENGTH]),
+    )));
+    let bond_close = Tx::timeout_close(bond_edge(), &Terms::work_stake_bond(bond_terms()))
+        .expect("the bond has a deterministic timeout close");
+
+    let origin_payload = [0x71; 32];
+    let blocks = Blocks {
+        blocks: vec![
+            FinalizedWork {
+                height: scan().height + 1,
+                parent: scan().payload,
+                payload: origin_payload,
+                txs: vec![payment_open, contest],
+            },
+            FinalizedWork {
+                height: scan().height + 2,
+                parent: origin_payload,
+                payload: [0x72; 32],
+                txs: vec![bond_close],
+            },
+        ],
+    };
+
+    // The history batch is fetched and journaled first, and the mount
+    // runs on the next step.
+    match advance_setup(&NoView, &blocks, &NoSink, &mut journal, &verifier).await {
+        Ok(SetupProgress::HistoryAdvanced { through }) => assert_eq!(through, scan().height + 2),
+        other => panic!("the history batch is fetched first: {other:?}"),
+    }
+    let origin = match advance_setup(&NoView, &blocks, &NoSink, &mut journal, &verifier).await {
+        Ok(SetupProgress::CloseOnly { origin, settled }) => {
+            assert!(!settled, "the payment edge is contested, not closed");
+            origin
+        }
+        other => panic!("a bond-timed-out payment mounts close-only: {other:?}"),
+    };
+    assert_eq!(origin.height, scan().height + 1, "the origin is the payment Open block");
+
+    // The mounted channel journal holds the contest: the Start ordered
+    // after the Open in the origin block was replayed, not dropped with
+    // the block the cursor already sat on.
+    let descriptor = journal
+        .state()
+        .close_descriptor()
+        .expect("the armed close descriptor");
+    let channel = descriptor.channel().clone();
+    let settlement = descriptor
+        .expected_settlement()
+        .expect("the expected settlement");
+    let mounted = ChannelStore::open(
+        journal.root(),
+        channel,
+        settlement,
+        Role::Provider,
+        origin,
+        &verifier,
+    )
+    .expect("the mounted channel journal reopens");
+    assert!(
+        mounted.state().close_opened().is_some(),
+        "the same-block contest is journaled on the mounted channel",
+    );
 }
 
 /// Every ending this handshake can reach survives the journal, under
 /// the code it has always had.
 ///
-/// All seven are reachable — `decide` returns each of them from the
+/// All eight are reachable — `decide` returns each of them from the
 /// chain state it observes — so none of this is a test of dead surface.
 /// The codes are pinned rather than only round-tripped, because a
 /// round-trip is a conversation between an encoder and a decoder that
@@ -1114,7 +1691,7 @@ fn the_record_codec_is_exact() {
 fn every_setup_ending_round_trips_under_its_own_code() {
     // The tag `4` and the seven codes, written out here rather than
     // read from the module that assigns them.
-    let endings: [(SetupEnd, u8); 7] = [
+    let endings: [(SetupEnd, u8); 8] = [
         (SetupEnd::Complete, 0),
         (SetupEnd::Aborted(SetupAbort::BondOpenExpired), 1),
         (SetupEnd::Aborted(SetupAbort::PaymentFundingSpent), 2),
@@ -1122,6 +1699,7 @@ fn every_setup_ending_round_trips_under_its_own_code() {
         (SetupEnd::Faulted(SetupFault::LeaseMalformed), 4),
         (SetupEnd::Faulted(SetupFault::LeasedElsewhere), 5),
         (SetupEnd::Faulted(SetupFault::UnexplainedState), 6),
+        (SetupEnd::Aborted(SetupAbort::BondReclaimed), 7),
     ];
     for (outcome, code) in endings {
         let bytes = SetupRecord::Ended { outcome }.encode();
@@ -1132,9 +1710,9 @@ fn every_setup_ending_round_trips_under_its_own_code() {
             "{outcome:?} reads back as itself"
         );
     }
-    // Seven codes, and nothing beyond them is an ending.
+    // Eight codes, and nothing beyond them is an ending.
     assert_eq!(
-        SetupRecord::decode(&[4, 7]),
+        SetupRecord::decode(&[4, 8]),
         Err(SetupStateError::Malformed)
     );
 }
@@ -1234,8 +1812,8 @@ fn completed_store_bytes() -> usize {
     let mut journal = store(dir.path(), Role::Provider);
     let one = proposed();
     let two = countersigned(one.clone());
-    for bundle in [&one, &two] {
-        if let Err(error) = journal.commit(bundle_record(bundle), &verifier) {
+    for record in [scan_record(), bundle_record(&one), bundle_record(&two)] {
+        if let Err(error) = journal.commit(record, &verifier) {
             panic!("the revision commits: {error}");
         }
     }
@@ -1244,7 +1822,7 @@ fn completed_store_bytes() -> usize {
         panic!("the journal reads");
     };
     let mut journal = store(dir.path(), Role::Provider);
-    if let Err(error) = journal.commit(bundle_record(&completed(two)), &verifier) {
+    if let Err(error) = journal.commit(armed_record(&completed(two)), &verifier) {
         panic!("the revision commits: {error}");
     }
     drop(journal);
@@ -1297,7 +1875,7 @@ fn a_recovered_journal_can_be_written_again() {
         assert_eq!(recovered.state().revision(), Some(2));
         // The interrupted revision, retried.
         if let Err(error) = recovered.commit(
-            bundle_record(&completed(countersigned(proposed()))),
+            armed_record(&completed(countersigned(proposed()))),
             &verifier,
         ) {
             panic!("the retried revision commits: {error}");
@@ -1306,7 +1884,7 @@ fn a_recovered_journal_can_be_written_again() {
 
     let reopened = store(dir.path(), Role::Provider);
     assert_eq!(reopened.state().revision(), Some(3));
-    assert_eq!(reopened.len(), 3);
+    assert_eq!(reopened.len(), 4);
 }
 
 /// Signatures are checked when the journal is read back, not only when
@@ -1341,6 +1919,9 @@ fn replay_checks_the_signatures_again() {
         ) else {
             panic!("the journal opens");
         };
+        if let Err(error) = credulous.commit(scan_record(), &AcceptAll) {
+            panic!("the scan arm commits: {error}");
+        }
         if let Err(error) = credulous.commit(bundle_record(&forged), &AcceptAll) {
             panic!("a credulous verifier accepts it: {error}");
         }

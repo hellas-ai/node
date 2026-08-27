@@ -332,6 +332,12 @@ impl EdgeValues {
         self.reserve
     }
 
+    /// Returns the fee schedule committed for future close execution.
+    #[must_use]
+    pub const fn close_fees(self) -> Fees {
+        self.close_fees
+    }
+
     /// Returns what a close of this cost distributes: the principal plus
     /// the part of the open-time reserve that close does not consume.
     ///

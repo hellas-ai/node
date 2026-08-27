@@ -37,14 +37,12 @@
 //! one whose accepted transactions contain an Open deriving this payment
 //! edge.
 //!
-//! `origin_floor` is where that scan starts and it is a cost, not a
-//! premise. An Open consumes its funding coins, so the whole chain holds
-//! at most one block containing it: a floor below the origin finds the
-//! same block a floor of zero would, and a floor above it finds nothing
-//! and returns [`SetupDriveError::OriginNotFound`] rather than recording
-//! a cursor it guessed. Nothing in the setup journal retains a scan
-//! position, so a driver that has restarted and has no floor of its own
-//! passes zero and pays for it in reads.
+//! The scan starts at the successor of the journal's immutable
+//! [`SetupRecord::ScanArmed`] floor. Its first parent must be the armed
+//! payload and every later parent must be the preceding payload. Submission
+//! markers are deliberately absent from this calculation: who happened to
+//! submit an Open cannot move the observation floor past an authorization a
+//! counterparty may already have put on chain.
 //!
 //! # What it does not do
 //!
@@ -58,18 +56,22 @@
 //! back only by an operator building and sending that transaction.
 //!
 //! It does not exchange revisions with the peer. That is
-//! [`crate::work_handshake::exchange_setup`], and a caller runs the two
-//! in the obvious order: exchange until the bundle is complete, then
-//! drive until the journals record it.
+//! [`crate::work_handshake::send_setup_exchange`], bracketed by its
+//! prepare/apply helpers, and a caller runs the two in the obvious order:
+//! exchange until the bundle is complete, then drive until the journals
+//! record it.
 
 use std::collections::BTreeSet;
 
 use hellas_kernel::{CoinId, Edge, EdgeId, LeaseSlots, SigVerifier, Tx};
 
-use crate::work_close::{BlockSourceError, FinalizedBlocks, TxSink};
+use crate::work_close::{
+    BlockSourceError, FinalizedBlocks, FinalizedWork, TxSink, apply_finalized_txs, observe,
+};
 use crate::work_store::{
-    ObservedSetup, SetupAbort, SetupDecision, SetupEnd, SetupFault, SetupOrigin, SetupRecord,
-    SetupState, SetupStore, WorkStoreError,
+    ChannelStore, ObservedSetup, SetupAbort, SetupDecision, SetupEnd, SetupFault,
+    SetupHistoryBatch, SetupHistoryBlock, SetupOrigin, SetupRecord, SetupScan, SetupState,
+    SetupStore, WorkStoreError,
 };
 
 /// Which channel a setup read answers for, and which coins it must
@@ -166,6 +168,20 @@ pub enum SetupProgress {
     /// Both edges and this channel's lease are finalized, and the
     /// journal now records where.
     Complete(SetupOrigin),
+    /// One bounded finalized-history batch was durably applied. The caller
+    /// yields before asking for another batch.
+    HistoryAdvanced {
+        /// Last finalized height in the batch.
+        through: u64,
+    },
+    /// Admission is unavailable, but the journal-only channel mount was
+    /// opened and its retained Start/Close history replayed.
+    CloseOnly {
+        /// Payment-Open origin recovered from finalized history.
+        origin: SetupOrigin,
+        /// Whether that history already contains the finalized payment close.
+        settled: bool,
+    },
     /// A retained Open was journaled and handed to consensus. It is not
     /// included until a block says so.
     Submitted {
@@ -183,6 +199,11 @@ pub enum SetupProgress {
     /// The bond is live and unleased and this channel cannot use it.
     /// Its Timeout is immediate, and nothing here sends one.
     TimeoutBond,
+    /// The deterministic bond Timeout was journaled and submitted.
+    BondTimeoutSubmitted {
+        /// What the node did with the transaction.
+        outcome: crate::SubmitTxOutcome,
+    },
     /// Setup stopped with the provider's coins unspent, and the journal
     /// records it.
     Aborted(SetupAbort),
@@ -235,6 +256,23 @@ pub enum SetupDriveError {
         /// Step whose transaction was missing.
         step: SetupStep,
     },
+    /// This journal predates recovery arming and therefore has no safe
+    /// history floor.
+    #[error("the setup journal has no armed history scan")]
+    ScanNotArmed,
+    /// Finalized history did not extend the immutable armed payload.
+    #[error("finalized block {height} does not extend the setup's armed history")]
+    OriginNotContiguous {
+        /// First height whose parent did not match.
+        height: u64,
+    },
+    /// An executable authorization escaped without its recovery descriptor.
+    #[error("the setup journal has no armed close descriptor")]
+    CloseNotArmed,
+    /// The retained executable bundle did not contain a timeout-closeable
+    /// bond Open.
+    #[error("the setup journal cannot reconstruct the deterministic bond Timeout")]
+    TimeoutUnavailable,
 }
 
 /// Takes one step of the setup this journal holds.
@@ -265,7 +303,6 @@ pub async fn advance_setup<W, B, T, V>(
     sink: &T,
     store: &mut SetupStore,
     verifier: &V,
-    origin_floor: u64,
 ) -> Result<SetupProgress, SetupDriveError>
 where
     W: SetupView + ?Sized,
@@ -278,14 +315,17 @@ where
     // the same question and would answer it the same way — but the one
     // shortcut that keeps a finished setup from reading the chain
     // forever, and the only place the recorded origin is still in hand.
-    if let Some(origin) = store.state().origin() {
-        return Ok(SetupProgress::Complete(origin));
-    }
     match store.state().end() {
+        Some(SetupEnd::Complete) => {
+            let origin = store
+                .state()
+                .origin()
+                .ok_or(SetupDriveError::CloseNotArmed)?;
+            return Ok(SetupProgress::Complete(origin));
+        }
         Some(SetupEnd::Aborted(abort)) => return Ok(SetupProgress::Aborted(abort)),
         Some(SetupEnd::Faulted(fault)) => return Ok(SetupProgress::Faulted(fault)),
-        // `Complete` is the origin above, which was `None`.
-        Some(SetupEnd::Complete) | None => {}
+        None => {}
     }
 
     let Some(query) = query_of(store.state()) else {
@@ -293,6 +333,14 @@ where
         // payment edge and there is no channel on chain to read for.
         return Ok(SetupProgress::AwaitingCounterparty);
     };
+
+    if let Some(through) = fetch_history_batch(blocks, store, verifier).await? {
+        return Ok(SetupProgress::HistoryAdvanced { through });
+    }
+
+    if store.state().close_only_recovery() {
+        return mount_close_only(store, verifier, None);
+    }
     let payment_edge = query.payment_edge;
     let Some(finalized) = view.finalized_setup(query).await? else {
         return Ok(SetupProgress::AwaitingFinalizedState);
@@ -302,7 +350,11 @@ where
         SetupDecision::SubmitBond => submit(store, sink, verifier, SetupStep::Bond).await,
         SetupDecision::SubmitPayment => submit(store, sink, verifier, SetupStep::Payment).await,
         SetupDecision::Complete => {
-            let origin = find_origin(blocks, payment_edge, origin_floor).await?;
+            let scan = store
+                .state()
+                .scan_armed()
+                .ok_or(SetupDriveError::ScanNotArmed)?;
+            let origin = find_origin(blocks, payment_edge, scan).await?;
             store.commit(
                 SetupRecord::Complete {
                     payment_edge: origin.payment_edge,
@@ -314,6 +366,7 @@ where
             )?;
             Ok(SetupProgress::Complete(origin))
         }
+        SetupDecision::CloseOnly => mount_close_only(store, verifier, finalized.payment.as_ref()),
         SetupDecision::Abort(abort) => {
             store.commit(
                 SetupRecord::Ended {
@@ -332,8 +385,176 @@ where
             )?;
             Ok(SetupProgress::Faulted(fault))
         }
-        SetupDecision::TimeoutBond => Ok(SetupProgress::TimeoutBond),
+        SetupDecision::TimeoutBond => {
+            let tx = store
+                .state()
+                .bond_open()
+                .and_then(|open| match open {
+                    Tx::Open {
+                        funding: _, terms, ..
+                    } => Tx::timeout_close(store.state().bond_edge(), &terms),
+                    _ => None,
+                })
+                .ok_or(SetupDriveError::TimeoutUnavailable)?;
+            store.commit(SetupRecord::BondTimeoutSubmitted, verifier)?;
+            let outcome = sink.submit(tx).await?;
+            Ok(SetupProgress::BondTimeoutSubmitted { outcome })
+        }
         SetupDecision::AwaitingCounterparty => Ok(SetupProgress::AwaitingCounterparty),
+    }
+}
+
+async fn fetch_history_batch<B, V>(
+    blocks: &B,
+    store: &mut SetupStore,
+    verifier: &V,
+) -> Result<Option<u64>, SetupDriveError>
+where
+    B: FinalizedBlocks + ?Sized,
+    V: SigVerifier,
+{
+    let scan = store
+        .state()
+        .history_cursor()
+        .ok_or(SetupDriveError::ScanNotArmed)?;
+    let Some(tip) = blocks.latest_height().await? else {
+        return Ok(None);
+    };
+    if scan.height >= tip {
+        return Ok(None);
+    }
+    let bond_edge = store.state().bond_edge();
+    let payment_edge = store
+        .state()
+        .payment_edge()
+        .ok_or(SetupDriveError::CloseNotArmed)?;
+    let through = tip.min(scan.height.saturating_add(256));
+    let mut history = Vec::with_capacity((through - scan.height) as usize);
+    for height in scan.height.saturating_add(1)..=through {
+        let block = blocks
+            .block_at(height)
+            .await?
+            .ok_or(SetupDriveError::OriginUnreadable { height })?;
+        history.push(SetupHistoryBlock {
+            height: block.height,
+            parent: block.parent,
+            payload: block.payload,
+            txs: block
+                .txs
+                .into_iter()
+                .filter(|tx| touches(tx, bond_edge, payment_edge))
+                .collect(),
+        });
+    }
+    store.commit(
+        SetupRecord::SetupHistoryBatch(SetupHistoryBatch { blocks: history }),
+        verifier,
+    )?;
+    Ok(Some(through))
+}
+
+fn mount_close_only<V: SigVerifier>(
+    store: &SetupStore,
+    verifier: &V,
+    payment: Option<&Edge>,
+) -> Result<SetupProgress, SetupDriveError> {
+    let payment_edge = store
+        .state()
+        .payment_edge()
+        .ok_or(SetupDriveError::CloseNotArmed)?;
+    let origin = store
+        .state()
+        .origin()
+        .ok_or(SetupDriveError::OriginNotFound {
+            floor: store.state().scan_armed().map_or(0, |scan| scan.height),
+            tip: store.state().history_cursor().map_or(0, |scan| scan.height),
+            edge: payment_edge,
+        })?;
+    let descriptor = store
+        .state()
+        .close_descriptor()
+        .ok_or(SetupDriveError::CloseNotArmed)?;
+    let to_store =
+        |error| WorkStoreError::Setup(crate::work_store::SetupStateError::Descriptor(error));
+    // A never-settled payment edge distributes exactly what admission
+    // expected: the edge id is a hash over the funding, so a live edge
+    // under these terms and parties funds `expected_settlement` and
+    // nothing else. When the funded read is in hand the two are computed
+    // and checked against each other rather than one being trusted; the
+    // closed-edge path has only the expectation to go on.
+    let settlement = match payment {
+        None => descriptor.expected_settlement().map_err(to_store)?,
+        Some(payment) => {
+            let funded = descriptor.funded_settlement(payment).map_err(to_store)?;
+            let expected = descriptor.expected_settlement().map_err(to_store)?;
+            debug_assert_eq!(
+                expected, funded,
+                "a never-settled payment edge funds exactly what admission expected",
+            );
+            funded
+        }
+    };
+    let mut channel = ChannelStore::open(
+        store.root(),
+        descriptor.channel().clone(),
+        settlement,
+        store.role(),
+        origin,
+        verifier,
+    )?;
+    // The origin block carries the payment Open that established this
+    // channel, and the store opened with its cursor already on that block.
+    // A `StartPaymentClose` ordered after the Open in the very same block
+    // is a contest a client can raise the instant it opens, and `observe`
+    // would never see it: that block is not the cursor's next one, it is
+    // the cursor's own. So its post-Open moves are replayed directly —
+    // the Open matches no arm and is skipped, and any same-block contest
+    // is journaled exactly as a later one would be.
+    for block in store.state().history() {
+        if block.height == origin.height {
+            apply_finalized_txs(
+                &mut channel,
+                block.height,
+                block.payload,
+                &block.txs,
+                verifier,
+            )?;
+        }
+    }
+    for block in store.state().history() {
+        if block.height <= origin.height || block.height <= channel.state().cursor().0 {
+            continue;
+        }
+        observe(
+            &mut channel,
+            &FinalizedWork {
+                height: block.height,
+                parent: block.parent,
+                payload: block.payload,
+                txs: block.txs.clone(),
+            },
+            verifier,
+        )?;
+    }
+    Ok(SetupProgress::CloseOnly {
+        origin,
+        settled: channel.state().close_settled().is_some(),
+    })
+}
+
+fn touches(tx: &Tx, bond_edge: EdgeId, payment_edge: EdgeId) -> bool {
+    match tx {
+        Tx::Open { funding, terms, .. } => {
+            let edge = Tx::edge_id_of(funding, terms);
+            edge == bond_edge || edge == payment_edge
+        }
+        Tx::Close { input, .. } => *input == bond_edge || *input == payment_edge,
+        Tx::Move { action } => match action {
+            hellas_kernel::Move::StartPaymentClose(start) => start.payment_edge() == payment_edge,
+            hellas_kernel::Move::RespondPaymentClose(response) => {
+                response.payment_edge() == payment_edge
+            }
+        },
     }
 }
 
@@ -391,18 +612,23 @@ where
 async fn find_origin<B>(
     blocks: &B,
     payment_edge: EdgeId,
-    floor: u64,
+    scan: SetupScan,
 ) -> Result<SetupOrigin, SetupDriveError>
 where
     B: FinalizedBlocks + ?Sized,
 {
     let tip = blocks.latest_height().await?.unwrap_or(0);
+    let floor = scan.height;
+    let mut expected_parent = scan.payload;
     let mut height = floor.saturating_add(1);
     while height <= tip {
         let block = blocks
             .block_at(height)
             .await?
             .ok_or(SetupDriveError::OriginUnreadable { height })?;
+        if block.parent != expected_parent {
+            return Err(SetupDriveError::OriginNotContiguous { height });
+        }
         if block.txs.iter().any(|tx| opens(tx, payment_edge)) {
             return Ok(SetupOrigin {
                 payment_edge,
@@ -411,6 +637,7 @@ where
                 parent: block.parent,
             });
         }
+        expected_parent = block.payload;
         height = height.saturating_add(1);
     }
     Err(SetupDriveError::OriginNotFound {
