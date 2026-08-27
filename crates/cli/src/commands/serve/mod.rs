@@ -30,6 +30,9 @@ mod node_handler;
 mod openai_provider;
 mod responses_fetch;
 mod responses_projector;
+pub mod work_config;
+
+pub use work_config::{WorkConfig, load_work_config};
 
 pub(crate) const DEFAULT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 
@@ -39,7 +42,12 @@ pub struct ServeOptions {
     pub queue_size: usize,
     pub preload_models: Vec<String>,
     pub artifact_store_path: Option<PathBuf>,
-    pub work_config_file: Option<PathBuf>,
+    /// The loaded paid-work configuration, not the path it came from.
+    /// Its presence is still what serves the two work ALPNs; what is new
+    /// is that the node holds the chain cross-check, the validator
+    /// fan-out, the journal root, and the policies it would mount a
+    /// channel with.
+    pub work_config: Option<WorkConfig>,
     /// Read only by the fastresume load/save below, which go through
     /// `hellas-models` and so exist only on an `evaluate` build.
     #[cfg(feature = "evaluate")]
@@ -123,6 +131,26 @@ async fn run_with_store(
         );
     }
 
+    // What the operator configured, said back once. The last line is the
+    // one that matters: §4 disables setup and new work on missing
+    // evidence and never disables recovery, so a node with no measured
+    // artifact still serves its journals and still answers a contest.
+    if let Some(work) = options.work_config.as_ref() {
+        info!(
+            network = %work.chain.network,
+            validators = work.validators.len(),
+            journal_root = %work.journal.root.display(),
+            poll_ms = work.poll.as_millis(),
+            response_alarm_margin_blocks = work.response_alarm_margin_blocks,
+            "loaded the paid-work configuration",
+        );
+        if work.measured_artifact().is_none() {
+            warn!("{}", work.admission_summary());
+        } else {
+            info!("{}", work.admission_summary());
+        }
+    }
+
     let preload_models = dedupe_preload_models(options.preload_models);
     let build = option_env!("GIT_REV").unwrap_or("unknown").to_string();
     let graffiti = {
@@ -156,7 +184,7 @@ async fn run_with_store(
         fetch_routes,
         fetch_max_in_flight: options.fetch_max_in_flight,
         fetch_queue_size: options.fetch_queue_size,
-        work_configured: options.work_config_file.is_some(),
+        work_configured: options.work_config.is_some(),
         secret_key: options.secret_key,
         producer_key: options.producer_key,
         provider_genesis: options.provider_genesis,

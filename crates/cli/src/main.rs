@@ -739,27 +739,39 @@ async fn main() {
             fetch_max_in_flight,
             fetch_queue_size,
         } => {
-            commands::serve::run(commands::serve::ServeOptions {
-                port,
-                execute_policy,
-                queue_size,
-                preload_models,
-                artifact_store_path,
-                work_config_file,
-                #[cfg(feature = "evaluate")]
-                store_records,
-                metrics_port,
-                graffiti,
-                dtype,
-                fetch_config_file,
-                fetch_max_in_flight,
-                fetch_queue_size,
-                secret_key,
-                producer_key: local_identity.producer_key,
-                provider_genesis: local_identity.enrollment.canonical_bytes(),
-                assurance,
-            })
-            .await
+            // Loaded before anything binds: a work configuration that
+            // will not load is a node that would advertise two paid
+            // ALPNs and then have nothing to mount behind them.
+            match work_config_file
+                .as_deref()
+                .map(commands::serve::load_work_config)
+                .transpose()
+            {
+                Err(error) => Err(error),
+                Ok(work_config) => {
+                    commands::serve::run(commands::serve::ServeOptions {
+                        port,
+                        execute_policy,
+                        queue_size,
+                        preload_models,
+                        artifact_store_path,
+                        work_config,
+                        #[cfg(feature = "evaluate")]
+                        store_records,
+                        metrics_port,
+                        graffiti,
+                        dtype,
+                        fetch_config_file,
+                        fetch_max_in_flight,
+                        fetch_queue_size,
+                        secret_key,
+                        producer_key: local_identity.producer_key,
+                        provider_genesis: local_identity.enrollment.canonical_bytes(),
+                        assurance,
+                    })
+                    .await
+                }
+            }
         }
         #[cfg(feature = "gateway")]
         Commands::Gateway {

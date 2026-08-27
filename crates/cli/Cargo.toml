@@ -14,7 +14,12 @@ default = []
 # always present because remote confidential-open supports Apple providers.
 apple-app-attest = []
 
-node = ["dep:hellas-executor", "hellas-client/work"]
+# The node serves paid work, and paid work is a chain: the work config's
+# threshold identity is decoded by consensus's own constructor, and the
+# settlement watcher reads finalized blocks. So `node` reaches
+# `hellas-chain` through the feature graph rather than through a second
+# dependency.
+node = ["chain", "dep:hellas-executor", "hellas-client/work"]
 # HTTP gateway front-end (OpenAI/Anthropic/plain APIs).
 gateway = ["dep:hellas-gateway"]
 evaluate = [
