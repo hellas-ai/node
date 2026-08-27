@@ -28,25 +28,30 @@
 //! unknown fields, which is what turns that into an error naming the
 //! field.
 //!
-//! The **measured-artifact gate** is not here either. The artifact's
-//! *identity* is loaded, because that is a field of the configuration;
-//! the `64 >= T` floor arithmetic and the Clopper–Pearson confidence
-//! test consume timings no producer in this tree yet emits. Until that
-//! lands, a configuration with no artifact is a node with no paid
-//! admission — [`WorkConfig::measured_artifact`] is how the serve path
-//! asks, and it answers `None` rather than inventing a measurement.
+//! The **floor arithmetic** is not here either: the `64 >= T`
+//! inequality and the Clopper–Pearson confidence test consume timings no
+//! producer in this tree yet emits. What is here is the artifact those
+//! timings will be written into, and the labelling that lets a node with
+//! none of them say so out loud. Every number in the artifact carries
+//! `measured` or `assumed`; one `assumed` field is a node that
+//! countersigns no new channel; and no number is invented to fill a gap.
+//! [`load_paid_work_duties`] is how the serve path asks which of §4's
+//! four evidence cases it started in, and every one of them still
+//! answers a contest.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context as _, bail};
-use hellas_kernel::NetworkId;
+use hellas_kernel::{EdgeValues, Fees, NetworkId};
 use hellas_rpc::ContentId;
 use hellas_rpc::protocol::Digest;
 use hellas_rpc::protocol::work::{
     PaidChannelPolicyV1, PaidExecutionPolicyV1, check_execution_policy,
 };
+use hellas_rpc::protocol::work_setup::{OmissionMeasurements, ProviderChannelPolicy};
+use hellas_rpc::work_handshake::PaymentAdmission;
 use hellas_rpc::work_store::journal::MAX_RECORD_BYTES;
 use serde::Deserialize;
 
@@ -107,18 +112,31 @@ impl WorkConfig {
         self.artifact.as_ref()
     }
 
-    /// The one line the operator gets at startup about paid admission.
+    /// The provider policy this configuration and one read artifact
+    /// make together.
     ///
-    /// A method rather than a string built at the log site, so what the
-    /// node says is the same thing a test can read back. It says which
-    /// of the two configurations this is and nothing more: grading the
-    /// artifact is the measured gate's job, not this one's.
-    #[must_use]
-    pub const fn admission_summary(&self) -> &'static str {
-        if self.artifact.is_some() {
-            "paid admission rests on the configured measured artifact"
-        } else {
-            "no paid admission: no measured artifact is configured"
+    /// The four fields a provider fixes for itself come from the
+    /// configuration; the two it can only have measured come from the
+    /// artifact. Which variant it lands in is the artifact's weakest
+    /// label and nothing else — the numbers are identical either way,
+    /// which is the point: what turns admission off is the absence of
+    /// evidence, not a value that failed a test.
+    fn duties(&self, artifact: MeasuredArtifact) -> PaidWorkDuties {
+        let evidence = Box::new(MeasuredEvidence {
+            provenance: artifact.provenance,
+            samples: artifact.samples,
+            policy: ProviderChannelPolicy {
+                network: self.chain.network,
+                policy_salt: self.policy_salt,
+                channel_policy: self.channel_policy,
+                execution_policy: self.execution_policy,
+                expected_payment_values: artifact.expected_payment_values,
+                omission: artifact.omission,
+            },
+        });
+        match artifact.evidence {
+            Evidence::Measured => PaidWorkDuties::Admits(evidence),
+            Evidence::Assumed => PaidWorkDuties::Assumed(evidence),
         }
     }
 }
@@ -168,6 +186,178 @@ pub struct ArtifactIdentity {
     pub digest: Digest,
 }
 
+/// What one node's evidence lets it do with paid work, decided once at
+/// startup.
+///
+/// These are §4's four cases, and its rule is what separates them:
+/// missing, changed or `assumed` evidence disables setup and new work,
+/// and never disables recovery or the close duty. So *every* variant
+/// below is a node that still answers a contest — the close half is
+/// built from a journal and a key and asks for no policy at all
+/// ([`CloseEndpoint`]) — and only [`Self::Admits`] countersigns a new
+/// channel.
+///
+/// [`CloseEndpoint`]: hellas_rpc::work::CloseEndpoint
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "the endpoint these duties are handed to is the node runner's half; deciding them is this one"
+)]
+pub enum PaidWorkDuties {
+    /// The pinned artifact was read and every field in it is measured.
+    /// This node countersigns new paid channels over the policy it
+    /// makes.
+    Admits(Box<MeasuredEvidence>),
+    /// The pinned artifact was read and at least one field in it is
+    /// `assumed`. The policy is still made, because setup journals and
+    /// close descriptors are derived from it, and no payment is ever
+    /// countersigned over it.
+    Assumed(Box<MeasuredEvidence>),
+    /// The configuration names no artifact.
+    NotConfigured,
+    /// The configuration names an artifact and there is no file there.
+    /// This is a node before its bootstrap run, not a broken one.
+    NotFound,
+    /// A well-formed artifact that is not the one `artifact.digest`
+    /// pins: §4's *changed* evidence, from another binary, another
+    /// configuration or another machine.
+    Changed,
+}
+
+impl PaidWorkDuties {
+    /// What a setup endpoint over this evidence will countersign, or
+    /// `None` when there is no policy to build one from.
+    ///
+    /// [`PaymentAdmission::Admits`] only under a fully measured
+    /// artifact. Under an assumed one the same policy is handed over as
+    /// [`PaymentAdmission::Proposes`], which is the admission that holds
+    /// a policy, derives close state from it through
+    /// [`ProviderChannelPolicy::describe_close`], and countersigns
+    /// nothing: an endpoint under it refuses every proposed payment as
+    /// `Declined`. That is what turns an unmeasured number into a
+    /// missing countersignature, without a second admission flag beside
+    /// the one the handshake already reads.
+    ///
+    /// `None` is not a weaker admission, it is no setup endpoint at all.
+    /// With no artifact there are no omission measurements and no
+    /// expected funding, and a policy invented to fill that gap would be
+    /// exactly the measurement this node does not have.
+    #[must_use]
+    #[allow(
+        dead_code,
+        reason = "the endpoint these duties are handed to is the node runner's half; deciding them is this one"
+    )]
+    pub fn payment_admission(&self) -> Option<PaymentAdmission> {
+        match self {
+            Self::Admits(evidence) => {
+                Some(PaymentAdmission::Admits(Box::new(evidence.policy.clone())))
+            }
+            Self::Assumed(evidence) => Some(PaymentAdmission::Proposes(Box::new(
+                evidence.policy.clone(),
+            ))),
+            Self::NotConfigured | Self::NotFound | Self::Changed => None,
+        }
+    }
+
+    /// The artifact this node started under, when it read one.
+    #[must_use]
+    #[allow(
+        dead_code,
+        reason = "the endpoint these duties are handed to is the node runner's half; deciding them is this one"
+    )]
+    pub const fn evidence(&self) -> Option<&MeasuredEvidence> {
+        match self {
+            Self::Admits(evidence) | Self::Assumed(evidence) => Some(evidence),
+            Self::NotConfigured | Self::NotFound | Self::Changed => None,
+        }
+    }
+
+    /// Whether this node countersigns new paid channels.
+    #[must_use]
+    pub const fn admits_paid_work(&self) -> bool {
+        matches!(self, Self::Admits(_))
+    }
+
+    /// The one line the operator gets at startup, naming the case.
+    ///
+    /// A method rather than a string built at the log site, so what the
+    /// node says is the same thing a test can read back. Every line that
+    /// is not the admitting one opens with the same four words, because
+    /// that is the fact an operator is looking for, and then says which
+    /// of the four cases produced it.
+    #[must_use]
+    pub const fn summary(&self) -> &'static str {
+        match self {
+            Self::Admits(_) => {
+                "paid admission is on: every field of the pinned artifact is measured"
+            }
+            Self::Assumed(_) => {
+                "no paid admission: the pinned artifact carries at least one assumed field; \
+                 setup, recovery and the close duty still run"
+            }
+            Self::NotConfigured => {
+                "no paid admission: no measured artifact is configured; \
+                 recovery and the close duty still run"
+            }
+            Self::NotFound => {
+                "no paid admission: no artifact was found at the configured path; \
+                 recovery and the close duty still run"
+            }
+            Self::Changed => {
+                "no paid admission: the artifact at the configured path is not the one \
+                 artifact.digest pins; recovery and the close duty still run"
+            }
+        }
+    }
+}
+
+/// One artifact a node started under, and the policy it makes.
+///
+/// The two numbers the artifact contributes are inside the policy, which
+/// is where every consumer wants them. What stays outside is what the
+/// policy has no field for and an operator still has to be able to read
+/// back: who produced this evidence, and how much of it there is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "the endpoint these duties are handed to is the node runner's half; deciding them is this one"
+)]
+pub struct MeasuredEvidence {
+    /// Which binary, configuration and machine produced the artifact,
+    /// and when.
+    pub provenance: ArtifactProvenance,
+    /// The fewest samples any one field of the artifact rests on. Zero
+    /// whenever any field is `assumed`, because an assumed field rests
+    /// on none — so this is the weakest link and not an average.
+    pub samples: u64,
+    /// The policy a setup endpoint is built over.
+    pub policy: ProviderChannelPolicy,
+}
+
+/// Which run produced one artifact.
+///
+/// A measurement is a statement about a binary on a machine under a
+/// configuration, and an artifact that does not say which is a number
+/// with no subject. None of this is compared to anything here: this node
+/// has no clock in this path and builds none, so the timestamp is read
+/// and carried and never checked against a now.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "the endpoint these duties are handed to is the node runner's half; deciding them is this one"
+)]
+pub struct ArtifactProvenance {
+    /// Digest of the binary that measured.
+    pub binary: Digest,
+    /// Digest of the work configuration it measured under.
+    pub config: Digest,
+    /// The machine it measured on, as the operator names it.
+    pub machine: String,
+    /// When the run finished, in milliseconds since the Unix epoch, as
+    /// the artifact records it.
+    pub measured_at_unix_ms: u64,
+}
+
 /// Loads and checks one paid-work configuration file.
 ///
 /// Every failure is a startup failure naming the field that failed, for
@@ -190,6 +380,58 @@ pub fn load_work_config(path: &Path) -> CliResult<WorkConfig> {
         .with_context(|| format!("failed to parse {}", path.display()))?;
     file.into_config()
         .with_context(|| format!("invalid work config {}", path.display()))
+}
+
+/// Reads the artifact a configuration pins, and decides what this node's
+/// evidence lets it do.
+///
+/// Three of the five answers are answers and not errors, which is §4's
+/// rule rather than a leniency: a node whose artifact is absent, or is
+/// not the pinned one, still owes every open contest a response, and
+/// refusing to start is the one thing that guarantees the response is
+/// never made. So missing and changed evidence turn admission off and
+/// leave the node running.
+///
+/// What *is* an error is a file that is present and is not an artifact.
+/// An operator writes this by hand until the bootstrap run writes it, so
+/// the field that is wrong is named, at startup, exactly as
+/// [`load_work_config`] names a configuration field.
+///
+/// The pin is compared after the parse and not before, for that reason:
+/// a typo in a file whose digest also differs would otherwise be
+/// reported as somebody else's artifact, and the operator would never
+/// learn which field they got wrong.
+///
+/// # Errors
+///
+/// A file that does not parse, an unknown or missing field, a digest or
+/// machine name that is not one, and a label its sample count
+/// contradicts.
+pub fn load_paid_work_duties(config: &WorkConfig) -> CliResult<PaidWorkDuties> {
+    let Some(identity) = config.measured_artifact() else {
+        return Ok(PaidWorkDuties::NotConfigured);
+    };
+    let bytes = match fs::read(&identity.path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(PaidWorkDuties::NotFound);
+        }
+        Err(error) => {
+            return Err(anyhow::Error::new(error).context(format!(
+                "failed to read artifact {}",
+                identity.path.display()
+            )));
+        }
+    };
+    let file: ArtifactBodyFile = serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to parse artifact {}", identity.path.display()))?;
+    let artifact = file
+        .into_artifact()
+        .with_context(|| format!("invalid artifact {}", identity.path.display()))?;
+    if Digest::hash(&bytes) != identity.digest {
+        return Ok(PaidWorkDuties::Changed);
+    }
+    Ok(config.duties(artifact))
 }
 
 #[derive(Debug, Deserialize)]
@@ -472,6 +714,216 @@ impl ArtifactFile {
     }
 }
 
+// ── The measured artifact ─────────────────────────────────────────────
+
+/// Whether one number was measured or written down.
+///
+/// Two answers and no third. `assumed` is a legal value and not a parse
+/// error, because it is how a node that has never run a bootstrap says
+/// what it *would* use without claiming to have seen it; §4 makes that
+/// node one that admits no paid work and still runs recovery, which is a
+/// startup case rather than a refusal.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum Evidence {
+    /// Observed, over the samples reported beside it.
+    Measured,
+    /// Written down. No sample supports it.
+    Assumed,
+}
+
+impl Evidence {
+    /// The weaker of two labels: one assumed field makes a whole
+    /// artifact assumed.
+    const fn weakest(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Measured, Self::Measured) => Self::Measured,
+            _ => Self::Assumed,
+        }
+    }
+}
+
+/// One number in the artifact, and what it rests on.
+///
+/// The label travels with the number rather than with the file, because
+/// a run that measured five of six quantities has an artifact that can
+/// say which one it did not. `samples` is what the label is answerable
+/// to: a `measured` number with no sample behind it is not a
+/// measurement, and an `assumed` number reporting samples is a
+/// measurement wearing the wrong label. Both are refused, by name.
+///
+/// Nothing here grades the number. The `64 >= T` floor and the
+/// confidence bound are §4-B's and consume timings this tree does not
+/// yet emit; this is the honest label they will one day be computed
+/// from.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MeasuredU64 {
+    value: u64,
+    evidence: Evidence,
+    samples: u64,
+}
+
+impl MeasuredU64 {
+    fn check(&self, field: &str) -> CliResult<()> {
+        match (self.evidence, self.samples) {
+            (Evidence::Measured, 0) => {
+                bail!("{field} is labelled measured and rests on no samples")
+            }
+            (Evidence::Assumed, samples) if samples != 0 => {
+                bail!("{field} is labelled assumed and reports {samples} samples")
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+/// One artifact, read and folded into the two values a policy needs.
+struct MeasuredArtifact {
+    provenance: ArtifactProvenance,
+    omission: OmissionMeasurements,
+    expected_payment_values: EdgeValues,
+    evidence: Evidence,
+    samples: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArtifactBodyFile {
+    provenance: ProvenanceFile,
+    omission: OmissionFile,
+    expected_payment_values: PaymentValuesFile,
+}
+
+impl ArtifactBodyFile {
+    fn into_artifact(self) -> CliResult<MeasuredArtifact> {
+        // Every labelled number in the file, checked against its own
+        // sample count and then folded to the two summaries a node acts
+        // on: the weakest label any field carries, and the fewest
+        // samples any field rests on. Listed rather than derived so a
+        // field added to the schema and left out of this list is a
+        // compile-time hole an author sees, not a field whose label is
+        // silently never read.
+        let fields = [
+            (
+                "omission.response_probability",
+                &self.omission.response_probability,
+            ),
+            ("omission.response_blocks", &self.omission.response_blocks),
+            (
+                "omission.response_cost_cap",
+                &self.omission.response_cost_cap,
+            ),
+            (
+                "expected_payment_values.value",
+                &self.expected_payment_values.value,
+            ),
+            (
+                "expected_payment_values.reserve",
+                &self.expected_payment_values.reserve,
+            ),
+            (
+                "expected_payment_values.close_fees.base",
+                &self.expected_payment_values.close_fees.base,
+            ),
+            (
+                "expected_payment_values.close_fees.slot",
+                &self.expected_payment_values.close_fees.slot,
+            ),
+            (
+                "expected_payment_values.close_fees.proof",
+                &self.expected_payment_values.close_fees.proof,
+            ),
+            (
+                "expected_payment_values.close_fees.lifetime",
+                &self.expected_payment_values.close_fees.lifetime,
+            ),
+        ];
+        let mut evidence = Evidence::Measured;
+        let mut samples = u64::MAX;
+        for (name, field) in fields {
+            field.check(name)?;
+            evidence = evidence.weakest(field.evidence);
+            samples = samples.min(field.samples);
+        }
+
+        Ok(MeasuredArtifact {
+            provenance: self.provenance.into_provenance()?,
+            omission: OmissionMeasurements {
+                response_probability: self.omission.response_probability.value,
+                response_blocks: self.omission.response_blocks.value,
+                response_cost_cap: self.omission.response_cost_cap.value,
+            },
+            expected_payment_values: EdgeValues::new(
+                self.expected_payment_values.value.value,
+                self.expected_payment_values.reserve.value,
+                Fees::new(
+                    self.expected_payment_values.close_fees.base.value,
+                    self.expected_payment_values.close_fees.slot.value,
+                    self.expected_payment_values.close_fees.proof.value,
+                    self.expected_payment_values.close_fees.lifetime.value,
+                ),
+            ),
+            evidence,
+            samples,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProvenanceFile {
+    binary: String,
+    config: String,
+    machine: String,
+    measured_at_unix_ms: u64,
+}
+
+impl ProvenanceFile {
+    fn into_provenance(self) -> CliResult<ArtifactProvenance> {
+        if self.machine.trim().is_empty() {
+            bail!("provenance.machine must name a machine");
+        }
+        Ok(ArtifactProvenance {
+            binary: parse_digest("provenance.binary", &self.binary)?,
+            config: parse_digest("provenance.config", &self.config)?,
+            machine: self.machine,
+            measured_at_unix_ms: self.measured_at_unix_ms,
+        })
+    }
+}
+
+/// The three numbers [`OmissionMeasurements`] is, field for field.
+///
+/// Spelled out rather than flattened for [`ExecutionPolicyFile`]'s
+/// reason: these are the numbers a provider's whole new-work admission
+/// rests on, and a default here would be this node claiming a
+/// measurement its operator never made.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OmissionFile {
+    response_probability: MeasuredU64,
+    response_blocks: MeasuredU64,
+    response_cost_cap: MeasuredU64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PaymentValuesFile {
+    value: MeasuredU64,
+    reserve: MeasuredU64,
+    close_fees: CloseFeesFile,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CloseFeesFile {
+    base: MeasuredU64,
+    slot: MeasuredU64,
+    proof: MeasuredU64,
+    lifetime: MeasuredU64,
+}
+
 fn parse_hex(field: &str, raw: &str) -> CliResult<Vec<u8>> {
     let bytes = hex::decode(raw.trim()).with_context(|| format!("{field} is not hexadecimal"))?;
     if bytes.is_empty() {
@@ -623,22 +1075,6 @@ mod tests {
         assert_eq!(
             loaded.measured_artifact().map(|artifact| artifact.digest),
             Some(Digest::from_bytes([0x77; 32])),
-        );
-        assert_eq!(
-            loaded.admission_summary(),
-            "paid admission rests on the configured measured artifact",
-        );
-    }
-
-    /// No artifact is no paid admission, and it is not an error: §4
-    /// disables setup and new work on missing evidence, never recovery.
-    #[test]
-    fn a_config_without_an_artifact_admits_no_paid_work() {
-        let loaded = load(without(config(), &[], "artifact")).expect("the config still loads");
-        assert!(loaded.measured_artifact().is_none());
-        assert_eq!(
-            loaded.admission_summary(),
-            "no paid admission: no measured artifact is configured",
         );
     }
 
@@ -837,5 +1273,487 @@ mod tests {
             load(with(config(), "poll_ms", serde_json::json!(0))).unwrap_err(),
         );
         assert!(error.contains("poll_ms"), "unexpected error: {error}");
+    }
+
+    // ── The measured artifact ─────────────────────────────────────────
+
+    use hellas_kernel::{
+        BlockHeight, CoinId, EdgeId, Funding, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Parties,
+        Payout, Secp256k1Signer, Secp256k1Verifier, Terms, Tx, WorkPaymentTerms,
+        WorkStakeBondTerms,
+    };
+    use hellas_rpc::protocol::work::private_policy_commitment;
+    use hellas_rpc::work_handshake::SetupEndpoint;
+    use hellas_rpc::work_store::{Role, SetupScan, SetupStore};
+
+    /// The window the fixture artifact measured its response
+    /// probability over, and the one the fixture's terms admit.
+    const WINDOW: u64 = hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS + 4;
+    const OMISSION_BOND: u64 = 4;
+    const PAYMENT_VALUE: u64 = 1_000;
+    const PAYMENT_RESERVE: u64 = 200;
+
+    fn network() -> NetworkId {
+        let Some(network) = NetworkId::new("hellas-devnet") else {
+            panic!("the fixture configuration's network id is one");
+        };
+        network
+    }
+
+    fn measured(value: u64) -> serde_json::Value {
+        serde_json::json!({ "value": value, "evidence": "measured", "samples": 3_000 })
+    }
+
+    fn assumed(value: u64) -> serde_json::Value {
+        serde_json::json!({ "value": value, "evidence": "assumed", "samples": 0 })
+    }
+
+    /// The artifact a completed bootstrap run leaves behind: every
+    /// number measured, and every number one this fixture's terms are
+    /// priced by.
+    fn artifact() -> serde_json::Value {
+        serde_json::json!({
+            "provenance": {
+                "binary": hex32(0x21),
+                "config": hex32(0x22),
+                "machine": "bootstrap-1",
+                "measured_at_unix_ms": 1_756_339_200_000_u64,
+            },
+            "omission": {
+                "response_probability": measured(999_000),
+                "response_blocks": measured(WINDOW),
+                "response_cost_cap": measured(1),
+            },
+            "expected_payment_values": {
+                "value": measured(PAYMENT_VALUE),
+                "reserve": measured(PAYMENT_RESERVE),
+                "close_fees": {
+                    "base": measured(0),
+                    "slot": measured(0),
+                    "proof": measured(0),
+                    "lifetime": measured(0),
+                },
+            },
+        })
+    }
+
+    /// Writes one artifact beside a configuration that pins it, and
+    /// answers what that node's evidence lets it do.
+    ///
+    /// The pin is the digest of the bytes actually written, unless
+    /// `pin` overrides it: the changed-evidence case then differs from
+    /// the matching one in exactly the field under test and in nothing
+    /// else.
+    fn duties_for(artifact: &serde_json::Value, pin: Option<String>) -> CliResult<PaidWorkDuties> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("artifact.json");
+        let bytes = artifact.to_string();
+        fs::write(&path, &bytes).unwrap();
+        let digest = pin.unwrap_or_else(|| hex::encode(Digest::hash(bytes.as_bytes()).as_bytes()));
+        let loaded = load(with(
+            config(),
+            "artifact",
+            serde_json::json!({ "path": path.display().to_string(), "digest": digest }),
+        ))?;
+        load_paid_work_duties(&loaded)
+    }
+
+    /// Inserts `field` into the object at `path`, which the schema does
+    /// not define.
+    fn with_unknown(mut value: serde_json::Value, path: &[&str], field: &str) -> serde_json::Value {
+        let mut cursor = &mut value;
+        for step in path {
+            cursor = cursor.get_mut(step).unwrap();
+        }
+        cursor
+            .as_object_mut()
+            .unwrap()
+            .insert(field.to_string(), serde_json::json!(1));
+        value
+    }
+
+    fn signer(byte: u8) -> Secp256k1Signer {
+        let Ok(signer) = Secp256k1Signer::from_secret_scalar([byte; 32]) else {
+            panic!("a fixed scalar is a key");
+        };
+        signer
+    }
+
+    fn coins(ids: &[u8]) -> List<CoinId, MAX_PARTY_INPUTS> {
+        let mut slots = [CoinId::from_bytes([0; CoinId::LENGTH]); MAX_PARTY_INPUTS];
+        for (slot, id) in slots.iter_mut().zip(ids) {
+            *slot = CoinId::from_bytes([*id; CoinId::LENGTH]);
+        }
+        List::take(slots, ids.len())
+    }
+
+    fn bond_terms() -> WorkStakeBondTerms {
+        WorkStakeBondTerms {
+            parties: Parties::new(signer(0x22).party_key(), signer(0x21).party_key()),
+            timeout: BlockHeight::new(500),
+            timeout_outputs: List::take(
+                [Payout::new(signer(0x22).party_key(), 64); MAX_EDGE_OUTPUTS],
+                1,
+            ),
+            max_job_price: 40,
+        }
+    }
+
+    /// The provider's stake funding: its own coins, none of the
+    /// client's.
+    fn bond_funding() -> Funding {
+        Funding::new(coins(&[0xa1]), coins(&[]))
+    }
+
+    /// The edge the bond opens at, which is also the key the setup
+    /// journal is opened under.
+    fn bond_edge() -> EdgeId {
+        Tx::edge_id_of(&bond_funding(), &Terms::work_stake_bond(bond_terms()))
+    }
+
+    /// The terms a client proposes over that bond.
+    ///
+    /// The commitment is opened against the *configuration's* own salt
+    /// and credit policy, because that is what a provider's admission
+    /// re-derives: terms committing to any other policy are refused
+    /// rather than countersigned.
+    fn payment_terms() -> WorkPaymentTerms {
+        WorkPaymentTerms {
+            bond_edge: bond_edge(),
+            bond_terms: bond_terms(),
+            private_policy_commitment: private_policy_commitment(
+                network(),
+                &[0x5a; 32],
+                &PaidChannelPolicyV1 {
+                    compute_credit_limit: 40,
+                    delivery_credit_limit: 40,
+                },
+            ),
+            omit_response_blocks: WINDOW,
+            start_validity_blocks: 8,
+            omission_bond: OMISSION_BOND,
+        }
+    }
+
+    fn payment_edge() -> EdgeId {
+        EdgeId::from_bytes([0xc0; EdgeId::LENGTH])
+    }
+
+    /// Opens a provider's setup journal under its own directory, with
+    /// its immutable history floor armed.
+    ///
+    /// The floor is armed here because a provider's own first revision
+    /// is refused without one: recovery arming is not a step evidence
+    /// gates, it is the step every later one is refused before.
+    fn setup_endpoint(dir: &tempfile::TempDir, admission: PaymentAdmission) -> SetupEndpoint {
+        let store = match SetupStore::open(
+            dir.path(),
+            network(),
+            bond_edge(),
+            Role::Provider,
+            &Secp256k1Verifier::new(),
+        ) {
+            Ok(store) => store,
+            Err(error) => panic!("the fixture journal opens: {error}"),
+        };
+        let mut endpoint = SetupEndpoint::new(store, signer(0x22), admission);
+        if let Err(error) = endpoint.arm_scan(SetupScan {
+            height: 7,
+            payload: [0x47; 32],
+        }) {
+            panic!("the fixture arms its immutable history floor: {error}");
+        }
+        endpoint
+    }
+
+    /// The artifact round-trips: every labelled number arrives in the
+    /// policy, and what the policy has no field for arrives beside it.
+    #[test]
+    fn a_measured_artifact_round_trips_into_a_policy() {
+        let duties = duties_for(&artifact(), None).expect("the fixture artifact loads");
+
+        assert!(duties.admits_paid_work());
+        let evidence = duties.evidence().expect("a read artifact is evidence");
+        assert_eq!(
+            evidence.provenance,
+            ArtifactProvenance {
+                binary: Digest::from_bytes([0x21; 32]),
+                config: Digest::from_bytes([0x22; 32]),
+                machine: "bootstrap-1".to_string(),
+                measured_at_unix_ms: 1_756_339_200_000,
+            },
+        );
+        assert_eq!(evidence.samples, 3_000);
+        assert_eq!(
+            evidence.policy.omission,
+            OmissionMeasurements {
+                response_probability: 999_000,
+                response_blocks: WINDOW,
+                response_cost_cap: 1,
+            },
+        );
+        assert_eq!(
+            evidence.policy.expected_payment_values,
+            EdgeValues::new(PAYMENT_VALUE, PAYMENT_RESERVE, Fees::new(0, 0, 0, 0)),
+        );
+        // The four fields a provider fixes for itself come from the
+        // configuration and never from the artifact.
+        assert_eq!(evidence.policy.network.as_str(), "hellas-devnet");
+        assert_eq!(evidence.policy.policy_salt, [0x5a; 32]);
+        assert_eq!(evidence.policy.channel_policy.compute_credit_limit, 40);
+        assert_eq!(evidence.policy.execution_policy.fixed_price, 10);
+        assert_eq!(
+            duties.summary(),
+            "paid admission is on: every field of the pinned artifact is measured",
+        );
+    }
+
+    /// An unknown artifact field is refused by name, wherever it sits.
+    ///
+    /// The names are §4-B's on purpose: the confidence bound, the
+    /// lower-tail block time and the restart downtime are what a later
+    /// measured gate consumes, and a file carrying one today is an
+    /// operator configuring something this node does not implement.
+    #[test]
+    fn an_unknown_artifact_field_is_refused_by_name() {
+        for (path, field) in [
+            (&[][..], "lower_tail_block_ms"),
+            (&["provenance"][..], "restart_downtime_ms"),
+            (&["omission"][..], "general_inclusion_blocks"),
+            (
+                &["omission", "response_probability"][..],
+                "confidence_upper",
+            ),
+            (&["expected_payment_values", "close_fees"][..], "settlement"),
+        ] {
+            let error = format!(
+                "{:?}",
+                duties_for(&with_unknown(artifact(), path, field), None)
+                    .expect_err("an unknown artifact field is refused"),
+            );
+            assert!(
+                error.contains(field),
+                "the refusal for {field} does not name it: {error}",
+            );
+        }
+    }
+
+    /// Every artifact field is required, and the label most of all: a
+    /// number with no `evidence` beside it would be a measurement
+    /// nobody claimed.
+    #[test]
+    fn a_missing_artifact_field_is_refused_by_name() {
+        for (path, field) in [
+            (&["provenance"][..], "machine"),
+            (&["provenance"][..], "measured_at_unix_ms"),
+            (&["omission"][..], "response_blocks"),
+            (&["omission", "response_cost_cap"][..], "evidence"),
+            (&["omission", "response_cost_cap"][..], "samples"),
+            (&["expected_payment_values"][..], "close_fees"),
+            (&["expected_payment_values", "close_fees"][..], "lifetime"),
+        ] {
+            let error = format!(
+                "{:?}",
+                duties_for(&without(artifact(), path, field), None)
+                    .expect_err("an artifact missing a required field is refused"),
+            );
+            assert!(
+                error.contains(field),
+                "the refusal for a missing {field} does not name it: {error}",
+            );
+        }
+    }
+
+    /// A label its own sample count contradicts is refused by name.
+    ///
+    /// Both directions, because both are dishonest: a `measured` number
+    /// resting on nothing is not a measurement, and an `assumed` number
+    /// reporting samples is a measurement wearing the wrong label — and
+    /// the second one would turn paid admission *off* for a node that
+    /// had actually earned it.
+    #[test]
+    fn a_label_its_samples_contradict_is_refused_by_name() {
+        let mut unsampled = artifact();
+        unsampled["omission"]["response_blocks"] =
+            serde_json::json!({ "value": WINDOW, "evidence": "measured", "samples": 0 });
+        let error = format!("{:?}", duties_for(&unsampled, None).unwrap_err());
+        assert!(
+            error.contains("omission.response_blocks") && error.contains("no samples"),
+            "unexpected error: {error}",
+        );
+
+        let mut oversampled = artifact();
+        oversampled["expected_payment_values"]["reserve"] = serde_json::json!({
+            "value": PAYMENT_RESERVE,
+            "evidence": "assumed",
+            "samples": 12,
+        });
+        let error = format!("{:?}", duties_for(&oversampled, None).unwrap_err());
+        assert!(
+            error.contains("expected_payment_values.reserve"),
+            "unexpected error: {error}",
+        );
+    }
+
+    /// A fully measured artifact yields a policy that admits, and an
+    /// admission that countersigns.
+    #[test]
+    fn a_measured_artifact_yields_a_policy_that_admits() {
+        let duties = duties_for(&artifact(), None).expect("the fixture artifact loads");
+        let policy = &duties
+            .evidence()
+            .expect("a read artifact is evidence")
+            .policy;
+
+        let descriptor = policy
+            .admit(payment_edge(), payment_terms())
+            .expect("a measured policy admits the terms it was measured for");
+
+        assert_eq!(descriptor.bond_edge(), bond_edge());
+        assert!(matches!(
+            duties.payment_admission(),
+            Some(PaymentAdmission::Admits(_)),
+        ));
+    }
+
+    /// One `assumed` field is a node that countersigns nothing and
+    /// still runs setup and the close duty.
+    ///
+    /// The numbers are the measured fixture's, to the byte: only the
+    /// label moves. So what refuses admission is the absence of
+    /// evidence and not a value that failed a check — `admit` on this
+    /// very policy still succeeds, and the endpoint built over it never
+    /// gets to ask, because `Proposes` declines every proposed payment.
+    #[test]
+    fn an_assumed_field_refuses_admission_and_keeps_setup_and_close() {
+        let mut value = artifact();
+        value["omission"]["response_cost_cap"] = assumed(1);
+        let duties = duties_for(&value, None).expect("an assumed artifact still loads");
+        let measured = duties_for(&artifact(), None).expect("the fixture artifact loads");
+
+        assert!(!duties.admits_paid_work());
+        let evidence = duties.evidence().expect("a read artifact is evidence");
+        assert_eq!(evidence.samples, 0, "an assumed field rests on no samples");
+        assert_eq!(
+            evidence.policy,
+            measured
+                .evidence()
+                .expect("a read artifact is evidence")
+                .policy,
+            "only the label moved",
+        );
+        evidence
+            .policy
+            .admit(payment_edge(), payment_terms())
+            .expect("the numbers themselves still price these terms");
+
+        // Setup and the close duty still run: close state is derivable
+        // from this policy, and an endpoint is built over an admission
+        // that countersigns nothing.
+        evidence
+            .policy
+            .describe_close(payment_edge(), payment_terms())
+            .expect("close state is derivable from an assumed policy");
+        let admission = duties.payment_admission().expect("an artifact was read");
+        assert!(matches!(admission, PaymentAdmission::Proposes(_)));
+        let dir = tempfile::tempdir().unwrap();
+        let mut endpoint = setup_endpoint(&dir, admission);
+        endpoint
+            .propose_bond(network(), bond_funding(), bond_terms())
+            .expect("an unmeasured provider still journals its half of a setup");
+
+        assert!(
+            duties.summary().contains("no paid admission"),
+            "unexpected summary: {}",
+            duties.summary(),
+        );
+    }
+
+    /// No file at the configured path is a node before its bootstrap
+    /// run, not a broken one: §4 disables new work on missing evidence
+    /// and never disables recovery or the close duty.
+    #[test]
+    fn a_missing_artifact_admits_no_paid_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let loaded = load(with(
+            config(),
+            "artifact",
+            serde_json::json!({
+                "path": dir.path().join("artifact.json").display().to_string(),
+                "digest": hex32(0x77),
+            }),
+        ))
+        .expect("a configuration pinning an artifact that is not there still loads");
+
+        let duties =
+            load_paid_work_duties(&loaded).expect("a missing artifact is an answer, not an error");
+
+        assert_eq!(duties, PaidWorkDuties::NotFound);
+        assert!(!duties.admits_paid_work());
+        assert!(duties.payment_admission().is_none());
+        assert!(
+            duties.summary().contains("no paid admission"),
+            "unexpected summary: {}",
+            duties.summary(),
+        );
+    }
+
+    /// A configuration naming no artifact at all is the same answer in
+    /// different words.
+    #[test]
+    fn a_config_without_an_artifact_admits_no_paid_work() {
+        let loaded = load(without(config(), &[], "artifact")).expect("the config still loads");
+        assert!(loaded.measured_artifact().is_none());
+
+        let duties = load_paid_work_duties(&loaded).expect("no artifact is not an error");
+
+        assert_eq!(duties, PaidWorkDuties::NotConfigured);
+        assert!(duties.payment_admission().is_none());
+        assert!(
+            duties.summary().contains("no paid admission"),
+            "unexpected summary: {}",
+            duties.summary(),
+        );
+    }
+
+    /// An artifact that is not the one the configuration pins is
+    /// refused as evidence, and the node still starts.
+    ///
+    /// §4 groups changed evidence with missing evidence: both disable
+    /// setup and new work, and neither disables recovery or the close
+    /// duty. Refusing to start would be the one way to guarantee an
+    /// open contest is never answered.
+    #[test]
+    fn an_artifact_that_is_not_the_pinned_one_is_refused() {
+        let duties = duties_for(&artifact(), Some(hex32(0x77)))
+            .expect("changed evidence is an answer, not a startup failure");
+
+        assert_eq!(duties, PaidWorkDuties::Changed);
+        assert!(duties.payment_admission().is_none());
+        assert!(
+            duties.summary().contains("no paid admission"),
+            "unexpected summary: {}",
+            duties.summary(),
+        );
+    }
+
+    /// A `ProviderChannelPolicy` is built from a configuration and its
+    /// artifact, and a `SetupEndpoint` over that — which is the pair
+    /// nothing in this crate could construct at all.
+    #[test]
+    fn a_setup_endpoint_is_built_from_the_loaded_policy() {
+        let duties = duties_for(&artifact(), None).expect("the fixture artifact loads");
+        let admission = duties
+            .payment_admission()
+            .expect("a measured artifact carries an admission");
+        let dir = tempfile::tempdir().unwrap();
+        let mut endpoint = setup_endpoint(&dir, admission);
+
+        assert!(endpoint.state().revision().is_none());
+        let state = endpoint
+            .propose_bond(network(), bond_funding(), bond_terms())
+            .expect("the endpoint signs and journals its bond proposal");
+
+        assert_eq!(state.revision(), Some(1));
     }
 }

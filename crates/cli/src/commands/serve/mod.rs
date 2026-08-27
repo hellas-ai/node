@@ -131,10 +131,14 @@ async fn run_with_store(
         );
     }
 
-    // What the operator configured, said back once. The last line is the
-    // one that matters: §4 disables setup and new work on missing
-    // evidence and never disables recovery, so a node with no measured
-    // artifact still serves its journals and still answers a contest.
+    // What the operator configured, said back once, and then which of
+    // §4's four evidence cases this node started in, in words. The
+    // second line is the one that matters: §4 disables setup and new
+    // work on missing, changed or `assumed` evidence and never disables
+    // recovery, so a node that admits no paid work still serves its
+    // journals and still answers a contest. That is why an artifact that
+    // is absent or is not the pinned one is a warning here and not a
+    // startup refusal.
     if let Some(work) = options.work_config.as_ref() {
         info!(
             network = %work.chain.network,
@@ -144,10 +148,11 @@ async fn run_with_store(
             response_alarm_margin_blocks = work.response_alarm_margin_blocks,
             "loaded the paid-work configuration",
         );
-        if work.measured_artifact().is_none() {
-            warn!("{}", work.admission_summary());
+        let duties = work_config::load_paid_work_duties(work)?;
+        if duties.admits_paid_work() {
+            info!("{}", duties.summary());
         } else {
-            info!("{}", work.admission_summary());
+            warn!("{}", duties.summary());
         }
     }
 
