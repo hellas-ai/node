@@ -369,7 +369,9 @@ const fn channel_refusal(error: &ChannelStateError) -> WorkRefusal {
 
 // ── Endpoint construction ─────────────────────────────────────────────
 
-/// Why an endpoint could not be built over this channel, store, and key.
+/// Why an endpoint could not be built over this channel, store, and key
+/// — or, for [`Self::NotAdmitting`], why one that was built admits no
+/// new work.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum EndpointError {
     /// The journal is another channel's.
@@ -394,6 +396,11 @@ pub enum EndpointError {
         /// Which party the endpoint signs as.
         party: &'static str,
     },
+    /// No readiness decision is held, so this channel admits no new
+    /// work. Its close duties are unaffected: they are the reason the
+    /// channel is mounted at all.
+    #[error("this channel holds no readiness decision, and admits no new work")]
+    NotAdmitting,
     /// A handler panicked while holding the endpoint.
     #[error("the endpoint lock is poisoned")]
     Poisoned,
@@ -429,6 +436,22 @@ fn bind(
     if state.settlement() != ready.settlement() {
         return Err(EndpointError::WrongSettlement);
     }
+    bind_store(store, signer, role)
+}
+
+/// Checks that a store and a signing key are two views of the same half
+/// of the same channel.
+///
+/// The two disagreements a readiness decision has nothing to say about.
+/// A journal carries the channel and the role it was opened at, so these
+/// are answerable without one — which is what lets a close capability be
+/// built for a channel no readiness decision could be made for.
+fn bind_store(
+    store: &ChannelStore,
+    signer: &Secp256k1Signer,
+    role: Role,
+) -> Result<(), EndpointError> {
+    let state = store.state();
     if state.role() != role {
         return Err(EndpointError::WrongRole {
             expected: role_name(role),
@@ -436,8 +459,8 @@ fn bind(
         });
     }
     let party = match role {
-        Role::Client => ready.channel().client_key(),
-        Role::Provider => ready.channel().provider_key(),
+        Role::Client => state.channel().client_key(),
+        Role::Provider => state.channel().provider_key(),
     };
     if signer.party_key() != party {
         return Err(EndpointError::WrongKey {
@@ -449,6 +472,35 @@ fn bind(
 
 // ── The provider ──────────────────────────────────────────────────────
 
+/// The provider half of the close, and nothing else.
+///
+/// Built from the journal and the key alone, because that is all a close
+/// reads. A close driver exists *because* a channel is contested, or its
+/// bond is gone, or its horizon has passed — and
+/// [`WorkChannelDescriptor::check_ready`](crate::protocol::work_setup::WorkChannelDescriptor::check_ready)
+/// refuses every one of those. A close capability that needed a
+/// [`ReadyChannel`] could therefore never be built for the channels it
+/// exists for.
+///
+/// The two facts every method here reads are the *store's*: the channel
+/// each signature is bound to, and what the funded edge settles. Both
+/// were fixed when the journal was opened, and [`bind`] is what asserts
+/// they are the same two a readiness decision carries — so nothing is
+/// bypassed by reading them here, and there is no second copy to
+/// disagree with. What a readiness decision adds beyond them — the
+/// execution policy, the height it was decided at, and the admission
+/// horizon — belongs to new work, and no close consults any of it.
+///
+/// Its public surface is the close core. Admission lives on
+/// [`ProviderEndpoint`], which cannot be built without a readiness
+/// decision, and on [`WorkService`], which refuses it until one arrives.
+#[derive(Debug)]
+pub struct CloseEndpoint {
+    store: ChannelStore,
+    signer: Secp256k1Signer,
+    close_handoff: Option<(StartId, Handoff)>,
+}
+
 /// The provider half of the acceptance exchange.
 ///
 /// It owns one channel's journal and answers proposals on that channel
@@ -456,12 +508,15 @@ fn bind(
 /// [`check_authorization`], never routed: routing many channels through
 /// one endpoint is a later concern, and pretending to do it here would
 /// mean an authorization whose `channel_id` selects its own validator.
+///
+/// It is a [`CloseEndpoint`] plus the readiness decision new work is
+/// admitted under. [`Self::new`] takes one, so an endpoint that answers
+/// proposals cannot exist without one; the close half underneath it
+/// never reads it.
 #[derive(Debug)]
 pub struct ProviderEndpoint {
-    ready: ReadyChannel,
-    store: ChannelStore,
-    signer: Secp256k1Signer,
-    close_handoff: Option<(StartId, Handoff)>,
+    close: CloseEndpoint,
+    ready: Option<ReadyChannel>,
 }
 
 /// How far this process has got with the answer to a live contest.
@@ -490,6 +545,33 @@ pub enum Handoff {
     Accepted,
 }
 
+impl CloseEndpoint {
+    /// Builds the close half over one channel's journal and key.
+    ///
+    /// No readiness decision, and none is asked for. What is checked is
+    /// what a journal can answer on its own: that it is the provider's,
+    /// and that this key is the provider key its channel names.
+    ///
+    /// # Errors
+    ///
+    /// [`EndpointError`] when the store and the key are not both the
+    /// provider's view of the same channel.
+    pub fn new(store: ChannelStore, signer: Secp256k1Signer) -> Result<Self, EndpointError> {
+        bind_store(&store, &signer, Role::Provider)?;
+        Ok(Self {
+            store,
+            signer,
+            close_handoff: None,
+        })
+    }
+
+    /// Returns what this endpoint durably knows.
+    #[must_use]
+    pub const fn state(&self) -> &ChannelState {
+        self.store.state()
+    }
+}
+
 impl ProviderEndpoint {
     /// Builds the provider endpoint for one ready channel.
     ///
@@ -504,17 +586,57 @@ impl ProviderEndpoint {
     ) -> Result<Self, EndpointError> {
         bind(&ready, &store, &signer, Role::Provider)?;
         Ok(Self {
-            ready,
-            store,
-            signer,
-            close_handoff: None,
+            close: CloseEndpoint {
+                store,
+                signer,
+                close_handoff: None,
+            },
+            ready: Some(ready),
         })
+    }
+
+    /// Wraps a close half as an endpoint that admits no new work.
+    ///
+    /// Private, because a caller wanting exactly this already has it:
+    /// [`CloseEndpoint`] is the close capability, whole. This is what
+    /// [`WorkService::close_only`] serves it behind, where one type has
+    /// to carry both halves because one handler answers the wire.
+    const fn close_only(close: CloseEndpoint) -> Self {
+        Self { close, ready: None }
+    }
+
+    /// The readiness this endpoint admits new work under, or the refusal
+    /// that says it has none.
+    ///
+    /// # Errors
+    ///
+    /// [`EndpointError::NotAdmitting`] when no readiness decision is
+    /// held. Nothing about a close reaches this.
+    fn admitting(&self) -> Result<&ReadyChannel, EndpointError> {
+        self.ready.as_ref().ok_or(EndpointError::NotAdmitting)
+    }
+
+    /// Takes a fresh readiness decision, and admits new work under it.
+    ///
+    /// # Errors
+    ///
+    /// [`EndpointError`] when it is not this journal's own channel, at
+    /// this journal's own settlement.
+    fn admit_new_work(&mut self, ready: ReadyChannel) -> Result<(), EndpointError> {
+        bind(
+            &ready,
+            &self.close.store,
+            &self.close.signer,
+            Role::Provider,
+        )?;
+        self.ready = Some(ready);
+        Ok(())
     }
 
     /// Returns what this endpoint durably knows.
     #[must_use]
     pub const fn state(&self) -> &ChannelState {
-        self.store.state()
+        self.close.state()
     }
 
     /// Answers one proposal.
@@ -523,6 +645,12 @@ impl ProviderEndpoint {
     /// one of the six refusal codes or a co-signature, so there is one
     /// channel for answers and not two. Transport faults stay the
     /// transport's.
+    ///
+    /// A channel holding no readiness decision refuses every proposal as
+    /// `NotReady`, before a byte of it is read and before anything is
+    /// journaled. It is retryable because it is about this endpoint's
+    /// own state and not the proposal: a fresh readiness decision is all
+    /// that stands between the same bytes and a co-signature.
     ///
     /// On the accepting path the client's proposal is journaled — which
     /// is what reserves the compute credit — before the co-signature is
@@ -550,10 +678,14 @@ impl ProviderEndpoint {
     }
 
     fn decide(&mut self, request: &AcceptWorkRequest) -> Result<Sig, Refusal> {
+        let ready = self
+            .admitting()
+            .map_err(|error| Refusal::new(endpoint_refusal(error), error.to_string()))?
+            .clone();
         let authorization = PaidJobAuthorizationV1::decode(&request.authorization)?;
         let client_signature = signature(&request.client_signature)
             .ok_or_else(|| Refusal::invalid("the client signature is not 64 bytes"))?;
-        let work_id = work_id(self.ready.channel(), &authorization);
+        let work_id = work_id(ready.channel(), &authorization);
 
         // A question already answered is answered again, with the same
         // bytes and without re-deciding it. The deadlines are not
@@ -565,12 +697,12 @@ impl ProviderEndpoint {
         }
 
         let (cursor_height, _) = self.state().cursor();
-        let policy = *self.ready.execution_policy();
-        check_authorization(self.ready.channel(), &authorization, &policy, cursor_height)?;
+        let policy = *ready.execution_policy();
+        check_authorization(ready.channel(), &authorization, &policy, cursor_height)?;
         let bundle = PreparedPaidInputV1::decode(&request.prepared_input, MAX_RECORD_BYTES)
             .map_err(|error| Refusal::invalid(error.to_string()))?;
-        check_prepared_input(self.ready.channel(), &authorization, &policy, &bundle)?;
-        self.ready.check_signable(
+        check_prepared_input(ready.channel(), &authorization, &policy, &bundle)?;
+        ready.check_signable(
             cursor_height,
             authorization.terminal_deadline,
             authorization.payment_deadline,
@@ -578,7 +710,7 @@ impl ProviderEndpoint {
 
         // The client's signature, its bundle, and the credit this job
         // costs, on the disk before a co-signature exists to leak.
-        self.store.commit(
+        self.close.store.commit(
             ChannelRecord::JobProposed {
                 authorization,
                 client_signature,
@@ -587,8 +719,8 @@ impl ProviderEndpoint {
             &Secp256k1Verifier::new(),
         )?;
 
-        let signature = self.signer.sign(signing_hash(work_id));
-        self.store.commit(
+        let signature = self.close.signer.sign(signing_hash(work_id));
+        self.close.store.commit(
             ChannelRecord::JobAccepted {
                 provider_signature: signature,
             },
@@ -673,8 +805,8 @@ impl ProviderEndpoint {
             phase => return Err(RunError::NotAccepted { phase }),
         }
 
-        bind(ready, &self.store, &self.signer, Role::Provider)?;
-        if ready.execution_policy() != self.ready.execution_policy() {
+        bind(ready, &self.close.store, &self.close.signer, Role::Provider)?;
+        if ready.execution_policy() != self.admitting()?.execution_policy() {
             return Err(RunError::Policy);
         }
         let (cursor_height, _) = self.state().cursor();
@@ -697,7 +829,8 @@ impl ProviderEndpoint {
             .map_err(PaidWorkError::from)?
             .evaluate_request;
 
-        self.store
+        self.close
+            .store
             .commit(ChannelRecord::JobRunning, &Secp256k1Verifier::new())?;
         Ok(RunAdmission::Invoke(request))
     }
@@ -731,12 +864,13 @@ impl ProviderEndpoint {
             return Err(RunError::NoSuchJob);
         }
         let authorization = *job.authorization();
-        let channel = self.ready.channel();
+        let ready = self.admitting()?.clone();
+        let channel = ready.channel();
         let result =
             terminal_result(channel, &authorization, transcript).map_err(RunError::Transcript)?;
         let spool = encode_transcript(transcript).map_err(RunError::Transcript)?;
         let spooled = u64::try_from(spool.len()).unwrap_or(u64::MAX);
-        let limit = self.ready.execution_policy().max_spool_bytes;
+        let limit = ready.execution_policy().max_spool_bytes;
         if spooled > limit {
             return Err(RunError::Record(PaidWorkError::OverEnvelope {
                 field: "spooled transcript length",
@@ -745,6 +879,7 @@ impl ProviderEndpoint {
             }));
         }
         let signature = self
+            .close
             .signer
             .sign(signing_hash(result_digest(channel, &result)));
         // The delivery this result will become, measured before it is
@@ -764,7 +899,7 @@ impl ProviderEndpoint {
             .encoded_len(),
         )
         .unwrap_or(u64::MAX);
-        let frame_limit = u64::from(self.ready.execution_policy().max_encoded_result_frame);
+        let frame_limit = u64::from(ready.execution_policy().max_encoded_result_frame);
         if frame > frame_limit {
             return Err(RunError::Record(PaidWorkError::OverEnvelope {
                 field: "encoded result frame",
@@ -772,7 +907,7 @@ impl ProviderEndpoint {
                 limit: frame_limit,
             }));
         }
-        self.store.commit(
+        self.close.store.commit(
             ChannelRecord::JobResult {
                 result,
                 provider_signature: signature,
@@ -832,15 +967,16 @@ impl ProviderEndpoint {
         if job.work_id() != work_id {
             return Err(DeliverError::NoSuchJob);
         }
+        let admitted = self.admitting()?.clone();
         // Who is asking, on this connection. A `work_id` says which job;
         // it says nothing about who may be handed it, and it travels —
         // so without this the plaintext goes to whoever learned one, and
         // the debit for it lands on the client that never asked.
         if !Secp256k1Verifier::new().verify_sig(
             signature,
-            self.ready.channel().client_key(),
+            admitted.channel().client_key(),
             signing_hash(delivery_request_digest(
-                self.ready.channel(),
+                admitted.channel(),
                 work_id,
                 exporter,
             )),
@@ -854,14 +990,15 @@ impl ProviderEndpoint {
         let transcript = job.transcript().to_vec();
         let terminal_deadline = job.authorization().terminal_deadline;
 
-        bind(ready, &self.store, &self.signer, Role::Provider)?;
-        if ready.execution_policy() != self.ready.execution_policy() {
+        bind(ready, &self.close.store, &self.close.signer, Role::Provider)?;
+        if ready.execution_policy() != admitted.execution_policy() {
             return Err(DeliverError::Policy);
         }
         let (cursor_height, _) = self.state().cursor();
         ready.check_releasable(cursor_height, terminal_deadline)?;
 
-        self.store
+        self.close
+            .store
             .commit(ChannelRecord::PlaintextReleased, &Secp256k1Verifier::new())?;
         Ok(Delivery {
             result,
@@ -910,7 +1047,7 @@ impl ProviderEndpoint {
         let certificate_signature = signature(&request.certificate_signature)
             .ok_or(PaymentError::Malformed("certificate signature"))?;
 
-        let state = self.store.commit(
+        let state = self.close.store.commit(
             ChannelRecord::JobTerminated {
                 outcome: TerminalOutcome::Certified {
                     certificate,
@@ -945,7 +1082,7 @@ impl ProviderEndpoint {
         if job.work_id() != work_id {
             return Err(RunError::NoSuchJob);
         }
-        self.store.commit(
+        self.close.store.commit(
             ChannelRecord::JobTerminated {
                 outcome: TerminalOutcome::Failed {
                     code: PROVIDER_FAULT_CODE,
@@ -969,7 +1106,13 @@ const SOLE_PROPOSAL_NONCE: u64 = 1;
 
 // ── Settling on chain ─────────────────────────────────────────────────
 
-impl ProviderEndpoint {
+/// Everything a close is, and not one line of it reads a readiness
+/// decision.
+///
+/// That is the whole of what makes "`check_ready` gates new work only"
+/// true here rather than asserted in a comment: these methods are
+/// defined on a type that has no [`ReadyChannel`] to read.
+impl CloseEndpoint {
     /// Applies one finalized block: every transition it carries, then
     /// the cursor that says it was read.
     ///
@@ -1022,8 +1165,9 @@ impl ProviderEndpoint {
         if let Some(retained) = self.state().includable_close_start(height) {
             return Ok(retained.clone());
         }
+        let channel = self.state().channel().clone();
         let start = close_start(
-            self.ready.channel(),
+            &channel,
             Party::Taker,
             height,
             self.state().executable_certificate(),
@@ -1139,15 +1283,12 @@ impl ProviderEndpoint {
         if contest.start_id != start_id {
             return None;
         }
-        let response = close_response(self.ready.channel(), start_id, certificate, &self.signer);
+        let channel = self.state().channel();
+        let response = close_response(channel, start_id, certificate, &self.signer);
         Some((
             ChannelRecord::CloseResponded {
                 start_id,
-                response_digest: response_body_digest(
-                    self.ready.channel(),
-                    start_id,
-                    &certificate.0,
-                ),
+                response_digest: response_body_digest(channel, start_id, &certificate.0),
             },
             Tx::move_action(Move::RespondPaymentClose(response)),
         ))
@@ -1187,7 +1328,7 @@ impl ProviderEndpoint {
                 deadline: record.response_deadline(),
             });
         }
-        adjudicated_close(self.ready.channel(), self.ready.settlement(), &record)
+        adjudicated_close(self.state().channel(), self.state().settlement(), &record)
     }
 
     /// Builds the one answer to a contest opened below what this
@@ -1243,11 +1384,12 @@ impl ProviderEndpoint {
                 held: self.state().max_executable_certificate(),
                 settled: record.final_cumulative(),
             })?;
-        let response = close_response(self.ready.channel(), held, certificate, &self.signer);
+        let channel = self.state().channel().clone();
+        let response = close_response(&channel, held, certificate, &self.signer);
         self.store.commit(
             ChannelRecord::CloseResponded {
                 start_id: held,
-                response_digest: response_body_digest(self.ready.channel(), held, &certificate.0),
+                response_digest: response_body_digest(&channel, held, &certificate.0),
             },
             &Secp256k1Verifier::new(),
         )?;
@@ -1255,9 +1397,86 @@ impl ProviderEndpoint {
     }
 }
 
+/// The close half is reachable through the whole endpoint, unchanged.
+///
+/// Forwarding rather than a second implementation: there is one close
+/// sequence on this channel, and this is the same one, reached from the
+/// endpoint that also admits work.
+impl ProviderEndpoint {
+    /// Applies one finalized block, as [`CloseEndpoint::observe_finalized`]
+    /// does.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`CloseEndpoint::observe_finalized`] raises.
+    pub fn observe_finalized(
+        &mut self,
+        block: &FinalizedWork,
+    ) -> Result<&ChannelState, WorkStoreError> {
+        self.close.observe_finalized(block)
+    }
+
+    /// Reads every finalized block this endpoint has not seen.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`CloseEndpoint::catch_up`] raises.
+    pub async fn catch_up<S: FinalizedBlocks + ?Sized>(
+        &mut self,
+        source: &S,
+    ) -> Result<u64, CatchUpError> {
+        self.close.catch_up(source).await
+    }
+
+    /// Signs, or returns, this channel's retained close start.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`CloseEndpoint::prepare_close`] raises.
+    pub fn prepare_close(&mut self) -> Result<PaymentCloseStart, CloseError> {
+        self.close.prepare_close()
+    }
+
+    /// Runs one close step.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`CloseEndpoint::advance_close`] raises.
+    pub async fn advance_close<S, T>(
+        &mut self,
+        source: &S,
+        sink: &T,
+    ) -> Result<CloseProgress, CatchUpError>
+    where
+        S: FinalizedBlocks + ?Sized,
+        T: TxSink + ?Sized,
+    {
+        self.close.advance_close(source, sink).await
+    }
+
+    /// Builds the close that ends this endpoint's contest.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`CloseEndpoint::adjudicated_close`] raises.
+    pub fn adjudicated_close(&self, observed: &ObservedChannel<'_>) -> Result<Tx, CloseError> {
+        self.close.adjudicated_close(observed)
+    }
+
+    /// Builds the one answer to a contest opened below what this
+    /// provider holds.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`CloseEndpoint::respond_to_close`] raises.
+    pub fn respond_to_close(&mut self, observed: &ObservedChannel<'_>) -> Result<Tx, CloseError> {
+        self.close.respond_to_close(observed)
+    }
+}
+
 /// A provider that owns its journal outright lends it directly, and owns
 /// the answer it may have to give.
-impl CloseChannel for ProviderEndpoint {
+impl CloseChannel for CloseEndpoint {
     fn with_store<R>(
         &mut self,
         step: impl FnOnce(&mut ChannelStore) -> R,
@@ -1761,6 +1980,13 @@ fn end_failed(service: &WorkService, work_id: Digest, fault: RunError) -> RunErr
 /// concurrent calls of one. It is never held across an await, because
 /// deciding a proposal — hashing, verifying, and two synchronous journal
 /// appends — never awaits.
+///
+/// One type carries both halves because one handler answers the wire,
+/// and the halves are not both always present: [`Self::close_only`]
+/// serves a channel that admits no new work, and every admission method
+/// on it answers [`EndpointError::NotAdmitting`] until
+/// [`Self::admit_new_work`] is given a fresh readiness decision. Nothing
+/// about a close consults that option.
 #[derive(Clone, Debug)]
 pub struct WorkService {
     endpoint: Arc<Mutex<ProviderEndpoint>>,
@@ -1817,7 +2043,7 @@ impl ChannelDriver<'_> {
     fn readable_cursor(&self, endpoint: &ProviderEndpoint) -> Result<u64, CatchUpError> {
         let state = endpoint.state();
         let (height, _) = state.cursor();
-        if close_duty_present(state, endpoint.accepted_contest()) {
+        if close_duty_present(state, endpoint.close.accepted_contest()) {
             return Err(CatchUpError::CloseDuty { height });
         }
         Ok(height)
@@ -1953,17 +2179,17 @@ impl CloseChannel for ChannelDriver<'_> {
         step: impl FnOnce(&mut ChannelStore) -> R,
     ) -> Result<R, CatchUpError> {
         let mut endpoint = self.service.endpoint().map_err(|_| CatchUpError::Busy)?;
-        Ok(step(&mut endpoint.store))
+        Ok(step(&mut endpoint.close.store))
     }
 
     fn handoff(&mut self) -> Result<Option<(StartId, Handoff)>, CatchUpError> {
         let endpoint = self.service.endpoint().map_err(|_| CatchUpError::Busy)?;
-        Ok(endpoint.close_handoff)
+        Ok(endpoint.close.close_handoff)
     }
 
     fn fix_answer(&mut self, start_id: StartId) -> Result<Option<Tx>, CatchUpError> {
         let mut endpoint = self.service.endpoint().map_err(|_| CatchUpError::Busy)?;
-        Ok(endpoint.fix_close_answer(start_id)?)
+        Ok(endpoint.close.fix_close_answer(start_id)?)
     }
 
     fn record_handoff(
@@ -1972,7 +2198,7 @@ impl CloseChannel for ChannelDriver<'_> {
         outcome: SubmitTxOutcome,
     ) -> Result<(), CatchUpError> {
         let mut endpoint = self.service.endpoint().map_err(|_| CatchUpError::Busy)?;
-        endpoint.record_close_handoff(start_id, outcome);
+        endpoint.close.record_close_handoff(start_id, outcome);
         Ok(())
     }
 }
@@ -1985,6 +2211,37 @@ impl WorkService {
             endpoint: Arc::new(Mutex::new(endpoint)),
             driving: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Wraps one close half as a service that drives closes and admits
+    /// no new work.
+    ///
+    /// This is the mount a channel gets when
+    /// [`WorkChannelDescriptor::check_ready`](crate::protocol::work_setup::WorkChannelDescriptor::check_ready)
+    /// has nothing to say: a contest is open, the bond edge is gone, or
+    /// the admission horizon has passed. Every one of those is a state a
+    /// close driver exists for, and none of them is a readiness
+    /// decision, so there is none to pass.
+    #[must_use]
+    pub fn close_only(endpoint: CloseEndpoint) -> Self {
+        Self::new(ProviderEndpoint::close_only(endpoint))
+    }
+
+    /// Admits new work under a fresh readiness decision.
+    ///
+    /// The one way an admitting service comes to exist after a close-only
+    /// mount, and it takes the value only
+    /// [`WorkChannelDescriptor::check_ready`](crate::protocol::work_setup::WorkChannelDescriptor::check_ready)
+    /// produces. Nothing here refreshes it afterwards: its freshness is
+    /// the caller's in exactly the sense [`ReadyChannel`] documents.
+    ///
+    /// # Errors
+    ///
+    /// [`EndpointError::Poisoned`] when the endpoint is unreachable, and
+    /// the binding errors when the decision is not this journal's own
+    /// channel at its own settlement.
+    pub fn admit_new_work(&self, ready: ReadyChannel) -> Result<(), EndpointError> {
+        self.endpoint()?.admit_new_work(ready)
     }
 
     /// Borrows the endpoint, privately.
@@ -2136,9 +2393,10 @@ impl WorkService {
     ) -> Result<AcceptWorkResponse, CatchUpError> {
         let work_id = {
             let endpoint = self.endpoint().map_err(|_| CatchUpError::Busy)?;
+            let channel = endpoint.state().channel();
             PaidJobAuthorizationV1::decode(&request.authorization)
                 .ok()
-                .map(|authorization| work_id(endpoint.ready.channel(), &authorization))
+                .map(|authorization| work_id(channel, &authorization))
         };
         if let Some(work_id) = work_id {
             self.catch_up_job(source, work_id).await?;
@@ -2220,7 +2478,7 @@ impl WorkService {
         exporter: &[u8; 32],
     ) -> Result<Delivery, DeliverError> {
         let mut endpoint = self.endpoint()?;
-        let ready = endpoint.ready.clone();
+        let ready = endpoint.admitting()?.clone();
         endpoint.deliver(request, &ready, exporter)
     }
 
@@ -2244,10 +2502,16 @@ impl WorkService {
     ) -> DeliverResultResponse {
         let outcome = match (self.endpoint(), context.open_exporter) {
             (Ok(mut endpoint), Some(exporter)) => {
-                let ready = endpoint.ready.clone();
-                endpoint
-                    .deliver(request, &ready, &exporter)
-                    .map_err(Refusal::from)
+                let admitted = endpoint.admitting().cloned();
+                match admitted {
+                    Ok(ready) => endpoint
+                        .deliver(request, &ready, &exporter)
+                        .map_err(Refusal::from),
+                    // A channel that admits no new work releases no
+                    // plaintext either: the readiness the margins are
+                    // measured against is the one that admitted the job.
+                    Err(error) => Err(Refusal::new(endpoint_refusal(error), error.to_string())),
+                }
             }
             (Ok(_), None) => Err(Refusal::from(DeliverError::Unbindable)),
             (Err(error), _) => Err(Refusal::new(endpoint_refusal(error), error.to_string())),
@@ -2291,9 +2555,13 @@ impl WorkService {
     }
 }
 
+/// `NotAdmitting` is retryable for [`EndpointError::CatchingUp`]'s
+/// reason and no other: a channel that admits no new work now may admit
+/// it the moment a fresh readiness decision lands, and nothing about the
+/// proposal is wrong.
 const fn endpoint_refusal(error: EndpointError) -> WorkRefusal {
     match error {
-        EndpointError::CatchingUp => WorkRefusal::NotReady,
+        EndpointError::CatchingUp | EndpointError::NotAdmitting => WorkRefusal::NotReady,
         _ => WorkRefusal::Unavailable,
     }
 }

@@ -45,13 +45,13 @@ use hellas_rpc::protocol::work::{
 };
 use hellas_rpc::protocol::work_setup::{
     ObservedChannel, OmissionMeasurements, ReadyChannel, WorkChannelConfig, WorkChannelDescriptor,
-    payment_terms_hash,
+    WorkSetupError, payment_terms_hash,
 };
 use hellas_rpc::protocol::{ContentId, Digest};
 use hellas_rpc::services::work::{WorkClientImpl, WorkServer};
 use hellas_rpc::work::{
-    BackendFault, ClientEndpoint, PaidEvaluateBackend, PaymentError, ProviderEndpoint, RunOutcome,
-    WorkService, admit_payment, fetch_result, run_accepted_work,
+    BackendFault, ClientEndpoint, CloseEndpoint, PaidEvaluateBackend, PaymentError,
+    ProviderEndpoint, RunOutcome, WorkService, admit_payment, fetch_result, run_accepted_work,
 };
 use hellas_rpc::work_close::{
     BlockSourceError, CatchUpError, CloseError, CloseProgress, FinalizedBlocks, FinalizedWork,
@@ -3629,5 +3629,332 @@ async fn a_local_ending_is_the_providers_own_failed_terminal() {
     assert!(
         failed,
         "a locally ended job rests at a failed terminal the provider bears",
+    );
+}
+
+// ── Closing what admits no new work ───────────────────────────────────
+//
+// Three states a close driver exists for, and `check_ready` refuses
+// every one of them: an open contest, a bond edge that is gone, and an
+// admission horizon that has passed. Each test asks that refusal first,
+// against the same descriptor and a coherent read, so the claim these
+// mounts rest on is checked rather than asserted — and then builds the
+// close capability from the journal and the key alone, which is the
+// whole of what a close reads.
+
+/// A provider journal opened without a readiness decision anywhere in
+/// sight.
+///
+/// The channel and the settlement come from the configured descriptor
+/// and the funded edge, which is exactly what `work_open::mount` hands a
+/// close-only channel. Nothing here calls `check_ready`, and on these
+/// channels nothing could.
+fn close_only_store(root: &std::path::Path, height: u64) -> ChannelStore {
+    let mut store = match ChannelStore::open(
+        root,
+        descriptor().channel().clone(),
+        settlement(),
+        Role::Provider,
+        origin(),
+        &Secp256k1Verifier::new(),
+    ) {
+        Ok(store) => store,
+        Err(error) => panic!("the close-only store opens: {error}"),
+    };
+    advance(&mut store, height);
+    store
+}
+
+/// The close half of a restarted provider, over the journal a paid job
+/// left behind.
+struct CloseWatcher {
+    provider: CloseEndpoint,
+    _client_root: tempfile::TempDir,
+    _provider_root: tempfile::TempDir,
+}
+
+fn close_only_restart(fixture: Checked, height: u64) -> CloseWatcher {
+    let Checked {
+        client_root,
+        provider_root,
+        service,
+        client,
+        ..
+    } = fixture;
+    drop(service);
+    drop(client);
+    let store = close_only_store(provider_root.path(), height);
+    match CloseEndpoint::new(store, provider()) {
+        Ok(provider) => CloseWatcher {
+            provider,
+            _client_root: client_root,
+            _provider_root: provider_root,
+        },
+        Err(error) => panic!("the close half binds without a readiness: {error}"),
+    }
+}
+
+/// One coherent finalized read of the fixture channel.
+fn observed<'a>(
+    height: u64,
+    bond: Option<&'a Edge>,
+    payment: Option<&'a Edge>,
+    pending: PendingSlot,
+) -> ObservedChannel<'a> {
+    ObservedChannel {
+        height,
+        bond,
+        payment,
+        lease: match bond {
+            None => LeaseSlots::Absent,
+            Some(_) => lease_over(bond_edge(), payment_edge()),
+        },
+        pending,
+    }
+}
+
+/// What this service answers a fresh proposal with.
+fn proposal_refusal(service: &WorkService) -> i32 {
+    match service.accept(&signed_request(NONCE, 1)).outcome {
+        Some(AcceptOutcome::Refused(refused)) => refused.code,
+        other => panic!("a channel that admits no new work refuses: {other:?}"),
+    }
+}
+
+/// The finalized close that pays this provider `payout`.
+fn settling_close(payout: u64) -> hellas_kernel::Tx {
+    hellas_kernel::Tx::close(
+        payment_edge(),
+        hellas_kernel::Proof::adjudicated(hellas_kernel::PaymentContestCommitment::from_bytes(
+            [0x44; 32],
+        )),
+        List::take(
+            [Payout::new(provider().party_key(), payout); MAX_EDGE_OUTPUTS],
+            1,
+        ),
+    )
+}
+
+/// A channel with an open contest mounts a close-capable service, and
+/// that service discharges the duty.
+///
+/// The contest is the one `check_ready` refuses, asked first and
+/// checked: a `PendingClose` is not a readiness decision, so the type
+/// the old `ProviderEndpoint::new` demanded could not be built for this
+/// channel at all, and the answer this provider owes could not be sent.
+/// The journal, meanwhile, holds everything the answer is derived from —
+/// the contest the watcher recorded, and the client's own certificate —
+/// so the close half needs nothing the readiness carried.
+#[tokio::test]
+async fn a_contested_channel_mounts_a_close_capable_service() {
+    let fixture = paid_job().await;
+    let ready = fixture.ready.clone();
+    let inclusion = CURSOR + 1;
+    let understated = close_start(ready.channel(), Party::Maker, CURSOR, None, &client())
+        .expect("a client opens a close");
+    let expected = contest_id(&ready, &understated, inclusion);
+    let deadline = inclusion + payment_terms().omit_response_blocks;
+
+    // The readiness this endpoint would once have needed does not exist.
+    let bond = bond_object();
+    let payment = payment_object();
+    let contested = observed(
+        inclusion,
+        Some(&bond),
+        Some(&payment),
+        pending_slot(&Contest::opened(expected, deadline, 0)),
+    );
+    match descriptor().check_ready(&contested) {
+        Err(WorkSetupError::PendingClose { .. }) => {}
+        other => panic!("an open contest admits no new work: {other:?}"),
+    }
+
+    let watcher = close_only_restart(fixture, CURSOR);
+    let service = WorkService::close_only(watcher.provider);
+    let chain = Chain {
+        blocks: vec![block(
+            inclusion,
+            vec![hellas_kernel::Tx::move_action(
+                hellas_kernel::Move::StartPaymentClose(understated),
+            )],
+        )],
+        withheld: None,
+    };
+    let sink = Mempool::default();
+    match service.advance_close(&chain, &sink).await {
+        Ok(CloseProgress::Opened { start_id }) => assert_eq!(start_id, expected),
+        other => panic!("the contest is read and answered: {other:?}"),
+    }
+
+    let taken = sink.taken();
+    assert_eq!(taken.len(), 1, "the close-only service answered");
+    let hellas_kernel::Tx::Move {
+        action: hellas_kernel::Move::RespondPaymentClose(response),
+    } = &taken[0]
+    else {
+        panic!("the submitted transaction is a response move");
+    };
+    assert_eq!(response.start_id(), expected);
+    assert_eq!(response.certificate().earned_cumulative(), PRICE);
+
+    let responded = service
+        .with_state(|state| state.close_responded())
+        .expect("the endpoint is reachable")
+        .expect("the serviced duty is on the disk");
+    assert_eq!(responded.start_id, expected);
+    assert_eq!(
+        responded.response_digest,
+        response_body_digest(ready.channel(), expected, response.certificate()),
+        "the journaled digest is the one the submitted answer was signed over",
+    );
+    assert_eq!(
+        proposal_refusal(&service),
+        WorkRefusalCode::NotReady as i32,
+        "and it admits no new work while it has no readiness decision",
+    );
+}
+
+/// The `(bond absent, payment live)` mount closes its own payment edge.
+///
+/// This is §7's permissionless leased-bond timeout: the bond is gone,
+/// the lease with it, and the payment edge this provider is owed out of
+/// is untouched. `check_ready` refuses at the first fact it reads, and
+/// the close that recovers the earnings is exactly what must still run.
+#[tokio::test]
+async fn a_close_only_mount_without_a_bond_closes_its_payment_edge() {
+    let fixture = paid_job().await;
+    let payment = payment_object();
+    match descriptor().check_ready(&observed(
+        CURSOR,
+        None,
+        Some(&payment),
+        PendingSlot::Absent,
+    )) {
+        Err(WorkSetupError::NotLive { object }) => assert_eq!(object, "the bond edge"),
+        other => panic!("a channel whose bond is gone admits no new work: {other:?}"),
+    }
+
+    let mut watcher = close_only_restart(fixture, CURSOR);
+    let start = watcher
+        .provider
+        .prepare_close()
+        .expect("a paid channel closes without a readiness decision");
+    assert_eq!(
+        start.certificate().map(|(earned, _)| earned
+            .earned_cumulative()),
+        Some(PRICE),
+        "the start spends the certificate the journal holds",
+    );
+
+    let sink = Mempool::default();
+    let empty = Chain {
+        blocks: Vec::new(),
+        withheld: None,
+    };
+    match watcher.provider.advance_close(&empty, &sink).await {
+        Ok(CloseProgress::Submitted { valid_through, .. }) => {
+            assert_eq!(valid_through, CURSOR + payment_terms().start_validity_blocks);
+        }
+        other => panic!("the retained start is handed to consensus: {other:?}"),
+    }
+    assert_eq!(sink.taken().len(), 1);
+
+    // And the close that lands is observed for itself, which is the
+    // terminal answer a close-only mount exists to reach.
+    let settling = Chain {
+        blocks: vec![block(CURSOR + 1, vec![settling_close(PRICE)])],
+        withheld: None,
+    };
+    match watcher.provider.advance_close(&settling, &sink).await {
+        Ok(CloseProgress::Settled { provider_payout }) => assert_eq!(provider_payout, PRICE),
+        other => panic!("the close settles this edge: {other:?}"),
+    }
+}
+
+/// A channel past its admission horizon still closes.
+///
+/// The horizon is the last height new work may be admitted at, and
+/// nothing else: the payment edge outlives it, and so does what this
+/// provider has already earned on it.
+#[tokio::test]
+async fn a_channel_past_its_horizon_still_closes() {
+    let fixture = paid_job().await;
+    let bond = bond_object();
+    let payment = payment_object();
+    match descriptor().check_ready(&observed(
+        HORIZON,
+        Some(&bond),
+        Some(&payment),
+        PendingSlot::Absent,
+    )) {
+        Err(WorkSetupError::HorizonPassed { height, horizon }) => {
+            assert_eq!((height, horizon), (HORIZON, HORIZON));
+        }
+        other => panic!("a channel at its horizon admits no new work: {other:?}"),
+    }
+
+    let mut watcher = close_only_restart(fixture, HORIZON);
+    assert_eq!(watcher.provider.state().cursor().0, HORIZON);
+    watcher
+        .provider
+        .prepare_close()
+        .expect("a channel past its horizon still closes");
+
+    let sink = Mempool::default();
+    let empty = Chain {
+        blocks: Vec::new(),
+        withheld: None,
+    };
+    match watcher.provider.advance_close(&empty, &sink).await {
+        Ok(CloseProgress::Submitted { valid_through, .. }) => {
+            assert_eq!(
+                valid_through,
+                HORIZON + payment_terms().start_validity_blocks
+            );
+        }
+        other => panic!("the retained start is handed to consensus: {other:?}"),
+    }
+    assert_eq!(sink.taken().len(), 1);
+}
+
+/// A close-only service admits no new work until a fresh readiness
+/// decision arrives, and admits it the moment one does.
+///
+/// The option is the whole gate, and the value that fills it has one
+/// producer: `check_ready`. So "refuses until a fresh readiness
+/// succeeds" is not a rule this service applies, it is the only way the
+/// value it needs can come into existence.
+#[tokio::test]
+async fn a_close_only_service_admits_work_only_once_a_readiness_arrives() {
+    let root = temp();
+    let endpoint = CloseEndpoint::new(close_only_store(root.path(), CURSOR), provider())
+        .expect("the close half binds without a readiness");
+    let service = WorkService::close_only(endpoint);
+
+    assert_eq!(
+        proposal_refusal(&service),
+        WorkRefusalCode::NotReady as i32,
+        "a channel with no readiness decision admits no work",
+    );
+    assert!(
+        service
+            .with_state(|state| state.job().is_none())
+            .expect("the endpoint is reachable"),
+        "and the refused proposal reserved nothing",
+    );
+
+    service
+        .admit_new_work(ready())
+        .expect("a fresh readiness for this journal's own channel is taken");
+
+    match service.accept(&signed_request(NONCE, 1)).outcome {
+        Some(AcceptOutcome::Accepted(_)) => {}
+        other => panic!("the same proposal is now co-signed: {other:?}"),
+    }
+    assert!(
+        service
+            .with_state(|state| state.job().is_some())
+            .expect("the endpoint is reachable"),
+        "and the accepted job is on the disk",
     );
 }
