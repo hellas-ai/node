@@ -147,6 +147,14 @@ impl JournalKind {
             Self::Channel => 2,
         }
     }
+
+    const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::Setup),
+            2 => Some(Self::Channel),
+            _ => None,
+        }
+    }
 }
 
 /// Which side of the channel this endpoint is.
@@ -168,6 +176,14 @@ impl Role {
         match self {
             Self::Client => 1,
             Self::Provider => 2,
+        }
+    }
+
+    const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::Client),
+            2 => Some(Self::Provider),
+            _ => None,
         }
     }
 }
@@ -231,6 +247,16 @@ pub enum JournalError {
         expected: u8,
         /// Operator-facing reason this version cannot be migrated safely.
         retirement: &'static str,
+    },
+    /// The file does not begin with a header this binary writes at all,
+    /// so there is no kind, role or key in it to name.
+    ///
+    /// Distinct from [`Self::HeaderMismatch`], which is a journal that
+    /// is somebody else's: this one is not a journal.
+    #[error("the file at {path} does not begin with a journal header")]
+    NotAJournal {
+        /// File that was read.
+        path: PathBuf,
     },
     /// The file exists and is not a journal of this kind, role, and key.
     #[error("the file at {path} is not this endpoint's {kind:?} journal")]
@@ -348,17 +374,7 @@ impl Journal {
                 return Err(JournalError::OldVersion {
                     found,
                     expected: FORMAT_VERSION,
-                    retirement: match found {
-                        0 | 1 => {
-                            "pre-arming journals have no recoverable scan floor or close descriptor"
-                        }
-                        2 => {
-                            "pre-terminal channel journals reuse tags 7-11 with other meanings and would mis-replay"
-                        }
-                        _ => {
-                            "pre-response channel journals cannot record an answered contest, so a fixed answer replays as one never given"
-                        }
-                    },
+                    retirement: retirement(found),
                 });
             }
             // A file that is a strict prefix of the header this journal
@@ -402,54 +418,9 @@ impl Journal {
     /// Walks every frame, truncating one partial tail and refusing any
     /// complete frame that does not verify.
     fn replay(&mut self, bytes: &[u8]) -> Result<Replay, JournalError> {
-        let mut offset = HEADER_SIZE;
-        let mut records = Vec::new();
-        let mut truncated_tail = false;
-        while let Some(rest) = bytes.get(offset..).filter(|rest| !rest.is_empty()) {
-            let Some(prefix) = rest.get(..4) else {
-                truncated_tail = true;
-                break;
-            };
-            let mut len_bytes = [0_u8; 4];
-            len_bytes.copy_from_slice(prefix);
-            let len = u32::from_be_bytes(len_bytes) as usize;
-            // The extent first, and the length's plausibility second: a
-            // frame that runs past the end of the file is an append the
-            // file ends inside, whether its length field is a hundred
-            // bytes too many or four gigabytes too many. Only a length
-            // that fits inside the file could be a complete frame, and
-            // only there is an oversized one evidence of corruption
-            // rather than of a tear.
-            let Some(frame) = FRAME_OVERHEAD
-                .checked_add(len)
-                .and_then(|end| rest.get(..end))
-            else {
-                truncated_tail = true;
-                break;
-            };
-            if len > MAX_RECORD_BYTES {
-                return Err(JournalError::RecordTooLarge { len });
-            }
-            let (Some(payload), Some(stored)) = (frame.get(4..4 + len), frame.get(4 + len..))
-            else {
-                truncated_tail = true;
-                break;
-            };
-            if stored != frame_digest(self.header, self.next_seq, payload).as_bytes() {
-                // Every byte this frame claims is in the file, so it was
-                // long enough to be a complete append — and a complete
-                // append is one whose caller may have been given an
-                // `Ok`. Nothing here can tell that from a machine that
-                // died mid-flush, so the file is refused rather than
-                // read back one record short of what a peer may hold.
-                return Err(JournalError::Corrupt { seq: self.next_seq });
-            }
-            records.push(payload.to_vec());
-            self.next_seq = self.next_seq.saturating_add(1);
-            offset += FRAME_OVERHEAD + len;
-        }
-
-        if truncated_tail {
+        let (replay, next_seq, offset) = walk(self.header, bytes)?;
+        self.next_seq = next_seq;
+        if replay.truncated_tail {
             // The interrupted bytes are removed rather than left in
             // place: the next append must land where the next frame's
             // digest says it does, and a reader that skipped a partial
@@ -457,10 +428,36 @@ impl Journal {
             self.file.set_len(offset as u64)?;
             self.file.sync_all()?;
         }
-        Ok(Replay {
-            records,
-            truncated_tail,
-        })
+        Ok(replay)
+    }
+
+    /// Reads what the file at `path` says it is, and what verifies in
+    /// it, without taking it over.
+    ///
+    /// The header names the kind, the role and the key, so a reader that
+    /// does not already know them can still be told. That is the whole
+    /// reason this exists: [`Self::open`] can only be asked for a
+    /// journal that is already named, and an endpoint enumerating the
+    /// journals it owns has nobody to name them for it.
+    ///
+    /// Nothing is locked and nothing is written. A torn tail is left in
+    /// the file and is merely absent from the records returned, because
+    /// removing it is the writer's act and this is not the writer — the
+    /// next [`Self::open`] does it, under the lock, exactly as it would
+    /// have without this call.
+    ///
+    /// # Errors
+    ///
+    /// [`JournalError::NotAJournal`] when the file does not begin with a
+    /// header this binary writes, [`JournalError::OldVersion`] for a
+    /// retired one, [`JournalError::Corrupt`] when a complete frame does
+    /// not verify, [`JournalError::RecordTooLarge`] for a frame longer
+    /// than the ceiling, and [`JournalError::Io`] for the filesystem.
+    pub fn inspect(path: &Path) -> Result<(JournalId, Replay), JournalError> {
+        let bytes = fs::read(path)?;
+        let id = read_id(path, &bytes)?;
+        let (replay, _, _) = walk(id.digest(), &bytes)?;
+        Ok((id, replay))
     }
 
     /// Appends one record and returns only once it is on the disk.
@@ -524,6 +521,121 @@ impl Journal {
     pub const fn is_empty(&self) -> bool {
         self.next_seq == 0
     }
+}
+
+/// Reads the header a journal file opens with, without being told what
+/// it should say.
+///
+/// The one place the header's bytes are read back rather than compared:
+/// [`Journal::open`] knows the journal it wants and matches the whole
+/// header at once, and everything below is for the reader that does not.
+/// A code this binary does not write is not a journal it can describe,
+/// so it is refused here rather than mapped to some nearby value.
+fn read_id(path: &Path, bytes: &[u8]) -> Result<JournalId, JournalError> {
+    let not_a_journal = || JournalError::NotAJournal {
+        path: path.to_path_buf(),
+    };
+    if bytes.len() < HEADER_SIZE || !bytes.starts_with(MAGIC) {
+        return Err(not_a_journal());
+    }
+    let version = bytes[MAGIC.len()];
+    if version < FORMAT_VERSION {
+        return Err(JournalError::OldVersion {
+            found: version,
+            expected: FORMAT_VERSION,
+            retirement: retirement(version),
+        });
+    }
+    if version > FORMAT_VERSION {
+        return Err(not_a_journal());
+    }
+    let (Some(kind), Some(role)) = (
+        JournalKind::from_code(bytes[MAGIC.len() + 1]),
+        Role::from_code(bytes[MAGIC.len() + 2]),
+    ) else {
+        return Err(not_a_journal());
+    };
+    let mut key = [0_u8; 32];
+    key.copy_from_slice(&bytes[MAGIC.len() + 3..HEADER_SIZE]);
+    Ok(JournalId { kind, role, key })
+}
+
+/// Returns why one retired envelope version cannot be migrated.
+const fn retirement(found: u8) -> &'static str {
+    match found {
+        0 | 1 => "pre-arming journals have no recoverable scan floor or close descriptor",
+        2 => {
+            "pre-terminal channel journals reuse tags 7-11 with other meanings and would mis-replay"
+        }
+        _ => {
+            "pre-response channel journals cannot record an answered contest, so a fixed answer replays as one never given"
+        }
+    }
+}
+
+/// Walks the frames after the header, stopping at the first partial one.
+///
+/// Returns what verified, the sequence the next frame would occupy, and
+/// the offset a partial tail begins at — which is the length the file
+/// would be truncated to. Reading and truncating are separated because
+/// one caller is opening the journal to write it and the other is only
+/// looking at it.
+fn walk(header: Digest, bytes: &[u8]) -> Result<(Replay, u64, usize), JournalError> {
+    let mut offset = HEADER_SIZE;
+    let mut seq = 0_u64;
+    let mut records = Vec::new();
+    let mut truncated_tail = false;
+    while let Some(rest) = bytes.get(offset..).filter(|rest| !rest.is_empty()) {
+        let Some(prefix) = rest.get(..4) else {
+            truncated_tail = true;
+            break;
+        };
+        let mut len_bytes = [0_u8; 4];
+        len_bytes.copy_from_slice(prefix);
+        let len = u32::from_be_bytes(len_bytes) as usize;
+        // The extent first, and the length's plausibility second: a
+        // frame that runs past the end of the file is an append the
+        // file ends inside, whether its length field is a hundred
+        // bytes too many or four gigabytes too many. Only a length
+        // that fits inside the file could be a complete frame, and
+        // only there is an oversized one evidence of corruption
+        // rather than of a tear.
+        let Some(frame) = FRAME_OVERHEAD
+            .checked_add(len)
+            .and_then(|end| rest.get(..end))
+        else {
+            truncated_tail = true;
+            break;
+        };
+        if len > MAX_RECORD_BYTES {
+            return Err(JournalError::RecordTooLarge { len });
+        }
+        let (Some(payload), Some(stored)) = (frame.get(4..4 + len), frame.get(4 + len..)) else {
+            truncated_tail = true;
+            break;
+        };
+        if stored != frame_digest(header, seq, payload).as_bytes() {
+            // Every byte this frame claims is in the file, so it was
+            // long enough to be a complete append — and a complete
+            // append is one whose caller may have been given an
+            // `Ok`. Nothing here can tell that from a machine that
+            // died mid-flush, so the file is refused rather than
+            // read back one record short of what a peer may hold.
+            return Err(JournalError::Corrupt { seq });
+        }
+        records.push(payload.to_vec());
+        seq = seq.saturating_add(1);
+        offset += FRAME_OVERHEAD + len;
+    }
+
+    Ok((
+        Replay {
+            records,
+            truncated_tail,
+        },
+        seq,
+        offset,
+    ))
 }
 
 /// Returns the digest that binds one frame to its journal and position.

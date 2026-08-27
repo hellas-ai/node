@@ -1388,11 +1388,19 @@ mod tests {
     }
 
     fn bond_terms() -> WorkStakeBondTerms {
+        bond_terms_staked_by(&signer(0x22))
+    }
+
+    /// The same bond, staked by whichever key this node settles with.
+    ///
+    /// A provider signs its own bond, so the staking party is not a
+    /// fixture constant when the key comes from an identity file.
+    fn bond_terms_staked_by(provider: &Secp256k1Signer) -> WorkStakeBondTerms {
         WorkStakeBondTerms {
-            parties: Parties::new(signer(0x22).party_key(), signer(0x21).party_key()),
+            parties: Parties::new(provider.party_key(), signer(0x21).party_key()),
             timeout: BlockHeight::new(500),
             timeout_outputs: List::take(
-                [Payout::new(signer(0x22).party_key(), 64); MAX_EDGE_OUTPUTS],
+                [Payout::new(provider.party_key(), 64); MAX_EDGE_OUTPUTS],
                 1,
             ),
             max_job_price: 40,
@@ -1753,6 +1761,115 @@ mod tests {
         let state = endpoint
             .propose_bond(network(), bond_funding(), bond_terms())
             .expect("the endpoint signs and journals its bond proposal");
+
+        assert_eq!(state.revision(), Some(1));
+    }
+
+    /// A restarted node rebuilds the endpoint from what serve holds: the
+    /// configured journal root, the stored identity, and the journals
+    /// themselves.
+    ///
+    /// This is the whole of the gap. `SetupStore::open` is keyed by a
+    /// bond edge and a role, and a `SetupEndpoint` needs a settlement
+    /// key: the configuration below carries none of the three, the bond
+    /// edge is recovered from the file, the role from its header, and
+    /// the key from the identity `identity init` wrote. Re-proposing the
+    /// retained bond is what proves the rebuilt endpoint is the one that
+    /// wrote the journal — a different key signs different bytes, and
+    /// the journal refuses a revision that rewrites the one it holds.
+    #[test]
+    fn a_restarted_node_rebuilds_its_endpoint_from_the_root_and_the_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("work-journals");
+        let artifact_path = dir.path().join("artifact.json");
+        let bytes = artifact().to_string();
+        fs::write(&artifact_path, &bytes).unwrap();
+        let loaded = load(with(
+            with(
+                config(),
+                "journal",
+                serde_json::json!({
+                    "root": root.display().to_string(),
+                    "max_active_bytes": 67_108_864_u64,
+                    "max_active_frames": 4_096_u64,
+                    "max_checkpoint_bytes": 4_194_304_u64,
+                }),
+            ),
+            "artifact",
+            serde_json::json!({
+                "path": artifact_path.display().to_string(),
+                "digest": hex::encode(Digest::hash(bytes.as_bytes()).as_bytes()),
+            }),
+        ))
+        .expect("the fixture configuration loads");
+        let duties = load_paid_work_duties(&loaded).expect("the pinned artifact is read");
+
+        // The identity `identity init` wrote, and the key it settles
+        // with. Nothing in the configuration above names either.
+        let identity_path = dir.path().join("identity");
+        let identity = crate::identity::load_or_create(Some(&identity_path), true)
+            .expect("the operator's identity is created once");
+        let settlement = crate::identity::settlement_signer(&identity);
+        let terms = bond_terms_staked_by(&settlement);
+        let bond_edge = Tx::edge_id_of(&bond_funding(), &Terms::work_stake_bond(terms.clone()));
+
+        // The first process: one setup journal under the configured
+        // root, staking the bond this node's own key is the maker of.
+        {
+            let store = SetupStore::open(
+                &loaded.journal.root,
+                loaded.chain.network,
+                bond_edge,
+                Role::Provider,
+                &Secp256k1Verifier::new(),
+            )
+            .expect("the journal opens under the configured root");
+            let mut endpoint = SetupEndpoint::new(
+                store,
+                settlement.clone(),
+                duties.payment_admission().expect("an artifact was read"),
+            );
+            endpoint
+                .arm_scan(SetupScan {
+                    height: 7,
+                    payload: [0x47; 32],
+                })
+                .expect("the immutable history floor is armed");
+            endpoint
+                .propose_bond(loaded.chain.network, bond_funding(), terms.clone())
+                .expect("the endpoint signs and journals its bond proposal");
+        }
+
+        // The restart: the root and the network, and no bond edge or
+        // role anywhere in the configuration to be told them by.
+        let found =
+            hellas_rpc::work_store::discover_setups(&loaded.journal.root, loaded.chain.network)
+                .expect("the configured root enumerates");
+        assert!(found.unidentified.is_empty(), "{:?}", found.unidentified);
+        let [discovered] = found.setups.as_slice() else {
+            panic!("one journal was written, one is found: {:?}", found.setups);
+        };
+        assert_eq!(discovered.bond_edge, bond_edge);
+        assert_eq!(discovered.role, Role::Provider);
+
+        let store = SetupStore::open(
+            &loaded.journal.root,
+            loaded.chain.network,
+            discovered.bond_edge,
+            discovered.role,
+            &Secp256k1Verifier::new(),
+        )
+        .expect("the discovered journal reopens");
+        assert_eq!(store.state().revision(), Some(1));
+        let mut endpoint = SetupEndpoint::new(
+            store,
+            crate::identity::settlement_signer(&identity),
+            duties.payment_admission().expect("an artifact was read"),
+        );
+
+        let state = endpoint
+            .propose_bond(loaded.chain.network, bond_funding(), terms)
+            .expect("the rebuilt endpoint answers for the journal it reopened");
 
         assert_eq!(state.revision(), Some(1));
     }

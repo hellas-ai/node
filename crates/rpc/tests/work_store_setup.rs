@@ -31,12 +31,12 @@ use hellas_rpc::work_handshake::{PaymentAdmission, SetupEndpoint, SetupService};
 use hellas_rpc::work_open::{
     FinalizedSetup, SetupDriveError, SetupProgress, SetupQuery, SetupStep, SetupView, advance_setup,
 };
-use hellas_rpc::work_store::journal::JournalError;
+use hellas_rpc::work_store::journal::{Journal, JournalError, JournalId, JournalKind};
 use hellas_rpc::work_store::setup::setup_key;
 use hellas_rpc::work_store::{
-    ObservedSetup, Role, SetupAbort, SetupDecision, SetupEnd, SetupFault, SetupHistoryBatch,
-    SetupHistoryBlock, SetupRecord, SetupScan, SetupState, SetupStateError, SetupStore,
-    WorkStoreError,
+    DiscoveredSetup, ObservedSetup, Role, SetupAbort, SetupDecision, SetupDiscoveryError, SetupEnd,
+    SetupFault, SetupHistoryBatch, SetupHistoryBlock, SetupRecord, SetupScan, SetupState,
+    SetupStateError, SetupStore, WorkStoreError, discover_setups,
 };
 
 // ── Fixture ───────────────────────────────────────────────────────────
@@ -107,6 +107,14 @@ fn bond_funding() -> Funding {
     Funding::new(coins(&[BOND_COIN]), empty_coins())
 }
 
+/// A second bond, over a coin the first one does not stake.
+///
+/// Two bonds is what a journal root holds: one file each, and nothing
+/// outside the files says which bond either of them is about.
+fn other_bond_funding() -> Funding {
+    Funding::new(coins(&[BOND_COIN + 1]), empty_coins())
+}
+
 fn payment_funding() -> Funding {
     Funding::new(coins(&[PAYMENT_COIN]), empty_coins())
 }
@@ -163,14 +171,14 @@ fn provider_policy() -> ProviderChannelPolicy {
 }
 
 fn proposed() -> WorkChannelSetupBundleV1 {
-    let hash = Tx::open_hash(
-        network(),
-        &bond_funding(),
-        &Terms::work_stake_bond(bond_terms()),
-    );
+    proposed_over(bond_funding())
+}
+
+fn proposed_over(funding: Funding) -> WorkChannelSetupBundleV1 {
+    let hash = Tx::open_hash(network(), &funding, &Terms::work_stake_bond(bond_terms()));
     match WorkChannelSetupBundleV1::propose_bond(
         network(),
-        bond_funding(),
+        funding,
         bond_terms(),
         Auth::native(provider().sign(hash)),
     ) {
@@ -268,6 +276,18 @@ fn same_block_contest() -> Tx {
         None,
         Sig::from_bytes([0_u8; Sig::LENGTH]),
     )))
+}
+
+/// The file name a setup journal for one bond takes under a root.
+fn journal_name(bond_edge: EdgeId) -> String {
+    let key = setup_key(network(), bond_edge);
+    let mut name = String::from("setup-");
+    for byte in key.into_bytes() {
+        use std::fmt::Write as _;
+        let _ = write!(name, "{byte:02x}");
+    }
+    name.push_str(".journal");
+    name
 }
 
 fn store(root: &std::path::Path, role: Role) -> SetupStore {
@@ -961,6 +981,260 @@ fn journal_path(root: &std::path::Path, network: NetworkId, bond: EdgeId) -> std
         "setup-{}.journal",
         hex(&setup_key(network, bond).into_bytes())
     ))
+}
+
+// ── What a root holds ─────────────────────────────────────────────────
+
+/// A restarted node opens every journal under its root, and the file
+/// alone tells it which bond and which side each one is.
+///
+/// The two values asserted are `SetupStore::open`'s two keys, and
+/// neither is anywhere but in the journals: the second process below is
+/// given the root, the network and nothing else. So the reopened
+/// revisions are what proves the recovery — a wrong bond edge names a
+/// file that is not there and replays as empty, and a wrong role is a
+/// header the journal refuses.
+#[test]
+fn a_restart_finds_every_journal_its_root_holds() {
+    let dir = temp();
+    let verifier = Secp256k1Verifier::new();
+    let staked = proposed();
+    let funded = proposed_over(other_bond_funding());
+    assert_ne!(staked.bond_edge(), funded.bond_edge());
+
+    // One bond this node stakes as the provider, one it funds as the
+    // client, both under the one root.
+    {
+        let mut provider_store = store(dir.path(), Role::Provider);
+        for record in [scan_record(), bundle_record(&staked)] {
+            if let Err(error) = provider_store.commit(record, &verifier) {
+                panic!("the provider's revision commits: {error}");
+            }
+        }
+        let mut client_store = match SetupStore::open(
+            dir.path(),
+            network(),
+            funded.bond_edge(),
+            Role::Client,
+            &verifier,
+        ) {
+            Ok(store) => store,
+            Err(error) => panic!("the client's journal opens: {error}"),
+        };
+        if let Err(error) = client_store.commit(bundle_record(&funded), &verifier) {
+            panic!("the client's revision commits: {error}");
+        }
+    }
+
+    let found = match discover_setups(dir.path(), network()) {
+        Ok(found) => found,
+        Err(error) => panic!("the root enumerates: {error}"),
+    };
+
+    assert!(
+        found.unidentified.is_empty(),
+        "every journal under the root is one this node wrote",
+    );
+    assert_eq!(found.setups.len(), 2);
+    for (bundle, role) in [(&staked, Role::Provider), (&funded, Role::Client)] {
+        let expected = DiscoveredSetup {
+            bond_edge: bundle.bond_edge(),
+            role,
+        };
+        assert!(
+            found.setups.contains(&expected),
+            "discovery did not recover {expected:?} from {:?}",
+            found.setups,
+        );
+        let reopened = match SetupStore::open(
+            dir.path(),
+            network(),
+            expected.bond_edge,
+            expected.role,
+            &verifier,
+        ) {
+            Ok(store) => store,
+            Err(error) => panic!("the discovered journal reopens: {error}"),
+        };
+        assert_eq!(reopened.role(), role);
+        assert_eq!(
+            reopened.state().bundle_bytes(),
+            Some(bundle.encode().as_slice()),
+            "the reopened journal is the one that bond's revision was written to",
+        );
+    }
+}
+
+/// A root holding no journals owns none, which is an answer and not a
+/// failure — and so is a root the node has not created yet.
+#[test]
+fn a_root_holding_no_journals_yields_none() {
+    let dir = temp();
+    // A channel journal beside them is the other store's, and is not a
+    // setup this discovery has anything to say about.
+    if let Err(error) = std::fs::write(
+        dir.path()
+            .join(format!("channel-{}.journal", "00".repeat(32))),
+        b"not this module's file",
+    ) {
+        panic!("the fixture file is written: {error}");
+    }
+
+    let found = match discover_setups(dir.path(), network()) {
+        Ok(found) => found,
+        Err(error) => panic!("an empty root is not a failure: {error}"),
+    };
+    assert!(found.setups.is_empty());
+    assert!(found.unidentified.is_empty());
+
+    let unopened = dir.path().join("never-opened");
+    let found = match discover_setups(&unopened, network()) {
+        Ok(found) => found,
+        Err(error) => panic!("a root that does not exist yet owns nothing: {error}"),
+    };
+    assert!(found.setups.is_empty());
+    assert!(found.unidentified.is_empty());
+}
+
+/// A setup journal that cannot be named is reported by name, and the
+/// journal beside it is still opened.
+///
+/// Skipping it silently is the failure this guards: a file this node
+/// cannot open may be a channel it still owes a close, and nobody would
+/// ever be told it was there.
+#[test]
+fn a_journal_that_cannot_be_identified_is_reported_by_name() {
+    let dir = temp();
+    let verifier = Secp256k1Verifier::new();
+    let armed = proposed_over(other_bond_funding());
+
+    // A handshake that armed its immutable history floor and crashed
+    // before its first revision: the file is this endpoint's, and the
+    // bond it is keyed to is nowhere inside it.
+    {
+        let mut store = match SetupStore::open(
+            dir.path(),
+            network(),
+            armed.bond_edge(),
+            Role::Provider,
+            &verifier,
+        ) {
+            Ok(store) => store,
+            Err(error) => panic!("the armed journal opens: {error}"),
+        };
+        if let Err(error) = store.commit(scan_record(), &verifier) {
+            panic!("the scan arm commits: {error}");
+        }
+    }
+    // And a file wearing a setup journal's name that is not one.
+    let counterfeit = dir
+        .path()
+        .join(format!("setup-{}.journal", "ab".repeat(32)));
+    if let Err(error) = std::fs::write(&counterfeit, b"not a journal at all") {
+        panic!("the fixture file is written: {error}");
+    }
+    // And one complete journal beside them.
+    {
+        let mut store = store(dir.path(), Role::Provider);
+        for record in [scan_record(), bundle_record(&proposed())] {
+            if let Err(error) = store.commit(record, &verifier) {
+                panic!("the revision commits: {error}");
+            }
+        }
+    }
+
+    let found = match discover_setups(dir.path(), network()) {
+        Ok(found) => found,
+        Err(error) => panic!("one unreadable journal does not stop the root: {error}"),
+    };
+
+    assert_eq!(
+        found.setups,
+        vec![DiscoveredSetup {
+            bond_edge: bond_edge(),
+            role: Role::Provider,
+        }],
+        "the journal beside the two unnameable ones is still opened",
+    );
+    let named: BTreeSet<_> = found
+        .unidentified
+        .iter()
+        .map(|setup| setup.path.clone())
+        .collect();
+    assert_eq!(
+        named,
+        BTreeSet::from([
+            counterfeit.clone(),
+            dir.path().join(journal_name(armed.bond_edge())),
+        ]),
+        "both unnameable files are named",
+    );
+    for setup in &found.unidentified {
+        if setup.path == counterfeit {
+            assert!(
+                matches!(setup.reason, SetupDiscoveryError::Journal(_)),
+                "unexpected reason: {}",
+                setup.reason,
+            );
+        } else {
+            assert!(
+                matches!(setup.reason, SetupDiscoveryError::NoRevision),
+                "unexpected reason: {}",
+                setup.reason,
+            );
+        }
+    }
+}
+
+/// A journal whose only revision is another bond's is refused, not
+/// believed.
+///
+/// The key is what ties a revision to the file it was found in:
+/// `setup_key(network, bond_edge)` is the file's name and its header,
+/// and a discovery that read the bond out of the records without
+/// checking it would hand back an edge this journal was never opened
+/// under — and the store would then open a second, empty file for it.
+#[test]
+fn a_revision_that_is_not_this_journals_bond_is_refused() {
+    let dir = temp();
+    let key = setup_key(network(), bond_edge());
+    {
+        let (mut journal, _) = match Journal::open(
+            dir.path().join(journal_name(bond_edge())),
+            JournalId {
+                kind: JournalKind::Setup,
+                role: Role::Provider,
+                key: key.into_bytes(),
+            },
+        ) {
+            Ok(opened) => opened,
+            Err(error) => panic!("the fixture journal opens: {error}"),
+        };
+        if let Err(error) =
+            journal.append(&bundle_record(&proposed_over(other_bond_funding())).encode())
+        {
+            panic!("the foreign revision appends: {error}");
+        }
+    }
+
+    let found = match discover_setups(dir.path(), network()) {
+        Ok(found) => found,
+        Err(error) => panic!("the root enumerates: {error}"),
+    };
+
+    assert!(found.setups.is_empty());
+    let [unidentified] = found.unidentified.as_slice() else {
+        panic!("one journal, one refusal: {:?}", found.unidentified);
+    };
+    assert_eq!(
+        unidentified.path,
+        dir.path().join(journal_name(bond_edge()))
+    );
+    assert!(
+        matches!(unidentified.reason, SetupDiscoveryError::WrongKey),
+        "unexpected reason: {}",
+        unidentified.reason,
+    );
 }
 
 // ── The recovery decision ─────────────────────────────────────────────

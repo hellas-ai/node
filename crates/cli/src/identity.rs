@@ -219,6 +219,19 @@ pub(crate) fn load_or_create(
     }
 }
 
+/// The key this identity settles a paid channel with.
+///
+/// Not a second key and not a new one: the provider's on-chain party key
+/// *is* its producer identity, one secp256k1 scalar read through two
+/// primitive crates ([`hellas_executor::kernel_signer`]). So `identity
+/// init` is where an operator's settlement key comes from, and there is
+/// nothing here that could invent one — a party nobody has funded stakes
+/// no bond and settles no channel.
+#[cfg(feature = "node")]
+pub(crate) fn settlement_signer(identity: &LocalIdentity) -> hellas_kernel::Secp256k1Signer {
+    hellas_executor::kernel_signer(&identity.producer_key)
+}
+
 pub(crate) fn load_existing(path: Option<&Path>) -> anyhow::Result<LocalIdentity> {
     let path = path
         .map(Path::to_owned)

@@ -9,6 +9,7 @@ use hellas_executor::{
     FetchRoute, FetchRouteEntry, FetchRouteGrant, FetchRoutePolicy, FetchRouteRegistry,
     RequestRateLimit, SpendLimit,
 };
+use hellas_kernel::Secp256k1Signer;
 use hellas_rpc::policy::ExecutePolicy;
 use hellas_rpc::{
     Assurance, ContentId, Dtype, FetchProgramManifest, ProducerSigningKey, ProgramManifest,
@@ -60,6 +61,15 @@ pub struct ServeOptions {
     pub fetch_queue_size: usize,
     pub secret_key: SecretKey,
     pub producer_key: ProducerSigningKey,
+    /// The settlement key both paid endpoints are built over, read from
+    /// the stored identity before this node binds anything.
+    ///
+    /// A `SetupEndpoint` and a `CloseEndpoint` each take one of these
+    /// and a journal, and neither the transport key nor the producer key
+    /// above is one — so without it a node that had loaded its whole
+    /// paid-work configuration still had nothing to sign a settlement
+    /// with.
+    pub settlement_key: Secp256k1Signer,
     pub provider_genesis: Vec<u8>,
     pub assurance: Assurance,
 }
@@ -146,6 +156,10 @@ async fn run_with_store(
             journal_root = %work.journal.root.display(),
             poll_ms = work.poll.as_millis(),
             response_alarm_margin_blocks = work.response_alarm_margin_blocks,
+            // Said back because it is the party the chain will see: an
+            // operator who funded a different one has configured a node
+            // that can settle nothing, and this is where they find out.
+            settlement_party = %hex::encode(options.settlement_key.party_key().to_bytes()),
             "loaded the paid-work configuration",
         );
         let duties = work_config::load_paid_work_duties(work)?;

@@ -31,6 +31,7 @@
 //! one supplied height.
 
 use std::collections::BTreeSet;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use hellas_kernel::{CoinId, Decode, Edge, EdgeId, Encode, LeaseSlots, NetworkId, SigVerifier, Tx};
@@ -39,7 +40,7 @@ use hellas_xet::XetFileHasher;
 use crate::protocol::Digest;
 use crate::protocol::work_bundle::{SetupBundleError, WorkChannelSetupBundleV1};
 use crate::protocol::work_setup::{CloseDescriptor, WorkSetupError};
-use crate::work_store::journal::{Journal, JournalId, JournalKind, Role};
+use crate::work_store::journal::{Journal, JournalError, JournalId, JournalKind, Role};
 use crate::work_store::{Applied, WorkStoreError, cursor::Cursor, hex, put_u64};
 
 /// Domain of the setup journal's key.
@@ -1392,4 +1393,169 @@ pub fn setup_key(network: NetworkId, bond_edge: EdgeId) -> Digest {
     hasher.update(network.as_str().as_bytes());
     hasher.update(&bond_edge.to_bytes());
     hasher.finalize()
+}
+
+/// One setup journal found under a root, named by what is inside it.
+///
+/// The two values [`SetupStore::open`] is keyed by, and nothing else: a
+/// path is not carried, because the store derives its own from the key
+/// and a second copy could only ever disagree with it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DiscoveredSetup {
+    /// The bond this journal's handshake stakes.
+    pub bond_edge: EdgeId,
+    /// Which endpoint wrote it.
+    pub role: Role,
+}
+
+/// A setup journal under the root that names no setup this node can
+/// open.
+#[derive(Debug)]
+pub struct UnidentifiedSetup {
+    /// The file, so an operator is told which one to go and look at.
+    pub path: PathBuf,
+    /// What stopped it being named.
+    pub reason: SetupDiscoveryError,
+}
+
+/// Why one setup journal could not be named from what is in it.
+#[derive(Debug, thiserror::Error)]
+pub enum SetupDiscoveryError {
+    /// The file is not a journal this binary can read.
+    #[error(transparent)]
+    Journal(#[from] JournalError),
+    /// A record in it is not a setup record.
+    #[error(transparent)]
+    Record(#[from] SetupStateError),
+    /// It is a journal of another kind, or under another key than its
+    /// name carries.
+    #[error("the file is not the setup journal its own name makes it")]
+    NotThisSetup,
+    /// It holds no revision, so the bond is not in it to recover. A
+    /// handshake that armed its history floor and crashed before its
+    /// first revision leaves exactly this.
+    #[error("the journal holds no setup revision, so the bond it is keyed to is not in it")]
+    NoRevision,
+    /// Its revision names a bond, and this file is not the journal that
+    /// bond and this network key to.
+    #[error("the journal is not keyed to the configured network and the bond its revision names")]
+    WrongKey,
+}
+
+/// What the setup journals under one root are about.
+#[derive(Debug, Default)]
+pub struct SetupDiscovery {
+    /// Every journal whose bond and role were recovered from it, in the
+    /// order its file name sorts.
+    pub setups: Vec<DiscoveredSetup>,
+    /// Every setup journal that could not be named, and why. Named
+    /// rather than dropped: a file this node cannot open is a channel it
+    /// may still owe a close, and a discovery that silently skipped it
+    /// would be a node that quietly stopped answering.
+    pub unidentified: Vec<UnidentifiedSetup>,
+}
+
+/// Enumerates the setup journals under `root`, recovering what each one
+/// is about from the file itself.
+///
+/// [`SetupStore::open`] is keyed by a bond edge and a role, and a
+/// restarting node is told neither: its configuration carries this root
+/// and no more. Both are on the disk. The role is in the journal's own
+/// header, and the bond edge is in the first revision it retained —
+/// every later revision fixes the bond leg, so the first one is the
+/// whole answer. What ties them to *this* file is the key: a journal is
+/// named and bound by `setup_key(network, bond_edge)`, so a revision
+/// whose bond does not reproduce the name is a revision that does not
+/// belong to it, and is refused rather than believed.
+///
+/// Only `setup-<key>.journal` files are considered. A channel journal
+/// beside them is another store's, and a file that is not either is not
+/// this module's business.
+///
+/// # Errors
+///
+/// [`WorkStoreError::Journal`] when the root itself cannot be
+/// enumerated. A root that does not exist yet is not one of those: a
+/// node that has never opened a journal owns none, which is an answer.
+/// Nor is one unreadable journal — that is reported by name in
+/// [`SetupDiscovery::unidentified`], because the journals beside it are
+/// still this node's to open.
+pub fn discover_setups(root: &Path, network: NetworkId) -> Result<SetupDiscovery, WorkStoreError> {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(SetupDiscovery::default());
+        }
+        Err(error) => return Err(JournalError::Io(error).into()),
+    };
+    // Sorted, because `read_dir` hands them over in whatever order the
+    // filesystem holds them: a caller that mounted them in that order
+    // would mount them differently on two machines holding the same
+    // journals.
+    let mut paths = Vec::new();
+    for entry in entries {
+        let path = entry.map_err(JournalError::Io)?.path();
+        if setup_file_key(&path).is_some() {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+
+    let mut discovery = SetupDiscovery::default();
+    for path in paths {
+        match identify_setup(&path, network) {
+            Ok(setup) => discovery.setups.push(setup),
+            Err(reason) => discovery
+                .unidentified
+                .push(UnidentifiedSetup { path, reason }),
+        }
+    }
+    Ok(discovery)
+}
+
+/// Returns the key a setup journal's file name carries, if it is one.
+fn setup_file_key(path: &Path) -> Option<[u8; 32]> {
+    let name = path.file_name()?.to_str()?;
+    let named = name.strip_prefix("setup-")?.strip_suffix(".journal")?;
+    if named.len() != 64 {
+        return None;
+    }
+    let mut key = [0_u8; 32];
+    for (slot, pair) in key.iter_mut().zip(named.as_bytes().chunks_exact(2)) {
+        let Ok(pair) = std::str::from_utf8(pair) else {
+            return None;
+        };
+        *slot = u8::from_str_radix(pair, 16).ok()?;
+    }
+    // Written back rather than trusted: the parse above accepts a sign
+    // and mixed case, and neither is a name this store ever wrote.
+    (hex(&key) == named).then_some(key)
+}
+
+/// Recovers what one setup journal is about, or says why it cannot.
+fn identify_setup(path: &Path, network: NetworkId) -> Result<DiscoveredSetup, SetupDiscoveryError> {
+    let Some(named) = setup_file_key(path) else {
+        return Err(SetupDiscoveryError::NotThisSetup);
+    };
+    let (id, replay) = Journal::inspect(path)?;
+    if id.kind != JournalKind::Setup || id.key != named {
+        return Err(SetupDiscoveryError::NotThisSetup);
+    }
+    for bytes in &replay.records {
+        let (SetupRecord::Bundle { bundle } | SetupRecord::ArmedBundle { bundle, .. }) =
+            SetupRecord::decode(bytes)?
+        else {
+            continue;
+        };
+        let decoded = WorkChannelSetupBundleV1::decode(&bundle).map_err(SetupStateError::from)?;
+        let bond_edge = decoded.bond_edge();
+        if setup_key(network, bond_edge).into_bytes() != id.key {
+            return Err(SetupDiscoveryError::WrongKey);
+        }
+        return Ok(DiscoveredSetup {
+            bond_edge,
+            role: id.role,
+        });
+    }
+    Err(SetupDiscoveryError::NoRevision)
 }

@@ -8,7 +8,7 @@ use clap::{Parser, Subcommand};
 use hellas_rpc::Dtype;
 use iroh::EndpointId;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 mod commands;
 mod identity;
@@ -81,6 +81,51 @@ fn validate_serve_assurance(
         )
     } else {
         Ok(())
+    }
+}
+
+/// Loads the identity this command runs under, creating one only where
+/// creating one is what the operator asked for.
+///
+/// Two commands read the file and never write it. `show-node-id` is a
+/// query, and creating an identity as a side effect of one would race
+/// with a running service's own creator. A `serve` that was handed a
+/// work configuration is the other: paid channels are settled with the
+/// stored identity's key, so the key must be one an operator already
+/// made — `identity init` is where it comes from. Minting one here would
+/// give the node a settlement party nobody has funded and no bond names,
+/// and the first symptom would be a channel that cannot be opened.
+///
+/// # Errors
+///
+/// Whatever the identity file's own loader says, which names the file it
+/// could not read.
+fn load_command_identity(
+    command: &Commands,
+    path: Option<&Path>,
+    software_root: bool,
+) -> anyhow::Result<identity::LocalIdentity> {
+    #[cfg(feature = "node")]
+    let settles_paid_work = matches!(
+        command,
+        Commands::Serve {
+            work_config_file: Some(_),
+            ..
+        }
+    );
+    #[cfg(not(feature = "node"))]
+    let settles_paid_work = false;
+    let read_only = settles_paid_work
+        || matches!(
+            command,
+            Commands::Identity {
+                command: IdentityCommand::ShowNodeId,
+            }
+        );
+    if read_only {
+        identity::load_existing(path)
+    } else {
+        identity::load_or_create(path, software_root)
     }
 }
 
@@ -689,25 +734,16 @@ async fn main() {
         command => command,
     };
 
-    // show-node-id is a read-only query; never create an identity file as a
-    // side effect of it (would race with a running service's own creator).
-    let read_only = matches!(
-        &command,
-        Commands::Identity {
-            command: IdentityCommand::ShowNodeId,
-        }
-    );
-    let local_identity = match if read_only {
-        identity::load_existing(cli.identity.as_deref())
-    } else {
-        identity::load_or_create(cli.identity.as_deref(), cli.software_root)
-    } {
-        Ok(identity) => identity,
-        Err(err) => {
-            eprintln!("error: {err:#}");
-            std::process::exit(1);
-        }
-    };
+    // Before anything binds, and before any other startup work: a
+    // command that cannot have an identity has nothing further to do.
+    let local_identity =
+        match load_command_identity(&command, cli.identity.as_deref(), cli.software_root) {
+            Ok(identity) => identity,
+            Err(err) => {
+                eprintln!("error: {err:#}");
+                std::process::exit(1);
+            }
+        };
     let secret_key = local_identity.transport_key.clone();
     #[cfg(feature = "node")]
     if matches!(&command, Commands::Serve { .. })
@@ -749,6 +785,10 @@ async fn main() {
             {
                 Err(error) => Err(error),
                 Ok(work_config) => {
+                    // The key every settlement this node signs is signed
+                    // with, taken from the identity loaded above and
+                    // never made here.
+                    let settlement_key = identity::settlement_signer(&local_identity);
                     commands::serve::run(commands::serve::ServeOptions {
                         port,
                         execute_policy,
@@ -766,6 +806,7 @@ async fn main() {
                         fetch_queue_size,
                         secret_key,
                         producer_key: local_identity.producer_key,
+                        settlement_key,
                         provider_genesis: local_identity.enrollment.canonical_bytes(),
                         assurance,
                     })
@@ -1511,6 +1552,72 @@ mod tests {
             ),
             _ => panic!("expected serve command"),
         }
+    }
+
+    /// A node asked to serve paid work loads its settlement identity
+    /// before anything binds, and a missing one is a startup failure
+    /// naming the file.
+    ///
+    /// The whole point is what it does *not* do: the same `serve`
+    /// without a work configuration creates the file, so the refusal
+    /// below is this rule and not a loader that always refuses. A node
+    /// that minted its own settlement key would advertise two paid ALPNs
+    /// as a party nobody has funded — and would say nothing about it.
+    #[cfg(feature = "node")]
+    #[test]
+    fn serving_paid_work_loads_a_stored_settlement_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity");
+        let paid =
+            Cli::try_parse_from(["hellas", "serve", "--work-config", "/tmp/work.json"]).unwrap();
+        let unpaid = Cli::try_parse_from(["hellas", "serve"]).unwrap();
+
+        let Err(error) = load_command_identity(&paid.command, Some(&path), true) else {
+            panic!("paid work is settled with a key an operator already made");
+        };
+        assert!(
+            format!("{error:#}").contains(&path.display().to_string()),
+            "the refusal does not name the identity file: {error:#}",
+        );
+        assert!(!path.exists(), "no identity was created by the refusal");
+
+        // The key is the identity's own, and the identity is the one on
+        // disk: created here by a `serve` that was asked for no paid
+        // work, and read back by the paid one that would not create it.
+        let created = load_command_identity(&unpaid.command, Some(&path), true)
+            .expect("a serve with no paid work still creates its transport identity");
+        let loaded = load_command_identity(&paid.command, Some(&path), true)
+            .expect("the stored identity is what paid work settles with");
+        assert_eq!(
+            identity::settlement_signer(&loaded).party_key(),
+            identity::settlement_signer(&created).party_key(),
+        );
+        assert_eq!(
+            &identity::settlement_signer(&loaded).party_key().to_bytes()[..],
+            loaded.producer_key.public_key().bytes(),
+            "the settlement party is the producer identity, not a second key",
+        );
+    }
+
+    /// An identity file that is there and is not one is the same
+    /// startup failure, and names the same file.
+    #[cfg(feature = "node")]
+    #[test]
+    fn an_unreadable_settlement_identity_is_a_startup_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity");
+        std::fs::write(&path, b"not an identity").unwrap();
+        let paid =
+            Cli::try_parse_from(["hellas", "serve", "--work-config", "/tmp/work.json"]).unwrap();
+
+        let Err(error) = load_command_identity(&paid.command, Some(&path), true) else {
+            panic!("an identity file that is not one is not a key to settle with");
+        };
+
+        assert!(
+            format!("{error:#}").contains(&path.display().to_string()),
+            "the refusal does not name the identity file: {error:#}",
+        );
     }
 
     #[cfg(feature = "node")]
