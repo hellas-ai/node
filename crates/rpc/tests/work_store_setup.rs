@@ -27,9 +27,9 @@ use hellas_rpc::work_open::{FinalizedSetup, SetupProgress, SetupQuery, SetupView
 use hellas_rpc::work_store::journal::JournalError;
 use hellas_rpc::work_store::setup::setup_key;
 use hellas_rpc::work_store::{
-    ChannelStore, ObservedSetup, Role, SetupAbort, SetupDecision, SetupEnd, SetupFault,
-    SetupHistoryBatch, SetupHistoryBlock, SetupRecord, SetupScan, SetupState, SetupStateError,
-    SetupStore, WorkStoreError,
+    ObservedSetup, Role, SetupAbort, SetupDecision, SetupEnd, SetupFault, SetupHistoryBatch,
+    SetupHistoryBlock, SetupRecord, SetupScan, SetupState, SetupStateError, SetupStore,
+    WorkStoreError,
 };
 
 // ── Fixture ───────────────────────────────────────────────────────────
@@ -244,6 +244,19 @@ fn payment_edge() -> EdgeId {
         panic!("a proposed payment derives its edge");
     };
     edge
+}
+
+/// The client's close Start on the payment edge, as it appears when it
+/// is ordered after the Open in the very block that carried it.
+fn same_block_contest() -> Tx {
+    Tx::move_action(Move::StartPaymentClose(PaymentCloseStart::new(
+        payment_edge(),
+        Terms::work_payment(payment_terms(bond_edge())),
+        Party::Maker,
+        (scan().height + 2, scan().height + 9),
+        None,
+        Sig::from_bytes([0_u8; Sig::LENGTH]),
+    )))
 }
 
 fn store(root: &std::path::Path, role: Role) -> SetupStore {
@@ -501,6 +514,48 @@ impl SetupView for SurvivingPayment {
             payment: Some(self.payment),
             lease: LeaseSlots::Absent,
             live_funding: BTreeSet::new(),
+        }))
+    }
+}
+
+/// One coherent finalized read of a channel whose bond, payment edge,
+/// and lease are all live: the state a completed setup is decided from,
+/// and the state its mount settles against.
+///
+/// It counts its reads for [`SurvivingPayment`]'s reason. A mount that
+/// never consults the edge settled against something else.
+struct LiveChannel {
+    payment: Edge,
+    height: u64,
+    reads: std::sync::atomic::AtomicUsize,
+}
+
+impl LiveChannel {
+    fn at(height: u64, payment: Edge) -> Self {
+        Self {
+            payment,
+            height,
+            reads: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn reads(&self) -> usize {
+        self.reads.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl SetupView for LiveChannel {
+    async fn finalized_setup(
+        &self,
+        _query: SetupQuery,
+    ) -> Result<Option<FinalizedSetup>, BlockSourceError> {
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(Some(FinalizedSetup {
+            height: self.height,
+            bond: Some(bond_object()),
+            payment: Some(self.payment),
+            lease: lease_over(bond_edge(), payment_edge()),
+            live_funding: all_live(),
         }))
     }
 }
@@ -1671,6 +1726,172 @@ fn a_finalized_bond_timeout_reclaims_the_stake_cleanly() {
     );
 }
 
+/// A completed setup hands back the channel it mounted, opened at the
+/// origin it recorded and settled against the edge it read.
+///
+/// The completion is where a caller would otherwise start re-deriving:
+/// it would take the origin, reach into `close_descriptor()`, pick a
+/// settlement, open a store, and replay history — four decisions the
+/// library already made. Two of them are visible here. The client funded
+/// 4,096 where the provider's configuration expected 1,200, and a close
+/// built on the expectation is one consensus refuses; and the contest
+/// ordered after the Open in the origin block is one only a replay of
+/// that block sees, because the mount's cursor already sits on it.
+#[tokio::test]
+async fn a_completed_setup_hands_back_the_channel_it_mounted() {
+    let dir = temp();
+    let verifier = Secp256k1Verifier::new();
+    let mut journal = completed_store(dir.path());
+
+    let bundle = completed(countersigned(proposed()));
+    let payment_open = bundle.payment_open().expect("the executable payment Open");
+    let origin_payload = [0xa1; 32];
+    let blocks = Blocks {
+        blocks: vec![FinalizedWork {
+            height: scan().height + 1,
+            parent: scan().payload,
+            payload: origin_payload,
+            txs: vec![payment_open, same_block_contest()],
+        }],
+    };
+    let view = LiveChannel::at(scan().height + 1, overfunded_payment_object());
+
+    match advance_setup(&view, &blocks, &NoSink, &mut journal, &verifier).await {
+        Ok(advance) => match advance.progress {
+            SetupProgress::HistoryAdvanced { through } => {
+                assert_eq!(through, scan().height + 1);
+            }
+            other => panic!("the history batch is fetched first: {other:?}"),
+        },
+        Err(error) => panic!("the history batch is fetched first: {error}"),
+    }
+    let advance = match advance_setup(&view, &blocks, &NoSink, &mut journal, &verifier).await {
+        Ok(advance) => advance,
+        Err(error) => panic!("a live leased pair completes: {error}"),
+    };
+    let SetupProgress::Complete(origin) = advance.progress else {
+        panic!("a live leased pair completes: {:?}", advance.progress);
+    };
+    assert_eq!(
+        origin.height,
+        scan().height + 1,
+        "the origin is the block the payment Open landed in",
+    );
+    assert_eq!(journal.state().end(), Some(SetupEnd::Complete));
+
+    let mounted = advance
+        .mounted
+        .expect("completion hands back the channel it opened");
+    assert_eq!(
+        mounted.state().cursor(),
+        (origin.height, origin_payload),
+        "the channel was opened at the origin the completion recorded",
+    );
+    assert_eq!(
+        mounted.state().settlement().adjudicated_total(),
+        4_096,
+        "the mount settled against the edge the coherent read found",
+    );
+    assert_eq!(mounted.state().settlement().capacity(), 4_092);
+    assert!(
+        mounted.state().close_opened().is_some(),
+        "and the origin block's own contest is journaled on the channel handed back",
+    );
+    let expected = journal
+        .state()
+        .close_descriptor()
+        .expect("the armed close descriptor")
+        .expected_settlement()
+        .expect("the configured expectation settles");
+    assert_eq!(
+        expected.adjudicated_total(),
+        1_200,
+        "and the expectation a re-deriving caller would have reached is another number",
+    );
+}
+
+/// A restart over a completed setup hands the channel back too, and it
+/// is the same channel.
+///
+/// A completed setup is terminal: the only branch a restarted process
+/// reaches it by is the journal shortcut, which decides nothing and
+/// records nothing. If that branch handed back only the origin, every
+/// restart would be the one place a caller had to mount for itself —
+/// and it would settle against the configured expectation, because the
+/// funded value is the one thing the setup journal does not hold.
+#[tokio::test]
+async fn a_restart_over_a_completed_setup_hands_back_the_same_channel() {
+    let dir = temp();
+    let verifier = Secp256k1Verifier::new();
+    let mut journal = completed_store(dir.path());
+
+    let bundle = completed(countersigned(proposed()));
+    let payment_open = bundle.payment_open().expect("the executable payment Open");
+    let origin_payload = [0xa2; 32];
+    let blocks = Blocks {
+        blocks: vec![FinalizedWork {
+            height: scan().height + 1,
+            parent: scan().payload,
+            payload: origin_payload,
+            txs: vec![payment_open, same_block_contest()],
+        }],
+    };
+    let view = LiveChannel::at(scan().height + 1, overfunded_payment_object());
+
+    let (origin, records) = loop {
+        match advance_setup(&view, &blocks, &NoSink, &mut journal, &verifier).await {
+            Ok(advance) => match advance.progress {
+                SetupProgress::HistoryAdvanced { .. } => continue,
+                SetupProgress::Complete(origin) => {
+                    let mounted = advance.mounted.expect("completion hands its channel back");
+                    break (origin, mounted.len());
+                }
+                other => panic!("the setup completes: {other:?}"),
+            },
+            Err(error) => panic!("the setup completes: {error}"),
+        }
+    };
+    // The mounted channel's journal is exclusive for as long as it
+    // lives, so the restart below is a restart of both files.
+    drop(journal);
+
+    let mut restarted = store(dir.path(), Role::Provider);
+    assert_eq!(restarted.state().end(), Some(SetupEnd::Complete));
+    let before = view.reads();
+    let advance = match advance_setup(&view, &blocks, &NoSink, &mut restarted, &verifier).await {
+        Ok(advance) => advance,
+        Err(error) => panic!("the restart answers from the journal: {error}"),
+    };
+    assert_eq!(
+        advance.progress,
+        SetupProgress::Complete(origin),
+        "the restart reaches the completion by the journal, not by a second scan",
+    );
+    let mounted = advance
+        .mounted
+        .expect("the restart hands the channel back as well");
+    assert_eq!(
+        view.reads(),
+        before + 1,
+        "and it read the surviving edge to settle it",
+    );
+    assert_eq!(mounted.state().cursor(), (origin.height, origin_payload));
+    assert_eq!(
+        mounted.state().settlement().adjudicated_total(),
+        4_096,
+        "the restart settled at the funded edge, not at the configuration",
+    );
+    assert!(
+        mounted.state().close_opened().is_some(),
+        "the contest the first mount replayed is still on the channel it hands back",
+    );
+    assert_eq!(
+        mounted.len(),
+        records,
+        "and it reopened the first mount's journal rather than writing a second one",
+    );
+}
+
 /// A close ordered after the payment Open in the origin block itself is
 /// seen when the channel is mounted, not lost with the block that opened
 /// it.
@@ -1680,7 +1901,8 @@ fn a_finalized_bond_timeout_reclaims_the_stake_cleanly() {
 /// out, which is what puts this setup on the close-only recovery path.
 /// The mount opens with its cursor already on the origin block, so a
 /// same-block contest is exactly the one an inclusive-observe would drop
-/// — and the assertion is that the mounted channel journal holds it.
+/// — and the assertion is that the channel the caller is handed holds
+/// it, without the caller having replayed anything itself.
 #[tokio::test]
 async fn a_mount_replays_a_same_block_contest() {
     let dir = temp();
@@ -1689,14 +1911,6 @@ async fn a_mount_replays_a_same_block_contest() {
 
     let bundle = completed(countersigned(proposed()));
     let payment_open = bundle.payment_open().expect("the executable payment Open");
-    let contest = Tx::move_action(Move::StartPaymentClose(PaymentCloseStart::new(
-        payment_edge(),
-        Terms::work_payment(payment_terms(bond_edge())),
-        Party::Maker,
-        (scan().height + 2, scan().height + 9),
-        None,
-        Sig::from_bytes([0_u8; Sig::LENGTH]),
-    )));
     let bond_close = Tx::timeout_close(bond_edge(), &Terms::work_stake_bond(bond_terms()))
         .expect("the bond has a deterministic timeout close");
 
@@ -1707,7 +1921,7 @@ async fn a_mount_replays_a_same_block_contest() {
                 height: scan().height + 1,
                 parent: scan().payload,
                 payload: origin_payload,
-                txs: vec![payment_open, contest],
+                txs: vec![payment_open, same_block_contest()],
             },
             FinalizedWork {
                 height: scan().height + 2,
@@ -1722,42 +1936,37 @@ async fn a_mount_replays_a_same_block_contest() {
     // runs on the next step.
     let view = SurvivingPayment::at(scan().height + 2, payment_object());
     match advance_setup(&view, &blocks, &NoSink, &mut journal, &verifier).await {
-        Ok(SetupProgress::HistoryAdvanced { through }) => assert_eq!(through, scan().height + 2),
-        other => panic!("the history batch is fetched first: {other:?}"),
+        Ok(advance) => match advance.progress {
+            SetupProgress::HistoryAdvanced { through } => {
+                assert_eq!(through, scan().height + 2);
+            }
+            other => panic!("the history batch is fetched first: {other:?}"),
+        },
+        Err(error) => panic!("the history batch is fetched first: {error}"),
     }
-    let origin = match advance_setup(&view, &blocks, &NoSink, &mut journal, &verifier).await {
-        Ok(SetupProgress::CloseOnly { origin, settled }) => {
-            assert!(!settled, "the payment edge is contested, not closed");
-            origin
-        }
-        other => panic!("a bond-timed-out payment mounts close-only: {other:?}"),
+    let advance = match advance_setup(&view, &blocks, &NoSink, &mut journal, &verifier).await {
+        Ok(advance) => advance,
+        Err(error) => panic!("a bond-timed-out payment mounts close-only: {error}"),
     };
+    let SetupProgress::CloseOnly { origin, settled } = advance.progress else {
+        panic!(
+            "a bond-timed-out payment mounts close-only: {:?}",
+            advance.progress
+        );
+    };
+    assert!(!settled, "the payment edge is contested, not closed");
     assert_eq!(
         origin.height,
         scan().height + 1,
         "the origin is the payment Open block"
     );
 
-    // The mounted channel journal holds the contest: the Start ordered
-    // after the Open in the origin block was replayed, not dropped with
-    // the block the cursor already sat on.
-    let descriptor = journal
-        .state()
-        .close_descriptor()
-        .expect("the armed close descriptor");
-    let channel = descriptor.channel().clone();
-    let settlement = descriptor
-        .funded_settlement(&payment_object())
-        .expect("the settlement of the edge that survived");
-    let mounted = ChannelStore::open(
-        journal.root(),
-        channel,
-        settlement,
-        Role::Provider,
-        origin,
-        &verifier,
-    )
-    .expect("the mounted channel journal reopens");
+    // The channel handed back holds the contest: the Start ordered after
+    // the Open in the origin block was replayed, not dropped with the
+    // block the cursor already sat on. Nothing here re-derived it.
+    let mounted = advance
+        .mounted
+        .expect("a close-only mount hands back the channel it opened");
     assert!(
         mounted.state().close_opened().is_some(),
         "the same-block contest is journaled on the mounted channel",
@@ -1806,8 +2015,13 @@ async fn a_client_history_crosses_a_permissionless_bond_timeout() {
     let view = SurvivingPayment::at(scan().height + 2, payment_object());
 
     match advance_setup(&view, &blocks, &NoSink, &mut journal, &verifier).await {
-        Ok(SetupProgress::HistoryAdvanced { through }) => assert_eq!(through, scan().height + 2),
-        other => panic!("the client's history crosses the bond Timeout: {other:?}"),
+        Ok(advance) => match advance.progress {
+            SetupProgress::HistoryAdvanced { through } => {
+                assert_eq!(through, scan().height + 2);
+            }
+            other => panic!("the client's history crosses the bond Timeout: {other:?}"),
+        },
+        Err(error) => panic!("the client's history crosses the bond Timeout: {error}"),
     }
     assert_eq!(
         journal.state().history_cursor().map(|scan| scan.height),
@@ -1833,11 +2047,18 @@ async fn a_client_history_crosses_a_permissionless_bond_timeout() {
     // The client is not stuck: the surviving payment edge mounts, and
     // its origin is the block its own Open landed in.
     match advance_setup(&view, &blocks, &NoSink, &mut journal, &verifier).await {
-        Ok(SetupProgress::CloseOnly { origin, settled }) => {
-            assert!(!settled, "the payment edge outlived the bond");
-            assert_eq!(origin.height, scan().height + 1);
-        }
-        other => panic!("the client mounts the surviving payment edge: {other:?}"),
+        Ok(advance) => match advance.progress {
+            SetupProgress::CloseOnly { origin, settled } => {
+                assert!(!settled, "the payment edge outlived the bond");
+                assert_eq!(origin.height, scan().height + 1);
+                assert!(
+                    advance.mounted.is_some(),
+                    "and the client is handed the channel it mounted",
+                );
+            }
+            other => panic!("the client mounts the surviving payment edge: {other:?}"),
+        },
+        Err(error) => panic!("the client mounts the surviving payment edge: {error}"),
     }
 }
 
@@ -1882,8 +2103,13 @@ async fn an_overfunded_close_only_channel_settles_at_the_edge_it_holds() {
     let view = SurvivingPayment::at(scan().height + 2, overfunded_payment_object());
 
     match advance_setup(&view, &blocks, &NoSink, &mut journal, &verifier).await {
-        Ok(SetupProgress::HistoryAdvanced { through }) => assert_eq!(through, scan().height + 2),
-        other => panic!("the history batch is fetched first: {other:?}"),
+        Ok(advance) => match advance.progress {
+            SetupProgress::HistoryAdvanced { through } => {
+                assert_eq!(through, scan().height + 2);
+            }
+            other => panic!("the history batch is fetched first: {other:?}"),
+        },
+        Err(error) => panic!("the history batch is fetched first: {error}"),
     }
     assert!(
         journal.state().close_only_recovery(),
@@ -1891,32 +2117,59 @@ async fn an_overfunded_close_only_channel_settles_at_the_edge_it_holds() {
     );
 
     // The first mount, on the journal-only route: it still reads.
-    let origin = match advance_setup(&view, &blocks, &NoSink, &mut journal, &verifier).await {
-        Ok(SetupProgress::CloseOnly { origin, settled }) => {
-            assert!(!settled, "the payment edge outlived the bond");
-            origin
-        }
-        other => panic!("a bond-timed-out payment mounts close-only: {other:?}"),
+    let advance = match advance_setup(&view, &blocks, &NoSink, &mut journal, &verifier).await {
+        Ok(advance) => advance,
+        Err(error) => panic!("a bond-timed-out payment mounts close-only: {error}"),
     };
+    let SetupProgress::CloseOnly { origin, settled } = advance.progress else {
+        panic!(
+            "a bond-timed-out payment mounts close-only: {:?}",
+            advance.progress
+        );
+    };
+    assert!(!settled, "the payment edge outlived the bond");
     assert_eq!(
         view.reads(),
         1,
         "the mount settled against a coherent read of the edge",
     );
 
+    // And what it settled against is the number consensus will make an
+    // adjudicated close hand out, on the channel the caller was handed
+    // rather than on one the caller built for itself.
+    let mounted = advance
+        .mounted
+        .expect("a close-only mount hands back the channel it opened");
+    assert_eq!(mounted.state().settlement().adjudicated_total(), 4_096);
+    assert_eq!(mounted.state().settlement().capacity(), 4_092);
+    // The channel journal is held for as long as that store lives, so
+    // the restart below is a restart of both files.
+    drop(mounted);
+
     // The restart: the same journal reopened over its own files takes
     // the same step to the same answer.
     drop(journal);
     let mut restarted = store(dir.path(), Role::Provider);
     match advance_setup(&view, &blocks, &NoSink, &mut restarted, &verifier).await {
-        Ok(SetupProgress::CloseOnly {
-            origin: again,
-            settled,
-        }) => {
-            assert!(!settled);
-            assert_eq!(again, origin, "the restart mounts the same channel");
-        }
-        other => panic!("the restart mounts close-only: {other:?}"),
+        Ok(advance) => match advance.progress {
+            SetupProgress::CloseOnly {
+                origin: again,
+                settled,
+            } => {
+                assert!(!settled);
+                assert_eq!(again, origin, "the restart mounts the same channel");
+                let mounted = advance
+                    .mounted
+                    .expect("the restart is handed the channel too");
+                assert_eq!(
+                    mounted.state().settlement().adjudicated_total(),
+                    4_096,
+                    "and it settles at the funded edge, not at the configuration",
+                );
+            }
+            other => panic!("the restart mounts close-only: {other:?}"),
+        },
+        Err(error) => panic!("the restart mounts close-only: {error}"),
     }
     assert_eq!(view.reads(), 2, "and it read the edge again to do it");
 

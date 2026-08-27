@@ -201,7 +201,7 @@ mod tests {
     use hellas_rpc::services::work_setup::WorkSetupHandler;
     use hellas_rpc::work_close::{BlockSourceError, adjudicated_close, close_start};
     use hellas_rpc::work_handshake::{PaymentAdmission, SetupEndpoint, SetupService};
-    use hellas_rpc::work_open::{SetupProgress, SetupStep, advance_setup};
+    use hellas_rpc::work_open::{SetupAdvance, SetupProgress, SetupStep, advance_setup};
     use hellas_rpc::work_store::{
         Role, SetupAbort, SetupEnd, SetupOrigin, SetupRecord, SetupScan, SetupStateError,
         SetupStore, WorkStoreError,
@@ -933,7 +933,10 @@ mod tests {
             let mut restarted = open_store(provider_root.path(), Role::Provider);
             assert!(matches!(
                 advance_setup(&blocks, &blocks, &blocks, &mut restarted, &verifier).await,
-                Ok(SetupProgress::HistoryAdvanced { .. })
+                Ok(SetupAdvance {
+                    progress: SetupProgress::HistoryAdvanced { .. },
+                    ..
+                })
             ));
             assert!(
                 !restarted.state().bond_submitted(),
@@ -1065,6 +1068,11 @@ mod tests {
 
     /// One step of the driver against the real sink, panicking on the
     /// errors these tests do not expect.
+    ///
+    /// The channel a mounting step hands back is dropped here, which
+    /// releases its journal: these tests assert about what the setup
+    /// recorded, and `a_completed_setup_hands_back_the_channel_it_mounted`
+    /// asserts about what was handed back.
     async fn step<C>(
         view: &WorkBlocks<C>,
         blocks: &WorkBlocks<C>,
@@ -1075,8 +1083,11 @@ mod tests {
     {
         loop {
             match advance_setup(view, blocks, view, store, &Secp256k1Verifier::new()).await {
-                Ok(SetupProgress::HistoryAdvanced { .. }) => continue,
-                Ok(progress) => return progress,
+                Ok(SetupAdvance {
+                    progress: SetupProgress::HistoryAdvanced { .. },
+                    ..
+                }) => continue,
+                Ok(advance) => return advance.progress,
                 Err(error) => panic!("the driver takes a step: {error}"),
             }
         }

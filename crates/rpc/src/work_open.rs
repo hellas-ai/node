@@ -44,6 +44,24 @@
 //! submit an Open cannot move the observation floor past an authorization a
 //! counterparty may already have put on chain.
 //!
+//! # Who mounts
+//!
+//! Every step that opens the channel journal hands it back in
+//! [`SetupAdvance::mounted`]. There are three: the completion, the
+//! close-only mount, and the completed-journal shortcut — which matters
+//! because it is the only branch a restarted process reaches a finished
+//! setup by, and a caller that had to mount for itself there would have
+//! to mount for itself after every restart.
+//!
+//! A caller receives its channel; it never builds a second one. The
+//! alternative is re-deriving the settlement from the armed descriptor
+//! and re-running this replay outside the library — and the two
+//! spellings come apart at exactly the places that matter. The
+//! settlement comes from the coherent live edge rather than from what
+//! configuration expected, and the origin block's own post-Open moves
+//! are replayed because the mount's cursor already sits on that block.
+//! Neither is visible from the descriptor alone.
+//!
 //! # What it does not do
 //!
 //! It does not take an unleased bond's Timeout back.
@@ -166,8 +184,9 @@ pub enum SetupStep {
 /// How far one step of the driver got.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SetupProgress {
-    /// Both edges and this channel's lease are finalized, and the
-    /// journal now records where.
+    /// Both edges and this channel's lease are finalized, the journal
+    /// now records where, and the channel is mounted at that origin in
+    /// [`SetupAdvance::mounted`].
     Complete(SetupOrigin),
     /// One bounded finalized-history batch was durably applied. The caller
     /// yields before asking for another batch.
@@ -176,7 +195,8 @@ pub enum SetupProgress {
         through: u64,
     },
     /// Admission is unavailable, but the journal-only channel mount was
-    /// opened and its retained Start/Close history replayed.
+    /// opened and its retained Start/Close history replayed. The mount
+    /// itself is in [`SetupAdvance::mounted`].
     CloseOnly {
         /// Payment-Open origin recovered from finalized history.
         origin: SetupOrigin,
@@ -211,6 +231,33 @@ pub enum SetupProgress {
     /// Setup stopped in a state no automatic step can leave, and the
     /// journal records it.
     Faulted(SetupFault),
+}
+
+/// One step of the driver, and the channel that step mounted.
+///
+/// The channel is handed over rather than described, because a
+/// description is something a caller has to act on and every caller
+/// would act on it the same way. [`ChannelStore`] is also exclusive —
+/// its journal is held for as long as the value lives — so handing it
+/// back is the only way to give a caller the mount this step made
+/// rather than a second one beside it.
+#[derive(Debug)]
+pub struct SetupAdvance {
+    /// How far this step got.
+    pub progress: SetupProgress,
+    /// The channel journal this step opened, on every step that opens
+    /// one: both completion branches and the close-only mount.
+    pub mounted: Option<ChannelStore>,
+}
+
+impl SetupAdvance {
+    /// A step that opened no channel.
+    const fn bare(progress: SetupProgress) -> Self {
+        Self {
+            progress,
+            mounted: None,
+        }
+    }
 }
 
 /// Why one step of the driver did not finish.
@@ -282,8 +329,9 @@ pub enum SetupDriveError {
 /// reason: nothing in this crate has a clock, and a loop written here
 /// would spin against a chain that finalizes at its own rate. What the
 /// step gives a caller with one is the whole answer —
-/// [`SetupProgress`] says whether to call again, and the three terminal
-/// values are the three ways a setup ends.
+/// [`SetupProgress`] says whether to call again, the three terminal
+/// values are the three ways a setup ends, and
+/// [`SetupAdvance::mounted`] is the channel when the step opened one.
 ///
 /// Called on either endpoint. There is no role argument, because
 /// `decide` reads the role out of the journal and answers a client with
@@ -304,7 +352,7 @@ pub async fn advance_setup<W, B, T, V>(
     sink: &T,
     store: &mut SetupStore,
     verifier: &V,
-) -> Result<SetupProgress, SetupDriveError>
+) -> Result<SetupAdvance, SetupDriveError>
 where
     W: SetupView + ?Sized,
     B: FinalizedBlocks + ?Sized,
@@ -314,34 +362,56 @@ where
     // A setup that has already ended is answered from the journal. Not
     // a second copy of `decide`'s first branch — that branch answers
     // the same question and would answer it the same way — but the one
-    // shortcut that keeps a finished setup from reading the chain
+    // shortcut that keeps a finished setup from scanning the chain
     // forever, and the only place the recorded origin is still in hand.
-    match store.state().end() {
-        Some(SetupEnd::Complete) => {
-            let origin = store
-                .state()
-                .origin()
-                .ok_or(SetupDriveError::CloseNotArmed)?;
-            return Ok(SetupProgress::Complete(origin));
+    let completed = match store.state().end() {
+        Some(SetupEnd::Complete) => true,
+        Some(SetupEnd::Aborted(abort)) => {
+            return Ok(SetupAdvance::bare(SetupProgress::Aborted(abort)));
         }
-        Some(SetupEnd::Aborted(abort)) => return Ok(SetupProgress::Aborted(abort)),
-        Some(SetupEnd::Faulted(fault)) => return Ok(SetupProgress::Faulted(fault)),
-        None => {}
-    }
+        Some(SetupEnd::Faulted(fault)) => {
+            return Ok(SetupAdvance::bare(SetupProgress::Faulted(fault)));
+        }
+        None => false,
+    };
 
     let Some(query) = query_of(store.state()) else {
         // No payment leg has been proposed, so this setup names no
         // payment edge and there is no channel on chain to read for.
-        return Ok(SetupProgress::AwaitingCounterparty);
+        return Ok(SetupAdvance::bare(SetupProgress::AwaitingCounterparty));
     };
 
+    if completed {
+        // A restart reaches a completed setup here and nowhere else, so
+        // this is where its channel comes from. The origin is on the
+        // disk and no history may be added to an ended setup — but what
+        // the payment edge is worth is neither, and it is the one number
+        // every close this mount builds has to distribute. So the edge
+        // is read, at one coherent state, exactly as the completion that
+        // recorded the origin read it; the block scan the shortcut
+        // exists to avoid is still avoided.
+        let origin = store
+            .state()
+            .origin()
+            .ok_or(SetupDriveError::CloseNotArmed)?;
+        let Some(finalized) = view.finalized_setup(query).await? else {
+            return Ok(SetupAdvance::bare(SetupProgress::AwaitingFinalizedState));
+        };
+        return Ok(SetupAdvance {
+            progress: SetupProgress::Complete(origin),
+            mounted: Some(mount(store, verifier, origin, finalized.payment.as_ref())?),
+        });
+    }
+
     if let Some(through) = fetch_history_batch(blocks, store, verifier).await? {
-        return Ok(SetupProgress::HistoryAdvanced { through });
+        return Ok(SetupAdvance::bare(SetupProgress::HistoryAdvanced {
+            through,
+        }));
     }
 
     let payment_edge = query.payment_edge;
     let Some(finalized) = view.finalized_setup(query).await? else {
-        return Ok(SetupProgress::AwaitingFinalizedState);
+        return Ok(SetupAdvance::bare(SetupProgress::AwaitingFinalizedState));
     };
 
     // After the read, never before it. History proves this channel can
@@ -372,7 +442,16 @@ where
                 },
                 verifier,
             )?;
-            Ok(SetupProgress::Complete(origin))
+            // The completion is durable before the mount, in the order
+            // every other step here is written: the journal records
+            // where the channel begins, and only then is a channel
+            // opened there. A crash between the two restarts into the
+            // shortcut above, which mounts the same channel from the
+            // same origin and the same read.
+            Ok(SetupAdvance {
+                progress: SetupProgress::Complete(origin),
+                mounted: Some(mount(store, verifier, origin, finalized.payment.as_ref())?),
+            })
         }
         SetupDecision::CloseOnly => mount_close_only(store, verifier, finalized.payment.as_ref()),
         SetupDecision::Abort(abort) => {
@@ -382,7 +461,7 @@ where
                 },
                 verifier,
             )?;
-            Ok(SetupProgress::Aborted(abort))
+            Ok(SetupAdvance::bare(SetupProgress::Aborted(abort)))
         }
         SetupDecision::Fault(fault) => {
             store.commit(
@@ -391,7 +470,7 @@ where
                 },
                 verifier,
             )?;
-            Ok(SetupProgress::Faulted(fault))
+            Ok(SetupAdvance::bare(SetupProgress::Faulted(fault)))
         }
         SetupDecision::TimeoutBond => {
             let tx = store
@@ -406,9 +485,13 @@ where
                 .ok_or(SetupDriveError::TimeoutUnavailable)?;
             store.commit(SetupRecord::BondTimeoutSubmitted, verifier)?;
             let outcome = sink.submit(tx).await?;
-            Ok(SetupProgress::BondTimeoutSubmitted { outcome })
+            Ok(SetupAdvance::bare(SetupProgress::BondTimeoutSubmitted {
+                outcome,
+            }))
         }
-        SetupDecision::AwaitingCounterparty => Ok(SetupProgress::AwaitingCounterparty),
+        SetupDecision::AwaitingCounterparty => {
+            Ok(SetupAdvance::bare(SetupProgress::AwaitingCounterparty))
+        }
     }
 }
 
@@ -466,7 +549,7 @@ fn mount_close_only<V: SigVerifier>(
     store: &SetupStore,
     verifier: &V,
     payment: Option<&Edge>,
-) -> Result<SetupProgress, SetupDriveError> {
+) -> Result<SetupAdvance, SetupDriveError> {
     let payment_edge = store
         .state()
         .payment_edge()
@@ -479,6 +562,27 @@ fn mount_close_only<V: SigVerifier>(
             tip: store.state().history_cursor().map_or(0, |scan| scan.height),
             edge: payment_edge,
         })?;
+    let channel = mount(store, verifier, origin, payment)?;
+    let settled = channel.state().close_settled().is_some();
+    Ok(SetupAdvance {
+        progress: SetupProgress::CloseOnly { origin, settled },
+        mounted: Some(channel),
+    })
+}
+
+/// Opens this setup's channel journal at the origin it recorded, and
+/// replays into it the finalized history the setup journal holds.
+///
+/// The one mount, for every branch that has one to make. What is decided
+/// here — the settlement, the origin block's own moves, and the rest of
+/// history — is decided once, and the caller receives the result rather
+/// than repeating it.
+fn mount<V: SigVerifier>(
+    store: &SetupStore,
+    verifier: &V,
+    origin: SetupOrigin,
+    payment: Option<&Edge>,
+) -> Result<ChannelStore, SetupDriveError> {
     let descriptor = store
         .state()
         .close_descriptor()
@@ -539,10 +643,7 @@ fn mount_close_only<V: SigVerifier>(
             verifier,
         )?;
     }
-    Ok(SetupProgress::CloseOnly {
-        origin,
-        settled: channel.state().close_settled().is_some(),
-    })
+    Ok(channel)
 }
 
 /// Returns what to read for this setup, once it names a payment edge.
@@ -570,7 +671,7 @@ async fn submit<T, V>(
     sink: &T,
     verifier: &V,
     step: SetupStep,
-) -> Result<SetupProgress, SetupDriveError>
+) -> Result<SetupAdvance, SetupDriveError>
 where
     T: TxSink + ?Sized,
     V: SigVerifier,
@@ -586,7 +687,10 @@ where
     }
     .ok_or(SetupDriveError::NothingRetained { step })?;
     let outcome = sink.submit(tx).await?;
-    Ok(SetupProgress::Submitted { step, outcome })
+    Ok(SetupAdvance::bare(SetupProgress::Submitted {
+        step,
+        outcome,
+    }))
 }
 
 /// Finds the finalized block whose accepted transactions opened
