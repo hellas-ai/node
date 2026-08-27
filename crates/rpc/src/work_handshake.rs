@@ -105,6 +105,8 @@ use crate::protocol::work_bundle::WorkChannelSetupBundleV1;
 use crate::protocol::work_setup::{CloseDescriptor, ProviderChannelPolicy, WorkChannelDescriptor};
 use crate::services::work_setup::{WorkSetupClientImpl, WorkSetupHandler};
 use crate::work::{Refusal, WorkRefusal};
+use crate::work_close::{FinalizedBlocks, TxSink};
+use crate::work_open::{SetupAdvance, SetupChannel, SetupDriveError, SetupView, advance_setup};
 use crate::work_store::{
     SetupRecord, SetupScan, SetupState, SetupStateError, SetupStore, WorkStoreError,
 };
@@ -497,14 +499,130 @@ impl SetupEndpoint {
 /// what excludes a second process. It is never held across an await,
 /// because deciding a revision — verifying signatures, one signature of
 /// its own, and two synchronous journal appends — never awaits.
+///
+/// That exclusive lock is also why driving the setup is a method here
+/// rather than something a runner arranges for itself: a second
+/// [`SetupStore::open`] on this root is refused, so while this service
+/// exists there is exactly one journal and this is what reaches it.
 #[derive(Clone, Debug)]
-pub struct SetupService(Arc<Mutex<SetupEndpoint>>);
+pub struct SetupService {
+    endpoint: Arc<Mutex<SetupEndpoint>>,
+    driving: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// The authority to take this setup's next step, and the only thing that
+/// has it.
+///
+/// Positive rather than absent, exactly as `WorkService`'s channel
+/// driver is: a step submits an Open, records a marker, or mounts a
+/// channel, and two of them running at once would do those things twice.
+/// The `&mut SetupStore` a caller used to hold said the same thing by
+/// owning the store; this says it while the store stays behind the lock
+/// that keeps the ALPN answering.
+///
+/// The slot is returned by [`Drop`], which covers success, error, unwind
+/// and a dropped future.
+#[derive(Debug)]
+pub struct SetupDriver<'a> {
+    service: &'a SetupService,
+}
+
+impl Drop for SetupDriver<'_> {
+    fn drop(&mut self) {
+        self.service
+            .driving
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+impl SetupChannel for SetupDriver<'_> {
+    fn with_store<R>(
+        &mut self,
+        step: impl FnOnce(&mut SetupStore) -> R,
+    ) -> Result<R, SetupDriveError> {
+        let mut endpoint = self
+            .service
+            .endpoint
+            .lock()
+            .map_err(|_| SetupDriveError::Busy)?;
+        Ok(step(&mut endpoint.store))
+    }
+}
+
+impl SetupDriver<'_> {
+    /// Takes one step of this setup, holding the journal for no wait.
+    ///
+    /// The step is [`advance_setup`]'s and no other: what is different
+    /// here is only where the borrow begins and ends, so a setup can be
+    /// driven while the `WorkSetup` ALPN keeps being answered from the
+    /// same journal. What it returns is unchanged, including
+    /// [`SetupAdvance::mounted`] — a caller still mounts by receiving.
+    ///
+    /// # Errors
+    ///
+    /// [`SetupDriveError::Busy`] when the journal cannot be reached, and
+    /// whatever [`advance_setup`] raises otherwise.
+    pub async fn advance<W, B, T>(
+        &mut self,
+        view: &W,
+        blocks: &B,
+        sink: &T,
+    ) -> Result<SetupAdvance, SetupDriveError>
+    where
+        W: SetupView + ?Sized,
+        B: FinalizedBlocks + ?Sized,
+        T: TxSink + ?Sized,
+    {
+        advance_setup(view, blocks, sink, self, &Secp256k1Verifier::new()).await
+    }
+}
 
 impl SetupService {
     /// Wraps one setup endpoint as a dispatchable service.
     #[must_use]
     pub fn new(endpoint: SetupEndpoint) -> Self {
-        Self(Arc::new(Mutex::new(endpoint)))
+        Self {
+            endpoint: Arc::new(Mutex::new(endpoint)),
+            driving: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// Takes this setup's one driving authority, or says it is already
+    /// taken.
+    ///
+    /// # Errors
+    ///
+    /// [`SetupDriveError::Busy`] while a driver is live.
+    pub fn drive(&self) -> Result<SetupDriver<'_>, SetupDriveError> {
+        self.driving
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .map_err(|_| SetupDriveError::Busy)?;
+        Ok(SetupDriver { service: self })
+    }
+
+    /// Takes one step of this setup under that authority.
+    ///
+    /// # Errors
+    ///
+    /// [`SetupDriveError::Busy`] while another driver owns this setup,
+    /// and whatever [`SetupDriver::advance`] raises otherwise.
+    pub async fn advance_setup<W, B, T>(
+        &self,
+        view: &W,
+        blocks: &B,
+        sink: &T,
+    ) -> Result<SetupAdvance, SetupDriveError>
+    where
+        W: SetupView + ?Sized,
+        B: FinalizedBlocks + ?Sized,
+        T: TxSink + ?Sized,
+    {
+        self.drive()?.advance(view, blocks, sink).await
     }
 
     /// Answers one exchange, or says why not.
@@ -512,7 +630,7 @@ impl SetupService {
     /// Synchronous, which is why the lock above is a plain [`Mutex`]:
     /// nothing between taking it and dropping it can await.
     fn exchange(&self, request: &ExchangeSetupRequest) -> ExchangeSetupResponse {
-        let outcome = match self.0.lock() {
+        let outcome = match self.endpoint.lock() {
             Ok(mut endpoint) => endpoint.advance(&request.bundle),
             // A handler panicked mid-commit while holding this. The
             // durable effect of that is not knowable here, so the

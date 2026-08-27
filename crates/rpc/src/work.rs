@@ -146,7 +146,7 @@ use crate::protocol::work::{
 use crate::protocol::work_setup::{ObservedChannel, ReadyChannel, WorkSetupError};
 use crate::services::work::{WorkClientImpl, WorkHandler};
 use crate::work_close::{
-    CatchUpError, CloseError, CloseProgress, FinalizedBlocks, FinalizedWork, TxSink,
+    CatchUpError, CloseChannel, CloseError, CloseProgress, FinalizedBlocks, FinalizedWork, TxSink,
     adjudicated_close, advance_close, catch_up, close_duty_present, close_response, close_start,
     observe, response_body_digest,
 };
@@ -1067,30 +1067,48 @@ impl ProviderEndpoint {
         S: FinalizedBlocks + ?Sized,
         T: TxSink + ?Sized,
     {
-        let progress = advance_close(
-            source,
-            sink,
-            &mut self.store,
-            &Secp256k1Verifier::new(),
-            self.close_handoff,
-        )
-        .await?;
-        if let CloseProgress::Opened { start_id } = progress
-            && let Some((responded, response)) = self.close_duty(start_id)
-        {
-            // Durable before broadcast: the record is what refuses a
-            // second, different answer to this contest, and a record the
-            // state already holds is not written twice — so a
-            // resubmission after a failed hand-off costs no fsync and
-            // sends the same bytes.
-            self.store.commit(responded, &Secp256k1Verifier::new())?;
-            let handoff = match sink.submit(response).await? {
-                SubmitTxOutcome::Enqueued | SubmitTxOutcome::Duplicate => Handoff::Accepted,
-                SubmitTxOutcome::Full | SubmitTxOutcome::ValidationRejected => Handoff::Offered,
-            };
-            self.close_handoff = Some((start_id, handoff));
+        advance_close(source, sink, self, &Secp256k1Verifier::new()).await
+    }
+
+    /// Fixes this endpoint's answer to `start_id` on the disk and
+    /// returns the transaction that carries it.
+    ///
+    /// Durable before broadcast: the record is what refuses a second,
+    /// different answer to this contest, and a record the state already
+    /// holds is not written twice — so a resubmission after a failed
+    /// hand-off costs no fsync and sends the same bytes.
+    fn fix_close_answer(&mut self, start_id: StartId) -> Result<Option<Tx>, WorkStoreError> {
+        let Some((responded, response)) = self.close_duty(start_id) else {
+            return Ok(None);
+        };
+        self.store.commit(responded, &Secp256k1Verifier::new())?;
+        Ok(Some(response))
+    }
+
+    /// Records what a sink did with the answer to `start_id`.
+    ///
+    /// The two outcomes that mean *not enqueued* are the ones that leave
+    /// the answer owed, and this is the one place that reading is made.
+    const fn record_close_handoff(&mut self, start_id: StartId, outcome: SubmitTxOutcome) {
+        let handoff = match outcome {
+            SubmitTxOutcome::Enqueued | SubmitTxOutcome::Duplicate => Handoff::Accepted,
+            SubmitTxOutcome::Full | SubmitTxOutcome::ValidationRejected => Handoff::Offered,
+        };
+        self.close_handoff = Some((start_id, handoff));
+    }
+
+    /// The contest whose answer a sink has taken, and so the one contest
+    /// this endpoint's reads are excused from stopping for.
+    ///
+    /// [`Handoff::Offered`] is deliberately not one. The block it buys
+    /// is bought inside one close step, where the retry that spends it
+    /// is; a read that is not answering anything gets no such credit,
+    /// and stops.
+    const fn accepted_contest(&self) -> Option<StartId> {
+        match self.close_handoff {
+            Some((start_id, Handoff::Accepted)) => Some(start_id),
+            _ => None,
         }
-        Ok(progress)
     }
 
     /// Builds this provider's answer to a journaled contest, and the
@@ -1114,7 +1132,7 @@ impl ProviderEndpoint {
     /// offer the first one rather than a new decision. What it will not
     /// do is offer them to a sink that already took them.
     fn close_duty(&self, start_id: StartId) -> Option<(ChannelRecord, Tx)> {
-        if self.close_handoff == Some((start_id, Handoff::Accepted)) {
+        if self.accepted_contest() == Some(start_id) {
             return None;
         }
         let (contest, certificate) = self.state().answerable_contest()?;
@@ -1234,6 +1252,45 @@ impl ProviderEndpoint {
             &Secp256k1Verifier::new(),
         )?;
         Ok(Tx::move_action(Move::RespondPaymentClose(response)))
+    }
+}
+
+/// A provider that owns its journal outright lends it directly, and owns
+/// the answer it may have to give.
+impl CloseChannel for ProviderEndpoint {
+    fn with_store<R>(
+        &mut self,
+        step: impl FnOnce(&mut ChannelStore) -> R,
+    ) -> Result<R, CatchUpError> {
+        Ok(step(&mut self.store))
+    }
+
+    fn handoff(&mut self) -> Result<Option<(StartId, Handoff)>, CatchUpError> {
+        Ok(self.close_handoff)
+    }
+
+    fn fix_answer(&mut self, start_id: StartId) -> Result<Option<Tx>, CatchUpError> {
+        Ok(self.fix_close_answer(start_id)?)
+    }
+
+    fn record_handoff(
+        &mut self,
+        start_id: StartId,
+        outcome: SubmitTxOutcome,
+    ) -> Result<(), CatchUpError> {
+        self.record_close_handoff(start_id, outcome);
+        Ok(())
+    }
+}
+
+/// A client lends its journal and nothing else: no contest is ever its
+/// to answer, so the three defaulted answers are the true ones.
+impl CloseChannel for ClientEndpoint {
+    fn with_store<R>(
+        &mut self,
+        step: impl FnOnce(&mut ChannelStore) -> R,
+    ) -> Result<R, CatchUpError> {
+        Ok(step(&mut self.store))
     }
 }
 
@@ -1748,17 +1805,51 @@ impl ChannelDriver<'_> {
     /// Refuses the read while this channel owes a close duty, and
     /// returns the cursor otherwise.
     ///
-    /// No hand-off is consulted, because this service owns none: it has
-    /// no sink, so it has no answer anyone took, so nothing here excuses
-    /// the stop. That is the fail-closed half of the no-runner gap —
-    /// [`ProviderEndpoint::advance_close`] is what may read past a duty,
-    /// because it is what discharged it.
-    fn readable_cursor(&self, state: &ChannelState) -> Result<u64, CatchUpError> {
+    /// The hand-off consulted is this endpoint's own, and only a sink
+    /// that *took* the answer excuses the stop: a discharged duty is one
+    /// there is nothing left to do about but watch, so the cursor may
+    /// pass the contest it was stopped at. An answer nobody took is
+    /// still owed, and this is not what retries it — so it stops here,
+    /// and the deadline is not read past while the answer sits on the
+    /// disk. [`Self::advance_close`] is what buys the one further block
+    /// an unaccepted answer is worth, because it is what offers it
+    /// again.
+    fn readable_cursor(&self, endpoint: &ProviderEndpoint) -> Result<u64, CatchUpError> {
+        let state = endpoint.state();
         let (height, _) = state.cursor();
-        if close_duty_present(state, None) {
+        if close_duty_present(state, endpoint.accepted_contest()) {
             return Err(CatchUpError::CloseDuty { height });
         }
         Ok(height)
+    }
+
+    /// Reads to the tip, resubmits this channel's retained close start
+    /// if it has not landed, and answers a contest opened below what
+    /// this endpoint holds.
+    ///
+    /// The same one step [`ProviderEndpoint::advance_close`] is, in the
+    /// borrow shape a served channel has: the journal is taken and given
+    /// back for each apply, for the record that fixes the answer, and
+    /// for the hand-off that says what a sink did with it — and it is
+    /// held across neither the source's waits nor the sink's. So a
+    /// close drives while this channel's requests keep being answered,
+    /// and the two contend only for the moments the journal is actually
+    /// being read or written.
+    ///
+    /// # Errors
+    ///
+    /// [`CatchUpError::Busy`] when the endpoint is unreachable, and
+    /// whatever [`crate::work_close::advance_close`] raises otherwise.
+    pub async fn advance_close<S, T>(
+        &mut self,
+        source: &S,
+        sink: &T,
+    ) -> Result<CloseProgress, CatchUpError>
+    where
+        S: FinalizedBlocks + ?Sized,
+        T: TxSink + ?Sized,
+    {
+        advance_close(source, sink, self, &Secp256k1Verifier::new()).await
     }
 
     /// Applies exactly one finalized block, under one brief borrow, and
@@ -1772,7 +1863,7 @@ impl ChannelDriver<'_> {
     /// one or a transition it carries is refused.
     pub fn observe_finalized(&mut self, block: &FinalizedWork) -> Result<(), CatchUpError> {
         let mut endpoint = self.service.endpoint().map_err(|_| CatchUpError::Busy)?;
-        self.readable_cursor(endpoint.state())?;
+        self.readable_cursor(&endpoint)?;
         endpoint.observe_finalized(block)?;
         Ok(())
     }
@@ -1817,7 +1908,7 @@ impl ChannelDriver<'_> {
     /// it.
     fn cursor(&self) -> Result<u64, CatchUpError> {
         let endpoint = self.service.endpoint().map_err(|_| CatchUpError::Busy)?;
-        self.readable_cursor(endpoint.state())
+        self.readable_cursor(&endpoint)
     }
 
     /// Refuses a driver that named a job this channel's journal does not
@@ -1845,6 +1936,44 @@ impl ChannelDriver<'_> {
             Some(held) if held == work_id => Ok(()),
             Some(_) => Err(CatchUpError::OtherJob),
         }
+    }
+}
+
+/// The driver reaches the same journal and the same hand-off the
+/// endpoint owns, one short borrow at a time.
+///
+/// Every method takes the endpoint lock and gives it back before it
+/// returns, and none of them is async, so there is no shape in which a
+/// borrow reaches a source or a sink wait. The endpoint's own methods
+/// are what decide anything; this is only where the borrow begins and
+/// ends.
+impl CloseChannel for ChannelDriver<'_> {
+    fn with_store<R>(
+        &mut self,
+        step: impl FnOnce(&mut ChannelStore) -> R,
+    ) -> Result<R, CatchUpError> {
+        let mut endpoint = self.service.endpoint().map_err(|_| CatchUpError::Busy)?;
+        Ok(step(&mut endpoint.store))
+    }
+
+    fn handoff(&mut self) -> Result<Option<(StartId, Handoff)>, CatchUpError> {
+        let endpoint = self.service.endpoint().map_err(|_| CatchUpError::Busy)?;
+        Ok(endpoint.close_handoff)
+    }
+
+    fn fix_answer(&mut self, start_id: StartId) -> Result<Option<Tx>, CatchUpError> {
+        let mut endpoint = self.service.endpoint().map_err(|_| CatchUpError::Busy)?;
+        Ok(endpoint.fix_close_answer(start_id)?)
+    }
+
+    fn record_handoff(
+        &mut self,
+        start_id: StartId,
+        outcome: SubmitTxOutcome,
+    ) -> Result<(), CatchUpError> {
+        let mut endpoint = self.service.endpoint().map_err(|_| CatchUpError::Busy)?;
+        endpoint.record_close_handoff(start_id, outcome);
+        Ok(())
     }
 }
 
@@ -1955,22 +2084,47 @@ impl WorkService {
         self.endpoint()?.adjudicated_close(observed)
     }
 
+    /// Reads to the tip and services whatever close duty that read
+    /// surfaced, under one driver.
+    ///
+    /// The whole of what a caller with a clock does to a live edge, and
+    /// the reason this channel's requests are still answered while it
+    /// runs: the endpoint is borrowed per apply and per record, never
+    /// across the source's waits or the sink's.
+    ///
+    /// # Errors
+    ///
+    /// [`CatchUpError::Busy`] while another driver owns this channel,
+    /// and whatever [`ChannelDriver::advance_close`] raises otherwise.
+    pub async fn advance_close<S, T>(
+        &self,
+        source: &S,
+        sink: &T,
+    ) -> Result<CloseProgress, CatchUpError>
+    where
+        S: FinalizedBlocks + ?Sized,
+        T: TxSink + ?Sized,
+    {
+        let mut driver = self.drive().map_err(|_| CatchUpError::Busy)?;
+        driver.advance_close(source, sink).await
+    }
+
     // There is deliberately no `respond_to_close` here.
     //
     // An answer to a contest is not bytes, it is a sequence: read to the
     // block that opened it, fix the answer on the disk, offer it to a
     // sink, and let what the sink did decide whether the cursor may move
-    // past the duty. Nothing this service owns owns that sequence — it
-    // has a journal and no sink — so a service method returning the
-    // transaction would be handing out a submittable duty that no
-    // hand-off state accounts for, and two callers could take the same
-    // one. [`ProviderEndpoint::advance_close`] owns source, sink and
-    // hand-off together, and is the only operation that couples the
-    // three. A caller holding the endpoint itself can still build a
-    // response with [`ProviderEndpoint::respond_to_close`] — that is not
-    // the claim here; the claim is that *this service* has no such
-    // operation, so nothing reachable from a clone of it hands out a
-    // submittable answer.
+    // past the duty. A service method returning the transaction would be
+    // handing out a submittable duty that no hand-off state accounts
+    // for, and two callers could take the same one.
+    // [`ChannelDriver::advance_close`] owns source, sink and hand-off
+    // together, is the only operation that couples the three, and there
+    // is one driver of this channel at a time. A caller holding the
+    // endpoint itself can still build a response with
+    // [`ProviderEndpoint::respond_to_close`] — that is not the claim
+    // here; the claim is that *this service* hands out no submittable
+    // answer, only a driver that offers one and then records what
+    // became of it.
 
     /// Workflow phase boundary for provider acceptance: catch up with short
     /// borrows, reacquire by this channel service, then let the durable
@@ -2478,14 +2632,7 @@ impl ClientEndpoint {
         // No contest is ever this endpoint's to answer — only a
         // certificate's beneficiary may spend it — so a client never
         // holds one back, and never stops reading over one.
-        advance_close(
-            source,
-            sink,
-            &mut self.store,
-            &Secp256k1Verifier::new(),
-            None,
-        )
-        .await
+        advance_close(source, sink, self, &Secp256k1Verifier::new()).await
     }
 
     /// Takes one delivered answer, and makes it durable before it is

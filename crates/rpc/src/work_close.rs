@@ -727,46 +727,160 @@ fn expiry_at(
 /// journal only shows one after the block that opened it has been
 /// read. The other order resubmits a start that is already a contest.
 ///
-/// Nothing is journaled here. A submission is not a decision — the
-/// signature was journaled before it left [`crate::work::ProviderEndpoint::prepare_close`],
-/// and these are those same bytes.
+/// Nothing about a *start* is journaled here. A submission is not a
+/// decision — the signature was journaled before it left
+/// [`crate::work::ProviderEndpoint::prepare_close`], and these are those
+/// same bytes. The one record this writes is the contest's answer,
+/// through [`CloseChannel::fix_answer`], and it is written before the
+/// answer is offered rather than after one was taken: it fixes which
+/// answer this contest is answered by, and says nothing about consensus
+/// having received it.
 ///
 /// # Errors
 ///
 /// [`CatchUpError`] for the read, and [`BlockSourceError`] wrapped in
 /// it when the sink will not take the transaction.
-pub async fn advance_close<S, T, V>(
+pub async fn advance_close<C, S, T, V>(
     source: &S,
     sink: &T,
-    store: &mut ChannelStore,
+    channel: &mut C,
     verifier: &V,
-    handoff: Option<(StartId, Handoff)>,
 ) -> Result<CloseProgress, CatchUpError>
 where
+    C: CloseChannel,
     S: FinalizedBlocks + ?Sized,
     T: TxSink + ?Sized,
     V: SigVerifier,
 {
-    let height = catch_up_until_duty(source, store, verifier, handoff).await?;
-    let state = store.state();
-    if let Some(settled) = state.close_settled() {
-        return Ok(CloseProgress::Settled {
-            provider_payout: settled.provider_payout,
-        });
+    let handoff = channel.handoff()?;
+    let height = catch_up_until_duty(source, channel, verifier, handoff).await?;
+    let step = channel.with_store(|store| {
+        let state = store.state();
+        if let Some(settled) = state.close_settled() {
+            return CloseStep::Reached(CloseProgress::Settled {
+                provider_payout: settled.provider_payout,
+            });
+        }
+        if let Some((start_id, _)) = state.close_opened() {
+            return CloseStep::Reached(CloseProgress::Opened { start_id });
+        }
+        let Some(start) = state.includable_close_start(height) else {
+            return CloseStep::Reached(CloseProgress::Nothing);
+        };
+        CloseStep::Start {
+            valid_through: start.valid_through_height(),
+            tx: Box::new(Tx::move_action(hellas_kernel::Move::StartPaymentClose(
+                start.clone(),
+            ))),
+        }
+    })?;
+    match step {
+        // The answer, in the order a crash has to survive: the record
+        // is fixed under one borrow, the bytes are offered while
+        // nothing is borrowed, and what the sink did is recorded under
+        // another. Nothing waits on a sink holding this journal.
+        CloseStep::Reached(CloseProgress::Opened { start_id }) => {
+            if let Some(response) = channel.fix_answer(start_id)? {
+                let outcome = sink.submit(response).await?;
+                channel.record_handoff(start_id, outcome)?;
+            }
+            Ok(CloseProgress::Opened { start_id })
+        }
+        CloseStep::Reached(progress) => Ok(progress),
+        CloseStep::Start { valid_through, tx } => {
+            let outcome = sink.submit(*tx).await?;
+            Ok(CloseProgress::Submitted {
+                valid_through,
+                outcome,
+            })
+        }
     }
-    if let Some((start_id, _)) = state.close_opened() {
-        return Ok(CloseProgress::Opened { start_id });
+}
+
+/// What one close step decided under its borrow, and must now do
+/// without one.
+enum CloseStep {
+    /// The step is over, or its remaining work is the contest's answer.
+    Reached(CloseProgress),
+    /// A retained start that can still be included, and the last height
+    /// it can be included at.
+    Start {
+        /// Last height the retained signature can be included at.
+        valid_through: u64,
+        /// The retained bytes, verbatim. Boxed because a start is by
+        /// far the largest thing this enum carries.
+        tx: Box<Tx>,
+    },
+}
+
+/// Where a close step reaches one channel's journal, and the answer it
+/// may owe.
+///
+/// Every method here is synchronous, which is the whole content of the
+/// trait: a close waits on a source and on a sink, and neither wait may
+/// happen while this journal is borrowed. An endpoint that owns its
+/// store lends it directly; a service that keeps one behind a lock takes
+/// that lock for exactly as long as the step runs and hands back what
+/// the step produced. The sequence itself — read to the duty, fix the
+/// answer, offer it, record the hand-off — is [`advance_close`]'s and is
+/// written once for both.
+pub trait CloseChannel {
+    /// Lends this channel's journal for exactly as long as `step` runs.
+    ///
+    /// # Errors
+    ///
+    /// [`CatchUpError::Busy`] when this journal cannot be reached at
+    /// all, which is the only thing an implementation may decide here.
+    fn with_store<R>(
+        &mut self,
+        step: impl FnOnce(&mut ChannelStore) -> R,
+    ) -> Result<R, CatchUpError>;
+
+    /// What this channel's last send got back.
+    ///
+    /// Defaulted to none held, which is the whole of a client's answer:
+    /// only a certificate's beneficiary may spend it, so a client never
+    /// holds an answer back and never has one a sink took.
+    ///
+    /// # Errors
+    ///
+    /// [`CatchUpError::Busy`] when this journal cannot be reached.
+    fn handoff(&mut self) -> Result<Option<(StartId, Handoff)>, CatchUpError> {
+        Ok(None)
     }
-    let Some(start) = state.includable_close_start(height) else {
-        return Ok(CloseProgress::Nothing);
-    };
-    let valid_through = start.valid_through_height();
-    let tx = Tx::move_action(hellas_kernel::Move::StartPaymentClose(start.clone()));
-    let outcome = sink.submit(tx).await?;
-    Ok(CloseProgress::Submitted {
-        valid_through,
-        outcome,
-    })
+
+    /// Fixes this channel's answer to `start_id` on the disk and returns
+    /// the transaction carrying it, or `None` when no answer is owed.
+    ///
+    /// # Errors
+    ///
+    /// [`CatchUpError::Busy`] when this journal cannot be reached, and
+    /// [`CatchUpError::Store`] when it refuses the answer.
+    fn fix_answer(&mut self, _start_id: StartId) -> Result<Option<Tx>, CatchUpError> {
+        Ok(None)
+    }
+
+    /// Records what a sink did with the answer to `start_id`.
+    ///
+    /// # Errors
+    ///
+    /// [`CatchUpError::Busy`] when this journal cannot be reached.
+    fn record_handoff(
+        &mut self,
+        _start_id: StartId,
+        _outcome: crate::SubmitTxOutcome,
+    ) -> Result<(), CatchUpError> {
+        Ok(())
+    }
+}
+
+impl CloseChannel for ChannelStore {
+    fn with_store<R>(
+        &mut self,
+        step: impl FnOnce(&mut ChannelStore) -> R,
+    ) -> Result<R, CatchUpError> {
+        Ok(step(self))
+    }
 }
 
 /// Reads contiguously only until one newly observed block creates a duty.
@@ -791,41 +905,49 @@ where
 /// nobody took must be offered again before the block after next, or a
 /// backlog longer than the window swallows every retry and the contest
 /// ends unanswered on the claim this endpoint could have beaten.
-async fn catch_up_until_duty<S, V>(
+async fn catch_up_until_duty<C, S, V>(
     source: &S,
-    store: &mut ChannelStore,
+    channel: &mut C,
     verifier: &V,
     handoff: Option<(StartId, Handoff)>,
 ) -> Result<u64, CatchUpError>
 where
+    C: CloseChannel,
     S: FinalizedBlocks + ?Sized,
     V: SigVerifier,
 {
     let mut suppressed = handoff.map(|(start_id, _)| start_id);
-    if close_duty_present(store.state(), suppressed) {
-        return Ok(store.state().cursor().0);
+    if let Some(height) = channel.with_store(|store| {
+        let state = store.state();
+        close_duty_present(state, suppressed).then_some(state.cursor().0)
+    })? {
+        return Ok(height);
     }
     let Some(latest) = source.latest_height().await? else {
-        return Ok(store.state().cursor().0);
+        return channel.with_store(|store| store.state().cursor().0);
     };
-    let mut next = store.state().cursor().0.saturating_add(1);
+    let mut next = channel
+        .with_store(|store| store.state().cursor().0)?
+        .saturating_add(1);
     while next <= latest {
         let block = source
             .block_at(next)
             .await?
             .ok_or(CatchUpError::Missing { height: next })?;
-        observe(store, &block, verifier)?;
+        channel.with_store(|store| observe(store, &block, verifier))??;
         if handoff.is_some_and(|(_, state)| state == Handoff::Offered) {
             // The one block a still-owed answer paid for is spent.
             suppressed = None;
         }
-        let state = store.state();
-        if close_duty_present(state, suppressed) {
-            return Ok(state.cursor().0);
+        if let Some(height) = channel.with_store(|store| {
+            let state = store.state();
+            close_duty_present(state, suppressed).then_some(state.cursor().0)
+        })? {
+            return Ok(height);
         }
         next = next.saturating_add(1);
     }
-    Ok(store.state().cursor().0)
+    channel.with_store(|store| store.state().cursor().0)
 }
 
 /// Whether this journal holds a close duty its caller must service

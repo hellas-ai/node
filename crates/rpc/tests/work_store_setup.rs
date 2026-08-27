@@ -8,6 +8,8 @@
 #![cfg(feature = "work")]
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use hellas_kernel::{
     Auth, BlockHeight, CoinId, Decode as _, Edge, EdgeId, EdgeValues, Fees, Funding, Key,
@@ -16,14 +18,19 @@ use hellas_kernel::{
     Secp256k1Signer, Secp256k1Verifier, Sig, Terms, TermsHash, Tx, WorkPaymentTerms,
     WorkStakeBondTerms,
 };
+use hellas_rpc::pb::work::{ExchangeSetupRequest, exchange_setup_response::Outcome};
 use hellas_rpc::protocol::work::{
     PaidChannelPolicyV1, PaidExecutionPolicyV1, private_policy_commitment,
 };
 use hellas_rpc::protocol::work_bundle::WorkChannelSetupBundleV1;
 use hellas_rpc::protocol::work_setup::{OmissionMeasurements, ProviderChannelPolicy};
 use hellas_rpc::protocol::{ContentId, Digest};
+use hellas_rpc::services::work_setup::WorkSetupHandler;
 use hellas_rpc::work_close::{BlockSourceError, FinalizedBlocks, FinalizedWork, TxSink};
-use hellas_rpc::work_open::{FinalizedSetup, SetupProgress, SetupQuery, SetupView, advance_setup};
+use hellas_rpc::work_handshake::{PaymentAdmission, SetupEndpoint, SetupService};
+use hellas_rpc::work_open::{
+    FinalizedSetup, SetupDriveError, SetupProgress, SetupQuery, SetupStep, SetupView, advance_setup,
+};
 use hellas_rpc::work_store::journal::JournalError;
 use hellas_rpc::work_store::setup::setup_key;
 use hellas_rpc::work_store::{
@@ -74,6 +81,10 @@ fn coins(ids: &[u8]) -> List<CoinId, MAX_PARTY_INPUTS> {
         *slot = CoinId::from_bytes([*id; CoinId::LENGTH]);
     }
     List::take(slots, ids.len())
+}
+
+fn coin(id: u8) -> CoinId {
+    CoinId::from_bytes([id; CoinId::LENGTH])
 }
 
 fn empty_coins() -> List<CoinId, MAX_PARTY_INPUTS> {
@@ -285,6 +296,25 @@ fn completed_store(root: &std::path::Path) -> SetupStore {
         bundle_record(&two),
         armed_record(&three),
     ] {
+        if let Err(error) = store.commit(record, &verifier) {
+            panic!("the fixture revision commits: {error}");
+        }
+    }
+    store
+}
+
+/// A provider store recovered mid-handshake, holding revision 2.
+///
+/// The client's countersigned bond and proposed payment are journaled and
+/// this endpoint has not countersigned the payment yet — so the payment
+/// Open is not executable, and `funding_coins` names the bond's coin
+/// alone.
+fn revision_two_store(root: &std::path::Path) -> SetupStore {
+    let mut store = store(root, Role::Provider);
+    let verifier = Secp256k1Verifier::new();
+    let one = proposed();
+    let two = countersigned(one.clone());
+    for record in [scan_record(), bundle_record(&one), bundle_record(&two)] {
         if let Err(error) = store.commit(record, &verifier) {
             panic!("the fixture revision commits: {error}");
         }
@@ -1890,6 +1920,393 @@ async fn a_restart_over_a_completed_setup_hands_back_the_same_channel() {
         records,
         "and it reopened the first mount's journal rather than writing a second one",
     );
+}
+
+/// A setup is driven while its own `WorkSetup` ALPN is answered from the
+/// same journal, and the caller still mounts by receiving.
+///
+/// The journal is exclusive — the assertion below is that a second
+/// `SetupStore::open` on this root is refused — so "drive it and serve
+/// it" is not two stores, it is one store borrowed twice. A step that
+/// held that borrow across its finalized read would be a provider that
+/// stops answering the handshake for as long as the chain is slow; the
+/// view here is stopped for the whole of the exchange, and the exchange
+/// is answered with the retained revision anyway.
+///
+/// What comes back is unchanged: `SetupAdvance::mounted` carries the
+/// channel this step opened, so a driver reachable from the service
+/// mounts by receiving exactly as a caller holding the store did.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_setup_is_driven_while_its_alpn_is_served_from_the_same_journal() {
+    let dir = temp();
+    let journal = completed_store(dir.path());
+
+    // Why this has to go through the service at all: the journal is
+    // held, and a runner cannot open a second one to drive from.
+    match SetupStore::open(
+        dir.path(),
+        network(),
+        bond_edge(),
+        Role::Provider,
+        &Secp256k1Verifier::new(),
+    ) {
+        Err(WorkStoreError::Journal(JournalError::Locked { .. })) => {}
+        other => panic!("a second store over one root is refused: {other:?}"),
+    }
+
+    let three = completed(countersigned(proposed()));
+    let payment_open = three.payment_open().expect("the executable payment Open");
+    let origin_payload = [0xa3; 32];
+    let service = SetupService::new(SetupEndpoint::new(
+        journal,
+        provider(),
+        PaymentAdmission::Admits(Box::new(provider_policy())),
+    ));
+    let blocks = Arc::new(Blocks {
+        blocks: vec![FinalizedWork {
+            height: scan().height + 1,
+            parent: scan().payload,
+            payload: origin_payload,
+            txs: vec![payment_open, same_block_contest()],
+        }],
+    });
+    let released = Arc::new(AtomicBool::new(false));
+    let view = Arc::new(HeldChannel {
+        inner: LiveChannel::at(scan().height + 1, overfunded_payment_object()),
+        reached: AtomicUsize::new(0),
+        released: Arc::clone(&released),
+    });
+
+    // The history batch, which is decided from blocks alone and never
+    // reaches the held view.
+    match service
+        .advance_setup(view.as_ref(), blocks.as_ref(), &NoSink)
+        .await
+    {
+        Ok(advance) => match advance.progress {
+            SetupProgress::HistoryAdvanced { through } => {
+                assert_eq!(through, scan().height + 1);
+            }
+            other => panic!("the history batch is fetched first: {other:?}"),
+        },
+        Err(error) => panic!("the history batch is fetched first: {error}"),
+    }
+
+    // The completing step, stopped at its finalized read.
+    let driving = tokio::spawn({
+        let service = service.clone();
+        let view = Arc::clone(&view);
+        let blocks = Arc::clone(&blocks);
+        async move {
+            service
+                .advance_setup(view.as_ref(), blocks.as_ref(), &NoSink)
+                .await
+        }
+    });
+    let waited = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while view.reached.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(waited.is_ok(), "the driver reached the finalized read");
+
+    // The ALPN, answered from the same journal while that read waits.
+    let answering = tokio::spawn({
+        let service = service.clone();
+        async move { exchange(&service, Vec::new()).await }
+    });
+    let answered = tokio::time::timeout(std::time::Duration::from_secs(10), answering).await;
+    let Ok(Ok(offered)) = answered else {
+        panic!("the WorkSetup ALPN does not queue behind the drive: {answered:?}");
+    };
+    assert_eq!(
+        offered,
+        three.encode(),
+        "and it was answered with the revision the journal holds",
+    );
+    assert!(
+        !driving.is_finished(),
+        "the drive was still stopped at its finalized read while that was answered",
+    );
+
+    released.store(true, Ordering::SeqCst);
+    let Ok(Ok(advance)) = driving.await else {
+        panic!("the released drive completes the setup");
+    };
+    let SetupProgress::Complete(origin) = advance.progress else {
+        panic!(
+            "the released drive completes the setup: {:?}",
+            advance.progress
+        );
+    };
+    assert_eq!(origin.height, scan().height + 1);
+    let mounted = advance
+        .mounted
+        .expect("the driven completion hands back the channel it opened");
+    assert_eq!(
+        mounted.state().cursor(),
+        (origin.height, origin_payload),
+        "the channel was opened at the origin the completion recorded",
+    );
+    assert_eq!(
+        mounted.state().settlement().adjudicated_total(),
+        4_096,
+        "and settled against the edge the coherent read found",
+    );
+    assert!(
+        mounted.state().close_opened().is_some(),
+        "the origin block's own contest is journaled on the channel handed back",
+    );
+
+    // One driver: a second step while the first is live is refused
+    // rather than admitted to the drive.
+    let held = service.drive().expect("the setup has a driver to take");
+    assert!(
+        matches!(service.drive(), Err(SetupDriveError::Busy)),
+        "a second driver of one setup is turned away",
+    );
+    drop(held);
+    assert!(service.drive().is_ok(), "and the slot comes back");
+}
+
+/// A view that stops the driver where a real chain would, and counts
+/// that it got there.
+struct HeldChannel {
+    inner: LiveChannel,
+    reached: AtomicUsize,
+    released: Arc<AtomicBool>,
+}
+
+impl SetupView for HeldChannel {
+    async fn finalized_setup(
+        &self,
+        query: SetupQuery,
+    ) -> Result<Option<FinalizedSetup>, BlockSourceError> {
+        self.reached.fetch_add(1, Ordering::SeqCst);
+        while !self.released.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+        self.inner.finalized_setup(query).await
+    }
+}
+
+/// Offers one revision to a setup service through its own handler, and
+/// returns the revision it answers with.
+async fn exchange(service: &SetupService, bundle: Vec<u8>) -> Vec<u8> {
+    let answered = WorkSetupHandler::exchange_setup(
+        service,
+        ExchangeSetupRequest { bundle },
+        hellas_wire::TransportContext::default(),
+    )
+    .await
+    .expect("the setup handler answers");
+    let response: hellas_rpc::call::WithTrailer<_> = answered.into();
+    match response.response.outcome {
+        Some(Outcome::Advanced(advanced)) => advanced.bundle,
+        other => panic!("expected an advanced revision, got {other:?}"),
+    }
+}
+
+/// A step decides from the revision it asked the chain about, not from
+/// the one the ALPN journaled while it was waiting.
+///
+/// The provider is recovered at revision 2, where the payment Open is
+/// not yet executable and `funding_coins` therefore names the bond's
+/// coin alone. The step asks the chain that question and stops there.
+/// The ALPN — answered from the same journal, which is the whole reason
+/// the borrow is short — countersigns the payment and journals revision
+/// 3, and now the payment Open is executable and its funding coin is
+/// part of the question.
+///
+/// Every coin is live on chain throughout. The revision-2 answer says
+/// nothing about the payment coin because it was never asked, and a
+/// coin that was not asked about is not a coin that was spent: deciding
+/// from that answer at revision 3 aborts the setup with
+/// `PaymentFundingSpent`, or times the bond out, and both are
+/// permanent. So the assertion is the negative one — no end is
+/// journaled — and the positive one that this step reaches the
+/// submission a state it actually observed supports.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_setup_decides_from_the_revision_it_asked_the_chain_about() {
+    let dir = temp();
+    let journal = revision_two_store(dir.path());
+    let three = completed(countersigned(proposed()));
+    let service = SetupService::new(SetupEndpoint::new(
+        journal,
+        provider(),
+        PaymentAdmission::Admits(Box::new(provider_policy())),
+    ));
+    // Nothing of this setup is on chain yet, so there is no history to
+    // catch up on and the step goes straight to its finalized read.
+    let blocks = Arc::new(Blocks { blocks: Vec::new() });
+    let released = Arc::new(AtomicBool::new(false));
+    let view = Arc::new(HeldFunding::holding(Arc::clone(&released)));
+    let sink = Arc::new(Mempool::default());
+
+    let driving = tokio::spawn({
+        let service = service.clone();
+        let view = Arc::clone(&view);
+        let blocks = Arc::clone(&blocks);
+        let sink = Arc::clone(&sink);
+        async move {
+            service
+                .advance_setup(view.as_ref(), blocks.as_ref(), sink.as_ref())
+                .await
+        }
+    });
+    let waited = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while view.asked().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(waited.is_ok(), "the driver reached its revision-2 read");
+
+    // Revision 3, journaled through the ALPN while that read waits.
+    let answering = tokio::spawn({
+        let service = service.clone();
+        async move { exchange(&service, Vec::new()).await }
+    });
+    let answered = tokio::time::timeout(std::time::Duration::from_secs(10), answering).await;
+    let Ok(Ok(offered)) = answered else {
+        panic!("the WorkSetup ALPN does not queue behind the drive: {answered:?}");
+    };
+    assert_eq!(
+        offered,
+        three.encode(),
+        "the ALPN countersigned the payment and journaled revision 3",
+    );
+    assert!(
+        !driving.is_finished(),
+        "and it did that while the drive was still stopped at its revision-2 read",
+    );
+
+    released.store(true, Ordering::SeqCst);
+    let Ok(Ok(advance)) = driving.await else {
+        panic!("the released drive takes a step");
+    };
+    match advance.progress {
+        SetupProgress::Submitted {
+            step: SetupStep::Bond,
+            ..
+        } => {}
+        SetupProgress::Aborted(abort) => {
+            panic!("the step ended the setup from a state it never observed: {abort:?}");
+        }
+        SetupProgress::TimeoutBond | SetupProgress::BondTimeoutSubmitted { .. } => {
+            panic!("the step took the stake back from a state it never observed");
+        }
+        other => panic!("the step submits the bond it can now fund: {other:?}"),
+    }
+
+    let asked = view.asked();
+    assert_eq!(
+        asked.len(),
+        2,
+        "the revision-2 answer was discarded and the read taken again",
+    );
+    assert!(
+        !asked[0].funding.contains(&coin(PAYMENT_COIN)),
+        "the first read asked only about the executable bond's funding",
+    );
+    assert!(
+        asked[1].funding.contains(&coin(PAYMENT_COIN)),
+        "and the second asked about the funding revision 3 made executable",
+    );
+    assert_eq!(
+        sink.submitted().len(),
+        1,
+        "one bond Open was handed to consensus",
+    );
+
+    drop(service);
+    let recovered = store(dir.path(), Role::Provider);
+    assert_eq!(recovered.state().revision(), Some(3));
+    assert!(
+        recovered.state().end().is_none(),
+        "and the journal records no end at all: {:?}",
+        recovered.state().end(),
+    );
+}
+
+/// A finalized read that answers exactly the query it was asked, and
+/// stops the driver on the first one.
+///
+/// Every coin the query names is live, and nothing is spent for the
+/// whole of this test — so a `live_funding` short of a setup's funding
+/// can only be an answer to a query that did not ask about it.
+struct HeldFunding {
+    asked: std::sync::Mutex<Vec<SetupQuery>>,
+    released: Arc<AtomicBool>,
+}
+
+impl HeldFunding {
+    fn holding(released: Arc<AtomicBool>) -> Self {
+        Self {
+            asked: std::sync::Mutex::new(Vec::new()),
+            released,
+        }
+    }
+
+    fn asked(&self) -> Vec<SetupQuery> {
+        match self.asked.lock() {
+            Ok(asked) => asked.clone(),
+            Err(error) => panic!("the fixture view is not poisoned: {error}"),
+        }
+    }
+}
+
+impl SetupView for HeldFunding {
+    async fn finalized_setup(
+        &self,
+        query: SetupQuery,
+    ) -> Result<Option<FinalizedSetup>, BlockSourceError> {
+        let first = match self.asked.lock() {
+            Ok(mut asked) => {
+                asked.push(query.clone());
+                asked.len() == 1
+            }
+            Err(error) => panic!("the fixture view is not poisoned: {error}"),
+        };
+        if first {
+            while !self.released.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        }
+        Ok(Some(FinalizedSetup {
+            height: 10,
+            bond: None,
+            payment: None,
+            lease: LeaseSlots::Absent,
+            live_funding: query.funding,
+        }))
+    }
+}
+
+/// A sink that keeps what it was handed.
+#[derive(Default)]
+struct Mempool {
+    submitted: std::sync::Mutex<Vec<Tx>>,
+}
+
+impl Mempool {
+    fn submitted(&self) -> Vec<Tx> {
+        match self.submitted.lock() {
+            Ok(submitted) => submitted.clone(),
+            Err(error) => panic!("the fixture sink is not poisoned: {error}"),
+        }
+    }
+}
+
+impl TxSink for Mempool {
+    async fn submit(&self, tx: Tx) -> Result<hellas_rpc::SubmitTxOutcome, BlockSourceError> {
+        match self.submitted.lock() {
+            Ok(mut submitted) => submitted.push(tx),
+            Err(error) => panic!("the fixture sink is not poisoned: {error}"),
+        }
+        Ok(hellas_rpc::SubmitTxOutcome::Enqueued)
+    }
 }
 
 /// A close ordered after the payment Open in the origin block itself is

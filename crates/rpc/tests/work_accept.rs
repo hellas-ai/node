@@ -1104,6 +1104,83 @@ async fn a_proposal_is_answered_while_a_drive_waits_on_the_chain() {
     assert!(driving.await.is_ok(), "and it finishes afterwards");
 }
 
+/// The same, for the drive that owns a sink as well as a source.
+///
+/// A close drive commits, submits and records a hand-off, so it is the
+/// one that would be tempting to run under a single held borrow — and a
+/// held borrow here is a provider that stops answering proposals every
+/// time the chain is slow. It takes the endpoint per apply and per
+/// record and across neither wait, so the request is answered with its
+/// co-signature while the drive is stopped at the block source.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_proposal_is_answered_while_a_close_drive_waits_on_the_chain() {
+    let root = temp();
+    let service = WorkService::new(provider_endpoint(root.path()));
+    let released = Arc::new(AtomicBool::new(false));
+    let chain = HeldChain::over((CURSOR + 1)..=(CURSOR + 3), &released);
+    let fetches = Arc::clone(&chain.fetches);
+    let sink = Arc::new(NoSink::default());
+
+    let driving = tokio::spawn({
+        let service = service.clone();
+        let chain = Arc::clone(&chain);
+        let sink = Arc::clone(&sink);
+        async move { service.advance_close(chain.as_ref(), sink.as_ref()).await }
+    });
+    reaches(&fetches, 1).await;
+
+    let answering = tokio::spawn({
+        let service = service.clone();
+        async move { service.accept(&signed_request(1, 1)) }
+    });
+    let answered = tokio::time::timeout(std::time::Duration::from_secs(10), answering).await;
+    let Ok(Ok(response)) = answered else {
+        panic!("the request path does not queue behind the close drive: {answered:?}");
+    };
+    accepted_signature(&response);
+    assert!(
+        !driving.is_finished(),
+        "the drive was still stopped at the chain while that was answered",
+    );
+
+    released.store(true, Ordering::SeqCst);
+    let Ok(Ok(progress)) = driving.await else {
+        panic!("the close drive finishes its range");
+    };
+    assert_eq!(
+        progress,
+        hellas_rpc::work_close::CloseProgress::Nothing,
+        "this channel has no contest and no retained start, so nothing was sent",
+    );
+    assert_eq!(
+        sink.taken.load(Ordering::SeqCst),
+        0,
+        "and the sink was never asked to take anything",
+    );
+    assert_eq!(
+        service
+            .with_state(|state| state.cursor().0)
+            .expect("the endpoint is reachable"),
+        CURSOR + 3,
+    );
+}
+
+/// A sink that counts what it was asked to take, and takes it.
+#[derive(Debug, Default)]
+struct NoSink {
+    taken: AtomicUsize,
+}
+
+impl hellas_rpc::work_close::TxSink for NoSink {
+    async fn submit(
+        &self,
+        _tx: hellas_kernel::Tx,
+    ) -> Result<hellas_rpc::SubmitTxOutcome, BlockSourceError> {
+        self.taken.fetch_add(1, Ordering::SeqCst);
+        Ok(hellas_rpc::SubmitTxOutcome::Enqueued)
+    }
+}
+
 #[test]
 fn the_service_catalogue_names_the_work_service_and_nothing_settled() {
     let names: Vec<&str> = hellas_rpc::services::KNOWN_SERVICES

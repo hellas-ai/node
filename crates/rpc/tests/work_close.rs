@@ -2884,6 +2884,155 @@ async fn a_backlog_stops_on_the_block_that_opened_the_contest() {
     );
 }
 
+/// A served channel's close duty is *discharged*: the answer reaches a
+/// sink, and the cursor then reads past the contest that stopped it.
+///
+/// The other half of the no-runner gap. The stop was right and it was
+/// permanent: nothing reachable from a `WorkService` could offer the
+/// answer, so once a contest opened, every later read of this channel
+/// answered `CloseDuty` at the same height for ever. One driver now
+/// owns source, sink and hand-off together, and what lets the read
+/// through afterwards is that hand-off and not a journal claim of
+/// doneness — the contest is still answerable on the disk while the
+/// cursor moves past it, which is exactly the state a duty a sink holds
+/// is in.
+#[tokio::test]
+async fn a_driven_close_duty_is_discharged_and_the_cursor_passes() {
+    let fixture = paid_job().await;
+    let ready = fixture.ready.clone();
+    let inclusion = CURSOR + 1;
+    let (opened, deadline) = understated_contest(&ready, inclusion);
+    let chain = Chain {
+        blocks: std::iter::once(opened)
+            .chain(((inclusion + 1)..=(inclusion + 2)).map(|height| block(height, Vec::new())))
+            .collect(),
+        withheld: None,
+    };
+    assert!(
+        inclusion + 2 < deadline,
+        "the whole of this read is inside the response window",
+    );
+    let sink = Mempool::default();
+
+    // The drive: read to the contest, fix the answer, offer it, and
+    // record what the sink did with it.
+    let start_id = match fixture.service.advance_close(&chain, &sink).await {
+        Ok(CloseProgress::Opened { start_id }) => start_id,
+        other => panic!("the contest is read and answered: {other:?}"),
+    };
+    assert_eq!(
+        fixture
+            .service
+            .with_state(|state| state.cursor().0)
+            .expect("the endpoint is reachable"),
+        inclusion,
+        "the read stopped on the contest to service it",
+    );
+    let taken = sink.taken();
+    assert_eq!(taken.len(), 1, "one contest, one answer");
+    let hellas_kernel::Tx::Move {
+        action: hellas_kernel::Move::RespondPaymentClose(response),
+    } = &taken[0]
+    else {
+        panic!("the submitted transaction is a response move");
+    };
+    assert_eq!(response.start_id(), start_id);
+    assert_eq!(
+        response.certificate().earned_cumulative(),
+        PRICE,
+        "the answer spends the certificate the contest understated",
+    );
+    let responded = fixture
+        .service
+        .with_state(|state| state.close_responded())
+        .expect("the endpoint is reachable")
+        .expect("the serviced duty is on the disk");
+    assert_eq!(
+        responded.response_digest,
+        response_body_digest(ready.channel(), start_id, response.certificate()),
+        "the journaled digest is the one the submitted answer was signed over",
+    );
+
+    // And the read that was refused for ever now passes the contest —
+    // through the ordinary request-path catch-up, which owns no sink and
+    // discharged nothing itself.
+    let caught = fixture.service.catch_up_job(&chain, fixture.id).await;
+    assert!(
+        matches!(caught, Ok(height) if height == inclusion + 2),
+        "a discharged duty does not stop the read: {caught:?}",
+    );
+    assert!(
+        fixture
+            .service
+            .with_state(|state| state.answerable_contest().is_some())
+            .expect("the endpoint is reachable"),
+        "and the contest is still answerable on the disk, so it is the \
+         hand-off that let the cursor through and not a record saying done",
+    );
+}
+
+/// A sink that refuses the answer leaves the duty owed, and the cursor
+/// does not run to a tip past the deadline.
+///
+/// `Full` and `ValidationRejected` are successful results that mean *not
+/// enqueued*. Reading the hand-off as "offered, therefore finished"
+/// would let every later read run free — and the backlog here outlives
+/// the response window, so the cursor would arrive past the deadline
+/// with the answer still on the disk and the contest settling on the
+/// claim this provider could have beaten.
+#[tokio::test]
+async fn a_refused_hand_off_leaves_the_duty_owed_short_of_the_deadline() {
+    let fixture = paid_job().await;
+    let inclusion = CURSOR + 1;
+    let (opened, deadline) = understated_contest(&fixture.ready, inclusion);
+    let backlog = Chain {
+        blocks: std::iter::once(opened)
+            .chain(((inclusion + 1)..=(deadline + 4)).map(|height| block(height, Vec::new())))
+            .collect(),
+        withheld: None,
+    };
+
+    for outcome in [
+        hellas_rpc::SubmitTxOutcome::Full,
+        hellas_rpc::SubmitTxOutcome::ValidationRejected,
+    ] {
+        let name = format!("{outcome:?}");
+        let refusing = Mempool::answering(outcome);
+        match fixture.service.advance_close(&backlog, &refusing).await {
+            Ok(CloseProgress::Opened { .. }) => {}
+            other => panic!("{name}: the contest is still open: {other:?}"),
+        }
+        assert_eq!(
+            refusing.taken().len(),
+            1,
+            "{name}: the answer was offered once",
+        );
+
+        // Owed, so the ordinary read stops at it rather than running the
+        // backlog out past the window.
+        let caught = fixture.service.catch_up_job(&backlog, fixture.id).await;
+        let cursor = fixture
+            .service
+            .with_state(|state| state.cursor().0)
+            .expect("the endpoint is reachable");
+        assert!(
+            matches!(caught, Err(CatchUpError::CloseDuty { height }) if height == cursor),
+            "{name}: an answer nobody took still stops the read: {caught:?}",
+        );
+        assert!(
+            cursor < deadline,
+            "{name}: stopped at {cursor}, inside a window that shuts at {deadline}",
+        );
+        assert!(
+            fixture
+                .service
+                .with_state(|state| state.answerable_contest().is_some())
+                .expect("the endpoint is reachable"),
+            "{name}: and the answer is still owed rather than late",
+        );
+    }
+}
+
 // ── The cutoff a finalized close is ───────────────────────────────────
 
 /// One job, run to a signed result and not yet released.
