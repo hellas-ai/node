@@ -644,11 +644,10 @@ async fn one_answer_crosses_the_wire_and_is_debited_once() {
     // One debit on the provider's side, and the client is at Ready with
     // no verdict yet.
     {
-        let Ok(provider) = service.endpoint() else {
-            panic!("the endpoint is reachable");
-        };
         assert_eq!(
-            provider.state().job().map(JobState::phase),
+            service
+                .with_state(|state| state.job().map(JobState::phase))
+                .expect("the endpoint is reachable"),
             Some(JobPhase::Delivered)
         );
     }
@@ -835,12 +834,10 @@ async fn a_release_past_the_deadline_is_expired_on_the_wire() {
     };
     serving.abort();
     assert_eq!(refusal_code(&response), WorkRefusalCode::Expired);
-
-    let Ok(endpoint) = service.endpoint() else {
-        panic!("the endpoint is reachable");
-    };
     assert_eq!(
-        endpoint.state().job().map(JobState::phase),
+        service
+            .with_state(|state| state.job().map(JobState::phase))
+            .expect("the endpoint is reachable"),
         Some(JobPhase::Ready),
         "nothing was released",
     );
@@ -891,12 +888,10 @@ async fn a_delivery_named_for_another_job_finds_nothing() {
             "{name} is refused: {response:?}",
         );
     }
-
-    let Ok(endpoint) = service.endpoint() else {
-        panic!("the endpoint is reachable");
-    };
     assert_eq!(
-        endpoint.state().job().map(JobState::phase),
+        service
+            .with_state(|state| state.job().map(JobState::phase))
+            .expect("the endpoint is reachable"),
         Some(JobPhase::Ready),
     );
 }
@@ -941,12 +936,10 @@ async fn a_provider_signs_no_result_the_frame_would_not_carry() {
     assert_eq!(field, "encoded result frame");
     assert_eq!(actual, generous);
     assert_eq!(limit, u64::from(tight));
-
-    let Ok(endpoint) = service.endpoint() else {
-        panic!("the endpoint is reachable");
-    };
     assert_eq!(
-        endpoint.state().job().map(JobState::phase),
+        service
+            .with_state(|state| state.job().map(JobState::phase))
+            .expect("the endpoint is reachable"),
         None,
         "and the job is over, at the provider's own cost",
     );
@@ -986,14 +979,9 @@ async fn a_client_refuses_a_frame_over_the_bound_it_signed() {
         };
         let wide_service = WorkService::new(wide_endpoint);
         run_to_result(&wide_service, &wide_ready, wide_id).await;
-        let Ok(mut wide_endpoint) = wide_service.endpoint() else {
-            panic!("the endpoint is reachable");
-        };
-        let Ok(delivery) = wide_endpoint.deliver(
-            &delivery_request(wide_ready.channel(), wide_id),
-            &wide_ready,
-            &EXPORTER,
-        ) else {
+        let Ok(delivery) =
+            wide_service.deliver(&delivery_request(wide_ready.channel(), wide_id), &EXPORTER)
+        else {
             panic!("the wide delivery is released");
         };
         WorkDelivered {
@@ -1034,11 +1022,7 @@ async fn delivered_frame_len(frame: u32) -> u64 {
     };
     let service = WorkService::new(endpoint);
     run_to_result(&service, &ready, id).await;
-    let Ok(mut endpoint) = service.endpoint() else {
-        panic!("the endpoint is reachable");
-    };
-    let Ok(delivery) = endpoint.deliver(&delivery_request(ready.channel(), id), &ready, &EXPORTER)
-    else {
+    let Ok(delivery) = service.deliver(&delivery_request(ready.channel(), id), &EXPORTER) else {
         panic!("the fixture delivery is released");
     };
     WorkDelivered {
@@ -1073,14 +1057,9 @@ async fn a_transcript_swapped_in_transit_is_not_recorded() {
     };
     let service = WorkService::new(provider_endpoint);
     run_to_result(&service, &ready, id).await;
-    let Ok(mut provider) = service.endpoint() else {
-        panic!("the endpoint is reachable");
-    };
-    let Ok(delivery) = provider.deliver(&delivery_request(ready.channel(), id), &ready, &EXPORTER)
-    else {
+    let Ok(delivery) = service.deliver(&delivery_request(ready.channel(), id), &EXPORTER) else {
         panic!("the fixture delivery is released");
     };
-    drop(provider);
 
     let Ok(mut endpoint) = ClientEndpoint::new(ready.clone(), client_store, client()) else {
         panic!("the client endpoint binds");
@@ -1142,14 +1121,9 @@ async fn a_client_behind_its_readiness_records_no_receipt() {
     };
     let service = WorkService::new(provider_endpoint);
     run_to_result(&service, &ready, id).await;
-    let Ok(mut provider) = service.endpoint() else {
-        panic!("the endpoint is reachable");
-    };
-    let Ok(delivery) = provider.deliver(&delivery_request(ready.channel(), id), &ready, &EXPORTER)
-    else {
+    let Ok(delivery) = service.deliver(&delivery_request(ready.channel(), id), &EXPORTER) else {
         panic!("the fixture delivery is released");
     };
-    drop(provider);
 
     let delivered = WorkDelivered {
         result: delivery.result.encode(),
@@ -1347,11 +1321,10 @@ async fn a_work_id_alone_releases_nothing() {
             WorkRefusalCode::Invalid,
             "{name} releases nothing: {response:?}",
         );
-        let Ok(endpoint) = service.endpoint() else {
-            panic!("the endpoint is reachable");
-        };
         assert_eq!(
-            endpoint.state().job().map(JobState::phase),
+            service
+                .with_state(|state| state.job().map(JobState::phase))
+                .expect("the endpoint is reachable"),
             Some(JobPhase::Ready),
             "{name} leaves the answer where it was",
         );
@@ -1434,12 +1407,10 @@ async fn a_transport_without_an_exporter_delivers_nothing() {
         matches!(refused, Err(DeliverError::Unbindable)),
         "an unbindable connection asks for nothing: {refused:?}",
     );
-
-    let Ok(endpoint) = service.endpoint() else {
-        panic!("the endpoint is reachable");
-    };
     assert_eq!(
-        endpoint.state().job().map(JobState::phase),
+        service
+            .with_state(|state| state.job().map(JobState::phase))
+            .expect("the endpoint is reachable"),
         Some(JobPhase::Ready),
         "nothing was released",
     );

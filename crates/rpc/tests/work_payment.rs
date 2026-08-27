@@ -810,10 +810,10 @@ async fn one_certificate_pays_for_one_job() {
     );
 
     {
-        let Ok(provider) = fixture.service.endpoint() else {
-            panic!("the endpoint is reachable");
-        };
-        let state = provider.state();
+        let state = fixture
+            .service
+            .with_state(|state| state.clone())
+            .expect("the endpoint is reachable");
         assert!(state.job().is_none());
         assert_eq!(state.ledger().credited_cumulative(), PRICE);
         assert_eq!(state.max_executable_certificate(), PRICE);
@@ -1035,10 +1035,9 @@ async fn the_provider_prices_the_payment_itself() {
 
 /// Asserts that a refused payment moved no money at all.
 async fn assert_nothing_credited(service: &WorkService, what: &str) {
-    let Ok(provider) = service.endpoint() else {
-        panic!("the endpoint is reachable");
-    };
-    let state = provider.state();
+    let state = service
+        .with_state(|state| state.clone())
+        .expect("the endpoint is reachable");
     assert_eq!(
         state.ledger().credited_cumulative(),
         0,
@@ -1146,10 +1145,9 @@ async fn an_uncomputed_job_is_not_paid_for() {
     )
     .await;
     assert_eq!(refusal_of(&response), WorkRefusalCode::Declined);
-    let Ok(provider) = service.endpoint() else {
-        panic!("the endpoint is reachable");
-    };
-    let state = provider.state();
+    let state = service
+        .with_state(|state| state.clone())
+        .expect("the endpoint is reachable");
     assert_eq!(state.ledger().credited_cumulative(), 0);
     assert_eq!(state.max_executable_certificate(), 0);
     assert_eq!(
@@ -1234,15 +1232,19 @@ async fn a_defaulted_job_is_not_paid_for_as_well() {
     let mut fixture = checked_job().await;
     let id = fixture.id;
     {
-        let Ok(mut provider) = fixture.service.endpoint() else {
-            panic!("the endpoint is reachable");
-        };
+        let provider = &fixture.service;
         // The default is the watcher's, reached the only way it can
         // be: finalized blocks past the height this client signed to
         // pay by. No local call can ask for it.
-        let mut next = provider.state().cursor().0.saturating_add(1);
+        let Ok(mut driver) = provider.drive() else {
+            panic!("this channel's cursor driver is free");
+        };
+        let mut next = provider
+            .with_state(|state| state.cursor().0)
+            .expect("the endpoint is reachable")
+            .saturating_add(1);
         while next <= deadlines().payment + 1 {
-            if let Err(error) = provider.observe_finalized(&FinalizedWork {
+            if let Err(error) = driver.observe_finalized(&FinalizedWork {
                 height: next,
                 parent: payload_at(next.saturating_sub(1)),
                 payload: payload_at(next),
@@ -1252,17 +1254,20 @@ async fn a_defaulted_job_is_not_paid_for_as_well() {
             }
             next += 1;
         }
-        assert!(
-            provider.state().job().is_none(),
-            "the expired job is closed",
-        );
-        assert!(
-            matches!(
-                provider.state().terminal().map(|t| &t.outcome),
-                Some(hellas_rpc::work_store::TerminalOutcome::Expired { .. })
-            ),
-            "and rests at an expired terminal",
-        );
+        drop(driver);
+        let (open_job, expired) = provider
+            .with_state(|state| {
+                (
+                    state.job().is_some(),
+                    matches!(
+                        state.terminal().map(|t| &t.outcome),
+                        Some(hellas_rpc::work_store::TerminalOutcome::Expired { .. })
+                    ),
+                )
+            })
+            .expect("the endpoint is reachable");
+        assert!(!open_job, "the expired job is closed");
+        assert!(expired, "and rests at an expired terminal");
     }
 
     let paid = pay_over_wire(&fixture.service, &mut fixture.client, id).await;
@@ -1271,10 +1276,10 @@ async fn a_defaulted_job_is_not_paid_for_as_well() {
     };
     assert_eq!(refusal, WorkRefusal::Conflict);
     {
-        let Ok(provider) = fixture.service.endpoint() else {
-            panic!("the endpoint is reachable");
-        };
-        let state = provider.state();
+        let state = fixture
+            .service
+            .with_state(|state| state.clone())
+            .expect("the endpoint is reachable");
         assert_eq!(state.ledger().credited_cumulative(), 0);
         assert_eq!(
             state.max_executable_certificate(),
@@ -1295,13 +1300,16 @@ async fn a_defaulted_job_is_not_paid_for_as_well() {
         Ok(credited) => assert_eq!(credited, PRICE),
         Err(error) => panic!("the checked job is paid: {error}"),
     }
-    let Ok(mut provider) = fixture.service.endpoint() else {
-        panic!("the endpoint is reachable");
-    };
+    let provider = &fixture.service;
     let ended = provider.end_run(id);
     assert!(
         matches!(ended, Err(RunError::NoSuchJob)),
         "a paid job is closed: {ended:?}",
     );
-    assert_eq!(provider.state().ledger().credited_cumulative(), PRICE);
+    assert_eq!(
+        provider
+            .with_state(|state| state.ledger().credited_cumulative())
+            .expect("the endpoint is reachable"),
+        PRICE,
+    );
 }

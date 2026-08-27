@@ -78,7 +78,7 @@ use hellas_kernel::{
 };
 
 use crate::protocol::work::PaidChannel;
-use crate::work::Handoff;
+use crate::work::{EndpointError, Handoff};
 use crate::work_store::{
     Applied, ChannelRecord, ChannelStore, JobPhase, Role, TerminalOutcome, WorkStoreError,
 };
@@ -225,6 +225,10 @@ pub enum CloseError {
     /// The step could not be made durable, or the journal refused it.
     #[error(transparent)]
     Store(#[from] WorkStoreError),
+    /// The endpoint this close would be decided on is unreachable, so
+    /// nothing was decided and nothing was written.
+    #[error(transparent)]
+    Endpoint(#[from] EndpointError),
 }
 
 /// How far this channel's close has got.
@@ -257,10 +261,24 @@ pub enum CloseProgress {
 /// Why a catch-up did not finish.
 #[derive(Debug, thiserror::Error)]
 pub enum CatchUpError {
-    /// Another bounded catch-up owns this job; ordinary brief journal
+    /// This channel already has a cursor driver; ordinary brief journal
     /// operations remain independent of that ownership.
-    #[error("another catch-up already owns this job")]
+    #[error("this channel already has a cursor driver")]
     Busy,
+    /// The job a driver named is not the one this channel's journal
+    /// holds, so this channel's cursor is not that driver's to advance.
+    #[error("this channel's job is not the one the driver named")]
+    OtherJob,
+    /// A close duty stops the read at the cursor, which is §5's
+    /// stop-before-successor rule refusing it: an answer owed and not
+    /// yet taken by a sink, or a settlement after which there is nothing
+    /// left to read. A backlog read past either is how a response
+    /// deadline is lost.
+    #[error("a close duty stops this read at height {height}, and no successor block is read")]
+    CloseDuty {
+        /// Cursor height the duty was found at.
+        height: u64,
+    },
     /// The block source failed.
     #[error(transparent)]
     Source(#[from] BlockSourceError),
@@ -842,7 +860,7 @@ where
 /// is already on chain, and only reading further blocks can tell.
 /// Retrying is a separate question, and its answer is in
 /// [`crate::work::ProviderEndpoint::advance_close`].
-fn close_duty_present(
+pub(crate) fn close_duty_present(
     state: &crate::work_store::ChannelState,
     suppressed: Option<StartId>,
 ) -> bool {

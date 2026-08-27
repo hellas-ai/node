@@ -753,6 +753,20 @@ async fn paid_job() -> Checked {
     fixture
 }
 
+/// Applies one finalized block to a service, through the one thing that
+/// may apply one.
+///
+/// The driving authority is taken and given back per block, which is why
+/// this reads like the old one-block call and is not one: a loop over it
+/// stops where a loop inside the service stops, because the rule is the
+/// driver's and not the loop's.
+fn observe_one(service: &WorkService, applied: &FinalizedWork) -> Result<(), CatchUpError> {
+    match service.drive() {
+        Ok(mut driver) => driver.observe_finalized(applied),
+        Err(_) => Err(CatchUpError::Busy),
+    }
+}
+
 /// One `AcceptWorkRequest` for a fresh job at `proposal_nonce`.
 fn signed_request(nonce: u8, proposal_nonce: u64) -> AcceptWorkRequest {
     let authorization = match propose_authorization(
@@ -877,11 +891,14 @@ async fn a_paid_job_closes_at_exactly_what_it_earned() {
     let ready = fixture.ready.clone();
 
     let start = {
-        let Ok(mut provider) = fixture.service.endpoint() else {
+        let Ok(held) = fixture
+            .service
+            .with_state(|state| state.max_executable_certificate())
+        else {
             panic!("the endpoint is reachable");
         };
-        assert_eq!(provider.state().max_executable_certificate(), PRICE);
-        match provider.prepare_close() {
+        assert_eq!(held, PRICE);
+        match fixture.service.prepare_close() {
             Ok(start) => start,
             Err(error) => panic!("a paid channel closes: {error}"),
         }
@@ -915,11 +932,13 @@ async fn a_paid_job_closes_at_exactly_what_it_earned() {
     // Asking again before the window has passed is the resubmission,
     // not a second close: the same bytes, and no second record.
     let (again, before) = {
-        let Ok(mut provider) = fixture.service.endpoint() else {
+        let Ok(before) = fixture
+            .service
+            .with_state(|state| state.close_prepared().cloned())
+        else {
             panic!("the endpoint is reachable");
         };
-        let before = provider.state().close_prepared().cloned();
-        (provider.prepare_close(), before)
+        (fixture.service.prepare_close(), before)
     };
     match again {
         Ok(again) => assert_eq!(Some(&again), before.as_ref()),
@@ -931,22 +950,23 @@ async fn a_paid_job_closes_at_exactly_what_it_earned() {
     let inclusion = CURSOR + 1;
     let expected = contest_id(&ready, &start, inclusion);
     {
-        let Ok(mut provider) = fixture.service.endpoint() else {
-            panic!("the endpoint is reachable");
-        };
         let accepted = block(
             inclusion,
             vec![hellas_kernel::Tx::move_action(
                 hellas_kernel::Move::StartPaymentClose(start.clone()),
             )],
         );
-        match provider.observe_finalized(&accepted) {
-            Ok(state) => {
-                assert_eq!(state.close_opened(), Some((expected, Party::Taker)));
-                assert_eq!(state.cursor(), (inclusion, payload_at(inclusion)));
-            }
-            Err(error) => panic!("the block applies: {error}"),
+        if let Err(error) = observe_one(&fixture.service, &accepted) {
+            panic!("the block applies: {error}");
         }
+        let Ok((opened, cursor)) = fixture
+            .service
+            .with_state(|state| (state.close_opened(), state.cursor()))
+        else {
+            panic!("the endpoint is reachable");
+        };
+        assert_eq!(opened, Some((expected, Party::Taker)));
+        assert_eq!(cursor, (inclusion, payload_at(inclusion)));
         assert_ne!(
             expected,
             contest_id(&ready, &start, inclusion + 1),
@@ -961,9 +981,6 @@ async fn a_paid_job_closes_at_exactly_what_it_earned() {
     let bond = bond_object();
     let payment_edge_object = payment_object();
     let close = {
-        let Ok(provider) = fixture.service.endpoint() else {
-            panic!("the endpoint is reachable");
-        };
         let observed = ObservedChannel {
             height: deadline,
             bond: Some(&bond),
@@ -971,7 +988,7 @@ async fn a_paid_job_closes_at_exactly_what_it_earned() {
             lease: lease_over(bond_edge(), payment_edge()),
             pending: pending_slot(&record),
         };
-        match provider.adjudicated_close(&observed) {
+        match fixture.service.adjudicated_close(&observed) {
             Ok(close) => close,
             Err(error) => panic!("a spent window closes: {error}"),
         }
@@ -1007,19 +1024,20 @@ async fn a_close_is_built_at_the_deadline_and_not_before_it() {
     let bond = bond_object();
     let payment_edge_object = payment_object();
 
-    let Ok(mut provider) = fixture.service.endpoint() else {
-        panic!("the endpoint is reachable");
-    };
+    let provider = &fixture.service;
     let Ok(start) = provider.prepare_close() else {
         panic!("a paid channel closes");
     };
     let id = contest_id(&ready, &start, inclusion);
-    if let Err(error) = provider.observe_finalized(&block(
-        inclusion,
-        vec![hellas_kernel::Tx::move_action(
-            hellas_kernel::Move::StartPaymentClose(start),
-        )],
-    )) {
+    if let Err(error) = observe_one(
+        provider,
+        &block(
+            inclusion,
+            vec![hellas_kernel::Tx::move_action(
+                hellas_kernel::Move::StartPaymentClose(start),
+            )],
+        ),
+    ) {
         panic!("the block applies: {error}");
     }
 
@@ -1068,9 +1086,7 @@ async fn a_close_settles_the_contest_this_endpoint_started() {
     let bond = bond_object();
     let payment_edge_object = payment_object();
 
-    let Ok(mut provider) = fixture.service.endpoint() else {
-        panic!("the endpoint is reachable");
-    };
+    let provider = &fixture.service;
     let Ok(start) = provider.prepare_close() else {
         panic!("a paid channel closes");
     };
@@ -1094,12 +1110,15 @@ async fn a_close_settles_the_contest_this_endpoint_started() {
         "an unread block is not a contest this endpoint holds",
     );
 
-    if let Err(error) = provider.observe_finalized(&block(
-        inclusion,
-        vec![hellas_kernel::Tx::move_action(
-            hellas_kernel::Move::StartPaymentClose(start),
-        )],
-    )) {
+    if let Err(error) = observe_one(
+        provider,
+        &block(
+            inclusion,
+            vec![hellas_kernel::Tx::move_action(
+                hellas_kernel::Move::StartPaymentClose(start),
+            )],
+        ),
+    ) {
         panic!("the block applies: {error}");
     }
     if let Err(error) = provider.adjudicated_close(&observed) {
@@ -1155,9 +1174,7 @@ async fn a_close_settles_the_contest_this_endpoint_started() {
 #[tokio::test]
 async fn a_start_that_can_no_longer_land_is_replaced_and_one_that_can_is_not() {
     let fixture = paid_job().await;
-    let Ok(mut provider) = fixture.service.endpoint() else {
-        panic!("the endpoint is reachable");
-    };
+    let provider = &fixture.service;
     let Ok(first) = provider.prepare_close() else {
         panic!("a paid channel closes");
     };
@@ -1165,7 +1182,7 @@ async fn a_start_that_can_no_longer_land_is_replaced_and_one_that_can_is_not() {
 
     // Every block up to the last one that could have included it.
     for height in (CURSOR + 1)..=through {
-        if let Err(error) = provider.observe_finalized(&block(height, Vec::new())) {
+        if let Err(error) = observe_one(provider, &block(height, Vec::new())) {
             panic!("the block at {height} applies: {error}");
         }
         match provider.prepare_close() {
@@ -1178,7 +1195,7 @@ async fn a_start_that_can_no_longer_land_is_replaced_and_one_that_can_is_not() {
     }
 
     // One block further, and the old signature can never be included.
-    if let Err(error) = provider.observe_finalized(&block(through + 1, Vec::new())) {
+    if let Err(error) = observe_one(provider, &block(through + 1, Vec::new())) {
         panic!("the block applies: {error}");
     }
     let Ok(replacement) = provider.prepare_close() else {
@@ -1187,8 +1204,10 @@ async fn a_start_that_can_no_longer_land_is_replaced_and_one_that_can_is_not() {
     assert_ne!(replacement, first);
     assert_eq!(replacement.valid_from_height(), through + 2);
     assert_eq!(
-        provider.state().close_prepared(),
-        Some(&replacement),
+        provider
+            .with_state(|state| state.close_prepared().cloned())
+            .ok(),
+        Some(Some(replacement)),
         "and the disk holds the one that can land",
     );
 }
@@ -1207,19 +1226,20 @@ async fn settlement_is_the_block_that_closed_the_edge() {
     let fixture = paid_job().await;
     let ready = fixture.ready.clone();
     let inclusion = CURSOR + 1;
-    let Ok(mut provider) = fixture.service.endpoint() else {
-        panic!("the endpoint is reachable");
-    };
+    let provider = &fixture.service;
     let Ok(start) = provider.prepare_close() else {
         panic!("a paid channel closes");
     };
     let id = contest_id(&ready, &start, inclusion);
-    if let Err(error) = provider.observe_finalized(&block(
-        inclusion,
-        vec![hellas_kernel::Tx::move_action(
-            hellas_kernel::Move::StartPaymentClose(start),
-        )],
-    )) {
+    if let Err(error) = observe_one(
+        provider,
+        &block(
+            inclusion,
+            vec![hellas_kernel::Tx::move_action(
+                hellas_kernel::Move::StartPaymentClose(start),
+            )],
+        ),
+    ) {
         panic!("the block applies: {error}");
     }
 
@@ -1239,23 +1259,21 @@ async fn settlement_is_the_block_that_closed_the_edge() {
     };
 
     for height in (inclusion + 1)..deadline {
-        if let Err(error) = provider.observe_finalized(&block(height, Vec::new())) {
+        if let Err(error) = observe_one(provider, &block(height, Vec::new())) {
             panic!("the block at {height} applies: {error}");
         }
     }
-    match provider.observe_finalized(&block(deadline, vec![close])) {
-        Ok(state) => {
-            assert_eq!(
-                state.close_settled(),
-                Some(CloseSettlement {
-                    height: deadline,
-                    payload: payload_at(deadline),
-                    provider_payout: PRICE,
-                }),
-            );
-        }
-        Err(error) => panic!("the closing block applies: {error}"),
+    if let Err(error) = observe_one(provider, &block(deadline, vec![close])) {
+        panic!("the closing block applies: {error}");
     }
+    assert_eq!(
+        provider.with_state(|state| state.close_settled()).ok(),
+        Some(Some(CloseSettlement {
+            height: deadline,
+            payload: payload_at(deadline),
+            provider_payout: PRICE,
+        })),
+    );
 }
 
 /// The watcher applies a block's transactions in the order the
@@ -1268,16 +1286,14 @@ async fn settlement_is_the_block_that_closed_the_edge() {
 /// history from the first block.
 #[tokio::test]
 async fn a_blocks_transactions_are_applied_in_consensus_order() {
-    // The three fixtures are built before any endpoint is locked: one
-    // to derive the two transactions, and one for each reading order.
+    // Three fixtures: one to derive the two transactions, and one for
+    // each reading order.
     let fixture = paid_job().await;
     let ordered = paid_job().await;
     let reversed = paid_job().await;
     let ready = fixture.ready.clone();
     let inclusion = CURSOR + 1;
-    let Ok(mut provider) = fixture.service.endpoint() else {
-        panic!("the endpoint is reachable");
-    };
+    let provider = &fixture.service;
     let Ok(start) = provider.prepare_close() else {
         panic!("a paid channel closes");
     };
@@ -1294,7 +1310,7 @@ async fn a_blocks_transactions_are_applied_in_consensus_order() {
     // two together is the kernel's question; what is varied here is
     // only the order the watcher reads them in.
     let close = {
-        if let Err(error) = provider.observe_finalized(&block(inclusion, vec![start_tx.clone()])) {
+        if let Err(error) = observe_one(provider, &block(inclusion, vec![start_tx.clone()])) {
             panic!("the block applies: {error}");
         }
         let observed = ObservedChannel {
@@ -1309,44 +1325,45 @@ async fn a_blocks_transactions_are_applied_in_consensus_order() {
             Err(error) => panic!("a spent window closes: {error}"),
         }
     };
-    drop(provider);
     drop(fixture);
 
     // A second provider, in the same state, that has read nothing.
     {
-        let Ok(mut provider) = ordered.service.endpoint() else {
-            panic!("the endpoint is reachable");
-        };
+        let provider = &ordered.service;
         if let Err(error) = provider.prepare_close() {
             panic!("a paid channel closes: {error}");
         }
-        match provider.observe_finalized(&block(inclusion, vec![start_tx.clone(), close.clone()])) {
-            Ok(state) => {
-                assert_eq!(state.close_opened(), Some((id, Party::Taker)));
-                assert_eq!(
-                    state.close_settled().map(|settled| settled.provider_payout),
-                    Some(PRICE),
-                );
-            }
-            Err(error) => panic!("the block in consensus order applies: {error}"),
+        if let Err(error) = observe_one(
+            provider,
+            &block(inclusion, vec![start_tx.clone(), close.clone()]),
+        ) {
+            panic!("the block in consensus order applies: {error}");
         }
+        let Ok((opened, payout)) = provider.with_state(|state| {
+            (
+                state.close_opened(),
+                state.close_settled().map(|settled| settled.provider_payout),
+            )
+        }) else {
+            panic!("the endpoint is reachable");
+        };
+        assert_eq!(opened, Some((id, Party::Taker)));
+        assert_eq!(payout, Some(PRICE));
     }
 
     {
-        let Ok(mut provider) = reversed.service.endpoint() else {
-            panic!("the endpoint is reachable");
-        };
+        let provider = &reversed.service;
         if let Err(error) = provider.prepare_close() {
             panic!("a paid channel closes: {error}");
         }
-        let applied = provider.observe_finalized(&block(inclusion, vec![close, start_tx]));
+        let applied = observe_one(provider, &block(inclusion, vec![close, start_tx]));
         assert!(
             applied.is_err(),
             "a close before the start it answers is not a history this journal takes",
         );
         assert_eq!(
-            provider.state().cursor(),
-            (CURSOR, payload_at(CURSOR)),
+            provider.with_state(|state| state.cursor()).ok(),
+            Some((CURSOR, payload_at(CURSOR))),
             "and the cursor stays behind the block it could not apply",
         );
     }
@@ -2404,11 +2421,11 @@ async fn a_withheld_block_leaves_the_cursor_behind() {
 async fn the_watcher_ends_a_job_its_payment_deadline_has_passed() {
     let fixture = checked_job().await;
     let payment_deadline = deadlines().payment;
-    let Ok(mut provider) = fixture.service.endpoint() else {
-        panic!("the endpoint is reachable");
-    };
+    let provider = &fixture.service;
     assert_eq!(
-        provider.state().job().map(JobState::phase),
+        provider
+            .with_state(|state| state.job().map(JobState::phase))
+            .expect("the endpoint is reachable"),
         Some(JobPhase::Delivered),
     );
 
@@ -2420,44 +2437,49 @@ async fn the_watcher_ends_a_job_its_payment_deadline_has_passed() {
     );
 
     for height in (CURSOR + 1)..=payment_deadline {
-        if let Err(error) = provider.observe_finalized(&block(height, Vec::new())) {
+        if let Err(error) = observe_one(provider, &block(height, Vec::new())) {
             panic!("the block at {height} applies: {error}");
         }
     }
     assert!(
-        provider.state().job().is_some(),
+        provider
+            .with_state(|state| state.job().is_some())
+            .expect("the endpoint is reachable"),
         "the deadline itself is still inside the window the client signed",
     );
 
-    if let Err(error) = provider.observe_finalized(&block(payment_deadline + 1, Vec::new())) {
+    if let Err(error) = observe_one(provider, &block(payment_deadline + 1, Vec::new())) {
         panic!("the block past the deadline applies: {error}");
     }
-    assert!(provider.state().job().is_none(), "the job is over");
     assert!(
-        matches!(
-            provider
-                .state()
-                .terminal()
-                .map(|terminal| &terminal.outcome),
-            Some(TerminalOutcome::Expired { .. }),
-        ),
+        provider
+            .with_state(|state| state.job().is_none())
+            .expect("the endpoint is reachable"),
+        "the job is over",
+    );
+    assert!(
+        provider
+            .with_state(|state| matches!(
+                state.terminal().map(|terminal| &terminal.outcome),
+                Some(TerminalOutcome::Expired { .. }),
+            ))
+            .expect("the endpoint is reachable"),
         "a delivered, unpaid job rests at an expired terminal the provider bears",
     );
 
     // The next blocks change nothing: the terminal is permanent.
     for height in (payment_deadline + 2)..=(payment_deadline + 4) {
-        if let Err(error) = provider.observe_finalized(&block(height, Vec::new())) {
+        if let Err(error) = observe_one(provider, &block(height, Vec::new())) {
             panic!("the block at {height} applies: {error}");
         }
     }
     assert!(
-        matches!(
-            provider
-                .state()
-                .terminal()
-                .map(|terminal| &terminal.outcome),
-            Some(TerminalOutcome::Expired { .. }),
-        ),
+        provider
+            .with_state(|state| matches!(
+                state.terminal().map(|terminal| &terminal.outcome),
+                Some(TerminalOutcome::Expired { .. }),
+            ))
+            .expect("the endpoint is reachable"),
         "the expired terminal is permanent",
     );
 
@@ -2585,9 +2607,7 @@ fn the_start_window_is_the_next_block_and_the_span_the_terms_fix() {
 async fn a_start_signed_before_a_crash_is_the_start_that_is_resubmitted() {
     let fixture = paid_job().await;
     let signed = {
-        let Ok(mut provider) = fixture.service.endpoint() else {
-            panic!("the endpoint is reachable");
-        };
+        let provider = &fixture.service;
         match provider.prepare_close() {
             Ok(start) => start,
             Err(error) => panic!("a paid channel closes: {error}"),
@@ -2631,6 +2651,13 @@ async fn a_start_signed_before_a_crash_is_the_start_that_is_resubmitted() {
 /// nothing more than the contest already settles. The last is not a
 /// fault — it is the case where the one answer the window admits would
 /// buy nothing.
+///
+/// The endpoint here is the standalone one and not a [`WorkService`],
+/// because answering is not a service operation: the service has a
+/// journal and no sink, so it has nowhere to put an answer and no
+/// hand-off state to record what became of one. `ProviderEndpoint` owns
+/// source, sink and hand-off together, and is the only thing that may
+/// build these bytes.
 #[tokio::test]
 async fn the_provider_answers_an_understated_contest_exactly_once() {
     let fixture = paid_job().await;
@@ -2651,9 +2678,8 @@ async fn the_provider_answers_an_understated_contest_exactly_once() {
     };
     let id = contest_id(&ready, &understated, inclusion);
 
-    let Ok(mut provider) = fixture.service.endpoint() else {
-        panic!("the endpoint is reachable");
-    };
+    let mut watcher = restarted(fixture);
+    let provider = &mut watcher.provider;
     if let Err(error) = provider.observe_finalized(&block(
         inclusion,
         vec![hellas_kernel::Tx::move_action(
@@ -2751,6 +2777,113 @@ async fn the_provider_answers_an_understated_contest_exactly_once() {
     );
 }
 
+/// A block that opens a contest this endpoint may answer.
+fn understated_contest(ready: &ReadyChannel, inclusion: u64) -> (FinalizedWork, u64) {
+    let Ok(understated) = close_start(
+        ready.channel(),
+        hellas_kernel::Party::Maker,
+        CURSOR,
+        None,
+        &client(),
+    ) else {
+        panic!("a client opens a close");
+    };
+    let opened = block(
+        inclusion,
+        vec![hellas_kernel::Tx::move_action(
+            hellas_kernel::Move::StartPaymentClose(understated),
+        )],
+    );
+    (opened, inclusion + payment_terms().omit_response_blocks)
+}
+
+/// A caller stepping the cursor one block at a time is stopped at the
+/// duty, exactly where the service's own loop stops.
+///
+/// This is the composition the sealing is about. A one-block apply
+/// decides nothing about how far to read, so a caller that owns the
+/// `for` loop owns the reading — and what it can read past is a real
+/// deadline: once the cursor is at or beyond the response window,
+/// `answerable_contest` deliberately stops returning the duty, and the
+/// answer this endpoint could have given is never owed again. The stop
+/// belongs to the driver, so every loop over it inherits the stop.
+#[tokio::test]
+async fn a_loop_of_one_block_calls_cannot_step_past_a_duty() {
+    let fixture = paid_job().await;
+    let inclusion = CURSOR + 1;
+    let (opened, deadline) = understated_contest(&fixture.ready, inclusion);
+    let provider = &fixture.service;
+    if let Err(error) = observe_one(provider, &opened) {
+        panic!("the block that opens the contest applies: {error}");
+    }
+
+    // One block at a time, the way a caller holding a loop drives, all
+    // the way past the deadline it would otherwise cross.
+    for height in (inclusion + 1)..=(deadline + 1) {
+        let stepped = observe_one(provider, &block(height, Vec::new()));
+        assert!(
+            matches!(stepped, Err(CatchUpError::CloseDuty { height: at }) if at == inclusion),
+            "block {height} was stepped past the duty: {stepped:?}",
+        );
+    }
+    assert_eq!(
+        provider
+            .with_state(|state| state.cursor().0)
+            .expect("the endpoint is reachable"),
+        inclusion,
+        "the cursor is still on the block that opened the contest",
+    );
+    assert!(
+        provider
+            .with_state(|state| state.answerable_contest().is_some())
+            .expect("the endpoint is reachable"),
+        "and the answer is still owed rather than late",
+    );
+}
+
+/// A backlog whose *first* block opens a contest is read no further.
+///
+/// The restart case §5 names: ten thousand blocks behind, and the duty
+/// is in block one. A loop that read its advertised range to completion
+/// would discharge nothing until the tip, by which time the response
+/// window has shut. The source counts both its questions, so "no
+/// successor block is read" is a claim about reads and not about
+/// intentions.
+#[tokio::test]
+async fn a_backlog_stops_on_the_block_that_opened_the_contest() {
+    let fixture = paid_job().await;
+    let inclusion = CURSOR + 1;
+    let (opened, deadline) = understated_contest(&fixture.ready, inclusion);
+    let mut blocks = vec![opened];
+    blocks.extend(((inclusion + 1)..=(deadline + 5)).map(|height| block(height, Vec::new())));
+    let chain = CountingChain::over(blocks);
+
+    let caught = fixture.service.catch_up_job(&chain, fixture.id).await;
+    assert!(
+        matches!(caught, Err(CatchUpError::CloseDuty { height }) if height == inclusion),
+        "the backlog stopped on the duty rather than reading to its tip: {caught:?}",
+    );
+    assert_eq!(
+        chain.reads(),
+        2,
+        "the tip, then the one block that carried the duty, and nothing after it",
+    );
+    assert_eq!(
+        fixture
+            .service
+            .with_state(|state| state.cursor().0)
+            .expect("the endpoint is reachable"),
+        inclusion,
+    );
+    assert!(
+        fixture
+            .service
+            .with_state(|state| state.answerable_contest().is_some())
+            .expect("the endpoint is reachable"),
+        "and the duty is owed inside its window, not past it",
+    );
+}
+
 // ── The cutoff a finalized close is ───────────────────────────────────
 
 /// One job, run to a signed result and not yet released.
@@ -2809,32 +2942,37 @@ async fn a_finalized_close_start_takes_the_answer_off_the_wire() {
         hellas_kernel::Tx::move_action(hellas_kernel::Move::StartPaymentClose(understated));
 
     {
-        let Ok(mut provider) = fixture.service.endpoint() else {
-            panic!("the endpoint is reachable");
-        };
+        let provider = &fixture.service;
         assert_eq!(
-            provider.state().job().map(JobState::phase),
+            provider
+                .with_state(|state| state.job().map(JobState::phase))
+                .expect("the endpoint is reachable"),
             Some(JobPhase::Ready),
             "the answer exists and has not left",
         );
-        if let Err(error) = provider.observe_finalized(&block(inclusion, vec![start_tx])) {
+        if let Err(error) = observe_one(provider, &block(inclusion, vec![start_tx])) {
             panic!("the block applies: {error}");
         }
-        let state = provider.state();
-        assert_eq!(state.close_opened(), Some((contest, Party::Maker)));
+        let (opened, open_job, expired) = provider
+            .with_state(|state| {
+                (
+                    state.close_opened(),
+                    state.job().is_some(),
+                    matches!(
+                        state.terminal().map(|terminal| &terminal.outcome),
+                        Some(TerminalOutcome::Expired { .. }),
+                    ),
+                )
+            })
+            .expect("the endpoint is reachable");
+        assert_eq!(opened, Some((contest, Party::Maker)));
         assert!(
-            state.job().is_none(),
+            !open_job,
             "a job no payment can reach is not a job that is still open",
         );
         // And it rests at an expired terminal: the provider bears the
         // compute it spent on a job a close cut off.
-        assert!(
-            matches!(
-                state.terminal().map(|terminal| &terminal.outcome),
-                Some(TerminalOutcome::Expired { .. }),
-            ),
-            "the cut-off job rests at an expired terminal",
-        );
+        assert!(expired, "the cut-off job rests at an expired terminal");
     }
 
     // The delivery call the exploit ends with.
@@ -2855,9 +2993,7 @@ async fn a_finalized_close_start_takes_the_answer_off_the_wire() {
     // Nor is there a fresh job to take its place: this channel's one job
     // has reached its permanent terminal.
     let response = {
-        let Ok(mut provider) = fixture.service.endpoint() else {
-            panic!("the endpoint is reachable");
-        };
+        let provider = &fixture.service;
         provider.accept(&signed_request(NONCE, 1))
     };
     let Some(AcceptOutcome::Refused(refused)) = response.outcome else {
@@ -2878,10 +3014,10 @@ async fn a_finalized_close_start_takes_the_answer_off_the_wire() {
 async fn a_block_out_of_order_writes_nothing_before_it_is_refused() {
     let fixture = ready_job().await;
     let ready = fixture.ready.clone();
-    let Ok(mut provider) = fixture.service.endpoint() else {
-        panic!("the endpoint is reachable");
-    };
-    let before = provider.state().clone();
+    let provider = &fixture.service;
+    let before = provider
+        .with_state(|state| state.clone())
+        .expect("the endpoint is reachable");
 
     let Ok(understated) = close_start(ready.channel(), Party::Maker, CURSOR, None, &client())
     else {
@@ -2893,19 +3029,23 @@ async fn a_block_out_of_order_writes_nothing_before_it_is_refused() {
     // transition `observe` has would fire if it ran at all.
     let skipped = CURSOR + 2;
     assert!(skipped > deadlines().payment || CURSOR + 2 == skipped);
-    let applied = provider.observe_finalized(&block(skipped, vec![start_tx]));
+    let applied = observe_one(provider, &block(skipped, vec![start_tx]));
     assert!(
         matches!(
             applied,
-            Err(hellas_rpc::work_store::WorkStoreError::Channel(
-                hellas_rpc::work_store::ChannelStateError::CursorNotNext { held, actual }
+            Err(CatchUpError::Store(
+                hellas_rpc::work_store::WorkStoreError::Channel(
+                    hellas_rpc::work_store::ChannelStateError::CursorNotNext { held, actual }
+                )
             )) if held == CURSOR && actual == skipped
         ),
         "a skipped height is not this journal's next block: {applied:?}",
     );
     assert_eq!(
-        provider.state(),
-        &before,
+        provider
+            .with_state(|state| state.clone())
+            .expect("the endpoint is reachable"),
+        before,
         "and nothing the block claimed reached the disk",
     );
 }
@@ -3321,21 +3461,24 @@ async fn each_deadline_ends_its_own_job() {
 async fn a_local_ending_is_the_providers_own_failed_terminal() {
     let fixture = checked_job().await;
     let id = fixture.id;
-    let Ok(mut provider) = fixture.service.endpoint() else {
-        panic!("the endpoint is reachable");
-    };
+    let provider = &fixture.service;
     if let Err(error) = provider.end_run(id) {
         panic!("the local ending records: {error}");
     }
-    assert!(provider.state().job().is_none(), "the job is over");
+    let (open_job, failed) = provider
+        .with_state(|state| {
+            (
+                state.job().is_some(),
+                matches!(
+                    state.terminal().map(|terminal| &terminal.outcome),
+                    Some(TerminalOutcome::Failed { .. }),
+                ),
+            )
+        })
+        .expect("the endpoint is reachable");
+    assert!(!open_job, "the job is over");
     assert!(
-        matches!(
-            provider
-                .state()
-                .terminal()
-                .map(|terminal| &terminal.outcome),
-            Some(TerminalOutcome::Failed { .. }),
-        ),
+        failed,
         "a locally ended job rests at a failed terminal the provider bears",
     );
 }

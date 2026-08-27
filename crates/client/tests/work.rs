@@ -759,11 +759,10 @@ async fn a_checked_answer_is_the_only_thing_that_reaches_the_matched_phase() {
         "unexpected outcome: {again:?}",
     );
     {
-        let Ok(provider) = service.endpoint() else {
-            panic!("the endpoint is reachable");
-        };
         assert_eq!(
-            provider.state().job().map(JobState::phase),
+            service
+                .with_state(|state| state.job().map(JobState::phase))
+                .expect("the endpoint is reachable"),
             Some(JobPhase::Delivered),
             "the provider delivered the plaintext once",
         );
@@ -832,10 +831,9 @@ async fn a_checked_answer_becomes_a_payment_the_provider_admitted() {
     // The provider has the certificate and has let the job's credit go,
     // in that order and in one record.
     {
-        let Ok(provider) = service.endpoint() else {
-            panic!("the endpoint is reachable");
-        };
-        let state = provider.state();
+        let state = service
+            .with_state(|state| state.clone())
+            .expect("the endpoint is reachable");
         assert_eq!(state.ledger().credited_cumulative(), PRICE);
         assert_eq!(state.max_executable_certificate(), PRICE);
         assert!(state.job().is_none(), "the job is closed by its payment");
@@ -906,11 +904,10 @@ async fn a_payment_signed_before_a_crash_is_re_sent_after_it() {
     assert!(signed.is_ok(), "the client signs its payment: {signed:?}");
     drop(endpoint);
     {
-        let Ok(provider) = service.endpoint() else {
-            panic!("the endpoint is reachable");
-        };
         assert_eq!(
-            provider.state().ledger().credited_cumulative(),
+            service
+                .with_state(|state| state.ledger().credited_cumulative())
+                .expect("the endpoint is reachable"),
             0,
             "and the provider has seen nothing",
         );
@@ -925,11 +922,12 @@ async fn a_payment_signed_before_a_crash_is_re_sent_after_it() {
     let credited = pay_for_checked_result(transport, &mut endpoint, id).await;
     serving.abort();
     assert_eq!(credited.ok(), Some(PRICE));
-
-    let Ok(provider) = service.endpoint() else {
-        panic!("the endpoint is reachable");
-    };
-    assert_eq!(provider.state().ledger().credited_cumulative(), PRICE);
+    assert_eq!(
+        service
+            .with_state(|state| state.ledger().credited_cumulative())
+            .expect("the endpoint is reachable"),
+        PRICE,
+    );
 }
 
 /// A refuted answer closes the job at a permanent refuted terminal and
@@ -1010,10 +1008,12 @@ async fn a_refuted_answer_closes_the_job_and_is_not_paid_for() {
         "and nothing was signed",
     );
     {
-        let Ok(provider) = service.endpoint() else {
-            panic!("the endpoint is reachable");
-        };
-        assert_eq!(provider.state().ledger().credited_cumulative(), 0);
+        assert_eq!(
+            service
+                .with_state(|state| state.ledger().credited_cumulative())
+                .expect("the endpoint is reachable"),
+            0,
+        );
     }
 }
 

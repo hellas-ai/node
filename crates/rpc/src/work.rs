@@ -117,7 +117,7 @@
 //! What neither endpoint does here is wait. `advance_close` is one
 //! step, and the caller that owns a clock is the one that repeats it.
 
-use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use hellas_kernel::{
@@ -147,8 +147,8 @@ use crate::protocol::work_setup::{ObservedChannel, ReadyChannel, WorkSetupError}
 use crate::services::work::{WorkClientImpl, WorkHandler};
 use crate::work_close::{
     CatchUpError, CloseError, CloseProgress, FinalizedBlocks, FinalizedWork, TxSink,
-    adjudicated_close, advance_close, catch_up, close_response, close_start, observe,
-    response_body_digest,
+    adjudicated_close, advance_close, catch_up, close_duty_present, close_response, close_start,
+    observe, response_body_digest,
 };
 use crate::work_store::channel::encode_kernel;
 use crate::work_store::journal::MAX_RECORD_BYTES;
@@ -1436,10 +1436,7 @@ pub async fn run_accepted_work<B>(
 where
     B: PaidEvaluateBackend + Sync,
 {
-    let admission = {
-        let mut endpoint = service.endpoint()?;
-        endpoint.begin_run(work_id, ready)?
-    };
+    let admission = service.begin_run(work_id, ready)?;
     let request = match admission {
         RunAdmission::Invoke(request) => request,
         RunAdmission::Running => return Ok(RunOutcome::Running),
@@ -1454,10 +1451,7 @@ where
         Err(fault) => return Err(end_failed(service, work_id, RunError::Backend(fault))),
     };
 
-    let recorded = {
-        let mut endpoint = service.endpoint_wait()?;
-        endpoint.record_result(work_id, &transcript)
-    };
+    let recorded = service.record_result(work_id, &transcript);
     match recorded {
         Ok((result, signature)) => Ok(RunOutcome::Completed { result, signature }),
         // A transcript that is not this job's, and a result the signed
@@ -1694,11 +1688,7 @@ fn admit_request(payment: &PaidCertificate) -> AdmitCertificateRequest {
 /// Ends the job as failed, and returns `fault` if that ending was
 /// recorded.
 fn end_failed(service: &WorkService, work_id: Digest, fault: RunError) -> RunError {
-    let mut endpoint = match service.endpoint_wait() {
-        Ok(endpoint) => endpoint,
-        Err(error) => return RunError::Endpoint(error),
-    };
-    match endpoint.end_run(work_id) {
+    match service.end_run(work_id) {
         Ok(()) => fault,
         Err(error) => error,
     }
@@ -1717,20 +1707,143 @@ fn end_failed(service: &WorkService, work_id: Digest, fault: RunError) -> RunErr
 #[derive(Clone, Debug)]
 pub struct WorkService {
     endpoint: Arc<Mutex<ProviderEndpoint>>,
-    catch_up_jobs: Arc<Mutex<BTreeSet<Digest>>>,
+    driving: Arc<AtomicBool>,
 }
 
-/// RAII ownership of one job's bounded catch-up waiter.
+/// The authority to advance this channel's cursor, and the only thing
+/// that has it.
+///
+/// Positive rather than absent: driving is not "whatever a caller can
+/// still reach", it is this handle, and there is one of it. The
+/// ownership is the *channel's*, not a job's, because the cursor is the
+/// channel's — a driver naming some other digest is not a second
+/// channel, it is a second driver of this one, and
+/// [`WorkService::drive`] refuses it whatever it names.
+///
+/// Every read it does obeys §5's stop-before-successor rule, including
+/// the one-block [`Self::observe_finalized`]: a caller stepping the
+/// cursor by hand is stopped at exactly the block a loop would stop at,
+/// so the rule holds on every path rather than on the path a caller
+/// chose.
+///
+/// Known bound: the slot is returned by [`Drop`], which covers success,
+/// error, unwind and a dropped future, but a safe
+/// `std::mem::forget(driver)` leaks the handle and leaves the slot taken
+/// for the life of the process. Every later [`WorkService::drive`] then
+/// answers [`EndpointError::CatchingUp`]. That is a local denial of
+/// service a caller can only do to itself, and it fails closed — no
+/// cursor moves, and no second driver of this channel appears.
 #[derive(Debug)]
-pub struct JobCatchUpGuard {
-    held: Arc<Mutex<BTreeSet<Digest>>>,
-    work_id: Digest,
+pub struct ChannelDriver<'a> {
+    service: &'a WorkService,
 }
 
-impl Drop for JobCatchUpGuard {
+impl Drop for ChannelDriver<'_> {
     fn drop(&mut self) {
-        if let Ok(mut held) = self.held.lock() {
-            held.remove(&self.work_id);
+        self.service.driving.store(false, Ordering::Release);
+    }
+}
+
+impl ChannelDriver<'_> {
+    /// Refuses the read while this channel owes a close duty, and
+    /// returns the cursor otherwise.
+    ///
+    /// No hand-off is consulted, because this service owns none: it has
+    /// no sink, so it has no answer anyone took, so nothing here excuses
+    /// the stop. That is the fail-closed half of the no-runner gap —
+    /// [`ProviderEndpoint::advance_close`] is what may read past a duty,
+    /// because it is what discharged it.
+    fn readable_cursor(&self, state: &ChannelState) -> Result<u64, CatchUpError> {
+        let (height, _) = state.cursor();
+        if close_duty_present(state, None) {
+            return Err(CatchUpError::CloseDuty { height });
+        }
+        Ok(height)
+    }
+
+    /// Applies exactly one finalized block, under one brief borrow, and
+    /// only while no close duty is outstanding.
+    ///
+    /// # Errors
+    ///
+    /// [`CatchUpError::CloseDuty`] when a close duty stops the read,
+    /// [`CatchUpError::Busy`] when the endpoint is unreachable, and
+    /// [`CatchUpError::Store`] when the block is not the contiguous next
+    /// one or a transition it carries is refused.
+    pub fn observe_finalized(&mut self, block: &FinalizedWork) -> Result<(), CatchUpError> {
+        let mut endpoint = self.service.endpoint().map_err(|_| CatchUpError::Busy)?;
+        self.readable_cursor(endpoint.state())?;
+        endpoint.observe_finalized(block)?;
+        Ok(())
+    }
+
+    /// Reads contiguously to the tip, stopping on the first block that
+    /// creates a duty.
+    ///
+    /// The entry check comes before [`FinalizedBlocks::latest_height`] is
+    /// even called, which is the case a restart is: a duty already on the
+    /// disk is refused before one successor block is read, so a backlog
+    /// longer than the response window cannot be what loses it.
+    ///
+    /// The endpoint is borrowed for each apply and dropped again, never
+    /// held across the source await, so the request path does not queue
+    /// behind a slow chain.
+    ///
+    /// # Errors
+    ///
+    /// [`CatchUpError`] when a duty stops the read, the source fails, a
+    /// block in range cannot be read, or the journal refuses one.
+    pub async fn catch_up<S: FinalizedBlocks + ?Sized>(
+        &mut self,
+        source: &S,
+    ) -> Result<u64, CatchUpError> {
+        let mut cursor = self.cursor()?;
+        let Some(latest) = source.latest_height().await? else {
+            return Ok(cursor);
+        };
+        while cursor < latest {
+            let next = cursor.saturating_add(1);
+            let block = source
+                .block_at(next)
+                .await?
+                .ok_or(CatchUpError::Missing { height: next })?;
+            self.observe_finalized(&block)?;
+            cursor = self.cursor()?;
+        }
+        Ok(cursor)
+    }
+
+    /// The cursor this driver may read on from, or the duty that stops
+    /// it.
+    fn cursor(&self) -> Result<u64, CatchUpError> {
+        let endpoint = self.service.endpoint().map_err(|_| CatchUpError::Busy)?;
+        self.readable_cursor(endpoint.state())
+    }
+
+    /// Refuses a driver that named a job this channel's journal does not
+    /// hold.
+    ///
+    /// The open job and the permanent terminal both name it, and either
+    /// one contradicts a stranger: ending a job clears the open one but
+    /// keeps the terminal, so a check that read only the open job would
+    /// stop refusing the moment the job was certified, expired, failed
+    /// or refuted.
+    ///
+    /// A channel that has neither holds no job to contradict, which is
+    /// the acceptance phase boundary's own case: the digest being caught
+    /// up for is the proposal's, and the journal learns it from the
+    /// acceptance this read precedes.
+    fn for_job(&self, work_id: Digest) -> Result<(), CatchUpError> {
+        let endpoint = self.service.endpoint().map_err(|_| CatchUpError::Busy)?;
+        let state = endpoint.state();
+        let held = state
+            .job()
+            .map(JobState::work_id)
+            .or_else(|| state.terminal().map(|terminal| terminal.work_id));
+        match held {
+            None => Ok(()),
+            Some(held) if held == work_id => Ok(()),
+            Some(_) => Err(CatchUpError::OtherJob),
         }
     }
 }
@@ -1741,80 +1854,123 @@ impl WorkService {
     pub fn new(endpoint: ProviderEndpoint) -> Self {
         Self {
             endpoint: Arc::new(Mutex::new(endpoint)),
-            catch_up_jobs: Arc::new(Mutex::new(BTreeSet::new())),
+            driving: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    /// Borrows the endpoint.
+    /// Borrows the endpoint, privately.
+    ///
+    /// Private, and that is only half of the discipline. The other half
+    /// is positive: everything that advances this channel's cursor goes
+    /// through [`ChannelDriver`], and [`Self::drive`] hands out one of
+    /// those at a time. So there is no borrow to hold across a chain or
+    /// sink wait, no way to read on to the tip past a duty, and no
+    /// second copy of a duty another driver already took — by the shape
+    /// of the type, rather than by callers remembering to behave.
     ///
     /// # Errors
     ///
     /// [`EndpointError::Poisoned`] after a handler panicked while
     /// holding it. The state is not recovered, because a panic mid-
     /// commit is a bug whose durable effect this type cannot know.
-    pub fn endpoint(&self) -> Result<MutexGuard<'_, ProviderEndpoint>, EndpointError> {
+    fn endpoint(&self) -> Result<MutexGuard<'_, ProviderEndpoint>, EndpointError> {
         self.endpoint.lock().map_err(|_| EndpointError::Poisoned)
     }
 
-    fn endpoint_wait(&self) -> Result<MutexGuard<'_, ProviderEndpoint>, EndpointError> {
-        self.endpoint.lock().map_err(|_| EndpointError::Poisoned)
+    /// Reads what this endpoint durably knows, for exactly as long as
+    /// `read` runs.
+    ///
+    /// The state is lent, not handed over. `read` is synchronous, so
+    /// nothing can wait on a chain or a sink while this channel's
+    /// journal is borrowed, and it is handed a shared reference, so a
+    /// reader cannot become a driver.
+    ///
+    /// # Errors
+    ///
+    /// [`EndpointError::Poisoned`], as [`Self::endpoint`] documents.
+    pub fn with_state<R>(&self, read: impl FnOnce(&ChannelState) -> R) -> Result<R, EndpointError> {
+        Ok(read(self.endpoint()?.state()))
     }
 
-    /// Acquires the one bounded catch-up slot for `work_id`. Ordinary brief
-    /// journal operations do not contend on this guard, so a completed
-    /// backend transcript waits for the endpoint lock and is never dropped
-    /// merely because an unrelated watcher poll is running.
-    pub fn begin_job_catch_up(&self, work_id: Digest) -> Result<JobCatchUpGuard, EndpointError> {
-        let mut held = self
-            .catch_up_jobs
-            .lock()
-            .map_err(|_| EndpointError::Poisoned)?;
-        if !held.insert(work_id) {
-            return Err(EndpointError::CatchingUp);
-        }
-        Ok(JobCatchUpGuard {
-            held: Arc::clone(&self.catch_up_jobs),
-            work_id,
-        })
+    /// Takes this channel's one cursor-driving authority, or says it is
+    /// already taken.
+    ///
+    /// Channel-wide and service-owned: the slot is this service's own
+    /// flag, so no caller-supplied name buys a second one. Ordinary brief
+    /// journal operations do not contend on it, so a completed backend
+    /// transcript waits for the endpoint lock and is never dropped merely
+    /// because a watcher poll is running.
+    ///
+    /// # Errors
+    ///
+    /// [`EndpointError::CatchingUp`] while a driver is live.
+    pub fn drive(&self) -> Result<ChannelDriver<'_>, EndpointError> {
+        self.driving
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| EndpointError::CatchingUp)?;
+        Ok(ChannelDriver { service: self })
     }
 
-    /// Advances one job's cursor without holding the endpoint across a
-    /// chain await. A second catch-up is refused per job; proposal handlers
-    /// and completed backend transcripts use only the brief endpoint lock.
+    /// Advances this channel's cursor for `work_id`, without holding the
+    /// endpoint across a chain await.
+    ///
+    /// `work_id` is checked against the job this journal holds rather
+    /// than trusted: it names which job the read is *for*, and a caller
+    /// naming another one is refused instead of being given a drive of
+    /// its own.
+    ///
+    /// # Errors
+    ///
+    /// [`CatchUpError::Busy`] while another driver owns this channel,
+    /// [`CatchUpError::OtherJob`] when the journal's job is not the one
+    /// named, and whatever [`ChannelDriver::catch_up`] raises otherwise.
     pub async fn catch_up_job<S: FinalizedBlocks + ?Sized>(
         &self,
         source: &S,
         work_id: Digest,
     ) -> Result<u64, CatchUpError> {
-        let _guard = self
-            .begin_job_catch_up(work_id)
-            .map_err(|_| CatchUpError::Busy)?;
-        let Some(latest) = source.latest_height().await? else {
-            return self
-                .endpoint_wait()
-                .map(|endpoint| endpoint.state().cursor().0)
-                .map_err(|_| CatchUpError::Busy);
-        };
-        loop {
-            let next = self
-                .endpoint_wait()
-                .map_err(|_| CatchUpError::Busy)?
-                .state()
-                .cursor()
-                .0
-                .saturating_add(1);
-            if next > latest {
-                return Ok(next.saturating_sub(1));
-            }
-            let block = source
-                .block_at(next)
-                .await?
-                .ok_or(CatchUpError::Missing { height: next })?;
-            self.endpoint_wait()
-                .map_err(|_| CatchUpError::Busy)?
-                .observe_finalized(&block)?;
-        }
+        let mut driver = self.drive().map_err(|_| CatchUpError::Busy)?;
+        driver.for_job(work_id)?;
+        driver.catch_up(source).await
     }
+
+    /// Signs, or returns, this channel's retained close start.
+    ///
+    /// # Errors
+    ///
+    /// [`CloseError::Endpoint`] when the endpoint is unreachable, and
+    /// whatever [`ProviderEndpoint::prepare_close`] raises otherwise.
+    pub fn prepare_close(&self) -> Result<PaymentCloseStart, CloseError> {
+        self.endpoint()?.prepare_close()
+    }
+
+    /// Builds the close that ends this endpoint's contest, from one
+    /// coherent finalized read.
+    ///
+    /// # Errors
+    ///
+    /// [`CloseError::Endpoint`] when the endpoint is unreachable, and
+    /// whatever [`ProviderEndpoint::adjudicated_close`] raises otherwise.
+    pub fn adjudicated_close(&self, observed: &ObservedChannel<'_>) -> Result<Tx, CloseError> {
+        self.endpoint()?.adjudicated_close(observed)
+    }
+
+    // There is deliberately no `respond_to_close` here.
+    //
+    // An answer to a contest is not bytes, it is a sequence: read to the
+    // block that opened it, fix the answer on the disk, offer it to a
+    // sink, and let what the sink did decide whether the cursor may move
+    // past the duty. Nothing this service owns owns that sequence — it
+    // has a journal and no sink — so a service method returning the
+    // transaction would be handing out a submittable duty that no
+    // hand-off state accounts for, and two callers could take the same
+    // one. [`ProviderEndpoint::advance_close`] owns source, sink and
+    // hand-off together, and is the only operation that couples the
+    // three. A caller holding the endpoint itself can still build a
+    // response with [`ProviderEndpoint::respond_to_close`] — that is not
+    // the claim here; the claim is that *this service* has no such
+    // operation, so nothing reachable from a clone of it hands out a
+    // submittable answer.
 
     /// Workflow phase boundary for provider acceptance: catch up with short
     /// borrows, reacquire by this channel service, then let the durable
@@ -1825,7 +1981,7 @@ impl WorkService {
         request: &AcceptWorkRequest,
     ) -> Result<AcceptWorkResponse, CatchUpError> {
         let work_id = {
-            let endpoint = self.endpoint_wait().map_err(|_| CatchUpError::Busy)?;
+            let endpoint = self.endpoint().map_err(|_| CatchUpError::Busy)?;
             PaidJobAuthorizationV1::decode(&request.authorization)
                 .ok()
                 .map(|authorization| work_id(endpoint.ready.channel(), &authorization))
@@ -1833,7 +1989,7 @@ impl WorkService {
         if let Some(work_id) = work_id {
             self.catch_up_job(source, work_id).await?;
         }
-        Ok(self.answer(request))
+        Ok(self.accept(request))
     }
 
     /// Answers one proposal, or says the endpoint is unreachable.
@@ -1841,7 +1997,7 @@ impl WorkService {
     /// Synchronous, and that is the whole of why the lock above is a
     /// plain [`Mutex`]: nothing between taking it and dropping it can
     /// await.
-    fn answer(&self, request: &AcceptWorkRequest) -> AcceptWorkResponse {
+    pub fn accept(&self, request: &AcceptWorkRequest) -> AcceptWorkResponse {
         match self.endpoint() {
             Ok(mut endpoint) => endpoint.accept(request),
             Err(error) => AcceptWorkResponse {
@@ -1851,6 +2007,67 @@ impl WorkService {
                 })),
             },
         }
+    }
+
+    /// Admits one accepted job for a real invocation, and journals the
+    /// running marker before it says so.
+    ///
+    /// # Errors
+    ///
+    /// [`RunError::Endpoint`] when the endpoint is unreachable, and
+    /// whatever [`ProviderEndpoint::begin_run`] raises otherwise.
+    pub fn begin_run(
+        &self,
+        work_id: Digest,
+        ready: &ReadyChannel,
+    ) -> Result<RunAdmission, RunError> {
+        self.endpoint()?.begin_run(work_id, ready)
+    }
+
+    /// Signs and journals the result of one invocation's transcript.
+    ///
+    /// # Errors
+    ///
+    /// [`RunError::Endpoint`] when the endpoint is unreachable, and
+    /// whatever [`ProviderEndpoint::record_result`] raises otherwise.
+    pub fn record_result(
+        &self,
+        work_id: Digest,
+        transcript: &[OutputEventEnvelope],
+    ) -> Result<(PaidJobResultV1, Sig), RunError> {
+        self.endpoint()?.record_result(work_id, transcript)
+    }
+
+    /// Ends the open job as this provider's own failure.
+    ///
+    /// # Errors
+    ///
+    /// [`RunError::Endpoint`] when the endpoint is unreachable, and
+    /// whatever [`ProviderEndpoint::end_run`] raises otherwise.
+    pub fn end_run(&self, work_id: Digest) -> Result<(), RunError> {
+        self.endpoint()?.end_run(work_id)
+    }
+
+    /// Releases one job's plaintext against this service's own
+    /// readiness, to a request bound to `exporter`.
+    ///
+    /// The readiness is not a parameter, and that is deliberate: it is
+    /// the endpoint's own, at the height this endpoint has actually
+    /// processed finalized blocks through. A caller choosing one would
+    /// be choosing the margins its own delivery is measured against.
+    ///
+    /// # Errors
+    ///
+    /// [`DeliverError::Endpoint`] when the endpoint is unreachable, and
+    /// whatever [`ProviderEndpoint::deliver`] raises otherwise.
+    pub fn deliver(
+        &self,
+        request: &DeliverResultRequest,
+        exporter: &[u8; 32],
+    ) -> Result<Delivery, DeliverError> {
+        let mut endpoint = self.endpoint()?;
+        let ready = endpoint.ready.clone();
+        endpoint.deliver(request, &ready, exporter)
     }
 
     /// Releases one job's answer, or says why not.
@@ -1935,7 +2152,7 @@ impl WorkHandler for WorkService {
     ) -> impl core::future::Future<
         Output = Result<impl Into<crate::call::WithTrailer<AcceptWorkResponse>> + Send, WireStatus>,
     > + Send {
-        core::future::ready(Ok(self.answer(&request)))
+        core::future::ready(Ok(self.accept(&request)))
     }
 
     fn deliver_result(

@@ -559,8 +559,8 @@ impl PaidEvaluateBackend for CountingBackend {
 // ── Reading answers ───────────────────────────────────────────────────
 
 fn phase_of(service: &WorkService) -> Option<JobPhase> {
-    match service.endpoint() {
-        Ok(endpoint) => endpoint.state().job().map(JobState::phase),
+    match service.with_state(|state| state.job().map(JobState::phase)) {
+        Ok(phase) => phase,
         Err(error) => panic!("the endpoint is reachable: {error}"),
     }
 }
@@ -858,10 +858,7 @@ async fn a_marker_a_process_did_not_come_back_from_is_indeterminate() {
 
     // Nor may a result be recorded for it, however well formed.
     let transcript = answer_transcript(&evaluate_request(1));
-    let Ok(mut endpoint) = service.endpoint() else {
-        panic!("the endpoint is reachable");
-    };
-    let refused = endpoint.record_result(id, &transcript);
+    let refused = service.record_result(id, &transcript);
     assert!(
         matches!(
             refused,
@@ -878,13 +875,10 @@ async fn a_marker_a_process_did_not_come_back_from_is_indeterminate() {
     let mut store = store_at(other.path(), CURSOR);
     let id = accept(&mut store, 1);
     let service = serving(store);
-    let Ok(mut endpoint) = service.endpoint() else {
-        panic!("the endpoint is reachable");
-    };
-    let RunAdmission::Invoke(_) = expect_admission(endpoint.begin_run(id, &ready())) else {
+    let RunAdmission::Invoke(_) = expect_admission(service.begin_run(id, &ready())) else {
         panic!("an accepted job may run");
     };
-    if let Err(error) = endpoint.record_result(id, &transcript) {
+    if let Err(error) = service.record_result(id, &transcript) {
         panic!("this process's own invocation records: {error}");
     }
 }
@@ -1094,18 +1088,20 @@ async fn a_backend_fault_is_not_the_clients_debt() {
     assert!(fault.to_string().contains("the weights did not load"));
     assert_eq!(backend.calls(), 1);
 
-    let Ok(endpoint) = service.endpoint() else {
-        panic!("the endpoint is reachable");
-    };
-    assert!(endpoint.state().job().is_none(), "the job was ended");
+    let (open_job, failed) = service
+        .with_state(|state| {
+            (
+                state.job().is_some(),
+                matches!(
+                    state.terminal().map(|terminal| &terminal.outcome),
+                    Some(TerminalOutcome::Failed { .. })
+                ),
+            )
+        })
+        .expect("the endpoint is reachable");
+    assert!(!open_job, "the job was ended");
     assert!(
-        matches!(
-            endpoint
-                .state()
-                .terminal()
-                .map(|terminal| &terminal.outcome),
-            Some(TerminalOutcome::Failed { .. })
-        ),
+        failed,
         "the job rests at a failed terminal the provider bears itself",
     );
 }
@@ -1127,13 +1123,14 @@ async fn a_backend_that_answers_the_wrong_question_signs_nothing() {
         );
         assert_eq!(backend.calls(), 1);
 
-        let Ok(endpoint) = service.endpoint() else {
-            panic!("the endpoint is reachable");
-        };
-        assert!(endpoint.state().job().is_none(), "the job was ended");
+        assert!(
+            service
+                .with_state(|state| state.job().is_none())
+                .expect("the endpoint is reachable"),
+            "the job was ended",
+        );
 
         // Nothing was signed: reopening finds no result on the disk.
-        drop(endpoint);
         drop(service);
         let recovered = store_at(dir.path(), CURSOR);
         assert!(recovered.state().job().is_none());
