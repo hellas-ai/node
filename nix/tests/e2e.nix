@@ -226,7 +226,7 @@ let
       machine.succeed(
           f"HOME=${homePrefix}/validator-home {cli} chain validator config "
           "-n 1 --seed ${toString validatorSeed} --start-port ${toString startPort} "
-          "--ws-bind 127.0.0.1:${toString chainRpcPort} "
+          "--light-client-bind 127.0.0.1:${toString chainRpcPort} "
           "--metrics-port ${toString metricsPort} ${allocationArgs} "
           "> ${homePrefix}/validator.toml"
       )

@@ -13,7 +13,7 @@ use crate::{
     init_block_store, init_finalization_store,
     relay::{authenticated_relay_request, serve_light_client_relay},
     rpc::LocalLightClient,
-    utxo_db_config,
+    spawn_light_client_server, utxo_db_config,
 };
 use commonware_broadcast::buffered;
 use commonware_codec::{DecodeExt, Encode};
@@ -125,6 +125,8 @@ pub enum ValidatorError {
     NonUtf8StorageDirectory(PathBuf),
     #[error("failed to replay owner index: {0}")]
     OwnerIndex(String),
+    #[error("failed to bind light-client server at {addr}: {source}")]
+    LightClientBind { addr: SocketAddr, source: io::Error },
     #[error("invalid relay configuration")]
     Relay(#[from] crate::relay::RelayConnectError),
 }
@@ -151,6 +153,7 @@ pub enum Command {
         addresses: Option<Vec<String>>,
         relay_urls: Vec<String>,
         metrics_port: Option<u16>,
+        light_client_bind: Option<SocketAddr>,
         genesis: Option<PathBuf>,
         genesis_allocations: Vec<String>,
     },
@@ -195,6 +198,7 @@ pub fn run_command(command: Command) -> Result<(), ValidatorError> {
             addresses,
             relay_urls,
             metrics_port,
+            light_client_bind,
             genesis,
             genesis_allocations,
         } => setup(SetupArgs {
@@ -205,6 +209,7 @@ pub fn run_command(command: Command) -> Result<(), ValidatorError> {
             addresses,
             relay_urls,
             metrics_port,
+            light_client_bind,
             genesis,
             genesis_allocations,
         }),
@@ -221,6 +226,7 @@ struct SetupArgs {
     addresses: Option<Vec<String>>,
     relay_urls: Vec<String>,
     metrics_port: Option<u16>,
+    light_client_bind: Option<SocketAddr>,
     genesis: Option<PathBuf>,
     genesis_allocations: Vec<String>,
 }
@@ -368,6 +374,7 @@ fn generate_network(args: GenerateNetworkArgs) -> Result<(), ValidatorError> {
             threshold_polynomial: encode_threshold_polynomial(&threshold_polynomial),
             listen_port: start_port + index as u16,
             metrics_port: Some(metrics_base_port + index as u16),
+            light_client_bind: None,
             relay_urls: relay_urls.clone(),
             genesis: genesis.clone(),
             peers,
@@ -395,6 +402,7 @@ fn setup(args: SetupArgs) -> Result<(), ValidatorError> {
         addresses,
         relay_urls,
         metrics_port,
+        light_client_bind,
         genesis,
         genesis_allocations,
     } = args;
@@ -503,6 +511,7 @@ fn setup(args: SetupArgs) -> Result<(), ValidatorError> {
         threshold_polynomial: encode_threshold_polynomial(&threshold_polynomial),
         listen_port: start_port + validator as u16,
         metrics_port: Some(metrics_port.unwrap_or(9090 + validator as u16)),
+        light_client_bind,
         relay_urls,
         genesis,
         peers,
@@ -787,6 +796,7 @@ enum ShutdownTrigger {
     Signal(&'static str),
     NetworkExited,
     EngineExited,
+    LightClientServerExited,
     RelayExited,
 }
 
@@ -1227,6 +1237,22 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
             consensus_info.clone(),
         );
         let light_client_rpc_state = LightClientRpcState::default();
+        let light_client_server_handle = if let Some(addr) = validator_config.light_client_bind {
+            Some(
+                spawn_light_client_server(
+                    addr,
+                    light_client.clone(),
+                    activity_tx.clone(),
+                    light_client_rpc_state.clone(),
+                )
+                .await
+                .unwrap_or_else(|source| {
+                    panic!("{}", ValidatorError::LightClientBind { addr, source })
+                }),
+            )
+        } else {
+            None
+        };
         let relay_handles: Vec<_> = validator_config
             .relay_urls
             .iter()
@@ -1291,6 +1317,11 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
         let qmdb_resolver_waiter = qmdb_resolver_handle
             .map(|_| ShutdownTrigger::EngineExited)
             .boxed();
+        let light_client_server_waiter = light_client_server_handle.map(|handle| {
+            handle
+                .map(|_| ShutdownTrigger::LightClientServerExited)
+                .boxed()
+        });
         let mut waiters = vec![
             signal_waiter,
             network_waiter,
@@ -1300,6 +1331,9 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
             stateful_waiter,
             qmdb_resolver_waiter,
         ];
+        if let Some(waiter) = light_client_server_waiter {
+            waiters.push(waiter);
+        }
         waiters.extend(
             relay_handles
                 .into_iter()
@@ -1318,6 +1352,9 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
             }
             ShutdownTrigger::EngineExited => {
                 warn!("engine task exited unexpectedly; triggering shutdown");
+            }
+            ShutdownTrigger::LightClientServerExited => {
+                warn!("light-client server exited unexpectedly; triggering shutdown");
             }
             ShutdownTrigger::RelayExited => {
                 warn!("relay task exited unexpectedly; triggering shutdown");

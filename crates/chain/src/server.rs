@@ -139,12 +139,12 @@ pub async fn spawn_light_client_server<T>(
     addr: SocketAddr,
     client: T,
     activity_tx: broadcast::Sender<ConsensusActivity>,
+    state: LightClientRpcState,
 ) -> io::Result<JoinHandle<()>>
 where
     T: LightClientApi + FinalizedWorkView,
 {
     let listener = TcpListener::bind(addr).await?;
-    let state = LightClientRpcState::default();
     Ok(tokio::spawn(async move {
         info!(%addr, "light client rpc server started");
         loop {
@@ -1288,7 +1288,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn two_transports_share_response_and_anonymous_general_bounds() {
+    async fn bound_and_relay_transports_answer_from_one_node_state() {
         let state = LightClientRpcState::default();
         let blocker = Arc::new(ResponseBlocker::default());
         let client = MempoolClient {
@@ -1297,18 +1297,35 @@ mod tests {
         };
         let forced_submit_outcome = client.forced_submit_outcome.clone();
         let (activity_tx, _activity_rx) = broadcast::channel(1);
-        let (client_transport_a, server_transport_a) = transport_pair();
-        let (client_transport_b, server_transport_b) = transport_pair();
-        let server_a = tokio::spawn(serve_light_client_transport(
-            server_transport_a,
-            LightClientRpc::with_state(client.clone(), activity_tx.clone(), state.clone()),
-        ));
-        let server_b = tokio::spawn(serve_light_client_transport(
-            server_transport_b,
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+        let bound_server =
+            spawn_light_client_server(addr, client.clone(), activity_tx.clone(), state.clone())
+                .await
+                .unwrap();
+        let bound_transport = hellas_wire::ws::connect(&format!("ws://{addr}"))
+            .await
+            .unwrap();
+
+        // This pair has the direction of an outbound relay connection: the
+        // relay owns the client-role half and opens calls toward the node's
+        // server-role half.
+        let (relay_transport, node_transport) = transport_pair();
+        let relay_server = tokio::spawn(serve_light_client_transport(
+            node_transport,
             LightClientRpc::with_state(client, activity_tx, state),
         ));
-        let wire_a = LightClientClientImpl::new(client_transport_a);
-        let wire_b = LightClientClientImpl::new(client_transport_b);
+        let wire_a = LightClientClientImpl::new(bound_transport);
+        let wire_b = LightClientClientImpl::new(relay_transport);
+
+        for wire in [&wire_a, &wire_b] {
+            let validators = wire
+                .get_validators(pb::GetValidatorsRequest {})
+                .await
+                .expect("both transports answer a real light-client request");
+            assert_eq!(validators.validators, ["validator-a"]);
+        }
 
         let response_request = synthetic_response_request();
         let mut held = Vec::new();
@@ -1378,8 +1395,8 @@ mod tests {
             Ok(ProtoSubmitTxOutcome::ValidationRejected),
         );
 
-        server_a.abort();
-        server_b.abort();
+        bound_server.abort();
+        relay_server.abort();
     }
 
     #[cfg(feature = "client")]
@@ -1392,9 +1409,14 @@ mod tests {
         drop(probe);
 
         let (activity_tx, _activity_rx) = broadcast::channel(8);
-        let server = spawn_light_client_server(addr, MempoolClient::default(), activity_tx)
-            .await
-            .unwrap();
+        let server = spawn_light_client_server(
+            addr,
+            MempoolClient::default(),
+            activity_tx,
+            LightClientRpcState::default(),
+        )
+        .await
+        .unwrap();
         let client = RemoteLightClient::connect(format!("ws://{addr}"))
             .await
             .unwrap();

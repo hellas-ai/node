@@ -192,10 +192,14 @@ async fn paid_block_source_rejects_history_signed_by_another_threshold() {
     let addr = probe.local_addr().expect("probe address");
     drop(probe);
     let (activity_tx, _activity_rx) = tokio::sync::broadcast::channel(1);
-    let server =
-        hellas_chain::spawn_light_client_server(addr, FinalizedHistory(snapshot), activity_tx)
-            .await
-            .expect("serve fabricated history");
+    let server = hellas_chain::spawn_light_client_server(
+        addr,
+        FinalizedHistory(snapshot),
+        activity_tx,
+        hellas_chain::LightClientRpcState::default(),
+    )
+    .await
+    .expect("serve fabricated history");
     let verifier = ConsensusVerifier::new(&configured.info).expect("configured threshold identity");
     let client = VerifiedRemoteLightClient::connect(format!("ws://{addr}"), verifier)
         .await

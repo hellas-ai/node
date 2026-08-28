@@ -260,6 +260,7 @@ fn genesis_allocations(genesis: Genesis) -> Vec<(SettlementKey, u64)> {
         threshold_polynomial: String::new(),
         listen_port: 0,
         metrics_port: None,
+        light_client_bind: None,
         relay_urls: Vec::new(),
         genesis,
         peers: Vec::new(),

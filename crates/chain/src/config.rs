@@ -124,6 +124,19 @@ pub struct ValidatorConfig {
     pub listen_port: u16,
     #[serde(default)]
     pub metrics_port: Option<u16>,
+    /// Address for a direct light-client RPC listener. Absent means no
+    /// inbound light-client socket is opened; `relay_urls` configures
+    /// serving through a relay separately, and both may be on at once —
+    /// they are one service on two transports.
+    ///
+    /// A `SocketAddr`, so the address is parsed before anything decides
+    /// from it and no host is ever matched by spelling. The gateway bind
+    /// refuses anything but loopback because its routes reach the
+    /// executor; this listener answers exactly the light-client service a
+    /// relay already publishes on the node's behalf, so an exposed
+    /// address is the operator's to ask for.
+    #[serde(default)]
+    pub light_client_bind: Option<SocketAddr>,
     #[serde(default)]
     pub relay_urls: Vec<String>,
     pub genesis: Genesis,
@@ -324,6 +337,7 @@ mod tests {
             threshold_polynomial: String::new(),
             listen_port: 0,
             metrics_port: None,
+            light_client_bind: None,
             relay_urls: Vec::new(),
             genesis: Genesis {
                 schema_version: crate::genesis::GENESIS_SCHEMA_VERSION,
@@ -339,6 +353,56 @@ mod tests {
             },
             peers: Vec::new(),
         }
+    }
+
+    #[cfg(feature = "validator")]
+    #[test]
+    fn an_omitted_light_client_bind_keeps_the_listener_off() {
+        let config = config_with_genesis("owner".to_string());
+        let rendered = toml::to_string(&config).expect("serialize validator config");
+        assert!(!rendered.contains("light_client_bind"));
+
+        let loaded: ValidatorConfig =
+            toml::from_str(&rendered).expect("load a config written before any bind was asked for");
+        assert!(loaded.light_client_bind.is_none());
+    }
+
+    #[cfg(feature = "validator")]
+    #[test]
+    fn a_light_client_bind_is_an_address_by_parse_and_not_by_spelling() {
+        let mut config = config_with_genesis("owner".to_string());
+        let bind = SocketAddr::from(([0, 0, 0, 0], 31_246));
+        config.light_client_bind = Some(bind);
+        let rendered = toml::to_string(&config).expect("serialize validator config");
+        assert!(
+            rendered.contains("light_client_bind = \"0.0.0.0:31246\""),
+            "{rendered}"
+        );
+
+        let loaded: ValidatorConfig = toml::from_str(&rendered).expect("load configured bind");
+        assert_eq!(loaded.light_client_bind, Some(bind));
+        // The gateway refuses a non-loopback bind because its routes reach
+        // the executor. This one answers what a relay already publishes, so
+        // an exposed address is accepted rather than refused.
+        assert!(!loaded.light_client_bind.unwrap().ip().is_loopback());
+
+        // Loopback is a property of the parsed address, not of how it is
+        // written: `127.0.0.2` is loopback and is not the string
+        // `127.0.0.1`.
+        let quiet: ValidatorConfig =
+            toml::from_str(&rendered.replace("0.0.0.0:31246", "127.0.0.2:31246"))
+                .expect("load a loopback bind spelled another way");
+        assert!(quiet.light_client_bind.unwrap().ip().is_loopback());
+
+        // A host name is not an address. It is refused at load rather than
+        // carried as a string for something later to match on.
+        assert!(
+            toml::from_str::<ValidatorConfig>(
+                &rendered.replace("0.0.0.0:31246", "localhost:31246")
+            )
+            .is_err(),
+            "a host name is not a bind address",
+        );
     }
 
     #[test]
