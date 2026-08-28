@@ -26,10 +26,10 @@
 //! - **The job.** A real [`ProviderEndpoint`] behind a real
 //!   [`WorkService`], reached by a real [`ClientEndpoint`] over a real
 //!   multiplexed transport, with both journals on disk.
-//! - **The close.** The runner's own close drive
-//!   ([`WorkService::advance_close`]) submits the start and answers the
-//!   contest; the adjudicated close is [`WorkService::adjudicated_close`]
-//!   built from one coherent finalized read.
+//! - **The close.** The runner's production clock entry
+//!   ([`advance_paid_work_clock`]) drives the start and response, submits
+//!   the adjudicated close from one coherent finalized read, and returns
+//!   the completed bond at its horizon from that same read.
 //!
 //! # What is simulated, exactly
 //!
@@ -53,11 +53,10 @@
 //!    backend is handed the prompt at construction. The *client's* side
 //!    is not stubbed: it derives its question from the journal-held
 //!    bundle through [`hellas_client::work::reproduce::plan`].
-//! 4. **The close cadence.** `serve`'s runner submits the start and the
-//!    response but nothing in the tree submits the final adjudicated
-//!    close on a clock (crates/cli/src/commands/serve/node.rs:574-583
-//!    calls `advance_close` and nothing else). The test plays that
-//!    caller, through the real library edge and no other.
+//! 4. **The timer.** The test advances the production paid-work clock
+//!    entry at explicit proposer turns rather than waiting on `serve`'s
+//!    wall-clock interval. Every provider-clock transaction still comes
+//!    from that entry; only when a tick occurs is controlled here.
 //! 5. **Transports.** No ALPN advertisement, no peer discovery and no
 //!    gateway. Both endpoints are constructed directly and the paid
 //!    exchange runs over a mux pair on in-memory pipes — real framing
@@ -157,7 +156,7 @@ use crate::indexer::spawn_follower_indexer;
 use crate::light_client::{ConsensusInfo, LightClient};
 use crate::owner_index::{ApplyOutcome, OwnerIndex};
 use crate::rpc::LocalLightClient;
-use crate::work_blocks::WorkBlocks;
+use crate::work_blocks::{PaidWorkClockAdvance, WorkBlocks, advance_paid_work_clock};
 use crate::work_view::{FinalizedWorkView, WorkChannelQuery};
 
 // ── The money, and the two numbers it is made of ──────────────────────
@@ -1412,47 +1411,43 @@ async fn run_one_paid_job(devnet: &Devnet, opened: &mut Opened) -> u64 {
     credited
 }
 
-/// Drives the provider's close until the contest it opened is on chain
-/// and the response window has run out, then returns the finalized
-/// contest read the adjudicated close is derived from.
-async fn drive_close_to_deadline(devnet: &mut Devnet, service: &WorkService) {
+/// One tick through the same per-channel entry `serve` puts on its timer.
+async fn provider_clock(devnet: &Devnet, service: &WorkService) -> PaidWorkClockAdvance {
     let blocks = devnet.blocks(PROVIDER_NODE);
-    let progress = service
-        .advance_close(&blocks, &blocks)
+    advance_paid_work_clock(service, &blocks)
         .await
-        .expect("the close drive submits the retained start");
-    assert!(
-        matches!(progress, CloseProgress::Submitted { .. }),
-        "the close drive submits a start: {progress:?}",
-    );
-    devnet.seal().await;
-
-    let blocks = devnet.blocks(PROVIDER_NODE);
-    let progress = service
-        .advance_close(&blocks, &blocks)
-        .await
-        .expect("the close drive reads its own contest");
-    let CloseProgress::Opened { .. } = progress else {
-        panic!("the start opened a contest: {progress:?}");
-    };
+        .expect("the provider's production clock advances")
 }
 
-/// Submits the adjudicated close through the party's own light client
-/// and returns the block it was finalized in.
-async fn settle(devnet: &mut Devnet, service: &WorkService, node: usize) -> HellasBlock {
-    let allocations = devnet.allocations.clone();
-    let snapshot = devnet.snapshot(node, &allocations).await;
-    let close = match service.adjudicated_close(&snapshot.observed_channel()) {
-        Ok(close) => close,
-        Err(error) => panic!("the finalized contest determines its close: {error}"),
+/// Drives the provider's close until the contest it opened is on chain.
+async fn drive_close_onto_chain(devnet: &mut Devnet, service: &WorkService) {
+    let advance = provider_clock(devnet, service).await;
+    assert!(
+        matches!(advance.close, CloseProgress::Submitted { .. }),
+        "the production clock submits a start: {advance:?}",
+    );
+    assert_eq!(advance.adjudication, None, "no contest is finalized yet");
+    assert_eq!(advance.bond_timeout, None, "the bond horizon is ahead");
+    devnet.seal().await;
+
+    let advance = provider_clock(devnet, service).await;
+    let CloseProgress::Opened { .. } = advance.close else {
+        panic!("the start opened a contest: {advance:?}");
     };
-    let blocks = devnet.blocks(node);
     assert_eq!(
-        blocks
-            .submit(close)
-            .await
-            .expect("the sink takes the close"),
-        crate::SubmitTxOutcome::Enqueued,
+        advance.adjudication, None,
+        "an unresponded contest below its deadline is not final",
+    );
+    assert_eq!(advance.bond_timeout, None, "the bond horizon is ahead");
+}
+
+/// Lets the production clock submit a due adjudication and finalizes it.
+async fn settle_on_the_clock(devnet: &mut Devnet, service: &WorkService) -> HellasBlock {
+    let allocations = devnet.allocations.clone();
+    assert_eq!(
+        provider_clock(devnet, service).await.adjudication,
+        Some(crate::SubmitTxOutcome::Enqueued),
+        "the production clock submits the due adjudicated close",
     );
     let block = devnet.seal().await;
     assert!(
@@ -1466,22 +1461,14 @@ async fn settle(devnet: &mut Devnet, service: &WorkService, node: usize) -> Hell
     block
 }
 
-/// Times the bond out at its horizon, which is the only thing in this
-/// system that returns the provider's stake principal.
-async fn return_the_stake(devnet: &mut Devnet) -> CoinId {
+/// Lets the production clock return the completed bond at its horizon.
+async fn return_the_stake(devnet: &mut Devnet, service: &WorkService) -> CoinId {
     let allocations = devnet.allocations.clone();
     devnet.seal_through(HORIZON).await;
-    let terms = KernelTerms::work_stake_bond(bond_terms());
-    let Some(timeout) = KernelTx::timeout_close(bond_edge(&allocations), &terms) else {
-        panic!("a stake bond has a deterministic timeout close");
-    };
-    let blocks = devnet.blocks(PROVIDER_NODE);
     assert_eq!(
-        blocks
-            .submit(timeout)
-            .await
-            .expect("the sink takes the timeout"),
-        crate::SubmitTxOutcome::Enqueued,
+        provider_clock(devnet, service).await.bond_timeout,
+        Some(crate::SubmitTxOutcome::Enqueued),
+        "the production clock submits the completed bond's timeout",
     );
     let block = devnet.seal().await;
     assert!(
@@ -1570,7 +1557,7 @@ fn one_paid_job_earns_the_price_and_returns_the_stake_separately() {
             .service
             .prepare_close()
             .expect("the provider prepares the close its certificate spends");
-        drive_close_to_deadline(&mut devnet, &opened.service).await;
+        drive_close_onto_chain(&mut devnet, &opened.service).await;
         let deadline = match devnet.snapshot(PROVIDER_NODE, &allocations).await.pending() {
             PendingSlot::Present(pending) => {
                 assert_eq!(
@@ -1583,21 +1570,19 @@ fn one_paid_job_earns_the_price_and_returns_the_stake_separately() {
             other => panic!("the start opened a contest on chain: {other:?}"),
         };
         devnet.seal_through(deadline).await;
-        settle(&mut devnet, &opened.service, PROVIDER_NODE).await;
+        settle_on_the_clock(&mut devnet, &opened.service).await;
 
         // The provider's own journal, caught up past its close, agrees
         // about what it was paid.
-        let blocks = devnet.blocks(PROVIDER_NODE);
+        let advance = provider_clock(&devnet, &opened.service).await;
         assert_eq!(
-            opened
-                .service
-                .advance_close(&blocks, &blocks)
-                .await
-                .expect("the close drive reads the settlement"),
+            advance.close,
             CloseProgress::Settled {
                 provider_payout: PRICE
             },
         );
+        assert_eq!(advance.adjudication, None, "the payment edge is gone");
+        assert_eq!(advance.bond_timeout, None, "the bond horizon is ahead");
 
         // ── The money ─────────────────────────────────────────────────
         //
@@ -1642,7 +1627,7 @@ fn one_paid_job_earns_the_price_and_returns_the_stake_separately() {
 
         // Returned principal, separately: a different coin, from a
         // different edge, minted by a different close.
-        let principal_coin = return_the_stake(&mut devnet).await;
+        let principal_coin = return_the_stake(&mut devnet, &opened.service).await;
         assert_ne!(
             principal_coin, earnings_coin,
             "principal and earnings are different coins",
@@ -1743,15 +1728,15 @@ fn an_understated_close_is_answered_and_pays_the_certificate() {
 
         // The runner's close drive, on its cadence, over the provider's
         // own validator. This is the whole of the provider's answer.
-        let provider_blocks = devnet.blocks(PROVIDER_NODE);
-        let progress = opened
-            .service
-            .advance_close(&provider_blocks, &provider_blocks)
-            .await
-            .expect("the close drive answers the contest");
-        let CloseProgress::Opened { .. } = progress else {
-            panic!("the drive saw the contest: {progress:?}");
+        let advance = provider_clock(&devnet, &opened.service).await;
+        let CloseProgress::Opened { .. } = advance.close else {
+            panic!("the drive saw the contest: {advance:?}");
         };
+        assert_eq!(
+            advance.adjudication, None,
+            "the response is not consensus evidence before it lands",
+        );
+        assert_eq!(advance.bond_timeout, None, "the bond horizon is ahead");
         let answer_block = devnet.seal().await;
         assert!(
             answer_block.txs().iter().any(|tx| matches!(
@@ -1779,7 +1764,7 @@ fn an_understated_close_is_answered_and_pays_the_certificate() {
             "the contest now settles at the certificate, not the claim",
         );
 
-        settle(&mut devnet, &opened.service, PROVIDER_NODE).await;
+        settle_on_the_clock(&mut devnet, &opened.service).await;
 
         // The adjudicated payouts: the certificate plus the forfeited
         // omission bond, and the client's remainder.
@@ -1806,7 +1791,7 @@ fn an_understated_close_is_answered_and_pays_the_certificate() {
         );
 
         // And the principal, separately, as above.
-        let principal_coin = return_the_stake(&mut devnet).await;
+        let principal_coin = return_the_stake(&mut devnet, &opened.service).await;
         assert_eq!(
             devnet
                 .value_of(PROVIDER_NODE, provider_key(), principal_coin)
