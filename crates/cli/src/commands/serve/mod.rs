@@ -30,11 +30,13 @@ mod node;
 mod node_handler;
 mod openai_provider;
 pub mod probe;
+pub mod provision;
 mod responses_fetch;
 mod responses_projector;
 pub mod work_config;
 
 pub use probe::{ProbeOptions, run_probe};
+pub use provision::{ProvisionOptions, run_provision};
 pub use work_config::{WorkConfig, load_work_config};
 
 pub(crate) const DEFAULT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";

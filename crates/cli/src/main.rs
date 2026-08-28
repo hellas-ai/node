@@ -87,14 +87,15 @@ fn validate_serve_assurance(
 /// Loads the identity this command runs under, creating one only where
 /// creating one is what the operator asked for.
 ///
-/// Two commands read the file and never write it. `show-node-id` is a
+/// Three commands read the file and never write it. `show-node-id` is a
 /// query, and creating an identity as a side effect of one would race
-/// with a running service's own creator. A `serve` that was handed a
-/// work configuration is the other: paid channels are settled with the
-/// stored identity's key, so the key must be one an operator already
-/// made — `identity init` is where it comes from. Minting one here would
-/// give the node a settlement party nobody has funded and no bond names,
-/// and the first symptom would be a channel that cannot be opened.
+/// with a running service's own creator. The other two settle paid work:
+/// a `serve` that was handed a work configuration, and the `provision`
+/// that stakes the bond such a node offers. Both sign with the stored
+/// identity's key, so the key must be one an operator already made —
+/// `identity init` is where it comes from. Minting one here would give
+/// the node a settlement party nobody has funded and no bond names, and
+/// the first symptom would be a channel that cannot be opened.
 ///
 /// # Errors
 ///
@@ -111,7 +112,7 @@ fn load_command_identity(
         Commands::Serve {
             work_config_file: Some(_),
             ..
-        }
+        } | Commands::Provision { .. }
     );
     #[cfg(not(feature = "node"))]
     let settles_paid_work = false;
@@ -690,6 +691,41 @@ enum Commands {
         #[arg(long = "out")]
         out: PathBuf,
     },
+    #[cfg(feature = "node")]
+    /// Make this provider's one bond offer, so a client has something to
+    /// answer
+    ///
+    /// A node serves `WorkSetup` from the setup journals under its work
+    /// root and creates none, so a fresh provider offers nothing however
+    /// well it is configured. This signs one bond and journals it, and
+    /// returns only once the runner's own replay of that journal finds
+    /// it. One root holds one offer: a second here is a node that serves
+    /// neither.
+    Provision {
+        /// The paid-work configuration this offer is made under
+        #[arg(long = "work-config")]
+        work_config: PathBuf,
+        /// The client this bond names as taker, hex-encoded
+        #[arg(long = "client")]
+        client: String,
+        /// A coin this provider stakes, hex-encoded. Repeat it for each
+        /// coin; the stake is the provider's alone, so none of these is
+        /// the client's.
+        #[arg(long = "stake-coin", required = true)]
+        stake_coin: Vec<String>,
+        /// Height the bond expires at, which is also the admission
+        /// horizon of the channel it insures
+        #[arg(long = "bond-timeout")]
+        bond_timeout: u64,
+        /// What the bond's timeout returns to this provider. Consensus
+        /// requires it to be the staked edge's close value exactly, and
+        /// refuses the open otherwise.
+        #[arg(long = "timeout-payout")]
+        timeout_payout: u64,
+        /// The largest job price this bond covers
+        #[arg(long = "max-job-price")]
+        max_job_price: u64,
+    },
     /// Discover peers and log network events
     Monitor {
         /// Stop monitoring after N seconds (default: run until Ctrl+C)
@@ -913,6 +949,32 @@ async fn main() {
                 }
             }
         }
+        #[cfg(feature = "node")]
+        Commands::Provision {
+            work_config,
+            client,
+            stake_coin,
+            bond_timeout,
+            timeout_payout,
+            max_job_price,
+        } => match commands::serve::load_work_config(&work_config) {
+            Err(error) => Err(error),
+            Ok(work_config) => {
+                commands::serve::run_provision(commands::serve::ProvisionOptions {
+                    work_config,
+                    // The bond is staked by the party this node already
+                    // settles as, taken from the identity loaded above
+                    // and never made here.
+                    settlement_key: identity::settlement_signer(&local_identity),
+                    client,
+                    stake_coins: stake_coin,
+                    bond_timeout,
+                    timeout_payout,
+                    max_job_price,
+                })
+                .await
+            }
+        },
         #[cfg(feature = "gateway")]
         Commands::Gateway {
             host,
@@ -1726,6 +1788,111 @@ mod tests {
             ),
             _ => panic!("expected serve command"),
         }
+    }
+
+    /// An offer names every term of the bond it stakes, and the coins it
+    /// stakes them with come one flag at a time.
+    #[cfg(feature = "node")]
+    #[test]
+    fn provision_accepts_the_terms_of_one_bond() {
+        let cli = Cli::try_parse_from([
+            "hellas",
+            "provision",
+            "--work-config",
+            "/tmp/work.json",
+            "--client",
+            "02aa",
+            "--stake-coin",
+            "a1",
+            "--stake-coin",
+            "a2",
+            "--bond-timeout",
+            "500",
+            "--timeout-payout",
+            "64",
+            "--max-job-price",
+            "40",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Provision {
+                work_config,
+                client,
+                stake_coin,
+                bond_timeout,
+                timeout_payout,
+                max_job_price,
+            } => {
+                assert_eq!(work_config, PathBuf::from("/tmp/work.json"));
+                assert_eq!(client, "02aa");
+                assert_eq!(stake_coin, vec!["a1".to_string(), "a2".to_string()]);
+                assert_eq!(bond_timeout, 500);
+                assert_eq!(timeout_payout, 64);
+                assert_eq!(max_job_price, 40);
+            }
+            _ => panic!("expected provision command"),
+        }
+    }
+
+    /// A bond funded by no coin is not one, so the stake is required
+    /// rather than defaulted to an empty list.
+    #[cfg(feature = "node")]
+    #[test]
+    fn provision_rejects_an_offer_with_nothing_staked() {
+        assert!(
+            Cli::try_parse_from([
+                "hellas",
+                "provision",
+                "--work-config",
+                "/tmp/work.json",
+                "--client",
+                "02aa",
+                "--bond-timeout",
+                "500",
+                "--timeout-payout",
+                "64",
+                "--max-job-price",
+                "40",
+            ])
+            .is_err(),
+            "an offer staking nothing was accepted",
+        );
+    }
+
+    /// The bond an offer stakes is settled with the key an operator
+    /// already made, exactly as a paid `serve` is: the same refusal, and
+    /// the same file named by it.
+    #[cfg(feature = "node")]
+    #[test]
+    fn provisioning_an_offer_loads_a_stored_settlement_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity");
+        let provision = Cli::try_parse_from([
+            "hellas",
+            "provision",
+            "--work-config",
+            "/tmp/work.json",
+            "--client",
+            "02aa",
+            "--stake-coin",
+            "a1",
+            "--bond-timeout",
+            "500",
+            "--timeout-payout",
+            "64",
+            "--max-job-price",
+            "40",
+        ])
+        .unwrap();
+
+        let Err(error) = load_command_identity(&provision.command, Some(&path), true) else {
+            panic!("a bond is staked with a key an operator already made");
+        };
+        assert!(
+            format!("{error:#}").contains(&path.display().to_string()),
+            "the refusal does not name the identity file: {error:#}",
+        );
+        assert!(!path.exists(), "no identity was created by the refusal");
     }
 
     /// A node asked to serve paid work loads its settlement identity
