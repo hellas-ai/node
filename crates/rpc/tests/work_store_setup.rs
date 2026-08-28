@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use hellas_kernel::{
     Auth, BlockHeight, CoinId, Decode as _, Edge, EdgeId, EdgeValues, Fees, Funding, Key,
     LeaseSlots, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Move, NetworkId, Parties, Party,
-    PaymentCloseStart, Payout, RegistryChunk, RegistryNamespace, RegistryRecordTag,
+    PaymentCloseStart, Payout, Proof, RegistryChunk, RegistryNamespace, RegistryRecordTag,
     Secp256k1Signer, Secp256k1Verifier, Sig, Terms, TermsHash, Tx, WorkPaymentTerms,
     WorkStakeBondTerms,
 };
@@ -286,7 +286,7 @@ fn journal_name(bond_edge: EdgeId) -> String {
         use std::fmt::Write as _;
         let _ = write!(name, "{byte:02x}");
     }
-    name.push_str(".journal");
+    name.push_str(".0000000000000000.journal");
     name
 }
 
@@ -978,7 +978,7 @@ fn a_torn_tail_recovers_and_a_corrupt_frame_does_not() {
 /// derives it rather than by looking for whatever is in the directory.
 fn journal_path(root: &std::path::Path, network: NetworkId, bond: EdgeId) -> std::path::PathBuf {
     root.join(format!(
-        "setup-{}.journal",
+        "setup-{}.0000000000000000.journal",
         hex(&setup_key(network, bond).into_bytes())
     ))
 }
@@ -1073,8 +1073,10 @@ fn a_root_holding_no_journals_yields_none() {
     // A channel journal beside them is the other store's, and is not a
     // setup this discovery has anything to say about.
     if let Err(error) = std::fs::write(
-        dir.path()
-            .join(format!("channel-{}.journal", "00".repeat(32))),
+        dir.path().join(format!(
+            "channel-{}.0000000000000000.journal",
+            "00".repeat(32)
+        )),
         b"not this module's file",
     ) {
         panic!("the fixture file is written: {error}");
@@ -1127,9 +1129,10 @@ fn a_journal_that_cannot_be_identified_is_reported_by_name() {
         }
     }
     // And a file wearing a setup journal's name that is not one.
-    let counterfeit = dir
-        .path()
-        .join(format!("setup-{}.journal", "ab".repeat(32)));
+    let counterfeit = dir.path().join(format!(
+        "setup-{}.0000000000000000.journal",
+        "ab".repeat(32)
+    ));
     if let Err(error) = std::fs::write(&counterfeit, b"not a journal at all") {
         panic!("the fixture file is written: {error}");
     }
@@ -1205,6 +1208,7 @@ fn a_revision_that_is_not_this_journals_bond_is_refused() {
                 kind: JournalKind::Setup,
                 role: Role::Provider,
                 key: key.into_bytes(),
+                generation: 0,
             },
         ) {
             Ok(opened) => opened,
@@ -3164,4 +3168,384 @@ impl hellas_kernel::SigVerifier for AcceptAll {
     ) -> bool {
         true
     }
+}
+
+// ── Rotation ──────────────────────────────────────────────────────────
+
+/// A handshake still waiting on both its Opens.
+///
+/// The two unresolved-submission flags, the timeout marker, and one
+/// history block that resolves nothing: the fields a settled fixture
+/// cannot hold at the same time as its own resolutions.
+fn in_flight_store(root: &std::path::Path) -> SetupStore {
+    let verifier = Secp256k1Verifier::new();
+    let mut store = completed_store(root);
+    for record in [
+        SetupRecord::BondSubmitted,
+        SetupRecord::PaymentSubmitted,
+        SetupRecord::BondTimeoutSubmitted,
+        SetupRecord::SetupHistoryBatch(SetupHistoryBatch {
+            blocks: vec![SetupHistoryBlock {
+                height: scan().height + 1,
+                parent: scan().payload,
+                payload: [0x48; 32],
+                txs: Vec::new(),
+            }],
+        }),
+    ] {
+        if let Err(error) = store.commit(record, &verifier) {
+            panic!("the in-flight fixture commits: {error}");
+        }
+    }
+    store
+}
+
+/// A handshake whose history has finalized and closed both edges.
+///
+/// The other half of the state space: both finalization flags, both
+/// close flags, the origin the payment Open fixes, and an end.
+fn settled_store(root: &std::path::Path) -> SetupStore {
+    let verifier = Secp256k1Verifier::new();
+    let mut store = completed_store(root);
+    let three = completed(countersigned(proposed()));
+    let (Some(bond_open), Some(payment_open)) = (three.bond_open(), three.payment_open()) else {
+        panic!("an executable revision holds both Opens");
+    };
+    // A work-payment edge commits no timeout payout, so the two closes
+    // are built the same way rather than one of each: what the journal
+    // reads off a close is its input edge, and nothing else.
+    let bond = Terms::work_stake_bond(bond_terms());
+    let Some(outputs) = bond.timeout_outputs().cloned() else {
+        panic!("a bond commits its timeout payout");
+    };
+    let close_of = |edge: EdgeId| Tx::close(edge, Proof::timeout(bond.clone()), outputs.clone());
+    let blocks = vec![
+        SetupHistoryBlock {
+            height: scan().height + 1,
+            parent: scan().payload,
+            payload: [0x48; 32],
+            txs: vec![bond_open],
+        },
+        SetupHistoryBlock {
+            height: scan().height + 2,
+            parent: [0x48; 32],
+            payload: [0x49; 32],
+            txs: vec![payment_open],
+        },
+        SetupHistoryBlock {
+            height: scan().height + 3,
+            parent: [0x49; 32],
+            payload: [0x4a; 32],
+            txs: vec![close_of(bond_edge()), close_of(payment_edge())],
+        },
+    ];
+    for record in [
+        SetupRecord::SetupHistoryBatch(SetupHistoryBatch { blocks }),
+        SetupRecord::Ended {
+            outcome: SetupEnd::Aborted(SetupAbort::BondReclaimed),
+        },
+    ] {
+        if let Err(error) = store.commit(record, &verifier) {
+            panic!("the settled fixture commits: {error}");
+        }
+    }
+    store
+}
+
+/// One named fixture: what to call it, and how to build it.
+type Fixture = (&'static str, fn(&std::path::Path) -> SetupStore);
+
+/// Every fixture a rotation is asserted over, named.
+const FIXTURES: [Fixture; 2] = [("in flight", in_flight_store), ("settled", settled_store)];
+
+/// The one journal file under a root, and the name it wears.
+fn only_journal(root: &std::path::Path) -> std::path::PathBuf {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        panic!("the root reads");
+    };
+    let mut found: Vec<std::path::PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.to_string_lossy().ends_with(".journal"))
+        .collect();
+    found.sort();
+    let [path] = found.as_slice() else {
+        panic!("one installed generation, not {found:?}");
+    };
+    path.clone()
+}
+
+fn read(path: &std::path::Path) -> Vec<u8> {
+    match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) => panic!("{} reads: {error}", path.display()),
+    }
+}
+
+fn write(path: &std::path::Path, bytes: &[u8]) {
+    if let Err(error) = std::fs::write(path, bytes) {
+        panic!("{} writes: {error}", path.display());
+    }
+}
+
+/// What a checkpoint replays to is exactly what the frames it replaced
+/// replayed to.
+///
+/// The comparison is of the whole [`SetupState`], not of the fields this
+/// test happens to think of: a field added to that struct and left out
+/// of the checkpoint fails to compile, and a field added and *encoded
+/// wrongly* fails here, as long as the two fixtures above reach a value
+/// for it that is not the one `SetupState::new` starts at. Both fixtures
+/// are asserted to reach such a value below, so a new field is covered
+/// the moment either fixture moves it.
+#[test]
+fn a_checkpoint_replays_to_what_the_frames_replayed_to() {
+    for (label, fixture) in FIXTURES {
+        let control = temp();
+        let expected = fixture(control.path()).state().clone();
+
+        let rotated = temp();
+        {
+            let mut store = fixture(rotated.path());
+            if let Err(error) = store.rotate() {
+                panic!("{label}: the rotation completes: {error}");
+            }
+            assert_eq!(
+                store.len(),
+                1,
+                "{label}: a fresh successor holds its checkpoint and nothing else",
+            );
+        }
+        let reopened = store(rotated.path(), Role::Provider);
+        assert_eq!(
+            reopened.state(),
+            &expected,
+            "{label}: the checkpoint is the state, not a summary of it",
+        );
+        assert!(
+            !reopened.recovered_torn_tail(),
+            "{label}: a rotation is not a tear",
+        );
+    }
+
+    // What the two fixtures between them exercise. Asserted rather than
+    // assumed, because a round trip over a state that is all defaults is
+    // a round trip that proves nothing.
+    let in_flight = temp();
+    let in_flight = in_flight_store(in_flight.path());
+    let in_flight = in_flight.state();
+    assert!(in_flight.bond_submitted());
+    assert!(in_flight.payment_submitted());
+    assert_eq!(in_flight.revision(), Some(3));
+    assert!(in_flight.close_descriptor().is_some());
+    assert!(in_flight.scan_armed().is_some());
+    assert_eq!(in_flight.history().len(), 1);
+    assert_ne!(in_flight.history_cursor(), in_flight.scan_armed());
+    assert_eq!(in_flight.end(), None);
+
+    let settled = temp();
+    let settled = settled_store(settled.path());
+    let settled = settled.state();
+    assert_eq!(settled.history().len(), 3);
+    assert!(settled.origin().is_some());
+    assert!(settled.close_only_recovery());
+    assert!(!settled.submitted_open_unresolved());
+    assert_eq!(
+        settled.end(),
+        Some(SetupEnd::Aborted(SetupAbort::BondReclaimed)),
+    );
+}
+
+/// A crash at any point of the install reopens the same handshake.
+///
+/// The successor's bytes are the store's own, taken from a real
+/// rotation; the four directories below are the four shapes the
+/// documented order passes through. What each one must yield is the
+/// state the predecessor had — which is what the checkpoint says, and
+/// what the predecessor's frames say, because a rotation moves bytes and
+/// not facts.
+#[test]
+fn a_rotation_crashing_at_any_step_reopens_the_same_setup() {
+    for (label, fixture) in FIXTURES {
+        let source = temp();
+        let expected = fixture(source.path()).state().clone();
+        let predecessor_name = only_journal(source.path());
+        let predecessor = read(&predecessor_name);
+        let Some(predecessor_name) = predecessor_name.file_name().map(std::ffi::OsStr::to_owned)
+        else {
+            panic!("{label}: the predecessor has a name");
+        };
+
+        let installed = temp();
+        {
+            let mut store = fixture(installed.path());
+            if let Err(error) = store.rotate() {
+                panic!("{label}: the rotation completes: {error}");
+            }
+        }
+        let successor_name = only_journal(installed.path());
+        let successor = read(&successor_name);
+        let Some(successor_name) = successor_name.file_name().map(std::ffi::OsStr::to_owned) else {
+            panic!("{label}: the successor has a name");
+        };
+        let mut candidate_name = successor_name.clone();
+        candidate_name.push(".candidate");
+
+        for step in [
+            "the candidate was still being written",
+            "the candidate is whole and unrenamed",
+            "the rename happened and the predecessor is still there",
+            "the predecessor is unlinked",
+        ] {
+            let dir = temp();
+            match step {
+                "the candidate was still being written" => {
+                    write(&dir.path().join(&predecessor_name), &predecessor);
+                    write(
+                        &dir.path().join(&candidate_name),
+                        &successor[..successor.len() / 2],
+                    );
+                }
+                "the candidate is whole and unrenamed" => {
+                    write(&dir.path().join(&predecessor_name), &predecessor);
+                    write(&dir.path().join(&candidate_name), &successor);
+                }
+                "the rename happened and the predecessor is still there" => {
+                    write(&dir.path().join(&predecessor_name), &predecessor);
+                    write(&dir.path().join(&successor_name), &successor);
+                }
+                _ => write(&dir.path().join(&successor_name), &successor),
+            }
+
+            let reopened = store(dir.path(), Role::Provider);
+            assert_eq!(
+                reopened.state(),
+                &expected,
+                "{label}, {step}: the same handshake reopens",
+            );
+        }
+    }
+}
+
+/// An uninstalled candidate is not read, even when it says something.
+///
+/// The candidate here is a real checkpoint of a real earlier state, and
+/// the predecessor beside it has moved on since. A recovery that read
+/// the candidate would answer with the older handshake and lose two
+/// journaled submissions; a recovery that ignores it answers with the
+/// file the writer was actually told about.
+#[test]
+fn an_uninstalled_candidate_is_never_read() {
+    let verifier = Secp256k1Verifier::new();
+
+    let earlier = temp();
+    {
+        let mut earlier_store = completed_store(earlier.path());
+        if let Err(error) = earlier_store.rotate() {
+            panic!("the rotation completes: {error}");
+        }
+    }
+    let stale = read(&only_journal(earlier.path()));
+    let Some(candidate_name) = only_journal(earlier.path())
+        .file_name()
+        .map(std::ffi::OsStr::to_owned)
+    else {
+        panic!("the successor has a name");
+    };
+    let mut candidate_name = candidate_name;
+    candidate_name.push(".candidate");
+
+    let dir = temp();
+    let expected = {
+        let mut later = completed_store(dir.path());
+        for record in [SetupRecord::BondSubmitted, SetupRecord::PaymentSubmitted] {
+            if let Err(error) = later.commit(record, &verifier) {
+                panic!("the later submission commits: {error}");
+            }
+        }
+        later.state().clone()
+    };
+    write(&dir.path().join(&candidate_name), &stale);
+
+    let reopened = store(dir.path(), Role::Provider);
+    assert_eq!(
+        reopened.state(),
+        &expected,
+        "the predecessor is what recovery reads",
+    );
+    assert!(
+        reopened.state().bond_submitted() && reopened.state().payment_submitted(),
+        "the two submissions the stale candidate does not know about",
+    );
+}
+
+/// A rotated journal is still a journal a restart can name.
+///
+/// Discovery reads the bond edge out of the first revision the file
+/// retained — and after a rotation that revision is in the checkpoint,
+/// not in a frame. A discovery that read only the frames would report
+/// every long-lived setup as holding no revision, and a setup a node
+/// cannot name is a close it stops answering.
+#[test]
+fn a_rotated_setup_is_still_discovered() {
+    let dir = temp();
+    {
+        let mut store = settled_store(dir.path());
+        if let Err(error) = store.rotate() {
+            panic!("the rotation completes: {error}");
+        }
+    }
+    let found = match discover_setups(dir.path(), network()) {
+        Ok(found) => found,
+        Err(error) => panic!("the root enumerates: {error}"),
+    };
+    assert!(
+        found.unidentified.is_empty(),
+        "nothing is unnameable: {:?}",
+        found.unidentified,
+    );
+    assert_eq!(
+        found.setups.as_slice(),
+        &[DiscoveredSetup {
+            bond_edge: bond_edge(),
+            role: Role::Provider,
+        }],
+        "one journal, one setup, whichever generation it is on",
+    );
+}
+
+/// A retired generation is not a second journal.
+///
+/// The crash between the rename and the unlink leaves two installed
+/// files for one setup. Discovery must offer the newest and not both:
+/// mounting the retired one would be a node running the same close duty
+/// twice, from a file it has already replaced.
+#[test]
+fn a_predecessor_left_by_a_crash_is_not_discovered_twice() {
+    let source = temp();
+    let predecessor_path = {
+        let store = settled_store(source.path());
+        drop(store);
+        only_journal(source.path())
+    };
+    let predecessor = read(&predecessor_path);
+    let Some(predecessor_name) = predecessor_path.file_name().map(std::ffi::OsStr::to_owned) else {
+        panic!("the predecessor has a name");
+    };
+
+    let dir = temp();
+    {
+        let mut store = settled_store(dir.path());
+        if let Err(error) = store.rotate() {
+            panic!("the rotation completes: {error}");
+        }
+    }
+    write(&dir.path().join(&predecessor_name), &predecessor);
+
+    let found = match discover_setups(dir.path(), network()) {
+        Ok(found) => found,
+        Err(error) => panic!("the root enumerates: {error}"),
+    };
+    assert!(found.unidentified.is_empty(), "{:?}", found.unidentified);
+    assert_eq!(found.setups.len(), 1, "one setup, not one per generation");
 }

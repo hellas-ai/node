@@ -40,8 +40,13 @@ use hellas_xet::XetFileHasher;
 use crate::protocol::Digest;
 use crate::protocol::work_bundle::{SetupBundleError, WorkChannelSetupBundleV1};
 use crate::protocol::work_setup::{CloseDescriptor, WorkSetupError};
-use crate::work_store::journal::{Journal, JournalError, JournalId, JournalKind, Role};
-use crate::work_store::{Applied, WorkStoreError, cursor::Cursor, hex, put_u64};
+use crate::work_store::journal::{
+    Journal, JournalError, JournalId, JournalKind, MAX_CHECKPOINT_BYTES, Role, journal_name_parts,
+};
+use crate::work_store::{
+    Applied, WorkStoreError, cursor::Cursor, hex, put_bytes, put_option, put_u64, take_bool,
+    take_bytes, take_option,
+};
 
 /// Domain of the setup journal's key.
 const SETUP_KEY: &[u8] = b"hellas.work.setup-journal-key.v1";
@@ -344,6 +349,32 @@ const fn end_from_code(code: u8) -> Option<SetupEnd> {
 }
 
 impl SetupRecord {
+    /// Whether recording this step is what lets a signature leave.
+    ///
+    /// The two revisions, and only those: everything else here is a
+    /// marker about transactions already signed, or a note of what a
+    /// finalized block said.
+    const fn exports_signature(&self) -> bool {
+        matches!(self, Self::Bundle { .. } | Self::ArmedBundle { .. })
+    }
+
+    /// Whether this step takes on an obligation rather than discharging
+    /// one.
+    ///
+    /// The scan floor and the two revisions are where a handshake
+    /// commits itself, so they are what stops when the journal cannot
+    /// rotate. Everything below them follows a revision this endpoint
+    /// has already exported — the submissions it authorised, the history
+    /// that resolves them, and the end it reaches — and a journal that
+    /// refused those would be one that stopped an obligation it had
+    /// already taken.
+    const fn is_new_work(&self) -> bool {
+        matches!(
+            self,
+            Self::Bundle { .. } | Self::ArmedBundle { .. } | Self::ScanArmed { .. }
+        )
+    }
+
     /// Returns this record's canonical bytes.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
@@ -374,16 +405,7 @@ impl SetupRecord {
                 out.push(tag::SETUP_HISTORY_BATCH);
                 out.extend_from_slice(&(batch.blocks.len() as u16).to_be_bytes());
                 for block in &batch.blocks {
-                    put_u64(&mut out, block.height);
-                    out.extend_from_slice(&block.parent);
-                    out.extend_from_slice(&block.payload);
-                    out.extend_from_slice(&(block.txs.len() as u16).to_be_bytes());
-                    for tx in &block.txs {
-                        let mut bytes = vec![0_u8; Tx::MAX_ENCODED_SIZE];
-                        let written = tx.write_to(&mut bytes);
-                        out.extend_from_slice(&(written as u32).to_be_bytes());
-                        out.extend_from_slice(&bytes[..written]);
-                    }
+                    put_block(&mut out, block);
                 }
             }
             Self::BondTimeoutSubmitted => out.push(tag::BOND_TIMEOUT_SUBMITTED),
@@ -445,32 +467,7 @@ impl SetupRecord {
                 ));
                 let mut blocks = Vec::with_capacity(count);
                 for _ in 0..count {
-                    let height = cursor.u64().ok_or(SetupStateError::Malformed)?;
-                    let parent = cursor.array::<32>().ok_or(SetupStateError::Malformed)?;
-                    let payload = cursor.array::<32>().ok_or(SetupStateError::Malformed)?;
-                    let tx_count = usize::from(u16::from_be_bytes(
-                        cursor.array::<2>().ok_or(SetupStateError::Malformed)?,
-                    ));
-                    let mut txs = Vec::with_capacity(tx_count);
-                    for _ in 0..tx_count {
-                        let len = usize::try_from(u32::from_be_bytes(
-                            cursor.array::<4>().ok_or(SetupStateError::Malformed)?,
-                        ))
-                        .map_err(|_| SetupStateError::Malformed)?;
-                        let bytes = cursor.take(len).ok_or(SetupStateError::Malformed)?;
-                        let (tx, consumed) =
-                            Tx::decode(bytes).map_err(|_| SetupStateError::Malformed)?;
-                        if consumed != len {
-                            return Err(SetupStateError::Malformed);
-                        }
-                        txs.push(tx);
-                    }
-                    blocks.push(SetupHistoryBlock {
-                        height,
-                        parent,
-                        payload,
-                        txs,
-                    });
+                    blocks.push(take_block(&mut cursor)?);
                 }
                 Self::SetupHistoryBatch(SetupHistoryBatch { blocks })
             }
@@ -499,6 +496,103 @@ impl SetupRecord {
     }
 }
 
+/// Writes one finalized header and the transactions in it.
+///
+/// One spelling, because a record and a checkpoint hold the same blocks:
+/// a second encoder for the checkpoint's copy would be a second answer
+/// to what a retained block is.
+fn put_block(out: &mut Vec<u8>, block: &SetupHistoryBlock) {
+    put_u64(out, block.height);
+    out.extend_from_slice(&block.parent);
+    out.extend_from_slice(&block.payload);
+    out.extend_from_slice(&(block.txs.len() as u16).to_be_bytes());
+    for tx in &block.txs {
+        let mut bytes = vec![0_u8; Tx::MAX_ENCODED_SIZE];
+        let written = tx.write_to(&mut bytes);
+        out.extend_from_slice(&(written as u32).to_be_bytes());
+        out.extend_from_slice(&bytes[..written]);
+    }
+}
+
+/// Reads back exactly what [`put_block`] wrote.
+fn take_block(cursor: &mut Cursor<'_>) -> Result<SetupHistoryBlock, SetupStateError> {
+    let height = cursor.u64().ok_or(SetupStateError::Malformed)?;
+    let parent = cursor.array::<32>().ok_or(SetupStateError::Malformed)?;
+    let payload = cursor.array::<32>().ok_or(SetupStateError::Malformed)?;
+    let tx_count = usize::from(u16::from_be_bytes(
+        cursor.array::<2>().ok_or(SetupStateError::Malformed)?,
+    ));
+    let mut txs = Vec::with_capacity(tx_count);
+    for _ in 0..tx_count {
+        let len = usize::try_from(u32::from_be_bytes(
+            cursor.array::<4>().ok_or(SetupStateError::Malformed)?,
+        ))
+        .map_err(|_| SetupStateError::Malformed)?;
+        let bytes = cursor.take(len).ok_or(SetupStateError::Malformed)?;
+        let (tx, consumed) = Tx::decode(bytes).map_err(|_| SetupStateError::Malformed)?;
+        if consumed != len {
+            return Err(SetupStateError::Malformed);
+        }
+        txs.push(tx);
+    }
+    Ok(SetupHistoryBlock {
+        height,
+        parent,
+        payload,
+        txs,
+    })
+}
+
+fn put_scan(out: &mut Vec<u8>, scan: &SetupScan) {
+    put_u64(out, scan.height);
+    out.extend_from_slice(&scan.payload);
+}
+
+fn take_scan(cursor: &mut Cursor<'_>) -> Result<SetupScan, SetupStateError> {
+    Ok(SetupScan {
+        height: cursor.u64().ok_or(SetupStateError::Malformed)?,
+        payload: cursor.array::<32>().ok_or(SetupStateError::Malformed)?,
+    })
+}
+
+const fn role_code(role: Role) -> u8 {
+    match role {
+        Role::Client => 1,
+        Role::Provider => 2,
+    }
+}
+
+const fn role_from_code(code: u8) -> Result<Role, SetupStateError> {
+    match code {
+        1 => Ok(Role::Client),
+        2 => Ok(Role::Provider),
+        _ => Err(SetupStateError::Malformed),
+    }
+}
+
+/// Whether a close descriptor is the one its setup bundle produces.
+///
+/// One spelling, asked when the descriptor is first armed beside its
+/// revision and again when a checkpoint carrying the pair is opened. A
+/// descriptor that described some other channel would be an endpoint
+/// recovering a close for a channel it does not have.
+fn describes_bundle(
+    bundle: &WorkChannelSetupBundleV1,
+    close_descriptor: &CloseDescriptor,
+) -> Result<(), SetupStateError> {
+    let Some(payment_edge) = bundle.payment_edge() else {
+        return Err(SetupStateError::DescriptorMismatch);
+    };
+    if close_descriptor.channel().network() != bundle.network()
+        || close_descriptor.channel().payment_edge() != payment_edge
+        || bundle.payment_terms() != Some(close_descriptor.channel().payment_terms())
+        || close_descriptor.bond_edge() != bundle.bond_edge()
+    {
+        return Err(SetupStateError::DescriptorMismatch);
+    }
+    Ok(())
+}
+
 /// Where the channel this journal opens is finalized.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SetupOrigin {
@@ -513,7 +607,7 @@ pub struct SetupOrigin {
 }
 
 /// Everything the handshake has durably reached.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SetupState {
     network: NetworkId,
     bond_edge: EdgeId,
@@ -557,6 +651,283 @@ impl SetupState {
             origin: None,
             end: None,
         }
+    }
+
+    /// Returns this state's canonical bytes: the whole of what a
+    /// successor generation replays from.
+    ///
+    /// Not a summary, and the destructuring below is what keeps it from
+    /// becoming one. Every field of this struct is named here and named
+    /// again in [`Self::decode_checkpoint`]'s literal, so a field added
+    /// to [`SetupState`] and forgotten here does not compile: the
+    /// pattern is refused for the field it does not mention, and the
+    /// literal for the field it cannot fill. A checkpoint that quietly
+    /// dropped a field a duty reads would be replay that is wrong and
+    /// says nothing, which is the one failure rotation must not add.
+    ///
+    /// The bundle is written as its exact retained bytes and read back
+    /// by decoding them, rather than as two copies of one revision that
+    /// could disagree. Everything the retained history decided is
+    /// written *and* re-derived on the way in — see [`Self::revalidate`]
+    /// — so the derived half of this encoding is checked rather than
+    /// believed.
+    #[must_use]
+    pub fn checkpoint(&self) -> Vec<u8> {
+        let Self {
+            network,
+            bond_edge,
+            role,
+            bundle,
+            bundle_bytes,
+            scan_armed,
+            close_descriptor,
+            unresolved_bond_open,
+            unresolved_payment_open,
+            history_cursor,
+            history,
+            bond_finalized,
+            payment_finalized,
+            bond_closed,
+            payment_closed,
+            bond_timeout_submitted,
+            origin,
+            end,
+        } = self;
+
+        let mut out = Vec::new();
+        put_bytes(&mut out, network.as_str().as_bytes());
+        out.extend_from_slice(&bond_edge.to_bytes());
+        out.push(role_code(*role));
+        // The value and its bytes are one field written once: the
+        // presence byte is the decoded revision's, and the body is the
+        // bytes it was decoded from.
+        put_option(&mut out, bundle.as_ref(), |out, _| {
+            put_bytes(out, bundle_bytes);
+        });
+        put_option(&mut out, scan_armed.as_ref(), put_scan);
+        put_option(&mut out, close_descriptor.as_ref(), |out, descriptor| {
+            put_bytes(out, &descriptor.encode());
+        });
+        out.push(u8::from(*unresolved_bond_open));
+        out.push(u8::from(*unresolved_payment_open));
+        put_option(&mut out, history_cursor.as_ref(), put_scan);
+        out.extend_from_slice(&(history.len() as u32).to_be_bytes());
+        for block in history {
+            put_block(&mut out, block);
+        }
+        out.push(u8::from(*bond_finalized));
+        out.push(u8::from(*payment_finalized));
+        out.push(u8::from(*bond_closed));
+        out.push(u8::from(*payment_closed));
+        out.push(u8::from(*bond_timeout_submitted));
+        put_option(&mut out, origin.as_ref(), |out, origin| {
+            out.extend_from_slice(&origin.payment_edge.to_bytes());
+            put_u64(out, origin.height);
+            out.extend_from_slice(&origin.payload);
+            out.extend_from_slice(&origin.parent);
+        });
+        put_option(&mut out, end.as_ref(), |out, end| {
+            out.push(end_to_code(*end));
+        });
+        out
+    }
+
+    /// Reads a checkpoint back into the state it was written from.
+    ///
+    /// Decoding only. What makes those bytes a state this endpoint may
+    /// hold is [`Self::revalidate`] and the signature check beside it,
+    /// and [`SetupStore::open`] runs both — this is separate because
+    /// discovery has a journal to name and no verifier to name it with.
+    ///
+    /// # Errors
+    ///
+    /// [`SetupStateError::Malformed`] for a truncated body, an unknown
+    /// code, or a trailing byte, and
+    /// [`SetupStateError::Bundle`]/[`SetupStateError::Descriptor`] when
+    /// a nested body does not decode.
+    pub fn decode_checkpoint(bytes: &[u8]) -> Result<Self, SetupStateError> {
+        let mut cursor = Cursor::new(bytes);
+        let network = std::str::from_utf8(take_bytes(&mut cursor, SetupStateError::Malformed)?)
+            .ok()
+            .and_then(NetworkId::new)
+            .ok_or(SetupStateError::Malformed)?;
+        let bond_edge = EdgeId::from_bytes(cursor.array::<32>().ok_or(SetupStateError::Malformed)?);
+        let role = role_from_code(cursor.byte().ok_or(SetupStateError::Malformed)?)?;
+        let bundle_bytes = take_option(&mut cursor, SetupStateError::Malformed, |cursor| {
+            Ok(take_bytes(cursor, SetupStateError::Malformed)?.to_vec())
+        })?;
+        let bundle = bundle_bytes
+            .as_deref()
+            .map(WorkChannelSetupBundleV1::decode)
+            .transpose()?;
+        let scan_armed = take_option(&mut cursor, SetupStateError::Malformed, take_scan)?;
+        let close_descriptor = take_option(&mut cursor, SetupStateError::Malformed, |cursor| {
+            Ok(CloseDescriptor::decode(take_bytes(
+                cursor,
+                SetupStateError::Malformed,
+            )?)?)
+        })?;
+        let unresolved_bond_open = take_bool(&mut cursor, SetupStateError::Malformed)?;
+        let unresolved_payment_open = take_bool(&mut cursor, SetupStateError::Malformed)?;
+        let history_cursor = take_option(&mut cursor, SetupStateError::Malformed, take_scan)?;
+        let block_count = usize::try_from(u32::from_be_bytes(
+            cursor.array::<4>().ok_or(SetupStateError::Malformed)?,
+        ))
+        .map_err(|_| SetupStateError::Malformed)?;
+        let mut history = Vec::new();
+        for _ in 0..block_count {
+            history.push(take_block(&mut cursor)?);
+        }
+        let state = Self {
+            network,
+            bond_edge,
+            role,
+            bundle,
+            bundle_bytes: bundle_bytes.unwrap_or_default(),
+            scan_armed,
+            close_descriptor,
+            unresolved_bond_open,
+            unresolved_payment_open,
+            history_cursor,
+            history,
+            bond_finalized: take_bool(&mut cursor, SetupStateError::Malformed)?,
+            payment_finalized: take_bool(&mut cursor, SetupStateError::Malformed)?,
+            bond_closed: take_bool(&mut cursor, SetupStateError::Malformed)?,
+            payment_closed: take_bool(&mut cursor, SetupStateError::Malformed)?,
+            bond_timeout_submitted: take_bool(&mut cursor, SetupStateError::Malformed)?,
+            origin: take_option(&mut cursor, SetupStateError::Malformed, |cursor| {
+                Ok(SetupOrigin {
+                    payment_edge: EdgeId::from_bytes(
+                        cursor.array::<32>().ok_or(SetupStateError::Malformed)?,
+                    ),
+                    height: cursor.u64().ok_or(SetupStateError::Malformed)?,
+                    payload: cursor.array::<32>().ok_or(SetupStateError::Malformed)?,
+                    parent: cursor.array::<32>().ok_or(SetupStateError::Malformed)?,
+                })
+            })?,
+            end: take_option(&mut cursor, SetupStateError::Malformed, |cursor| {
+                end_from_code(cursor.byte().ok_or(SetupStateError::Malformed)?)
+                    .ok_or(SetupStateError::Malformed)
+            })?,
+        };
+        if cursor.is_empty() {
+            Ok(state)
+        } else {
+            Err(SetupStateError::Malformed)
+        }
+    }
+
+    /// Reads a checkpoint and reruns every rule replay would have run to
+    /// reach it.
+    ///
+    /// Three things, and they are the same three a record-at-a-time
+    /// replay does. The journal this checkpoint was found in must be
+    /// this network's, this bond's and this role's, so a successor
+    /// carrying another handshake's state is refused rather than
+    /// adopted. Every signature the retained revision carries is
+    /// verified again, by [`check_signatures`] — the function replay
+    /// and commit both use. And [`Self::revalidate`] re-derives from the
+    /// retained history exactly what [`Self::apply_history_batch`]
+    /// derived when the blocks arrived, refusing a checkpoint whose
+    /// stored answers are not the ones its own contents give.
+    ///
+    /// # Errors
+    ///
+    /// [`SetupStateError::WrongChannel`] and
+    /// [`SetupStateError::WrongRole`] when it is another journal's
+    /// state, whatever the signature check refuses, and whatever
+    /// [`Self::revalidate`] refuses.
+    fn from_checkpoint<V: SigVerifier>(
+        bytes: &[u8],
+        network: NetworkId,
+        bond_edge: EdgeId,
+        role: Role,
+        verifier: &V,
+    ) -> Result<Self, SetupStateError> {
+        let state = Self::decode_checkpoint(bytes)?;
+        if state.network != network {
+            return Err(SetupStateError::WrongChannel { field: "network" });
+        }
+        if state.bond_edge != bond_edge {
+            return Err(SetupStateError::WrongChannel { field: "bond edge" });
+        }
+        if state.role != role {
+            return Err(SetupStateError::WrongRole {
+                step: "replaying a checkpoint",
+            });
+        }
+        check_bundle_signatures(state.bundle_bytes(), verifier)?;
+        state.revalidate()?;
+        Ok(state)
+    }
+
+    /// Refuses a checkpoint whose stored fields are not the ones its own
+    /// contents produce.
+    ///
+    /// The stage rules first: a revision is over this journal's network
+    /// and bond, an executable revision has its close descriptor and an
+    /// inexecutable one does not, the descriptor describes the revision
+    /// beside it, and neither exists before the scan floor that had to
+    /// precede it.
+    ///
+    /// Then the history. Everything the retained blocks decided —
+    /// where the cursor is, whether each edge is finalized, whether each
+    /// is closed — is derived again by feeding those blocks back through
+    /// [`Self::apply_history_batch`], which is the same function that
+    /// derived them the first time and the same function that refuses a
+    /// gap. A checkpoint that stored a different answer than its own
+    /// blocks give is refused here rather than replayed as fact.
+    fn revalidate(&self) -> Result<(), SetupStateError> {
+        if let Some(bundle) = &self.bundle {
+            if bundle.network() != self.network {
+                return Err(SetupStateError::WrongChannel { field: "network" });
+            }
+            if bundle.bond_edge() != self.bond_edge {
+                return Err(SetupStateError::WrongChannel { field: "bond edge" });
+            }
+            let executable = matches!(
+                (self.role, bundle.revision()),
+                (Role::Client, 2) | (Role::Provider, 3)
+            );
+            match (&self.close_descriptor, executable) {
+                (Some(descriptor), true) => describes_bundle(bundle, descriptor)?,
+                (None, false) => {}
+                _ => return Err(SetupStateError::DescriptorMismatch),
+            }
+            let armed_stage = executable || (self.role == Role::Provider && bundle.revision() == 1);
+            if armed_stage && self.scan_armed.is_none() {
+                return Err(SetupStateError::WrongStage {
+                    step: "holding a revision this endpoint armed",
+                    revision: self.revision(),
+                });
+            }
+        } else if self.close_descriptor.is_some() {
+            return Err(SetupStateError::DescriptorMismatch);
+        }
+
+        let mut rebuilt = Self::new(self.network, self.bond_edge, self.role);
+        rebuilt.bundle.clone_from(&self.bundle);
+        rebuilt.bundle_bytes.clone_from(&self.bundle_bytes);
+        rebuilt.scan_armed = self.scan_armed;
+        rebuilt.history_cursor = self.scan_armed;
+        for blocks in self.history.chunks(256) {
+            rebuilt.apply_history_batch(&SetupHistoryBatch {
+                blocks: blocks.to_vec(),
+            })?;
+        }
+        let derived = |state: &Self| {
+            (
+                state.history_cursor,
+                state.bond_finalized,
+                state.payment_finalized,
+                state.bond_closed,
+                state.payment_closed,
+            )
+        };
+        if derived(&rebuilt) != derived(self) {
+            return Err(SetupStateError::Malformed);
+        }
+        Ok(())
     }
 
     /// Returns the revision this endpoint has durably retained.
@@ -1028,16 +1399,7 @@ impl SetupState {
             }
             return Err(SetupStateError::DescriptorMismatch);
         }
-        let Some(payment_edge) = bundle.payment_edge() else {
-            return Err(SetupStateError::DescriptorMismatch);
-        };
-        if close_descriptor.channel().network() != bundle.network()
-            || close_descriptor.channel().payment_edge() != payment_edge
-            || bundle.payment_terms() != Some(close_descriptor.channel().payment_terms())
-            || close_descriptor.bond_edge() != bundle.bond_edge()
-        {
-            return Err(SetupStateError::DescriptorMismatch);
-        }
+        describes_bundle(&bundle, close_descriptor)?;
         let applied = self.apply_decoded_bundle(bytes, bundle)?;
         debug_assert_eq!(applied, Applied::Changed);
         self.close_descriptor = Some(close_descriptor.clone());
@@ -1279,10 +1641,13 @@ impl SetupStore {
             kind: JournalKind::Setup,
             role,
             key: key.into_bytes(),
+            generation: 0,
         };
-        let path = root.join(format!("setup-{}.journal", hex(&key.into_bytes())));
-        let (journal, replay) = Journal::open(path, id)?;
-        let mut state = SetupState::new(network, bond_edge, role);
+        let (journal, replay) = Journal::open_latest(root, &setup_stem(key), id)?;
+        let mut state = match &replay.checkpoint {
+            Some(bytes) => SetupState::from_checkpoint(bytes, network, bond_edge, role, verifier)?,
+            None => SetupState::new(network, bond_edge, role),
+        };
         for bytes in &replay.records {
             let record = SetupRecord::decode(bytes)?;
             check_signatures(&record, verifier)?;
@@ -1348,10 +1713,56 @@ impl SetupStore {
         // leave neither the file nor the state touched.
         let mut next = self.state.clone();
         if next.apply(&record)? == Applied::Changed {
+            // A revision is exported after this returns, so the state
+            // that authorises it has to be one a rotation can still
+            // carry. Refused here, before the append and before the
+            // signature leaves, rather than at the rotation that finds
+            // out too late.
+            if record.exports_signature() {
+                let len = next.checkpoint().len();
+                if len > MAX_CHECKPOINT_BYTES {
+                    return Err(JournalError::CheckpointTooLarge { len }.into());
+                }
+            }
+            self.rotate_if_full(record.is_new_work())?;
             self.journal.append(&record.encode())?;
             self.state = next;
         }
         Ok(&self.state)
+    }
+
+    /// Moves the journal on to its next generation, carrying this state
+    /// as its first frame.
+    ///
+    /// What [`Self::commit`] does for itself at the soft limit, and what
+    /// an operator may ask for at any time. The state is unchanged
+    /// either way: a rotation moves bytes, never facts.
+    ///
+    /// # Errors
+    ///
+    /// [`WorkStoreError::Journal`] when the checkpoint does not fit one
+    /// frame or an install step fails.
+    pub fn rotate(&mut self) -> Result<(), WorkStoreError> {
+        self.journal.rotate(&self.state.checkpoint())?;
+        Ok(())
+    }
+
+    /// Rotates at the soft limit, and decides who may go on without it.
+    ///
+    /// New work stops when a rotation cannot complete, because admitting
+    /// it would be promising a duty this journal has no room to finish.
+    /// A duty already exported does not stop: the reserve above the soft
+    /// limit is exactly the room it finishes in, and it is
+    /// [`Journal::append`] that refuses when even that is gone.
+    fn rotate_if_full(&mut self, new_work: bool) -> Result<(), WorkStoreError> {
+        if !self.journal.at_soft_limit() {
+            return Ok(());
+        }
+        match self.journal.rotate(&self.state.checkpoint()) {
+            Ok(()) => Ok(()),
+            Err(error) if new_work => Err(error.into()),
+            Err(_) => Ok(()),
+        }
     }
 
     /// Returns how many records the journal holds.
@@ -1380,9 +1791,29 @@ fn check_signatures<V: SigVerifier>(
         SetupRecord::Bundle { bundle } | SetupRecord::ArmedBundle { bundle, .. } => bundle,
         _ => return Ok(()),
     };
+    check_bundle_signatures(Some(bundle), verifier)
+}
+
+/// Verifies every signature one retained revision carries.
+///
+/// The one spelling of it, so a revision that arrived as a record, a
+/// revision replayed from a frame, and a revision recovered from a
+/// checkpoint are all checked by the same code against the same keys.
+fn check_bundle_signatures<V: SigVerifier>(
+    bundle: Option<&[u8]>,
+    verifier: &V,
+) -> Result<(), SetupStateError> {
+    let Some(bundle) = bundle else {
+        return Ok(());
+    };
     let decoded = WorkChannelSetupBundleV1::decode(bundle)?;
     decoded.check(verifier)?;
     Ok(())
+}
+
+/// Returns the name every generation of one setup journal shares.
+fn setup_stem(key: Digest) -> String {
+    format!("setup-{}", hex(&key.into_bytes()))
 }
 
 /// Returns the key a setup journal is named and bound by.
@@ -1492,14 +1923,22 @@ pub fn discover_setups(root: &Path, network: NetworkId) -> Result<SetupDiscovery
     // filesystem holds them: a caller that mounted them in that order
     // would mount them differently on two machines holding the same
     // journals.
-    let mut paths = Vec::new();
+    // One journal is a numbered sequence of files, and only its newest
+    // installed generation is the one to open. A discovery that offered
+    // the retired ones too would be a node mounting the same setup
+    // several times, once from a file it has already replaced.
+    let mut newest: std::collections::BTreeMap<[u8; 32], (u64, PathBuf)> =
+        std::collections::BTreeMap::new();
     for entry in entries {
         let path = entry.map_err(JournalError::Io)?.path();
-        if setup_file_key(&path).is_some() {
-            paths.push(path);
+        if let Some((key, generation)) = setup_file_key(&path) {
+            let slot = newest.entry(key).or_insert((generation, path.clone()));
+            if generation >= slot.0 {
+                *slot = (generation, path);
+            }
         }
     }
-    paths.sort();
+    let paths: Vec<PathBuf> = newest.into_values().map(|(_, path)| path).collect();
 
     let mut discovery = SetupDiscovery::default();
     for path in paths {
@@ -1513,10 +1952,12 @@ pub fn discover_setups(root: &Path, network: NetworkId) -> Result<SetupDiscovery
     Ok(discovery)
 }
 
-/// Returns the key a setup journal's file name carries, if it is one.
-fn setup_file_key(path: &Path) -> Option<[u8; 32]> {
+/// Returns the key and generation a setup journal's file name carries,
+/// if it is one.
+fn setup_file_key(path: &Path) -> Option<([u8; 32], u64)> {
     let name = path.file_name()?.to_str()?;
-    let named = name.strip_prefix("setup-")?.strip_suffix(".journal")?;
+    let (stem, generation) = journal_name_parts(name)?;
+    let named = stem.strip_prefix("setup-")?;
     if named.len() != 64 {
         return None;
     }
@@ -1529,25 +1970,39 @@ fn setup_file_key(path: &Path) -> Option<[u8; 32]> {
     }
     // Written back rather than trusted: the parse above accepts a sign
     // and mixed case, and neither is a name this store ever wrote.
-    (hex(&key) == named).then_some(key)
+    (hex(&key) == named).then_some((key, generation))
 }
 
 /// Recovers what one setup journal is about, or says why it cannot.
 fn identify_setup(path: &Path, network: NetworkId) -> Result<DiscoveredSetup, SetupDiscoveryError> {
-    let Some(named) = setup_file_key(path) else {
+    let Some((named, generation)) = setup_file_key(path) else {
         return Err(SetupDiscoveryError::NotThisSetup);
     };
     let (id, replay) = Journal::inspect(path)?;
-    if id.kind != JournalKind::Setup || id.key != named {
+    if id.kind != JournalKind::Setup || id.key != named || id.generation != generation {
         return Err(SetupDiscoveryError::NotThisSetup);
     }
+    // A rotated journal keeps its revision in the checkpoint rather than
+    // in a frame, so a discovery that read only the frames would report
+    // every long-lived setup as holding no revision — and a setup it
+    // cannot name is a close it stops answering.
+    let mut retained = Vec::new();
+    if let Some(bytes) = &replay.checkpoint {
+        retained.extend(
+            SetupState::decode_checkpoint(bytes)?
+                .bundle_bytes()
+                .map(<[u8]>::to_vec),
+        );
+    }
     for bytes in &replay.records {
-        let (SetupRecord::Bundle { bundle } | SetupRecord::ArmedBundle { bundle, .. }) =
+        if let SetupRecord::Bundle { bundle } | SetupRecord::ArmedBundle { bundle, .. } =
             SetupRecord::decode(bytes)?
-        else {
-            continue;
-        };
-        let decoded = WorkChannelSetupBundleV1::decode(&bundle).map_err(SetupStateError::from)?;
+        {
+            retained.push(bundle);
+        }
+    }
+    if let Some(bundle) = retained.first() {
+        let decoded = WorkChannelSetupBundleV1::decode(bundle).map_err(SetupStateError::from)?;
         let bond_edge = decoded.bond_edge();
         if setup_key(network, bond_edge).into_bytes() != id.key {
             return Err(SetupDiscoveryError::WrongKey);

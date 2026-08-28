@@ -107,6 +107,60 @@ pub(crate) fn put_u64(out: &mut Vec<u8>, value: u64) {
     out.extend_from_slice(&value.to_be_bytes());
 }
 
+/// Writes one optional body behind a presence byte.
+pub(crate) fn put_option<T>(
+    out: &mut Vec<u8>,
+    value: Option<&T>,
+    body: impl FnOnce(&mut Vec<u8>, &T),
+) {
+    match value {
+        None => out.push(0),
+        Some(value) => {
+            out.push(1);
+            body(out, value);
+        }
+    }
+}
+
+/// Reads back exactly what [`put_option`] wrote.
+pub(crate) fn take_option<T, E>(
+    cursor: &mut cursor::Cursor<'_>,
+    malformed: E,
+    body: impl FnOnce(&mut cursor::Cursor<'_>) -> Result<T, E>,
+) -> Result<Option<T>, E> {
+    match cursor.byte() {
+        Some(0) => Ok(None),
+        Some(1) => body(cursor).map(Some),
+        _ => Err(malformed),
+    }
+}
+
+/// Writes a variable-width body behind its own length.
+pub(crate) fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+    put_u64(out, bytes.len() as u64);
+    out.extend_from_slice(bytes);
+}
+
+/// Reads back exactly what [`put_bytes`] wrote.
+pub(crate) fn take_bytes<'a, E>(
+    cursor: &mut cursor::Cursor<'a>,
+    malformed: E,
+) -> Result<&'a [u8], E> {
+    let Some(len) = cursor.u64().and_then(|len| usize::try_from(len).ok()) else {
+        return Err(malformed);
+    };
+    cursor.take(len).ok_or(malformed)
+}
+
+/// Reads one byte that may only be a boolean.
+pub(crate) fn take_bool<E>(cursor: &mut cursor::Cursor<'_>, malformed: E) -> Result<bool, E> {
+    match cursor.byte() {
+        Some(0) => Ok(false),
+        Some(1) => Ok(true),
+        _ => Err(malformed),
+    }
+}
+
 /// Renders a journal key as the lowercase hex a file is named with.
 ///
 /// One spelling for both journals: a key rendered two ways is two

@@ -95,9 +95,14 @@ use crate::protocol::work::{
     PaymentBindingV1, PrivateRecord as _, decode_transcript, payment_binding_digest,
     prepared_input_digest, result_digest, signing_hash, terminal_result, work_id,
 };
-use crate::work_store::journal::{Journal, JournalId, JournalKind, MAX_RECORD_BYTES, Role};
+use crate::work_store::journal::{
+    Journal, JournalError, JournalId, JournalKind, MAX_CHECKPOINT_BYTES, MAX_RECORD_BYTES, Role,
+};
 use crate::work_store::setup::SetupOrigin;
-use crate::work_store::{Applied, WorkStoreError, cursor::Cursor, hex, put_u64};
+use crate::work_store::{
+    Applied, WorkStoreError, cursor::Cursor, hex, put_bytes, put_option, put_u64, take_bool,
+    take_bytes, take_option,
+};
 
 /// Domain of a channel journal's key.
 const CHANNEL_KEY: &[u8] = b"hellas.work.channel-journal-key.v1";
@@ -300,6 +305,44 @@ impl JobPhase {
     /// Whether reaching this phase means plaintext left the provider.
     const fn delivered(self) -> bool {
         matches!(self, Self::Delivered)
+    }
+
+    const fn code(self) -> u8 {
+        match self {
+            Self::HalfSigned => 0,
+            Self::Accepted => 1,
+            Self::Running => 2,
+            Self::Ready => 3,
+            Self::Matched => 4,
+            Self::Delivered => 5,
+        }
+    }
+
+    const fn from_code(code: u8) -> Result<Self, ChannelStateError> {
+        match code {
+            0 => Ok(Self::HalfSigned),
+            1 => Ok(Self::Accepted),
+            2 => Ok(Self::Running),
+            3 => Ok(Self::Ready),
+            4 => Ok(Self::Matched),
+            5 => Ok(Self::Delivered),
+            _ => Err(ChannelStateError::Malformed),
+        }
+    }
+
+    /// Which role a job in this phase belongs to, when only one may hold
+    /// it.
+    const fn only_role(self) -> Option<Role> {
+        match self {
+            Self::Running | Self::Delivered => Some(Role::Provider),
+            Self::Matched => Some(Role::Client),
+            _ => None,
+        }
+    }
+
+    /// Whether a signed result exists once a job has reached this phase.
+    const fn has_result(self) -> bool {
+        matches!(self, Self::Ready | Self::Matched | Self::Delivered)
     }
 }
 
@@ -580,7 +623,54 @@ mod tag {
     pub(super) const CLOSE_RESPONDED: u8 = 11;
 }
 
+/// What one job can still add to a checkpoint after it is proposed.
+///
+/// The result the provider will sign, the signature over it, and the
+/// certified terminal that pays for it — all fixed-width. The transcript
+/// is deliberately not in here: it is the one variable-width thing a
+/// proposal cannot know, and it is charged where it is known, at
+/// [`ChannelRecord::JobResult`], which is still ahead of the provider's
+/// own signature leaving the process.
+const JOB_TAIL_BYTES: usize = PaidJobResultV1::ENCODED_SIZE
+    + PaymentBindingV1::ENCODED_SIZE
+    + EarnedCertificate::ENCODED_SIZE
+    + 4 * Sig::LENGTH
+    + 64;
+
 impl ChannelRecord {
+    /// What this step must leave room for in one checkpoint, when
+    /// recording it is what lets a signature leave.
+    ///
+    /// `None` for the records that carry no signature and no
+    /// variable-width body: a cursor advance, a running marker, a
+    /// plaintext release, a match, and the two a finalized block
+    /// dictates. Those cannot move the width of a checkpoint by anything
+    /// this endpoint chooses.
+    const fn checkpoint_tail(&self) -> Option<usize> {
+        match self {
+            Self::JobProposed { .. } => Some(JOB_TAIL_BYTES),
+            Self::JobAccepted { .. }
+            | Self::JobResult { .. }
+            | Self::JobTerminated { .. }
+            | Self::ClosePrepared { .. }
+            | Self::CloseResponded { .. } => Some(0),
+            _ => None,
+        }
+    }
+
+    /// Whether this step takes on an obligation rather than discharging
+    /// one.
+    ///
+    /// The proposal, and only the proposal. Everything after it follows
+    /// a signature already exported — the co-signature the client is
+    /// waiting on, the result it bought, the payment, the close, the
+    /// answer, and every block the cursor must cross to know about
+    /// them — and a journal that refused those would be one that stopped
+    /// a duty it had already taken on.
+    const fn is_new_work(&self) -> bool {
+        matches!(self, Self::JobProposed { .. })
+    }
+
     /// Returns this record's canonical bytes.
     ///
     /// Each nested body is its own canonical encoding — the private
@@ -635,45 +725,7 @@ impl ChannelRecord {
             Self::ResultMatched => out.push(tag::MATCHED),
             Self::JobTerminated { outcome } => {
                 out.push(tag::TERMINATED);
-                match outcome {
-                    TerminalOutcome::Certified {
-                        certificate,
-                        binding,
-                        binding_signature,
-                        certificate_signature,
-                    } => {
-                        out.push(outcome_code::CERTIFIED);
-                        out.extend_from_slice(&encode_kernel(certificate));
-                        out.extend_from_slice(&binding.encode());
-                        out.extend_from_slice(binding_signature.as_bytes());
-                        out.extend_from_slice(certificate_signature.as_bytes());
-                    }
-                    TerminalOutcome::Refuted {
-                        result_digest,
-                        reproduction_digest,
-                    } => {
-                        out.push(outcome_code::REFUTED);
-                        out.extend_from_slice(result_digest.as_bytes());
-                        out.extend_from_slice(reproduction_digest.as_bytes());
-                    }
-                    TerminalOutcome::Expired {
-                        deadline,
-                        height,
-                        payload,
-                    } => {
-                        out.push(outcome_code::EXPIRED);
-                        put_u64(&mut out, *deadline);
-                        put_u64(&mut out, *height);
-                        out.extend_from_slice(payload);
-                    }
-                    TerminalOutcome::Failed { code } => {
-                        out.push(outcome_code::FAILED);
-                        out.extend_from_slice(&code.to_be_bytes());
-                    }
-                    TerminalOutcome::Indeterminate => {
-                        out.push(outcome_code::INDETERMINATE);
-                    }
-                }
+                put_outcome(&mut out, outcome);
             }
             Self::ClosePrepared { start } => {
                 out.push(tag::CLOSE_PREPARED);
@@ -749,30 +801,7 @@ impl ChannelRecord {
             tag::PLAINTEXT => Self::PlaintextReleased,
             tag::MATCHED => Self::ResultMatched,
             tag::TERMINATED => Self::JobTerminated {
-                outcome: match cursor.byte().ok_or(ChannelStateError::Malformed)? {
-                    outcome_code::CERTIFIED => TerminalOutcome::Certified {
-                        certificate: certificate(&mut cursor)?,
-                        binding: private_record(&mut cursor)?,
-                        binding_signature: signature(&mut cursor)?,
-                        certificate_signature: signature(&mut cursor)?,
-                    },
-                    outcome_code::REFUTED => TerminalOutcome::Refuted {
-                        result_digest: digest(&mut cursor)?,
-                        reproduction_digest: digest(&mut cursor)?,
-                    },
-                    outcome_code::EXPIRED => TerminalOutcome::Expired {
-                        deadline: cursor.u64().ok_or(ChannelStateError::Malformed)?,
-                        height: cursor.u64().ok_or(ChannelStateError::Malformed)?,
-                        payload: cursor.array::<32>().ok_or(ChannelStateError::Malformed)?,
-                    },
-                    outcome_code::FAILED => TerminalOutcome::Failed {
-                        code: u32::from_be_bytes(
-                            cursor.array::<4>().ok_or(ChannelStateError::Malformed)?,
-                        ),
-                    },
-                    outcome_code::INDETERMINATE => TerminalOutcome::Indeterminate,
-                    _ => return Err(ChannelStateError::Malformed),
-                },
+                outcome: take_outcome(&mut cursor)?,
             },
             tag::CLOSE_PREPARED => Self::ClosePrepared {
                 start: Box::new(decode_kernel(cursor.rest())?),
@@ -814,6 +843,78 @@ impl ChannelRecord {
     }
 }
 
+/// Writes how a job ended.
+///
+/// One spelling, because a terminal is written twice: once as the record
+/// that ends the job and once inside the checkpoint that carries the
+/// ended job across a rotation. A second encoder for the second place
+/// would be a second answer to what a certified job is.
+fn put_outcome(out: &mut Vec<u8>, outcome: &TerminalOutcome) {
+    match outcome {
+        TerminalOutcome::Certified {
+            certificate,
+            binding,
+            binding_signature,
+            certificate_signature,
+        } => {
+            out.push(outcome_code::CERTIFIED);
+            out.extend_from_slice(&encode_kernel(certificate));
+            out.extend_from_slice(&binding.encode());
+            out.extend_from_slice(binding_signature.as_bytes());
+            out.extend_from_slice(certificate_signature.as_bytes());
+        }
+        TerminalOutcome::Refuted {
+            result_digest,
+            reproduction_digest,
+        } => {
+            out.push(outcome_code::REFUTED);
+            out.extend_from_slice(result_digest.as_bytes());
+            out.extend_from_slice(reproduction_digest.as_bytes());
+        }
+        TerminalOutcome::Expired {
+            deadline,
+            height,
+            payload,
+        } => {
+            out.push(outcome_code::EXPIRED);
+            put_u64(out, *deadline);
+            put_u64(out, *height);
+            out.extend_from_slice(payload);
+        }
+        TerminalOutcome::Failed { code } => {
+            out.push(outcome_code::FAILED);
+            out.extend_from_slice(&code.to_be_bytes());
+        }
+        TerminalOutcome::Indeterminate => out.push(outcome_code::INDETERMINATE),
+    }
+}
+
+/// Reads back exactly what [`put_outcome`] wrote.
+fn take_outcome(cursor: &mut Cursor<'_>) -> Result<TerminalOutcome, ChannelStateError> {
+    Ok(match cursor.byte().ok_or(ChannelStateError::Malformed)? {
+        outcome_code::CERTIFIED => TerminalOutcome::Certified {
+            certificate: certificate(cursor)?,
+            binding: private_record(cursor)?,
+            binding_signature: signature(cursor)?,
+            certificate_signature: signature(cursor)?,
+        },
+        outcome_code::REFUTED => TerminalOutcome::Refuted {
+            result_digest: digest(cursor)?,
+            reproduction_digest: digest(cursor)?,
+        },
+        outcome_code::EXPIRED => TerminalOutcome::Expired {
+            deadline: cursor.u64().ok_or(ChannelStateError::Malformed)?,
+            height: cursor.u64().ok_or(ChannelStateError::Malformed)?,
+            payload: cursor.array::<32>().ok_or(ChannelStateError::Malformed)?,
+        },
+        outcome_code::FAILED => TerminalOutcome::Failed {
+            code: u32::from_be_bytes(cursor.array::<4>().ok_or(ChannelStateError::Malformed)?),
+        },
+        outcome_code::INDETERMINATE => TerminalOutcome::Indeterminate,
+        _ => return Err(ChannelStateError::Malformed),
+    })
+}
+
 fn private_record<R: crate::protocol::work::PrivateRecord>(
     cursor: &mut Cursor<'_>,
 ) -> Result<R, ChannelStateError> {
@@ -835,6 +936,21 @@ fn party(code: u8) -> Result<Party, ChannelStateError> {
     match code {
         0 => Ok(Party::Maker),
         1 => Ok(Party::Taker),
+        _ => Err(ChannelStateError::Malformed),
+    }
+}
+
+const fn role_code(role: Role) -> u8 {
+    match role {
+        Role::Client => 1,
+        Role::Provider => 2,
+    }
+}
+
+const fn role_from_code(code: u8) -> Result<Role, ChannelStateError> {
+    match code {
+        1 => Ok(Role::Client),
+        2 => Ok(Role::Provider),
         _ => Err(ChannelStateError::Malformed),
     }
 }
@@ -1075,6 +1191,400 @@ impl ChannelState {
             close_responded: None,
             close_settled: None,
         }
+    }
+
+    /// Returns this state's canonical bytes: the whole of what a
+    /// successor generation replays from.
+    ///
+    /// Not a summary, and the destructuring below is what keeps it from
+    /// becoming one. Every field of this struct is named here and named
+    /// again in [`Self::decode_checkpoint`]'s literal, so a field added
+    /// to [`ChannelState`] and forgotten here does not compile: the
+    /// pattern is refused for the field it does not mention, and the
+    /// literal for the field it cannot fill. The same holds one level
+    /// down, for [`JobState`] and for [`JobTerminal`].
+    ///
+    /// The channel and the settlement are written as what pins them
+    /// rather than as a second copy of themselves: the channel id is a
+    /// commitment to the network, both edges and both terms bodies, and
+    /// the opener supplies the value. A checkpoint whose id or
+    /// settlement is not the opener's is refused, so what the two hold
+    /// is one channel and not two that happen to agree.
+    #[must_use]
+    pub fn checkpoint(&self) -> Vec<u8> {
+        let Self {
+            channel,
+            settlement,
+            role,
+            ledger,
+            job,
+            terminal,
+            cursor,
+            indeterminate,
+            close_prepared,
+            close_opened,
+            close_responded,
+            close_settled,
+        } = self;
+
+        let mut out = Vec::new();
+        out.extend_from_slice(channel.id().as_bytes());
+        put_u64(&mut out, settlement.freeze_total());
+        put_u64(&mut out, settlement.adjudicated_total());
+        put_u64(&mut out, settlement.capacity());
+        put_u64(&mut out, settlement.omission_bond());
+        out.push(role_code(*role));
+        put_u64(&mut out, ledger.credited_cumulative());
+        put_option(&mut out, job.as_ref(), |out, job| {
+            let JobState {
+                authorization,
+                work_id,
+                prepared_input,
+                client_signature,
+                provider_signature,
+                phase,
+                result,
+                transcript,
+            } = job;
+            out.extend_from_slice(&authorization.encode());
+            out.extend_from_slice(work_id.as_bytes());
+            out.extend_from_slice(client_signature.as_bytes());
+            put_option(out, provider_signature.as_ref(), |out, signature| {
+                out.extend_from_slice(signature.as_bytes());
+            });
+            out.push(phase.code());
+            put_option(out, result.as_ref(), |out, (result, signature)| {
+                out.extend_from_slice(&result.encode());
+                out.extend_from_slice(signature.as_bytes());
+            });
+            put_bytes(out, prepared_input);
+            put_bytes(out, transcript);
+        });
+        put_option(&mut out, terminal.as_ref(), |out, terminal| {
+            let JobTerminal {
+                work_id,
+                phase,
+                outcome,
+            } = terminal;
+            out.extend_from_slice(work_id.as_bytes());
+            out.push(phase.code());
+            put_outcome(out, outcome);
+        });
+        put_u64(&mut out, cursor.0);
+        out.extend_from_slice(&cursor.1);
+        out.push(u8::from(*indeterminate));
+        put_option(&mut out, close_prepared.as_ref(), |out, start| {
+            put_bytes(out, &encode_kernel(start));
+        });
+        put_option(&mut out, close_opened.as_ref(), |out, contest| {
+            out.extend_from_slice(&contest.start_id.to_bytes());
+            out.push(party_code(contest.opener));
+            put_u64(out, contest.response_deadline);
+            put_u64(out, contest.claimed);
+        });
+        put_option(&mut out, close_responded.as_ref(), |out, answer| {
+            out.extend_from_slice(&answer.start_id.to_bytes());
+            out.extend_from_slice(answer.response_digest.as_bytes());
+        });
+        put_option(&mut out, close_settled.as_ref(), |out, settlement| {
+            put_u64(out, settlement.height);
+            out.extend_from_slice(&settlement.payload);
+            put_u64(out, settlement.provider_payout);
+        });
+        out
+    }
+
+    /// Reads a checkpoint back into the state it was written from.
+    ///
+    /// The channel and the settlement are the opener's, and the two
+    /// values the checkpoint pins them by are checked against them
+    /// first: a successor holding another channel's state is refused
+    /// rather than adopted under this channel's keys.
+    fn decode_checkpoint(
+        bytes: &[u8],
+        channel: PaidChannel,
+        settlement: WorkPaymentSettlement,
+        role: Role,
+    ) -> Result<Self, ChannelStateError> {
+        let mut cursor = Cursor::new(bytes);
+        if digest(&mut cursor)?.as_bytes() != channel.id().as_bytes() {
+            return Err(ChannelStateError::WrongChannel {
+                field: "checkpoint channel_id",
+            });
+        }
+        for (field, held) in [
+            ("freeze_total", settlement.freeze_total()),
+            ("adjudicated_total", settlement.adjudicated_total()),
+            ("capacity", settlement.capacity()),
+            ("omission_bond", settlement.omission_bond()),
+        ] {
+            if cursor.u64().ok_or(ChannelStateError::Malformed)? != held {
+                return Err(ChannelStateError::WrongChannel { field });
+            }
+        }
+        if role_from_code(cursor.byte().ok_or(ChannelStateError::Malformed)?)? != role {
+            return Err(ChannelStateError::WrongRole {
+                step: "replaying a checkpoint",
+                expected: match role {
+                    Role::Client => "client",
+                    Role::Provider => "provider",
+                },
+            });
+        }
+        let credited = cursor.u64().ok_or(ChannelStateError::Malformed)?;
+        let state = Self {
+            channel,
+            settlement,
+            role,
+            ledger: CreditLedger::credited(credited),
+            job: take_option(&mut cursor, ChannelStateError::Malformed, |cursor| {
+                let authorization = private_record(cursor)?;
+                let work_id = digest(cursor)?;
+                let client_signature = signature(cursor)?;
+                let provider_signature =
+                    take_option(cursor, ChannelStateError::Malformed, signature)?;
+                let phase =
+                    JobPhase::from_code(cursor.byte().ok_or(ChannelStateError::Malformed)?)?;
+                let result = take_option(cursor, ChannelStateError::Malformed, |cursor| {
+                    Ok((private_record(cursor)?, signature(cursor)?))
+                })?;
+                Ok(JobState {
+                    authorization,
+                    work_id,
+                    client_signature,
+                    provider_signature,
+                    phase,
+                    result,
+                    prepared_input: take_bytes(cursor, ChannelStateError::Malformed)?.to_vec(),
+                    transcript: take_bytes(cursor, ChannelStateError::Malformed)?.to_vec(),
+                })
+            })?,
+            terminal: take_option(&mut cursor, ChannelStateError::Malformed, |cursor| {
+                Ok(JobTerminal {
+                    work_id: digest(cursor)?,
+                    phase: JobPhase::from_code(cursor.byte().ok_or(ChannelStateError::Malformed)?)?,
+                    outcome: take_outcome(cursor)?,
+                })
+            })?,
+            cursor: (
+                cursor.u64().ok_or(ChannelStateError::Malformed)?,
+                cursor.array::<32>().ok_or(ChannelStateError::Malformed)?,
+            ),
+            indeterminate: take_bool(&mut cursor, ChannelStateError::Malformed)?,
+            close_prepared: take_option(&mut cursor, ChannelStateError::Malformed, |cursor| {
+                decode_kernel(take_bytes(cursor, ChannelStateError::Malformed)?)
+            })?,
+            close_opened: take_option(&mut cursor, ChannelStateError::Malformed, |cursor| {
+                Ok(OpenContest {
+                    start_id: StartId::from_bytes(
+                        cursor
+                            .array::<{ StartId::LENGTH }>()
+                            .ok_or(ChannelStateError::Malformed)?,
+                    ),
+                    opener: party(cursor.byte().ok_or(ChannelStateError::Malformed)?)?,
+                    response_deadline: cursor.u64().ok_or(ChannelStateError::Malformed)?,
+                    claimed: cursor.u64().ok_or(ChannelStateError::Malformed)?,
+                })
+            })?,
+            close_responded: take_option(&mut cursor, ChannelStateError::Malformed, |cursor| {
+                Ok(RespondedContest {
+                    start_id: StartId::from_bytes(
+                        cursor
+                            .array::<{ StartId::LENGTH }>()
+                            .ok_or(ChannelStateError::Malformed)?,
+                    ),
+                    response_digest: PayloadHash::from_bytes(
+                        cursor
+                            .array::<{ PayloadHash::LENGTH }>()
+                            .ok_or(ChannelStateError::Malformed)?,
+                    ),
+                })
+            })?,
+            close_settled: take_option(&mut cursor, ChannelStateError::Malformed, |cursor| {
+                Ok(CloseSettlement {
+                    height: cursor.u64().ok_or(ChannelStateError::Malformed)?,
+                    payload: cursor.array::<32>().ok_or(ChannelStateError::Malformed)?,
+                    provider_payout: cursor.u64().ok_or(ChannelStateError::Malformed)?,
+                })
+            })?,
+        };
+        if cursor.is_empty() {
+            Ok(state)
+        } else {
+            Err(ChannelStateError::Malformed)
+        }
+    }
+
+    /// Reads a checkpoint and reruns every rule replay would have run to
+    /// reach it.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`Self::decode_checkpoint`] refuses about the bytes, and
+    /// whatever [`Self::revalidate`] refuses about the state.
+    fn from_checkpoint<V: SigVerifier>(
+        bytes: &[u8],
+        channel: PaidChannel,
+        settlement: WorkPaymentSettlement,
+        role: Role,
+        verifier: &V,
+    ) -> Result<Self, ChannelStateError> {
+        let state = Self::decode_checkpoint(bytes, channel, settlement, role)?;
+        state.revalidate(verifier)?;
+        Ok(state)
+    }
+
+    /// Refuses a checkpoint whose stored fields are not the ones its own
+    /// contents produce.
+    ///
+    /// Every signature this journal ever verified is verified again,
+    /// against the party the channel names and over the same digest —
+    /// the client's authorization, the provider's co-signature, the
+    /// provider's result, and the client's binding and certificate. The
+    /// result is rebuilt from the transcript beside it by
+    /// [`terminal_result`], exactly as a record replay rebuilds it. The
+    /// inputs are hashed against the digest the authorization commits
+    /// to. The retained close start is checked against this channel and
+    /// this role, and the fixed answer is re-derived from the contest
+    /// and the certificate that determine it.
+    ///
+    /// What cannot be rerun is the height each of those steps was legal
+    /// at: a checkpoint is the state a replay reached, not the blocks it
+    /// crossed, and judging an old step by the cursor the checkpoint
+    /// carries would refuse a journal that was legal at every step. That
+    /// is the one thing this does not claim, and it is the reason the
+    /// deadline rules stay where they are — on the records, at the
+    /// heights they were taken.
+    fn revalidate<V: SigVerifier>(&self, verifier: &V) -> Result<(), ChannelStateError> {
+        // The one number consensus sees, against the one terminal that
+        // could have moved it. A ledger the terminal does not produce is
+        // a channel that would credit a second payment.
+        if self.ledger.credited_cumulative() != self.max_executable_certificate() {
+            return Err(ChannelStateError::WrongChannel {
+                field: "credited cumulative against the terminal",
+            });
+        }
+        if let Some(job) = &self.job {
+            if job.work_id != work_id(&self.channel, &job.authorization) {
+                return Err(ChannelStateError::WrongChannel { field: "work_id" });
+            }
+            self.check_authorization(&job.authorization, &job.prepared_input)?;
+            if job.phase.only_role().is_some_and(|role| role != self.role)
+                || job.provider_signature.is_some() != (job.phase != JobPhase::HalfSigned)
+                || job.result.is_some() != job.phase.has_result()
+            {
+                return Err(ChannelStateError::WrongPhase {
+                    step: "replaying a checkpoint",
+                    phase: job.phase.name(),
+                });
+            }
+            if !verifier.verify_sig(
+                job.client_signature,
+                self.client_key(),
+                signing_hash(job.work_id),
+            ) {
+                return Err(ChannelStateError::BadSignature {
+                    slot: "authorization",
+                    party: "the client",
+                });
+            }
+            if let Some(provider_signature) = job.provider_signature
+                && !verifier.verify_sig(
+                    provider_signature,
+                    self.provider_key(),
+                    signing_hash(job.work_id),
+                )
+            {
+                return Err(ChannelStateError::BadSignature {
+                    slot: "authorization",
+                    party: "the provider",
+                });
+            }
+            if let Some((result, provider_signature)) = &job.result {
+                let events = decode_transcript(&job.transcript, MAX_RECORD_BYTES)?;
+                if terminal_result(&self.channel, &job.authorization, &events)? != *result {
+                    return Err(ChannelStateError::WrongChannel {
+                        field: "result against its transcript",
+                    });
+                }
+                if !verifier.verify_sig(
+                    *provider_signature,
+                    self.provider_key(),
+                    signing_hash(result_digest(&self.channel, result)),
+                ) {
+                    return Err(ChannelStateError::BadSignature {
+                        slot: "result",
+                        party: "the provider",
+                    });
+                }
+            }
+        }
+        if let Some(terminal) = &self.terminal {
+            if self.job.is_some() {
+                return Err(ChannelStateError::Terminated {
+                    step: "replaying a checkpoint with a job still open",
+                    outcome: terminal.outcome.name(),
+                });
+            }
+            if let TerminalOutcome::Certified {
+                certificate,
+                binding,
+                binding_signature,
+                certificate_signature,
+            } = &terminal.outcome
+            {
+                for (slot, signature, hash) in [
+                    (
+                        "binding",
+                        *binding_signature,
+                        signing_hash(payment_binding_digest(&self.channel, binding)),
+                    ),
+                    (
+                        "certificate",
+                        *certificate_signature,
+                        certificate.digest(self.network()),
+                    ),
+                ] {
+                    if !verifier.verify_sig(signature, self.client_key(), hash) {
+                        return Err(ChannelStateError::BadSignature {
+                            slot,
+                            party: "the client",
+                        });
+                    }
+                }
+            }
+        }
+        if let Some(start) = &self.close_prepared {
+            self.check_close_start(start)?;
+        }
+        if let Some(answer) = self.close_responded {
+            let Some(contest) = self
+                .close_opened
+                .filter(|contest| contest.start_id == answer.start_id)
+            else {
+                return Err(ChannelStateError::WrongChannel {
+                    field: "close response start_id",
+                });
+            };
+            let Some((certificate, _)) = self.executable_certificate() else {
+                return Err(ChannelStateError::WrongPhase {
+                    step: "replaying a fixed contest answer",
+                    phase: "owed no answer",
+                });
+            };
+            if answer.response_digest
+                != crate::work_close::response_body_digest(
+                    &self.channel,
+                    contest.start_id,
+                    &certificate,
+                )
+            {
+                return Err(ChannelStateError::WrongChannel {
+                    field: "close response digest",
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Returns the channel every record here is bound to.
@@ -1562,32 +2072,7 @@ impl ChannelState {
         // sign. Only the beneficiary of a certificate can be the
         // provider, so a journal signing in the other role would be
         // building a close for the other party.
-        for (field, holds) in [
-            (
-                "close start payment_edge",
-                start.payment_edge() == self.channel.payment_edge(),
-            ),
-            (
-                "close start payment_terms_hash",
-                start.terms().hash() == self.channel.payment_terms_hash(),
-            ),
-            (
-                "close start opener_role",
-                start.opener_role()
-                    == match self.role {
-                        Role::Client => Party::Maker,
-                        Role::Provider => Party::Taker,
-                    },
-            ),
-            (
-                "close start certificate",
-                start.certificate().copied() == self.executable_certificate(),
-            ),
-        ] {
-            if !holds {
-                return Err(ChannelStateError::WrongChannel { field });
-            }
-        }
+        self.check_close_start(start)?;
         let (cursor_height, _) = self.cursor;
         if self.includable_close_start(cursor_height).is_some() {
             return Err(ChannelStateError::Conflict {
@@ -1729,40 +2214,20 @@ impl ChannelState {
         }
     }
 
-    fn apply_proposed<V: SigVerifier>(
-        &mut self,
+    /// Checks one authorization and its inputs against the channel this
+    /// journal is.
+    ///
+    /// One spelling, asked when the proposal arrives and again when a
+    /// checkpoint carrying the open job is opened. The rest of the
+    /// authorization's rules — the policy digest, the deadlines, the
+    /// price against the finalized height — are `check_authorization`'s,
+    /// and a second spelling of them here would be a second chance to
+    /// spell them differently.
+    fn check_authorization(
+        &self,
         authorization: &PaidJobAuthorizationV1,
-        client_signature: Sig,
         prepared_input: &[u8],
-        verifier: &V,
-    ) -> Result<Applied, ChannelStateError> {
-        let work_id = work_id(&self.channel, authorization);
-        if let Some(job) = &self.job {
-            if job.authorization == *authorization
-                && job.client_signature == client_signature
-                && job.prepared_input == prepared_input
-            {
-                return Ok(Applied::Redundant);
-            }
-            return Err(ChannelStateError::WrongPhase {
-                step: "proposing a job",
-                phase: job.phase.name(),
-            });
-        }
-        // This channel admits one job for its whole life. Once that job
-        // has reached its terminal, a fresh proposal has nothing to open.
-        self.refuse_if_terminated("proposing a job")?;
-        // A closing channel takes no new work. The close is built from
-        // what is held now, so a job admitted after it would be a job
-        // whose payment no close could carry.
-        self.refuse_if_closing("proposing a job")?;
-
-        // The channel this endpoint is, against the channel the
-        // authorization names. The rest of the authorization's rules —
-        // the policy digest, the deadlines, the price against the
-        // finalized height — are `check_authorization`'s, and a second
-        // spelling of them here would be a second chance to spell them
-        // differently.
+    ) -> Result<(), ChannelStateError> {
         let terms = self.channel.payment_terms();
         for (field, holds) in [
             (
@@ -1805,7 +2270,76 @@ impl ChannelState {
                 field: "prepared_input_digest",
             }));
         }
+        Ok(())
+    }
 
+    /// Checks one retained close start against the channel and role it
+    /// was signed for.
+    ///
+    /// One spelling, asked when the start is signed and again when a
+    /// checkpoint carrying it is opened. It does not ask whether the
+    /// start may still be *included* — that is the cursor's judgement
+    /// and it moves — only whether it is this endpoint's start for this
+    /// channel over the certificate this journal holds.
+    fn check_close_start(&self, start: &PaymentCloseStart) -> Result<(), ChannelStateError> {
+        for (field, holds) in [
+            (
+                "close start payment_edge",
+                start.payment_edge() == self.channel.payment_edge(),
+            ),
+            (
+                "close start payment_terms_hash",
+                start.terms().hash() == self.channel.payment_terms_hash(),
+            ),
+            (
+                "close start opener_role",
+                start.opener_role()
+                    == match self.role {
+                        Role::Client => Party::Maker,
+                        Role::Provider => Party::Taker,
+                    },
+            ),
+            (
+                "close start certificate",
+                start.certificate().copied() == self.executable_certificate(),
+            ),
+        ] {
+            if !holds {
+                return Err(ChannelStateError::WrongChannel { field });
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_proposed<V: SigVerifier>(
+        &mut self,
+        authorization: &PaidJobAuthorizationV1,
+        client_signature: Sig,
+        prepared_input: &[u8],
+        verifier: &V,
+    ) -> Result<Applied, ChannelStateError> {
+        let work_id = work_id(&self.channel, authorization);
+        if let Some(job) = &self.job {
+            if job.authorization == *authorization
+                && job.client_signature == client_signature
+                && job.prepared_input == prepared_input
+            {
+                return Ok(Applied::Redundant);
+            }
+            return Err(ChannelStateError::WrongPhase {
+                step: "proposing a job",
+                phase: job.phase.name(),
+            });
+        }
+        // This channel admits one job for its whole life. Once that job
+        // has reached its terminal, a fresh proposal has nothing to open.
+        self.refuse_if_terminated("proposing a job")?;
+        // A closing channel takes no new work. The close is built from
+        // what is held now, so a job admitted after it would be a job
+        // whose payment no close could carry.
+        self.refuse_if_closing("proposing a job")?;
+
+        self.check_authorization(authorization, prepared_input)?;
         if !verifier.verify_sig(client_signature, self.client_key(), signing_hash(work_id)) {
             return Err(ChannelStateError::BadSignature {
                 slot: "authorization",
@@ -2320,15 +2854,22 @@ impl ChannelStore {
             .into());
         }
         let key = channel_key(&channel).into_bytes();
-        let (journal, replay) = Journal::open(
-            root.join(format!("channel-{}.journal", hex(&key))),
+        let (journal, replay) = Journal::open_latest(
+            root,
+            &format!("channel-{}", hex(&key)),
             JournalId {
                 kind: JournalKind::Channel,
                 role,
                 key,
+                generation: 0,
             },
         )?;
-        let mut state = ChannelState::new(channel, settlement, role, origin);
+        let mut state = match &replay.checkpoint {
+            Some(bytes) => {
+                ChannelState::from_checkpoint(bytes, channel, settlement, role, verifier)?
+            }
+            None => ChannelState::new(channel, settlement, role, origin),
+        };
         for bytes in &replay.records {
             let record = ChannelRecord::decode(bytes)?;
             state.apply(&record, verifier)?;
@@ -2385,10 +2926,60 @@ impl ChannelStore {
         // neither the file nor the state touched.
         let mut next = self.state.clone();
         if next.apply(&record, verifier)? == Applied::Changed {
+            // The signature this record carries leaves after this
+            // returns, so the state that authorises it has to be one a
+            // rotation can still carry. The sole job is charged the
+            // fixed tail it can still add — the result it will be
+            // answered with and the terminal that pays for it — because
+            // by then there is no refusal left that costs nothing.
+            if let Some(tail) = record.checkpoint_tail() {
+                let len = next.checkpoint().len().saturating_add(tail);
+                if len > MAX_CHECKPOINT_BYTES {
+                    return Err(JournalError::CheckpointTooLarge { len }.into());
+                }
+            }
+            self.rotate_if_full(record.is_new_work())?;
             self.journal.append(&record.encode())?;
             self.state = next;
         }
         Ok(&self.state)
+    }
+
+    /// Moves the journal on to its next generation, carrying this state
+    /// as its first frame.
+    ///
+    /// What [`Self::commit`] does for itself at the soft limit, and what
+    /// an operator may ask for at any time. It is the step that makes a
+    /// close duty outlive the file it is written in: the successor's
+    /// first frame is everything the predecessor said, so the
+    /// predecessor's bytes go and none of its facts do.
+    ///
+    /// # Errors
+    ///
+    /// [`WorkStoreError::Journal`] when the checkpoint does not fit one
+    /// frame or an install step fails.
+    pub fn rotate(&mut self) -> Result<(), WorkStoreError> {
+        self.journal.rotate(&self.state.checkpoint())?;
+        Ok(())
+    }
+
+    /// Rotates at the soft limit, and decides who may go on without it.
+    ///
+    /// New work stops when a rotation cannot complete, because admitting
+    /// it would be promising a duty this journal has no room to finish.
+    /// A duty already exported does not stop: the reserve above the soft
+    /// limit is exactly the room the cursor advances, the close and the
+    /// answer finish in, and it is [`Journal::append`] that refuses when
+    /// even that is gone.
+    fn rotate_if_full(&mut self, new_work: bool) -> Result<(), WorkStoreError> {
+        if !self.journal.at_soft_limit() {
+            return Ok(());
+        }
+        match self.journal.rotate(&self.state.checkpoint()) {
+            Ok(()) => Ok(()),
+            Err(error) if new_work => Err(error.into()),
+            Err(_) => Ok(()),
+        }
     }
 
     /// Returns how many records the channel journal holds.

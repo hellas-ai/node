@@ -18,16 +18,18 @@
 use hellas_rpc::work_store::Role;
 use hellas_rpc::work_store::journal::{Journal, JournalId, JournalKind};
 
-/// Bytes before the first frame: magic, version, kind, role, key.
-const HEADER_BYTES: usize = 57;
+/// Bytes before the first frame: magic, version, kind, role,
+/// generation, key.
+const HEADER_BYTES: usize = 65;
 
-/// `hellas.work-journal.v1`, then `04` version, `02` channel, `02`
-/// provider, then the 32-byte key.
+/// `hellas.work-journal.v1`, then `05` version, `02` channel, `02`
+/// provider, the eight-byte generation, then the 32-byte key.
 const GOLDEN_HEADER: &str = concat!(
     "68656c6c61732e776f726b2d6a6f75726e616c2e7631",
-    "04",
+    "05",
     "02",
     "02",
+    "0000000000000000",
     "1111111111111111111111111111111111111111111111111111111111111111",
 );
 
@@ -36,7 +38,7 @@ const GOLDEN_HEADER: &str = concat!(
 const GOLDEN_FRAME: &str = concat!(
     "0000000a",
     "6f6e65207265636f7264",
-    "e1bc34e6a811749c213a0fcde6af035d1818579d2b69471d24bbee9fc738c862",
+    "4607087f3e8fbd8481bde856d457cd51c4110826e0a2ecb8b61085f91ffac1a4",
 );
 
 fn hex(bytes: &[u8]) -> String {
@@ -51,11 +53,12 @@ fn a_v1_journal_is_refused() {
     let Ok(dir) = tempfile::tempdir() else {
         panic!("a temporary directory");
     };
-    let path = dir.path().join("old.journal");
+    let path = dir.path().join("old.0000000000000000.journal");
     let id = JournalId {
         kind: JournalKind::Channel,
         role: Role::Provider,
         key: [0x11; 32],
+        generation: 0,
     };
     {
         let Ok((journal, _)) = Journal::open(&path, id) else {
@@ -76,7 +79,7 @@ fn a_v1_journal_is_refused() {
             error,
             hellas_rpc::work_store::JournalError::OldVersion {
                 found: 1,
-                expected: 4,
+                expected: 5,
                 ..
             }
         ),
@@ -124,6 +127,8 @@ fn a_v2_channel_journal_is_refused_not_misread() {
     header.push(2); // JournalKind::Channel
     header.push(2); // Role::Provider
     header.extend_from_slice(&[0x11; 32]);
+    // A v2 header carried no generation: thirty-two key bytes followed
+    // the role byte, and nothing else did.
     let mut header_preimage = b"hellas.work.journal-header.v1".to_vec();
     header_preimage.extend_from_slice(&header);
     let header_digest = Digest::hash(&header_preimage);
@@ -144,7 +149,7 @@ fn a_v2_channel_journal_is_refused_not_misread() {
     let Ok(dir) = tempfile::tempdir() else {
         panic!("a temporary directory");
     };
-    let path = dir.path().join("v2.journal");
+    let path = dir.path().join("v2.0000000000000000.journal");
     if let Err(error) = std::fs::write(&path, bytes) {
         panic!("the v2 fixture writes: {error}");
     }
@@ -152,6 +157,7 @@ fn a_v2_channel_journal_is_refused_not_misread() {
         kind: JournalKind::Channel,
         role: Role::Provider,
         key: [0x11; 32],
+        generation: 0,
     };
     let error =
         Journal::open(&path, id).expect_err("v2 channel records mis-replay under the v3 tags");
@@ -160,7 +166,7 @@ fn a_v2_channel_journal_is_refused_not_misread() {
             error,
             hellas_rpc::work_store::JournalError::OldVersion {
                 found: 2,
-                expected: 4,
+                expected: 5,
                 ..
             }
         ),
@@ -225,7 +231,7 @@ fn a_v3_channel_journal_is_refused_for_the_answer_it_cannot_hold() {
     let Ok(dir) = tempfile::tempdir() else {
         panic!("a temporary directory");
     };
-    let path = dir.path().join("v3.journal");
+    let path = dir.path().join("v3.0000000000000000.journal");
     if let Err(error) = std::fs::write(&path, bytes) {
         panic!("the v3 fixture writes: {error}");
     }
@@ -233,6 +239,7 @@ fn a_v3_channel_journal_is_refused_for_the_answer_it_cannot_hold() {
         kind: JournalKind::Channel,
         role: Role::Provider,
         key: [0x11; 32],
+        generation: 0,
     };
     let error = Journal::open(&path, id).expect_err("v3 cannot record an answered contest");
     let hellas_rpc::work_store::JournalError::OldVersion {
@@ -243,7 +250,7 @@ fn a_v3_channel_journal_is_refused_for_the_answer_it_cannot_hold() {
     else {
         panic!("unexpected error: {error}");
     };
-    assert_eq!((found, expected), (3, 4));
+    assert_eq!((found, expected), (3, 5));
     assert!(
         retirement.contains("answered contest"),
         "the reason given is v3's own, not v2's: {retirement}",
@@ -256,11 +263,12 @@ fn a_journal_of_one_record_is_these_bytes() {
     let Ok(dir) = tempfile::tempdir() else {
         panic!("a temporary directory");
     };
-    let path = dir.path().join("golden.journal");
+    let path = dir.path().join("golden.0000000000000000.journal");
     let id = JournalId {
         kind: JournalKind::Channel,
         role: Role::Provider,
         key: [0x11; 32],
+        generation: 0,
     };
     {
         let (mut journal, replay) = match Journal::open(&path, id) {

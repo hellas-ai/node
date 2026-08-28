@@ -1758,6 +1758,21 @@ impl CreditLedger {
         Self::default()
     }
 
+    /// A channel that has credited exactly this much.
+    ///
+    /// For the one caller that recovers a ledger rather than building
+    /// one: a journal checkpoint carries this value across a rotation,
+    /// and the job the credit was for is closed by then, so nothing is
+    /// left to re-run [`Self::credit_payment`] over. The store checks it
+    /// against the certificate its own terminal holds before it is
+    /// trusted; this is only the way to say the number.
+    #[must_use]
+    pub(crate) const fn credited(credited_cumulative: u64) -> Self {
+        Self {
+            credited_cumulative,
+        }
+    }
+
     /// Returns the cumulative amount already credited.
     pub const fn credited_cumulative(&self) -> u64 {
         self.credited_cumulative

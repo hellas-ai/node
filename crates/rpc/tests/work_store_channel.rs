@@ -2407,6 +2407,7 @@ fn inputs_swapped_on_the_disk_are_not_a_job_to_execute() {
                 kind: JournalKind::Channel,
                 role: Role::Provider,
                 key: channel_key_bytes(&path),
+                generation: 0,
             };
             let (mut journal, _) = match Journal::open(&path, id) {
                 Ok(opened) => opened,
@@ -2462,8 +2463,10 @@ fn channel_key_bytes(path: &std::path::Path) -> [u8; 32] {
     let Some(hex) = name
         .rsplit_once("channel-")
         .and_then(|(_, rest)| rest.strip_suffix(".journal"))
+        .and_then(|rest| rest.rsplit_once('.'))
+        .map(|(hex, _generation)| hex)
     else {
-        panic!("the channel journal is named channel-<key>.journal");
+        panic!("the channel journal is named channel-<key>.<generation>.journal");
     };
     let mut key = [0_u8; 32];
     assert_eq!(hex.len(), 2 * key.len(), "the name carries a 32-byte key");
@@ -2890,5 +2893,360 @@ fn one_contest_admits_one_answer() {
             Err(WorkStoreError::Channel(ChannelStateError::WrongRole { .. }))
         ),
         "only the certificate's beneficiary answers: {wrong_role:?}",
+    );
+}
+
+// ── Rotation ──────────────────────────────────────────────────────────
+
+/// A provider holding a delivered job that has not been paid for.
+///
+/// The half of the state a settled channel cannot hold: an open job,
+/// with its authorization, its inputs, both signatures, its signed
+/// result and the transcript that result was rebuilt from.
+fn delivered_store(root: &std::path::Path) -> ChannelStore {
+    let channel = channel();
+    let job = job_at(&channel, 1, 0);
+    let mut store = open_on(root, channel.clone(), Role::Provider);
+    advance(&mut store, RECEIPT_HEIGHT);
+    commit_all(
+        &mut store,
+        &[
+            job.proposed(),
+            job.accepted(),
+            ChannelRecord::JobRunning,
+            job.result_record(&channel),
+            ChannelRecord::PlaintextReleased,
+        ],
+    );
+    store
+}
+
+/// A provider whose one job is paid for and whose edge has closed.
+///
+/// The other half: a certified terminal, the ledger that terminal
+/// credited, the retained close start, the contest, the answer fixed for
+/// it, and the settlement that ended it.
+fn closed_store(root: &std::path::Path) -> ChannelStore {
+    let channel = channel();
+    let job = job_at(&channel, 1, 0);
+    let mut store = delivered_store(root);
+    commit_all(&mut store, &[job.paid(&channel)]);
+
+    let start = hellas_kernel::PaymentCloseStart::new(
+        channel.payment_edge(),
+        hellas_kernel::Terms::work_payment(channel.payment_terms().clone()),
+        Party::Taker,
+        (RECEIPT_HEIGHT + 1, RECEIPT_HEIGHT + 8),
+        Some((
+            job.certificate,
+            client().sign(job.certificate.digest(channel.network())),
+        )),
+        provider().sign(payload(job.work_id)),
+    );
+    let start_id = hellas_kernel::StartId::from_bytes([0x7c; 32]);
+    commit_all(
+        &mut store,
+        &[
+            ChannelRecord::ClosePrepared {
+                start: Box::new(start),
+            },
+            ChannelRecord::CloseOpened {
+                start_id,
+                opener: Party::Maker,
+                response_deadline: RECEIPT_HEIGHT + 16,
+                claimed: 0,
+            },
+            ChannelRecord::CloseResponded {
+                start_id,
+                response_digest: hellas_rpc::work_close::response_body_digest(
+                    &channel,
+                    start_id,
+                    &job.certificate,
+                ),
+            },
+            ChannelRecord::CloseSettled {
+                height: RECEIPT_HEIGHT + 20,
+                payload: payload_at(RECEIPT_HEIGHT + 20),
+                provider_payout: PRICE,
+            },
+        ],
+    );
+    store
+}
+
+/// One named fixture: what to call it, and how to build it.
+type Fixture = (&'static str, fn(&std::path::Path) -> ChannelStore);
+
+/// Every fixture a rotation is asserted over, named.
+const FIXTURES: [Fixture; 2] = [("delivered", delivered_store), ("closed", closed_store)];
+
+/// The one journal file under a root.
+fn only_journal(root: &std::path::Path) -> std::path::PathBuf {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        panic!("the root reads");
+    };
+    let mut found: Vec<std::path::PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.to_string_lossy().ends_with(".journal"))
+        .collect();
+    found.sort();
+    let [path] = found.as_slice() else {
+        panic!("one installed generation, not {found:?}");
+    };
+    path.clone()
+}
+
+fn read_file(path: &std::path::Path) -> Vec<u8> {
+    match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) => panic!("{} reads: {error}", path.display()),
+    }
+}
+
+fn write_file(path: &std::path::Path, bytes: &[u8]) {
+    if let Err(error) = std::fs::write(path, bytes) {
+        panic!("{} writes: {error}", path.display());
+    }
+}
+
+/// What a checkpoint replays to is exactly what the frames it replaced
+/// replayed to.
+///
+/// The comparison is of the whole [`ChannelState`], not of the fields
+/// this test happens to think of: a field added to that struct and left
+/// out of the checkpoint fails to compile, and a field added and encoded
+/// wrongly fails here, as long as one of the two fixtures reaches a
+/// value for it that is not the one a fresh store starts at. What each
+/// fixture reaches is asserted below rather than assumed.
+#[test]
+fn a_checkpoint_replays_to_what_the_frames_replayed_to() {
+    for (label, fixture) in FIXTURES {
+        let control = temp();
+        let expected = fixture(control.path()).state().clone();
+
+        let rotated = temp();
+        {
+            let mut store = fixture(rotated.path());
+            if let Err(error) = store.rotate() {
+                panic!("{label}: the rotation completes: {error}");
+            }
+            assert_eq!(
+                store.len(),
+                1,
+                "{label}: a fresh successor holds its checkpoint and nothing else",
+            );
+        }
+        let reopened = open(rotated.path(), Role::Provider);
+        assert_eq!(
+            reopened.state(),
+            &expected,
+            "{label}: the checkpoint is the state, not a summary of it",
+        );
+        assert!(
+            !reopened.recovered_torn_tail(),
+            "{label}: a rotation is not a tear",
+        );
+    }
+
+    let delivered = temp();
+    let delivered = delivered_store(delivered.path());
+    let delivered = delivered.state();
+    let Some(job) = delivered.job() else {
+        panic!("the delivered fixture holds its job");
+    };
+    assert_eq!(job.phase(), JobPhase::Delivered);
+    assert!(job.provider_signature().is_some());
+    assert!(job.result().is_some());
+    assert!(!job.transcript().is_empty());
+    assert!(!job.prepared_input().is_empty());
+    assert_eq!(delivered.cursor().0, RECEIPT_HEIGHT);
+    assert_eq!(delivered.terminal(), None);
+
+    let closed = temp();
+    let closed = closed_store(closed.path());
+    let closed = closed.state();
+    assert!(closed.job().is_none());
+    assert!(closed.terminal().is_some());
+    assert_eq!(closed.ledger().credited_cumulative(), PRICE);
+    assert!(closed.close_prepared().is_some());
+    assert!(closed.close_opened().is_some());
+    assert!(closed.close_responded().is_some());
+    assert!(closed.close_settled().is_some());
+    assert!(closed.last_payment().is_some());
+}
+
+/// A crash at any point of the install reopens the same channel.
+#[test]
+fn a_rotation_crashing_at_any_step_reopens_the_same_channel() {
+    for (label, fixture) in FIXTURES {
+        let source = temp();
+        let expected = fixture(source.path()).state().clone();
+        let predecessor_path = only_journal(source.path());
+        let predecessor = read_file(&predecessor_path);
+        let Some(predecessor_name) = predecessor_path.file_name().map(std::ffi::OsStr::to_owned)
+        else {
+            panic!("{label}: the predecessor has a name");
+        };
+
+        let installed = temp();
+        {
+            let mut store = fixture(installed.path());
+            if let Err(error) = store.rotate() {
+                panic!("{label}: the rotation completes: {error}");
+            }
+        }
+        let successor_path = only_journal(installed.path());
+        let successor = read_file(&successor_path);
+        let Some(successor_name) = successor_path.file_name().map(std::ffi::OsStr::to_owned) else {
+            panic!("{label}: the successor has a name");
+        };
+        let mut candidate_name = successor_name.clone();
+        candidate_name.push(".candidate");
+
+        for step in 0..4 {
+            let dir = temp();
+            if step < 3 {
+                write_file(&dir.path().join(&predecessor_name), &predecessor);
+            }
+            match step {
+                0 => write_file(
+                    &dir.path().join(&candidate_name),
+                    &successor[..successor.len() / 2],
+                ),
+                1 => write_file(&dir.path().join(&candidate_name), &successor),
+                _ => write_file(&dir.path().join(&successor_name), &successor),
+            }
+
+            let reopened = open(dir.path(), Role::Provider);
+            assert_eq!(
+                reopened.state(),
+                &expected,
+                "{label}, step {step}: the same channel reopens",
+            );
+        }
+    }
+}
+
+/// A duty outlives the file it is written in, however many times that
+/// file has to be replaced.
+///
+/// This is the case the whole slice is for. The channel is closed and
+/// paid; what is left is a provider reading blocks, which consensus does
+/// not bound and a file does. It advances the cursor far enough to cross
+/// the soft limit twice, and what is asserted afterwards is that the
+/// certificate, the terminal and the answer are still there — and that
+/// the bytes on the disk are bounded by one generation rather than by
+/// the number of blocks read.
+#[test]
+fn a_duty_survives_repeated_rotation() {
+    use hellas_rpc::work_store::journal::{MAX_ACTIVE_FRAMES, MAX_ACTIVE_JOURNAL_BYTES};
+
+    let dir = temp();
+    let expected = {
+        let mut store = closed_store(dir.path());
+        let before = store.state().clone();
+        let start = store.state().cursor().0;
+        // Two soft limits' worth of blocks, and a few more, so the
+        // second rotation is not the last record written.
+        advance(&mut store, start + 2 * MAX_ACTIVE_FRAMES + 32);
+        assert_eq!(
+            store.state().cursor().0,
+            start + 2 * MAX_ACTIVE_FRAMES + 32,
+            "every block was read",
+        );
+        assert_eq!(
+            store.state().terminal(),
+            before.terminal(),
+            "rotation moves bytes and not facts",
+        );
+        store.state().clone()
+    };
+
+    let path = only_journal(dir.path());
+    let bytes = read_file(&path).len() as u64;
+    assert!(
+        bytes < MAX_ACTIVE_JOURNAL_BYTES,
+        "the live generation is bounded, not the block count: {bytes} bytes",
+    );
+    let Some(name) = path.file_name().and_then(std::ffi::OsStr::to_str) else {
+        panic!("the journal has a name");
+    };
+    let Some((_, generation)) = hellas_rpc::work_store::journal::journal_name_parts(name) else {
+        panic!("the journal's name carries its generation");
+    };
+    assert!(
+        generation >= 2,
+        "two soft limits, two rotations: {generation}"
+    );
+
+    let reopened = open(dir.path(), Role::Provider);
+    assert_eq!(reopened.state(), &expected);
+    assert!(
+        reopened.state().last_payment().is_some(),
+        "the certificate a close still has to carry",
+    );
+    assert!(
+        reopened.state().close_responded().is_some(),
+        "and the one answer this endpoint fixed",
+    );
+}
+
+/// At the soft limit, a rotation that cannot complete stops new work and
+/// lets an exported duty finish.
+///
+/// The rotation is broken by taking away the directory the successor
+/// would be created in, which is the one failure that leaves the
+/// predecessor's open descriptor working — so what is exercised is
+/// exactly the split the spec names: the proposal is refused, and the
+/// cursor advances that a duty is made of are not.
+#[test]
+fn new_work_stops_where_a_duty_carries_on() {
+    use hellas_rpc::work_store::journal::{DUTY_RESERVE_FRAMES, MAX_ACTIVE_FRAMES};
+
+    let dir = temp();
+    let channel = channel();
+    let job = job_at(&channel, 1, 0);
+    let mut store = open_on(dir.path(), channel.clone(), Role::Provider);
+    let verifier = Secp256k1Verifier::new();
+
+    let start = store.state().cursor().0;
+    let soft = MAX_ACTIVE_FRAMES - DUTY_RESERVE_FRAMES;
+    // Exactly at the soft limit: the frames are written, and the next
+    // commit is the one that has to rotate before it appends.
+    advance(&mut store, start + soft);
+    assert_eq!(store.len(), soft);
+
+    if let Err(error) = std::fs::remove_dir_all(dir.path()) {
+        panic!("the journal root is removable: {error}");
+    }
+
+    let refused = store.commit(job.proposed(), &verifier);
+    assert!(
+        matches!(refused, Err(WorkStoreError::Journal(JournalError::Io(_)))),
+        "new work stops when the journal cannot rotate: {refused:?}",
+    );
+    assert!(
+        store.state().job().is_none(),
+        "and nothing was written for it",
+    );
+
+    // The duty carries on into the reserve, and only the hard cap ends
+    // it.
+    let mut height = store.state().cursor().0;
+    for _ in 0..DUTY_RESERVE_FRAMES {
+        height += 1;
+        if let Err(error) = store.commit(cursor_at(height), &verifier) {
+            panic!("the reserve is a duty's to use: {error}");
+        }
+    }
+    assert_eq!(store.len(), MAX_ACTIVE_FRAMES);
+    let full = store.commit(cursor_at(height + 1), &verifier);
+    assert!(
+        matches!(
+            full,
+            Err(WorkStoreError::Journal(JournalError::Full { .. }))
+        ),
+        "the hard cap is the end of the reserve: {full:?}",
     );
 }
