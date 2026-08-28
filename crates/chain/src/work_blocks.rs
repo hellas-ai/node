@@ -49,8 +49,8 @@ use hellas_rpc::work_open::{FinalizedSetup, SetupQuery, SetupView};
 use crate::SubmitTxOutcome;
 use crate::block_view::FinalizedBlockView;
 use crate::domain::{Digest, Transaction};
-use crate::light_client::{FinalizedBlockQuery, LightClient};
-use crate::work_view::{FinalizedWorkView, WorkChannelQuery};
+use crate::light_client::{FinalizedBlockQuery, LightClient, QueryError};
+use crate::work_view::{FinalizedWorkView, WorkChannelQuery, WorkChannelSnapshot};
 
 /// One light client, as a paid endpoint's block source.
 #[derive(Clone, Debug)]
@@ -106,6 +106,15 @@ impl<C: LightClient + FinalizedWorkView> SetupView for WorkBlocks<C> {
                 "the work channel snapshot answers for other funding coins than were asked for",
             )
         })
+    }
+}
+
+impl<C: LightClient + FinalizedWorkView> FinalizedWorkView for WorkBlocks<C> {
+    async fn work_channel_snapshot(
+        &self,
+        query: WorkChannelQuery,
+    ) -> Result<Option<WorkChannelSnapshot>, QueryError> {
+        self.0.work_channel_snapshot(query).await
     }
 }
 
@@ -752,8 +761,7 @@ mod tests {
             // to the readiness gate. This is what an endpoint mounting
             // the paid service needs, and it is the first time a chain
             // read has been able to produce one.
-            let snapshot = chain
-                .light_client()
+            let snapshot = blocks
                 .work_channel_snapshot(WorkChannelQuery {
                     bond_edge: bond_edge(),
                     payment_edge,
@@ -863,8 +871,7 @@ mod tests {
                 .await;
             chain.seal().await;
 
-            let snapshot = chain
-                .light_client()
+            let snapshot = blocks
                 .work_channel_snapshot(WorkChannelQuery {
                     bond_edge: bond_edge(),
                     payment_edge,
