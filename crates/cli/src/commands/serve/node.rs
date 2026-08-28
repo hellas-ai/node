@@ -1163,10 +1163,10 @@ mod tests {
     use hellas_chain::{LatestBlock, QueryError, WorkChannelQuery, WorkChannelSnapshot};
     use hellas_kernel::{
         Auth, BlockHeight, BufferWriter, CoinId, Decode as _, Edge, EdgeValues, Encode as _, Fees,
-        Funding, LeaseSlots, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, MIN_OMIT_RESPONSE_BLOCKS,
-        Move, Parties, Party, Payout, PendingPaymentClose, Proof, RegistryChunk, RegistryNamespace,
-        RegistryRecordTag, StartId, Terms, Tx, WorkPaymentSettlement, WorkPaymentTerms,
-        WorkStakeBondTerms, Writer as _,
+        Funding, LeaseSlots, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, MAX_START_VALIDITY_BLOCKS,
+        MIN_OMIT_RESPONSE_BLOCKS, Move, Parties, Party, Payout, PendingPaymentClose, Proof,
+        RegistryChunk, RegistryNamespace, RegistryRecordTag, StartId, Terms, Tx,
+        WorkPaymentSettlement, WorkPaymentTerms, WorkStakeBondTerms, Writer as _,
     };
     use hellas_rpc::call::WithTrailer;
     use hellas_rpc::evaluate::{
@@ -1174,31 +1174,41 @@ mod tests {
         input_commitment,
     };
     use hellas_rpc::protocol::artifacts::{
-        BoundTermId, InputAddressed as _, OutputAddressed as _, PreparedPaidInputV1, SourceRef,
-        TextArtifact, TextExecution, TextPolicy, TokenIds,
+        BoundTermId, Canonical as _, InputAddressed as _, OutputAddressed as _,
+        PreparedPaidInputV1, SourceRef, TextArtifact, TextExecution, TextPolicy, TokenIds,
     };
-    use hellas_rpc::protocol::mount::{MountBudget, MountFloor};
+    use hellas_rpc::protocol::mount::{
+        MountBudget, MountFloor, TRIAL_FLOOR, clopper_pearson_upper_ppb, grade_response_probability,
+    };
     use hellas_rpc::protocol::work::{
         JobDeadlines, PaidChannelPolicyV1, PaidExecutionPolicyV1, PaidJobAuthorizationV1,
-        encode_transcript, next_payment, payment_binding_digest, private_policy_commitment,
-        propose_authorization, result_digest, signing_hash, terminal_result, work_id,
+        PrivateRecord as _, encode_transcript, generation_policy_digest, identity_source_digest,
+        next_payment, payment_binding_digest, private_policy_commitment, propose_authorization,
+        result_digest, signing_hash, terminal_result, work_id,
     };
     use hellas_rpc::protocol::work_bundle::WorkChannelSetupBundleV1;
     use hellas_rpc::protocol::work_setup::{OmissionMeasurements, ProviderChannelPolicy};
     use hellas_rpc::protocol::{ContentId, Digest};
+    use hellas_rpc::services::work::WorkClientImpl;
+    use hellas_rpc::services::work_setup::WorkSetupClientImpl;
     use hellas_rpc::work::WorkRefusal;
     use hellas_rpc::work_close::{BlockSourceError, FinalizedWork};
+    use hellas_rpc::work_handshake::{apply_setup_exchange, prepare_setup_exchange};
     use hellas_rpc::work_open::{FinalizedSetup, SetupQuery};
     use hellas_rpc::work_store::{
-        ChannelRecord, SetupEnd, SetupOrigin, SetupRecord, TerminalOutcome,
+        ChannelRecord, SetupEnd, SetupOrigin, SetupRecord, SetupScan, TerminalOutcome,
     };
     use hellas_rpc::{
         Assurance, EvaluateProgramManifest, EvaluateRequest, OutputEventEnvelope,
         ProducerSigningKey, ProgramManifest, PublicKey, SubmitTxOutcome,
     };
+    use iroh::{EndpointAddr, TransportAddr};
     use tokio::sync::Semaphore;
 
     use super::*;
+    use crate::commands::serve::work_config::{
+        ArtifactIdentity, ChainCrossCheck, WorkConfig, load_paid_work_duties,
+    };
 
     fn assert_retryable_not_ready(refusal: WorkRefused) {
         assert_eq!(refusal.code, WorkRefusalCode::NotReady as i32);
@@ -1318,7 +1328,14 @@ mod tests {
     }
 
     fn temp() -> tempfile::TempDir {
-        match tempfile::tempdir() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/hellas-cli-tests");
+        if let Err(error) = std::fs::create_dir_all(&root) {
+            panic!("the persistent test-artifact directory exists: {error}");
+        }
+        match tempfile::Builder::new()
+            .prefix("paid-node-")
+            .tempdir_in(root)
+        {
             Ok(dir) => dir,
             Err(error) => panic!("a temporary directory: {error}"),
         }
@@ -1362,8 +1379,18 @@ mod tests {
     fn execution_policy() -> PaidExecutionPolicyV1 {
         PaidExecutionPolicyV1 {
             allowed_environment: manifest().content_id(),
-            generation_policy_digest: Digest::from_bytes([0x32; 32]),
-            identity_source_digest: Digest::from_bytes([0x33; 32]),
+            generation_policy_digest: match generation_policy_digest(
+                &text_policy().canonical_bytes(),
+            ) {
+                Ok(digest) => digest,
+                Err(error) => panic!("the fixture generation policy hashes: {error}"),
+            },
+            identity_source_digest: match identity_source_digest(
+                &identity_artifact().canonical_bytes(),
+            ) {
+                Ok(digest) => digest,
+                Err(error) => panic!("the fixture identity source hashes: {error}"),
+            },
             max_prompt_tokens: 512,
             max_new_tokens: 128,
             max_stop_token_ids: 4,
@@ -1387,7 +1414,7 @@ mod tests {
                 &channel_policy(),
             ),
             omit_response_blocks: MIN_OMIT_RESPONSE_BLOCKS,
-            start_validity_blocks: 8,
+            start_validity_blocks: MAX_START_VALIDITY_BLOCKS,
             omission_bond: OMISSION_BOND,
         }
     }
@@ -1447,6 +1474,134 @@ mod tests {
 
     fn proposes() -> PaymentAdmission {
         PaymentAdmission::Proposes(Box::new(provider_policy()))
+    }
+
+    const ARTIFACT_STARTED_AT: u64 = 1_756_339_000_000;
+    const ARTIFACT_FINISHED_AT: u64 = 1_756_339_200_000;
+
+    fn measured_artifact_value(value: u64) -> serde_json::Value {
+        serde_json::json!({ "value": value, "evidence": "measured", "samples": 3 })
+    }
+
+    fn observed_artifact_values(values: &[u64]) -> serde_json::Value {
+        let samples: Vec<_> = values
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                serde_json::json!({
+                    "at_unix_ms": ARTIFACT_STARTED_AT + index as u64,
+                    "value": value,
+                })
+            })
+            .collect();
+        serde_json::json!({ "evidence": "measured", "samples": samples })
+    }
+
+    /// Builds and loads the same kind of fully measured artifact a node
+    /// accepts at startup. The e2e proof takes its admission from this
+    /// production evidence gate, so `assumed` cannot accidentally make a
+    /// test pass by weakening §4.
+    fn fully_measured_admission(root: &Path) -> PaymentAdmission {
+        let executable = match std::env::current_exe() {
+            Ok(path) => path,
+            Err(error) => panic!("the test executable has a path: {error}"),
+        };
+        let executable = match std::fs::read(&executable) {
+            Ok(bytes) => bytes,
+            Err(error) => panic!("the test executable is readable: {error}"),
+        };
+        let binary = Digest::hash(&executable);
+        let response_probability = match grade_response_probability(TRIAL_FLOOR, 0) {
+            Some(probability) => probability,
+            None => panic!("the clean measured trial floor earns a probability"),
+        };
+        let artifact = serde_json::json!({
+            "provenance": {
+                "binary": hex::encode(binary.as_bytes()),
+                "config": hex::encode([0x44; 32]),
+                "machine": "node-e2e-fixture",
+                "started_at_unix_ms": ARTIFACT_STARTED_AT,
+                "measured_at_unix_ms": ARTIFACT_FINISHED_AT,
+            },
+            "omission": {
+                "response_probability": {
+                    "value": response_probability,
+                    "evidence": "measured",
+                    "samples": TRIAL_FLOOR,
+                },
+                "response_blocks": measured_artifact_value(MIN_OMIT_RESPONSE_BLOCKS),
+                "response_cost_cap": measured_artifact_value(1),
+                "response_trials": {
+                    "trials": TRIAL_FLOOR,
+                    "misses": 0,
+                    "miss_upper_ppb": clopper_pearson_upper_ppb(TRIAL_FLOOR, 0),
+                },
+            },
+            "expected_payment_values": {
+                "value": measured_artifact_value(PAYMENT_VALUE),
+                "reserve": measured_artifact_value(PAYMENT_RESERVE),
+                "close_fees": {
+                    "base": measured_artifact_value(0),
+                    "slot": measured_artifact_value(0),
+                    "proof": measured_artifact_value(0),
+                    "lifetime": measured_artifact_value(0),
+                },
+            },
+            "budget": {
+                "fsync_tail_ms": observed_artifact_values(&[0, 0]),
+                "rotation_tail_ms": observed_artifact_values(&[0, 0]),
+                "response_build_ms": observed_artifact_values(&[0, 0]),
+                "one_block_fetch_ms": observed_artifact_values(&[0, 0]),
+                "fresh_tip_ms": observed_artifact_values(&[0, 0]),
+                "close_prepared_fsync_ms": observed_artifact_values(&[0, 0]),
+                "rpc_ms": observed_artifact_values(&[0, 0]),
+                "response_worker_ms": observed_artifact_values(&[0, 0]),
+                "general_worker_ms": observed_artifact_values(&[0, 0]),
+                "validation_ms": observed_artifact_values(&[0, 0]),
+                "restart_replay_ms_at_cap": observed_artifact_values(&[0, 0]),
+                "restart_downtime_ms": observed_artifact_values(&[0, 0]),
+                "lower_tail_block_ms": observed_artifact_values(&[1, 1]),
+                "general_inclusion_blocks": observed_artifact_values(&[0, 0]),
+            },
+        });
+        let bytes = match serde_json::to_vec(&artifact) {
+            Ok(bytes) => bytes,
+            Err(error) => panic!("the measured artifact encodes: {error}"),
+        };
+        let path = root.join("measured-work-artifact.json");
+        if let Err(error) = std::fs::write(&path, &bytes) {
+            panic!("the measured artifact is written: {error}");
+        }
+        let config = WorkConfig {
+            chain: ChainCrossCheck {
+                network: network(),
+                genesis_payload_digest: Digest::from_bytes([0x45; 32]),
+                threshold_identity: threshold_identity(),
+            },
+            validators: Vec::new(),
+            journal_root: root.join("unused-by-the-artifact-loader"),
+            policy_salt: SALT,
+            channel_policy: channel_policy(),
+            execution_policy: execution_policy(),
+            poll: Duration::from_millis(1),
+            response_alarm_margin_blocks: MAX_START_VALIDITY_BLOCKS,
+            artifact: Some(ArtifactIdentity {
+                path,
+                digest: Digest::hash(&bytes),
+            }),
+        };
+        let duties = match load_paid_work_duties(&config) {
+            Ok(duties) => duties,
+            Err(error) => panic!("the fully measured fixture artifact loads: {error}"),
+        };
+        let Some(admission) = duties.payment_admission() else {
+            panic!("a fully measured artifact supplies paid admission");
+        };
+        assert!(
+            matches!(admission, PaymentAdmission::Admits(_)),
+            "a fully measured artifact admits rather than assuming",
+        );
+        admission
     }
 
     // ── The handshake this journal retains ────────────────────────────
@@ -1888,6 +2043,78 @@ mod tests {
         }
     }
 
+    /// The live payment edge at the values the measured artifact admitted.
+    fn live_payment() -> Edge {
+        let terms = Terms::work_payment(payment_terms());
+        let mut encoded = vec![0_u8; Edge::MAX_ENCODED_SIZE];
+        let written = {
+            let mut writer = BufferWriter::new(&mut encoded);
+            writer.write(&[1, 5]); // canonical Edge envelope
+            PAYMENT_VALUE.encode_to(&mut writer);
+            PAYMENT_RESERVE.encode_to(&mut writer);
+            Fees::ZERO.encode_to(&mut writer);
+            terms.timeout().encode_to(&mut writer);
+            terms.parties().encode_to(&mut writer);
+            terms.hash().encode_to(&mut writer);
+            terms.allowed_closes().encode_to(&mut writer);
+            writer.position()
+        };
+        match Edge::decode_exact(&encoded[..written]) {
+            Ok(edge) => edge,
+            Err(error) => panic!("the fixture live payment decodes: {error:?}"),
+        }
+    }
+
+    /// Canonical registry chunks for this payment channel's bond lease.
+    fn live_lease_slots() -> [Option<RegistryChunk>; 2] {
+        let terms = payment_terms();
+        let mut value = vec![1, 31, 2]; // envelope, BondLease tag, body version
+        value.extend_from_slice(&bond_edge().to_bytes());
+        value.extend_from_slice(&payment_edge().to_bytes());
+        value.extend_from_slice(Terms::work_payment(terms.clone()).hash().as_bytes());
+        value.extend_from_slice(&terms.private_policy_commitment);
+        value.extend_from_slice(&terms.admission_horizon().get().to_be_bytes());
+        let slots = [0, 1].map(|index| {
+            RegistryChunk::split(
+                RegistryNamespace::BondLease,
+                RegistryRecordTag::BondLease,
+                &value,
+                index,
+            )
+        });
+        assert!(
+            matches!(
+                hellas_kernel::parse_bond_lease(slots, bond_edge()),
+                LeaseSlots::Present(_)
+            ),
+            "the fixture lease is canonical",
+        );
+        slots
+    }
+
+    /// A coherent readable channel, optionally with a contest opened after
+    /// it was mounted.
+    fn ready_channel_snapshot(height: u64, pending: Option<RegistryChunk>) -> WorkChannelSnapshot {
+        WorkChannelSnapshot::new(
+            WorkChannelQuery {
+                bond_edge: bond_edge(),
+                payment_edge: payment_edge(),
+                funding: BTreeSet::new(),
+            },
+            LatestBlock {
+                height,
+                payload: hellas_chain::domain::Digest::from(payload_at(height)),
+                state_root: hellas_chain::domain::Digest::from([0xd1; 32]),
+                finalization: Vec::new(),
+            },
+            Some(live_bond()),
+            Some(live_payment()),
+            live_lease_slots(),
+            pending,
+            BTreeSet::new(),
+        )
+    }
+
     // ── The chain a test writes down ──────────────────────────────────
 
     /// One coherent finalized read, a tip that never moves, and a sink
@@ -2024,6 +2251,222 @@ mod tests {
         }
     }
 
+    /// The injectable finalized source used by the ALPN proof. It starts
+    /// at the scan floor, finalizes each setup Open handed to its sink in
+    /// the next block, and exposes the resulting channel through the same
+    /// coherent snapshot interface production uses.
+    #[derive(Clone)]
+    struct NodeChain(Arc<Mutex<NodeChainState>>);
+
+    struct NodeChainState {
+        setup: FinalizedSetup,
+        snapshot: WorkChannelSnapshot,
+        blocks: Vec<FinalizedWork>,
+        submitted: Vec<Tx>,
+    }
+
+    impl NodeChain {
+        fn new() -> Self {
+            let live_funding = [
+                CoinId::from_bytes([0xa1; CoinId::LENGTH]),
+                CoinId::from_bytes([0xb1; CoinId::LENGTH]),
+            ]
+            .into_iter()
+            .collect();
+            Self(Arc::new(Mutex::new(NodeChainState {
+                setup: FinalizedSetup {
+                    height: FLOOR,
+                    bond: None,
+                    payment: None,
+                    lease: LeaseSlots::Absent,
+                    live_funding,
+                },
+                snapshot: WorkChannelSnapshot::new(
+                    WorkChannelQuery {
+                        bond_edge: bond_edge(),
+                        payment_edge: payment_edge(),
+                        funding: BTreeSet::new(),
+                    },
+                    LatestBlock {
+                        height: FLOOR,
+                        payload: hellas_chain::domain::Digest::from(payload_at(FLOOR)),
+                        state_root: hellas_chain::domain::Digest::from([0xd1; 32]),
+                        finalization: Vec::new(),
+                    },
+                    None,
+                    None,
+                    [None, None],
+                    None,
+                    BTreeSet::new(),
+                ),
+                blocks: Vec::new(),
+                submitted: Vec::new(),
+            })))
+        }
+
+        fn latest(&self) -> u64 {
+            match self.0.lock() {
+                Ok(held) => held.blocks.last().map_or(FLOOR, |block| block.height),
+                Err(error) => panic!("the node-chain fixture is reachable: {error}"),
+            }
+        }
+
+        fn submitted(&self) -> Vec<Tx> {
+            match self.0.lock() {
+                Ok(held) => held.submitted.clone(),
+                Err(error) => panic!("the node-chain fixture is reachable: {error}"),
+            }
+        }
+
+        /// Exposes a pending client contest one finalized height after
+        /// mount. The otherwise empty block is deliberate: it proves that
+        /// cursor catch-up alone cannot substitute for the coherent state
+        /// predicate, without letting the raw journal's own close refusal
+        /// mask a stale-readiness mutation.
+        fn open_contest(&self) -> u64 {
+            let current = self.latest();
+            let height = current + 1;
+            let block = FinalizedWork {
+                height,
+                parent: payload_at(current),
+                payload: payload_at(height),
+                txs: Vec::new(),
+            };
+            match self.0.lock() {
+                Ok(mut held) => {
+                    held.blocks.push(block);
+                    held.snapshot = ready_channel_snapshot(height, Some(pending_contest(false)));
+                }
+                Err(error) => panic!("the node-chain fixture is reachable: {error}"),
+            }
+            height
+        }
+    }
+
+    impl SetupView for NodeChain {
+        async fn finalized_setup(
+            &self,
+            query: SetupQuery,
+        ) -> Result<Option<FinalizedSetup>, BlockSourceError> {
+            let expected_funding = [
+                CoinId::from_bytes([0xa1; CoinId::LENGTH]),
+                CoinId::from_bytes([0xb1; CoinId::LENGTH]),
+            ]
+            .into_iter()
+            .collect();
+            if query.bond_edge != bond_edge()
+                || query.payment_edge != payment_edge()
+                || query.funding != expected_funding
+            {
+                return Err(BlockSourceError::new(
+                    "the fixture was asked for another setup",
+                ));
+            }
+            match self.0.lock() {
+                Ok(held) => Ok(Some(held.setup.clone())),
+                Err(error) => Err(BlockSourceError::new(format!(
+                    "the node-chain setup lock failed: {error}",
+                ))),
+            }
+        }
+    }
+
+    impl FinalizedWorkView for NodeChain {
+        async fn work_channel_snapshot(
+            &self,
+            query: WorkChannelQuery,
+        ) -> Result<Option<WorkChannelSnapshot>, QueryError> {
+            match self.0.lock() {
+                Ok(held) if held.snapshot.query() == &query => Ok(Some(held.snapshot.clone())),
+                Ok(_) => Err(QueryError::StateUnavailable(
+                    "the fixture was asked for another work channel".to_string(),
+                )),
+                Err(error) => Err(QueryError::StateUnavailable(format!(
+                    "the node-chain snapshot lock failed: {error}",
+                ))),
+            }
+        }
+    }
+
+    impl FinalizedBlocks for NodeChain {
+        async fn latest_height(&self) -> Result<Option<u64>, BlockSourceError> {
+            Ok(Some(self.latest()))
+        }
+
+        async fn block_at(&self, height: u64) -> Result<Option<FinalizedWork>, BlockSourceError> {
+            match self.0.lock() {
+                Ok(held) => Ok(held
+                    .blocks
+                    .iter()
+                    .find(|block| block.height == height)
+                    .cloned()),
+                Err(error) => Err(BlockSourceError::new(format!(
+                    "the node-chain block lock failed: {error}",
+                ))),
+            }
+        }
+    }
+
+    impl TxSink for NodeChain {
+        async fn submit(&self, tx: Tx) -> Result<SubmitTxOutcome, BlockSourceError> {
+            let mut held = self
+                .0
+                .lock()
+                .map_err(|error| BlockSourceError::new(format!("the sink lock failed: {error}")))?;
+            held.submitted.push(tx.clone());
+            let open_number = held
+                .blocks
+                .iter()
+                .flat_map(|block| &block.txs)
+                .filter(|tx| matches!(tx, Tx::Open { .. }))
+                .count();
+            if !matches!(tx, Tx::Open { .. }) {
+                return Ok(SubmitTxOutcome::Enqueued);
+            }
+            let height = held
+                .blocks
+                .last()
+                .map_or(FLOOR + 1, |block| block.height + 1);
+            held.blocks.push(FinalizedWork {
+                height,
+                parent: payload_at(height - 1),
+                payload: payload_at(height),
+                txs: vec![tx],
+            });
+            match open_number {
+                0 => {
+                    held.setup = FinalizedSetup {
+                        height,
+                        bond: Some(live_bond()),
+                        payment: None,
+                        lease: LeaseSlots::Absent,
+                        live_funding: [CoinId::from_bytes([0xb1; CoinId::LENGTH])]
+                            .into_iter()
+                            .collect(),
+                    };
+                }
+                1 => {
+                    let lease = hellas_kernel::parse_bond_lease(live_lease_slots(), bond_edge());
+                    held.setup = FinalizedSetup {
+                        height,
+                        bond: Some(live_bond()),
+                        payment: Some(live_payment()),
+                        lease,
+                        live_funding: BTreeSet::new(),
+                    };
+                    held.snapshot = ready_channel_snapshot(height, None);
+                }
+                other => {
+                    return Err(BlockSourceError::new(format!(
+                        "the fixture received unexpected setup Open {}",
+                        other + 1,
+                    )));
+                }
+            }
+            Ok(SubmitTxOutcome::Enqueued)
+        }
+    }
+
     /// The runner a node starts with: the configured root, the stored
     /// identity, and whichever of §4's three admissions this node's
     /// evidence produced.
@@ -2079,6 +2522,410 @@ mod tests {
                 )
             })
             .count()
+    }
+
+    fn seed_provider_offer(root: &Path, admission: PaymentAdmission) {
+        let store = match SetupStore::open(
+            root,
+            network(),
+            bond_edge(),
+            Role::Provider,
+            &Secp256k1Verifier::new(),
+        ) {
+            Ok(store) => store,
+            Err(error) => panic!("the empty provider root opens its first setup: {error}"),
+        };
+        let mut endpoint = SetupEndpoint::new(store, provider(), admission);
+        if let Err(error) = endpoint.arm_scan(SetupScan {
+            height: FLOOR,
+            payload: payload_at(FLOOR),
+        }) {
+            panic!("the provider arms its finalized floor: {error}");
+        }
+        if let Err(error) = endpoint.propose_bond(network(), bond_funding(), bond_terms()) {
+            panic!("the provider journals its offer: {error}");
+        }
+    }
+
+    fn client_setup(root: &Path, policy: ProviderChannelPolicy) -> SetupEndpoint {
+        let store = match SetupStore::open(
+            root,
+            network(),
+            bond_edge(),
+            Role::Client,
+            &Secp256k1Verifier::new(),
+        ) {
+            Ok(store) => store,
+            Err(error) => panic!("the empty client root opens its first setup: {error}"),
+        };
+        SetupEndpoint::new(
+            store,
+            client(),
+            PaymentAdmission::Proposes(Box::new(policy)),
+        )
+    }
+
+    fn signed_accept_request() -> AcceptWorkRequest {
+        let authorization = authorization();
+        let id = work_id(descriptor().channel(), &authorization);
+        AcceptWorkRequest {
+            authorization: authorization.encode(),
+            client_signature: client().sign(signing_hash(id)).as_bytes().to_vec(),
+            prepared_input: match bundle().encode() {
+                Ok(bytes) => bytes,
+                Err(error) => panic!("the prepared fixture input encodes: {error}"),
+            },
+        }
+    }
+
+    /// A node endpoint with the production ALPN dispatcher and production
+    /// runner loop, parameterized only at the existing finalized-source
+    /// seam.
+    struct RunningPaidNode {
+        endpoint: Endpoint,
+        client: Endpoint,
+        target: EndpointAddr,
+        accept_task: JoinHandle<()>,
+        runner_task: JoinHandle<()>,
+        stop: Option<oneshot::Sender<()>>,
+        setup_mount: MountedSetup,
+        work_mount: MountedWork<NodeChain>,
+    }
+
+    impl RunningPaidNode {
+        async fn start(root: &Path, admission: PaymentAdmission, source: NodeChain) -> Self {
+            let setup_mount = MountedSetup::default();
+            let work_mount = MountedWork::default();
+            let runner = match WorkRunner::discover(
+                WorkRunnerConfig {
+                    network: network(),
+                    threshold_identity: threshold_identity(),
+                    journal_root: root.to_path_buf(),
+                    validators: Vec::new(),
+                    poll: Duration::from_millis(1),
+                    settlement_key: provider(),
+                    admission: Some(admission),
+                },
+                work_mount.clone(),
+                setup_mount.clone(),
+            ) {
+                Ok(runner) => runner,
+                Err(error) => panic!("the node discovers its provider offer: {error}"),
+            };
+
+            let alpns = served_alpns(true);
+            assert!(
+                alpns.contains(&<WorkSetup as ServiceMarker>::ALPN.as_bytes().to_vec())
+                    && alpns.contains(&<Work as ServiceMarker>::ALPN.as_bytes().to_vec()),
+                "the started node advertises both paid-work ALPNs",
+            );
+            let endpoint = match Endpoint::builder(presets::Minimal)
+                .secret_key(SecretKey::from_bytes(&[0x61; 32]))
+                .alpns(alpns)
+                .bind_addr(
+                    "127.0.0.1:0"
+                        .parse::<std::net::SocketAddr>()
+                        .expect("a loopback socket"),
+                ) {
+                Ok(builder) => match builder.bind().await {
+                    Ok(endpoint) => endpoint,
+                    Err(error) => panic!("the test node binds: {error}"),
+                },
+                Err(error) => panic!("the test node has a valid bind address: {error}"),
+            };
+            let target = EndpointAddr::from_parts(
+                endpoint.id(),
+                endpoint.bound_sockets().into_iter().map(TransportAddr::Ip),
+            );
+            let client = match Endpoint::builder(presets::Minimal)
+                .secret_key(SecretKey::from_bytes(&[0x62; 32]))
+                .bind_addr(
+                    "127.0.0.1:0"
+                        .parse::<std::net::SocketAddr>()
+                        .expect("a loopback socket"),
+                ) {
+                Ok(builder) => match builder.bind().await {
+                    Ok(endpoint) => endpoint,
+                    Err(error) => panic!("the test client binds: {error}"),
+                },
+                Err(error) => panic!("the test client has a valid bind address: {error}"),
+            };
+
+            let local_peer = PeerId::from_bytes(*endpoint.id().as_bytes());
+            let directory = Arc::new(PeerDirectory::with_config(
+                local_peer,
+                hellas_rpc::peer_directory_config(),
+            ));
+            let node_handler = NodeHandlerImpl::new(
+                endpoint.id(),
+                "paid-node-e2e".to_string(),
+                Vec::new(),
+                directory.clone(),
+            );
+            let accepting_endpoint = endpoint.clone();
+            let setup_for_accept = setup_mount.clone();
+            let work_for_accept = work_mount.clone();
+            let accept_task = tokio::spawn(async move {
+                while let Some(incoming) = accepting_endpoint.accept().await {
+                    let accepting = match incoming.accept() {
+                        Ok(accepting) => accepting,
+                        Err(error) => panic!("the test node accepts an incoming: {error}"),
+                    };
+                    let node_handler = node_handler.clone();
+                    let manager = directory.manager();
+                    let setup = setup_for_accept.clone();
+                    let work = work_for_accept.clone();
+                    tokio::spawn(async move {
+                        let connection = match accepting.await {
+                            Ok(connection) => connection,
+                            Err(error) => panic!("the test node negotiates a connection: {error}"),
+                        };
+                        let alpn = connection.alpn().to_vec();
+                        if let Err(error) = serve_connection(
+                            alpn,
+                            connection,
+                            node_handler,
+                            manager,
+                            Some(setup),
+                            Some(work),
+                        )
+                        .await
+                        {
+                            panic!("the test node serves its connection: {error}");
+                        }
+                    });
+                }
+            });
+
+            let (stop, stopped) = oneshot::channel();
+            let runner_task = tokio::spawn(async move {
+                runner
+                    .run_over(stopped, move || {
+                        let source = source.clone();
+                        async move { Some(source) }
+                    })
+                    .await;
+            });
+
+            Self {
+                endpoint,
+                client,
+                target,
+                accept_task,
+                runner_task,
+                stop: Some(stop),
+                setup_mount,
+                work_mount,
+            }
+        }
+
+        async fn connect(&self, alpn: &[u8]) -> (IrohTransport, Connection) {
+            let connecting = self.client.connect(self.target.clone(), alpn);
+            let connection = match tokio::time::timeout(Duration::from_secs(5), connecting).await {
+                Ok(Ok(connection)) => connection,
+                Ok(Err(error)) => panic!("the advertised ALPN is dialable: {error}"),
+                Err(_) => panic!("the advertised ALPN dial timed out"),
+            };
+            let closing = connection.clone();
+            (IrohTransport::new(connection), closing)
+        }
+
+        async fn exchange_setup(&self, request: ExchangeSetupRequest) -> ExchangeSetupResponse {
+            let (transport, connection) = self
+                .connect(<WorkSetup as ServiceMarker>::ALPN.as_bytes())
+                .await;
+            let client = WorkSetupClientImpl::new(transport);
+            let response = match client.exchange_setup(request).await {
+                Ok(response) => response,
+                Err(error) => panic!("WorkSetup exchange reaches the node: {error}"),
+            };
+            drop(client);
+            connection.close(0_u32.into(), b"setup round complete");
+            response
+        }
+
+        async fn accept_work(&self, request: AcceptWorkRequest) -> AcceptWorkResponse {
+            let (transport, connection) =
+                self.connect(<Work as ServiceMarker>::ALPN.as_bytes()).await;
+            let client = WorkClientImpl::new(transport);
+            let response = match client.accept_work(request).await {
+                Ok(response) => response,
+                Err(error) => panic!("Work acceptance reaches the node: {error}"),
+            };
+            drop(client);
+            connection.close(0_u32.into(), b"work request complete");
+            response
+        }
+
+        async fn wait_for_mount(&self) {
+            let mounted = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if self.work_mount.service().is_some() {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+            assert!(mounted.is_ok(), "the production clock mounts the channel");
+            assert!(
+                self.setup_mount.service().is_none(),
+                "the matching setup is cleared when its channel mounts",
+            );
+        }
+
+        async fn wait_for_cursor(&self, height: u64) {
+            let caught_up = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let cursor = self
+                        .work_mount
+                        .service()
+                        .and_then(|service| service.with_state(|state| state.cursor().0).ok());
+                    if cursor.is_some_and(|cursor| cursor >= height) {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+            assert!(
+                caught_up.is_ok(),
+                "the driven journal catches up to the contest snapshot",
+            );
+        }
+
+        async fn shutdown(mut self) {
+            if let Some(stop) = self.stop.take() {
+                let _ = stop.send(());
+            }
+            let _ = self.runner_task.await;
+            self.accept_task.abort();
+            let _ = self.accept_task.await;
+            self.client.close().await;
+            self.endpoint.close().await;
+        }
+    }
+
+    async fn run_advertised_paid_exchange(
+        root: &Path,
+        client_root: &Path,
+        admission: PaymentAdmission,
+        contested: bool,
+    ) {
+        let policy = match &admission {
+            PaymentAdmission::Admits(policy) => policy.as_ref().clone(),
+            PaymentAdmission::Proposes(_) => {
+                panic!("the e2e fixture must carry fully measured admission")
+            }
+        };
+        seed_provider_offer(root, admission.clone());
+        let source = NodeChain::new();
+        let node = RunningPaidNode::start(root, admission, source.clone()).await;
+        assert!(
+            node.setup_mount.service().is_some(),
+            "the runner mounts the exact setup it drives before the first dial",
+        );
+
+        let mut caller = client_setup(client_root, policy);
+        let first = node.exchange_setup(ExchangeSetupRequest::default()).await;
+        if let Err(error) = apply_setup_exchange(&mut caller, first) {
+            panic!("WorkSetup round 1 imports the driven provider offer: {error}");
+        }
+        if let Err(error) = caller.arm_scan(SetupScan {
+            height: FLOOR,
+            payload: payload_at(FLOOR),
+        }) {
+            panic!("the client arms the same finalized floor: {error}");
+        }
+        if let Err(error) = caller.propose_payment(payment_funding(), payment_terms()) {
+            panic!("the client journals its payment proposal: {error}");
+        }
+        let second = node.exchange_setup(prepare_setup_exchange(&caller)).await;
+        if let Err(error) = apply_setup_exchange(&mut caller, second) {
+            panic!("WorkSetup round 2 imports the provider countersignature: {error}");
+        }
+        assert_eq!(
+            caller.state().revision(),
+            Some(3),
+            "both ALPN rounds complete the three-revision setup",
+        );
+        drop(caller);
+
+        node.wait_for_mount().await;
+        let setup_opens = source
+            .submitted()
+            .into_iter()
+            .filter(|tx| matches!(tx, Tx::Open { .. }))
+            .count();
+        assert_eq!(
+            setup_opens, 2,
+            "the production clock submits and finalizes both setup Opens",
+        );
+
+        // Deliberately leave the raw driven service holding the readiness
+        // that was true when the channel mounted. The advertised Work
+        // wrapper must not trust that cached value: the contested arm below
+        // changes the coherent source before its first network request.
+        let mounted = node
+            .work_mount
+            .handler()
+            .expect("the production clock mounted a request handler");
+        if let Err(error) = mounted.refresh_admission().await {
+            panic!("mount-time readiness primes the exact driven service: {error}");
+        }
+
+        if contested {
+            let contest_height = source.open_contest();
+            node.wait_for_cursor(contest_height).await;
+        }
+        let response = node.accept_work(signed_accept_request()).await;
+        if contested {
+            let Some(accept_work_response::Outcome::Refused(refusal)) = response.outcome else {
+                panic!(
+                    "fresh readiness must refuse a pending contest, got {:?}",
+                    response.outcome,
+                );
+            };
+            assert_retryable_not_ready(refusal);
+        } else if !matches!(
+            response.outcome,
+            Some(accept_work_response::Outcome::Accepted(_))
+        ) {
+            panic!(
+                "the valid proposal must reach the freshly admitted driven service, got {:?}",
+                response.outcome,
+            );
+        }
+        node.shutdown().await;
+    }
+
+    /// An empty-root offer traverses the two ALPN setup rounds, the
+    /// production runner finalizes and mounts it, and a valid paid proposal
+    /// reaches that exact service. A second independent offer opens a
+    /// contest after mount and proves readiness is re-read per request.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn paid_setup_and_accept_reach_the_mounted_services_over_the_advertised_alpns() {
+        let fixture = temp();
+        let admission = fully_measured_admission(fixture.path());
+        for (name, contested) in [("ready", false), ("contested", true)] {
+            let root = fixture.path().join(format!("provider-{name}"));
+            let client_root = fixture.path().join(format!("client-{name}"));
+            if let Err(error) = std::fs::create_dir(&root) {
+                panic!("the empty provider root is created: {error}");
+            }
+            if let Err(error) = std::fs::create_dir(&client_root) {
+                panic!("the empty client root is created: {error}");
+            }
+            let mut entries = match std::fs::read_dir(&root) {
+                Ok(entries) => entries,
+                Err(error) => panic!("the provider root is readable: {error}"),
+            };
+            assert!(
+                entries.next().is_none(),
+                "each provider fixture starts from an empty root",
+            );
+            run_advertised_paid_exchange(&root, &client_root, admission.clone(), contested).await;
+        }
     }
 
     /// A restart with an open contest is answered by the clock, before
