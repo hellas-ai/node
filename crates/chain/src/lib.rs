@@ -18,8 +18,12 @@ mod execution;
 pub mod faucet;
 #[cfg(feature = "indexer")]
 pub mod follower;
+/// The shipped genesis documents and the type that reads them. It is its
+/// own `std` crate because a browser build and the relay in another
+/// repository read the same bytes a validator does; re-exported whole so
+/// `hellas_chain::genesis::*` is the path it always was.
 #[cfg(feature = "domain")]
-pub mod genesis;
+pub use hellas_genesis as genesis;
 #[cfg(any(feature = "indexer", feature = "validator"))]
 pub mod indexer;
 #[cfg(any(feature = "client-core", feature = "server"))]
@@ -86,3 +90,52 @@ pub use server::{
 pub use work_blocks::WorkBlocks;
 #[cfg(any(feature = "client-core", feature = "server"))]
 pub use work_view::{FinalizedWorkView, WorkChannelQuery, WorkChannelSnapshot};
+
+/// `hellas_chain::genesis::*` is a published path: the CLI, the client
+/// and the relay in the explorer repository all reach the shipped
+/// documents through it. A re-export can be re-pointed without any of
+/// them failing to compile, so this walks the path chain publishes and
+/// re-checks the reviewed bytes at the far end of it.
+#[cfg(all(test, feature = "domain"))]
+mod genesis_reexport {
+    use sha2::{Digest as _, Sha256};
+
+    #[test]
+    fn the_documents_reached_through_chain_are_the_reviewed_bytes() {
+        for (selector, id, json, expected) in [
+            (
+                "devnet",
+                crate::genesis::HELLAS_DEVNET_1_ID,
+                crate::genesis::HELLAS_DEVNET_1_JSON,
+                "caab04a9350edbe0d50aa9375dcee2742145cf5c24c57f42c844ebf4f27aa4b6",
+            ),
+            (
+                "testnet",
+                crate::genesis::HELLAS_TESTNET_1_ID,
+                crate::genesis::HELLAS_TESTNET_1_JSON,
+                "2c845c34455dc96e818ce40f4200edac79e6fb43f3e68a24e522d2030c3d8680",
+            ),
+        ] {
+            let hex: String = Sha256::digest(json.as_bytes())
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            assert_eq!(hex, expected, "{selector}");
+
+            let network = crate::genesis::known_network(selector).expect("shipped network");
+            assert_eq!(network.id, id);
+            assert_eq!(network.json, json);
+
+            let genesis: crate::genesis::Genesis =
+                serde_json::from_str(json).expect("shipped document parses");
+            genesis.validate().expect("shipped document validates");
+            assert_eq!(genesis.network_id, id);
+        }
+
+        assert_eq!(
+            crate::genesis::known_network_names(),
+            vec!["devnet", "testnet"]
+        );
+        assert_eq!(crate::genesis::GENESIS_SCHEMA_VERSION, 1);
+    }
+}

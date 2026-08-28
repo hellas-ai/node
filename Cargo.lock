@@ -3373,6 +3373,7 @@ dependencies = [
  "futures",
  "futures-util",
  "hellas-client",
+ "hellas-genesis",
  "hellas-kernel",
  "hellas-rpc",
  "hellas-wire",
@@ -3535,6 +3536,17 @@ dependencies = [
  "tokio-stream",
  "tower",
  "tracing",
+]
+
+[[package]]
+name = "hellas-genesis"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror 2.0.18",
+ "toml",
 ]
 
 [[package]]

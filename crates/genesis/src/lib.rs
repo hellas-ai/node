@@ -1,14 +1,15 @@
 //! Portable network identity and genesis configuration.
 //!
-//! This module intentionally contains no consensus engine, transport, or key
+//! This crate intentionally contains no consensus engine, transport, or key
 //! implementation. It is the small document shared by validators, relays,
 //! indexers, browsers, and deployment tooling. Cryptographic consumers decode
 //! and validate the key strings at their own boundary.
 //!
-//! It sits under `domain`, the lowest feature that has a network at all, so
-//! everything above it — the light client, the server, the indexer, the
-//! validator — reads the same document type, and a `wasm-client` browser build
-//! carries the shipped documents exactly as it did when this was a crate.
+//! It is `std` and it is a crate, because the document is `String`s, `Vec`s
+//! and a `BTreeSet` of them, and because the readers are not all nodes: a
+//! `wasm32-unknown-unknown` browser build and a relay in another repository
+//! read the same shipped bytes as the validator does. `hellas-chain`
+//! re-exports it whole as `hellas_chain::genesis`.
 
 use std::collections::BTreeSet;
 
