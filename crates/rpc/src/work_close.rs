@@ -77,10 +77,11 @@ use hellas_kernel::{
     StartId, Terms, Tx, WorkPaymentSettlement, adjudicated_payouts, no_earned_digest,
 };
 
+use crate::observe::{LEVEL, TARGET, Timing};
 use crate::protocol::work::PaidChannel;
 use crate::work::{EndpointError, Handoff};
 use crate::work_store::{
-    Applied, ChannelRecord, ChannelStore, JobPhase, Role, TerminalOutcome, WorkStoreError,
+    Applied, ChannelRecord, ChannelStore, JobPhase, Role, TerminalOutcome, WorkStoreError, hex,
 };
 
 /// One finalized block, as a watcher must see it.
@@ -420,14 +421,30 @@ pub fn close_response(
     certificate: (EarnedCertificate, Sig),
     signer: &Secp256k1Signer,
 ) -> PaymentCloseResponse {
+    // `response_build_ms`: the digest and the signature over it, which
+    // is the whole of what building an answer costs. The journal record
+    // that fixes it is not in here — §4 counts that separately, as one
+    // of `Wresp`'s three fsyncs.
+    let built = Timing::start();
     let digest = response_body_digest(channel, start_id, &certificate.0);
-    PaymentCloseResponse::new(
+    let response = PaymentCloseResponse::new(
         channel.payment_edge(),
         start_id,
         Party::Taker,
         certificate,
         signer.sign(digest),
-    )
+    );
+    if let Some(ms) = built.ms() {
+        tracing::event!(
+            name: "response_build_ms",
+            target: TARGET,
+            LEVEL,
+            edge = %hex(&channel.payment_edge().to_bytes()),
+            start_id = %hex(&start_id.to_bytes()),
+            ms,
+        );
+    }
+    response
 }
 
 /// Builds the close that pays out whatever the contest ended on.
@@ -476,6 +493,59 @@ pub fn adjudicated_close(
         )),
         List::take(outputs, payouts.len()),
     ))
+}
+
+/// Reads the finalized tip, and samples what asking for it cost.
+///
+/// `fresh_tip_ms`, as §4's `Wstart` names it: the read a close start is
+/// signed against, and the first thing an endpoint waits for before it
+/// can put a signature on a chain. One sample per ask, whether or not
+/// anything is finalized yet.
+async fn fresh_tip<S>(source: &S) -> Result<Option<u64>, BlockSourceError>
+where
+    S: FinalizedBlocks + ?Sized,
+{
+    let asked = Timing::start();
+    let latest = source.latest_height().await?;
+    if let Some(ms) = asked.ms() {
+        tracing::event!(
+            name: "fresh_tip_ms",
+            target: TARGET,
+            LEVEL,
+            height = latest.unwrap_or_default(),
+            finalized = latest.is_some(),
+            ms,
+        );
+    }
+    Ok(latest)
+}
+
+/// Fetches one finalized block, and samples what fetching it cost.
+///
+/// `one_block_fetch_ms`, as §4's `Wresp` names it. One block and one
+/// sample, because §5 makes the catch-up loop apply one block before it
+/// asks for another: the wait a response deadline is spent against is
+/// the cost of *one* fetch, never of a backlog.
+async fn one_block_fetch<S>(
+    source: &S,
+    height: u64,
+) -> Result<Option<FinalizedWork>, BlockSourceError>
+where
+    S: FinalizedBlocks + ?Sized,
+{
+    let asked = Timing::start();
+    let block = source.block_at(height).await?;
+    if let Some(ms) = asked.ms() {
+        tracing::event!(
+            name: "one_block_fetch_ms",
+            target: TARGET,
+            LEVEL,
+            height,
+            available = block.is_some(),
+            ms,
+        );
+    }
+    Ok(block)
 }
 
 /// Applies one finalized block to one channel's journal.
@@ -923,15 +993,14 @@ where
     })? {
         return Ok(height);
     }
-    let Some(latest) = source.latest_height().await? else {
+    let Some(latest) = fresh_tip(source).await? else {
         return channel.with_store(|store| store.state().cursor().0);
     };
     let mut next = channel
         .with_store(|store| store.state().cursor().0)?
         .saturating_add(1);
     while next <= latest {
-        let block = source
-            .block_at(next)
+        let block = one_block_fetch(source, next)
             .await?
             .ok_or(CatchUpError::Missing { height: next })?;
         channel.with_store(|store| observe(store, &block, verifier))??;
@@ -1001,13 +1070,12 @@ where
     S: FinalizedBlocks + ?Sized,
     V: SigVerifier,
 {
-    let Some(latest) = source.latest_height().await? else {
+    let Some(latest) = fresh_tip(source).await? else {
         return Ok(store.state().cursor().0);
     };
     let mut next = store.state().cursor().0.saturating_add(1);
     while next <= latest {
-        let block = source
-            .block_at(next)
+        let block = one_block_fetch(source, next)
             .await?
             .ok_or(CatchUpError::Missing { height: next })?;
         observe(store, &block, verifier)?;

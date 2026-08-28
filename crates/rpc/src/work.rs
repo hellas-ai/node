@@ -128,6 +128,7 @@ use hellas_wire::{StreamTransport, TransportContext, WireStatus};
 
 use prost::Message as _;
 
+use crate::observe::{LEVEL, TARGET, Timing};
 use crate::pb::work::{
     AcceptWorkRequest, AcceptWorkResponse, AdmitCertificateRequest, AdmitCertificateResponse,
     DeliverResultRequest, DeliverResultResponse, WorkAccepted, WorkDelivered, WorkPaid,
@@ -154,7 +155,7 @@ use crate::work_store::channel::encode_kernel;
 use crate::work_store::journal::MAX_RECORD_BYTES;
 use crate::work_store::{
     ChannelRecord, ChannelState, ChannelStateError, ChannelStore, JobPhase, JobState,
-    PaidCertificate, Role, TerminalOutcome, WorkStoreError,
+    PaidCertificate, Role, TerminalOutcome, WorkStoreError, hex,
 };
 use crate::{EvaluateRequest, OutputEventEnvelope, SubmitTxOutcome};
 
@@ -1106,6 +1107,38 @@ const SOLE_PROPOSAL_NONCE: u64 = 1;
 
 // ── Settling on chain ─────────────────────────────────────────────────
 
+/// Retains one signed close start, and samples what making it durable
+/// cost.
+///
+/// `close_prepared_fsync_ms`, as §4's `Wstart` names it: an endpoint
+/// that wants a close on a chain waits for this before the bytes may
+/// leave, so it is an addend of the wait a start is signed against.
+/// Both endpoints prepare their own close and both go through here, so
+/// there is one spelling of the record and one of the sample.
+fn retain_close_start(
+    store: &mut ChannelStore,
+    start: &PaymentCloseStart,
+) -> Result<(), WorkStoreError> {
+    let fsynced = Timing::start();
+    store.commit(
+        ChannelRecord::ClosePrepared {
+            start: Box::new(start.clone()),
+        },
+        &Secp256k1Verifier::new(),
+    )?;
+    if let Some(ms) = fsynced.ms() {
+        tracing::event!(
+            name: "close_prepared_fsync_ms",
+            target: TARGET,
+            LEVEL,
+            edge = %hex(&start.payment_edge().to_bytes()),
+            valid_through = start.valid_through_height(),
+            ms,
+        );
+    }
+    Ok(())
+}
+
 /// Everything a close is, and not one line of it reads a readiness
 /// decision.
 ///
@@ -1173,12 +1206,7 @@ impl CloseEndpoint {
             self.state().executable_certificate(),
             &self.signer,
         )?;
-        self.store.commit(
-            ChannelRecord::ClosePrepared {
-                start: Box::new(start.clone()),
-            },
-            &Secp256k1Verifier::new(),
-        )?;
+        retain_close_start(&mut self.store, &start)?;
         Ok(start)
     }
 
@@ -2871,12 +2899,7 @@ impl ClientEndpoint {
             self.state().executable_certificate(),
             &self.signer,
         )?;
-        self.store.commit(
-            ChannelRecord::ClosePrepared {
-                start: Box::new(start.clone()),
-            },
-            &Secp256k1Verifier::new(),
-        )?;
+        retain_close_start(&mut self.store, &start)?;
         Ok(start)
     }
 

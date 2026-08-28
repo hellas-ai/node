@@ -15,6 +15,7 @@ use hellas_kernel::{
 use hellas_rpc::{
     SubmitTxOutcome as DomainSubmitTxOutcome,
     call::StreamingCall,
+    observe::{LEVEL, TARGET, Timing},
     pb::{chain::*, services::light_client::LightClientClientImpl},
 };
 use hellas_wire::mux::MuxTransport;
@@ -235,22 +236,53 @@ impl LightClient for RemoteLightClient {
     ) -> impl Future<Output = Result<DomainSubmitTxOutcome, QueryError>> + Send {
         let client = self.client.clone();
         async move {
-            if let Transaction::Kernel(KernelTx::Move {
-                action: KernelMove::RespondPaymentClose(response),
-            }) = tx
-            {
-                let mut bytes = vec![0_u8; hellas_kernel::PaymentCloseResponse::MAX_ENCODED_SIZE];
-                let written = response.write_to(&mut bytes);
-                bytes.truncate(written);
-                let response = client
-                    .submit_work_response(SubmitWorkResponseRequest { response: bytes })
-                    .await
-                    .map_err(QueryError::from)?;
-                return submit_tx_outcome_from_proto(response.outcome);
+            // `rpc_ms`: one submission to one validator, measured where a
+            // submitter actually waits — the whole call, not the part of
+            // it this process can see. §4 maximises it over six
+            // validators, and the maximum is the reader's arithmetic:
+            // this client speaks to one validator, so one sample is one
+            // validator's term. The server's own `response_worker_ms`
+            // and `validation_ms` run inside this interval rather than
+            // beside it, so adding all three over-counts — which is the
+            // safe direction for a floor that fails closed.
+            let responding = matches!(
+                &tx,
+                Transaction::Kernel(KernelTx::Move {
+                    action: KernelMove::RespondPaymentClose(_),
+                })
+            );
+            let called = Timing::start();
+            let outcome = async {
+                if let Transaction::Kernel(KernelTx::Move {
+                    action: KernelMove::RespondPaymentClose(response),
+                }) = tx
+                {
+                    let mut bytes =
+                        vec![0_u8; hellas_kernel::PaymentCloseResponse::MAX_ENCODED_SIZE];
+                    let written = response.write_to(&mut bytes);
+                    bytes.truncate(written);
+                    let response = client
+                        .submit_work_response(SubmitWorkResponseRequest { response: bytes })
+                        .await
+                        .map_err(QueryError::from)?;
+                    return submit_tx_outcome_from_proto(response.outcome);
+                }
+                let req = transaction_to_proto(tx)?;
+                let response = client.submit_tx(req).await.map_err(QueryError::from)?;
+                submit_tx_outcome_from_proto(response.outcome)
             }
-            let req = transaction_to_proto(tx)?;
-            let response = client.submit_tx(req).await.map_err(QueryError::from)?;
-            submit_tx_outcome_from_proto(response.outcome)
+            .await;
+            if let Some(ms) = called.ms() {
+                tracing::event!(
+                    name: "rpc_ms",
+                    target: TARGET,
+                    LEVEL,
+                    method = if responding { "SubmitWorkResponse" } else { "SubmitTx" },
+                    answered = outcome.is_ok(),
+                    ms,
+                );
+            }
+            outcome
         }
     }
 

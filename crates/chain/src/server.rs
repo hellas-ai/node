@@ -1637,4 +1637,53 @@ mod tests {
         assert_eq!(event.relay_timestamps.len(), 1);
         assert!((before..=after).contains(&event.relay_timestamps[0]));
     }
+
+    /// One submission to one validator is one `rpc_ms` sample.
+    ///
+    /// §4 maximises `rpc_ms + response_worker_ms + validation_ms` over
+    /// six validators, and this tree fans a write to one validator at a
+    /// time (`crates/cli/src/commands/serve/node.rs`), so what a seam can
+    /// honestly emit is the per-validator term and the maximum is the
+    /// reader's. The interval is the whole call, which is where a
+    /// submitter actually waits — the server's own worker and validation
+    /// samples happen inside it.
+    #[cfg(feature = "client")]
+    #[tokio::test]
+    async fn one_validator_submission_is_one_rpc_sample() {
+        use crate::{LightClient as _, client::RemoteLightClient};
+        use hellas_rpc::observe::Samples;
+        use tracing::instrument::WithSubscriber as _;
+
+        let (client_transport, server_transport) = transport_pair();
+        let (activity_tx, _activity_rx) = broadcast::channel(1);
+        let server = tokio::spawn(serve_light_client_transport(
+            server_transport,
+            LightClientRpc::new(MempoolClient::default(), activity_tx),
+        ));
+        let client = RemoteLightClient::new(client_transport);
+        let samples = std::sync::Arc::new(Samples::new());
+
+        let tx = Transaction::Kernel(valid_open_tx().expect("general transaction fixture"));
+        let outcome = client
+            .submit_tx(tx)
+            .with_subscriber(samples.clone())
+            .await
+            .expect("the validator answers");
+        assert!(matches!(
+            outcome,
+            SubmitTxOutcome::Enqueued | SubmitTxOutcome::Duplicate
+        ));
+
+        let calls = samples.of("rpc_ms");
+        assert_eq!(calls.len(), 1, "one submission, one sample");
+        assert_eq!(
+            calls[0].field("method"),
+            Some("SubmitTx"),
+            "which of the two submission methods this validator was asked",
+        );
+        assert_eq!(calls[0].field("answered"), Some("true"));
+        assert!(calls[0].ms >= 0.0);
+
+        server.abort();
+    }
 }

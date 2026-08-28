@@ -1643,6 +1643,7 @@ impl SetupStore {
             key: key.into_bytes(),
             generation: 0,
         };
+        let replayed = crate::observe::Timing::start();
         let (journal, replay) = Journal::open_latest(root, &setup_stem(key), id)?;
         let mut state = match &replay.checkpoint {
             Some(bytes) => SetupState::from_checkpoint(bytes, network, bond_edge, role, verifier)?,
@@ -1653,6 +1654,7 @@ impl SetupStore {
             check_signatures(&record, verifier)?;
             state.apply(&record)?;
         }
+        journal.observe_replay(replayed, replay.records.len());
         Ok(Self {
             root: root.to_path_buf(),
             journal,

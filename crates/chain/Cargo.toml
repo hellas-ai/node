@@ -41,6 +41,9 @@ client-core = [
     "dep:p256",
     "dep:rand",
     "dep:thiserror",
+    # `client.rs` samples what one validator's RPC cost; the sample's one
+    # channel out is `tracing`.
+    "dep:tracing",
     "domain",
 ]
 # The finalized-block codec and accepted-transaction view, without a

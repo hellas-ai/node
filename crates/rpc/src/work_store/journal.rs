@@ -118,7 +118,10 @@ use std::path::{Path, PathBuf};
 
 use hellas_xet::XetFileHasher;
 
+use crate::observe::{LEVEL, TARGET, Timing};
 use crate::protocol::Digest;
+
+use super::hex;
 
 /// First bytes of every journal file.
 const MAGIC: &[u8] = b"hellas.work-journal.v1";
@@ -713,6 +716,44 @@ impl Journal {
         self.id.generation
     }
 
+    /// Returns how many bytes the active generation occupies.
+    #[must_use]
+    pub const fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    /// Emits `restart_replay_ms_at_cap` for the open that produced this
+    /// handle and the replay its caller then ran.
+    ///
+    /// The store calls it, not [`Self::open_latest`], because the
+    /// quantity §4 divides by a block time is not the walk of a file: it
+    /// is a process coming back and reaching the state it left, which is
+    /// the walk plus the caller's own decode, signature checks and
+    /// transitions. `timing` is therefore started before the open and
+    /// finished after the last record has been applied.
+    ///
+    /// "At cap" is the probe's filter and not this seam's: a restart
+    /// replays whatever the file happens to hold, so the sample carries
+    /// the `frames` and `bytes` it actually walked and whoever is
+    /// building a distribution decides which of them were full ones.
+    pub fn observe_replay(&self, timing: Timing, records: usize) {
+        if let Some(ms) = timing.ms() {
+            tracing::event!(
+                name: "restart_replay_ms_at_cap",
+                target: TARGET,
+                LEVEL,
+                kind = ?self.id.kind,
+                role = ?self.id.role,
+                key = %hex(&self.id.key),
+                generation = self.id.generation,
+                frames = self.next_seq,
+                bytes = self.bytes,
+                records,
+                ms,
+            );
+        }
+    }
+
     /// Returns whether this generation has reached the point where the
     /// caller must rotate.
     ///
@@ -762,6 +803,14 @@ impl Journal {
         let candidate = candidate_path(&self.directory, &self.stem, successor.generation);
         let installed = generation_path(&self.directory, &self.stem, successor.generation);
 
+        // `rotation_tail_ms`: the whole three-step install, candidate
+        // fsync through the second directory fsync, because that is what
+        // §4 puts in `Wresp` and `Wstart` — a duty that rotates waits for
+        // all of it. A rotation that fails before the rename emits
+        // nothing: no generation moved, so no rotation happened.
+        let rotation = Timing::start();
+        let retired_frames = self.next_seq;
+        let retired_bytes = self.bytes;
         let (file, bytes) = write_candidate(&candidate, successor, checkpoint)?;
         install(&candidate, &installed, &self.directory)?;
 
@@ -778,6 +827,21 @@ impl Journal {
         // window in which a second process opens a journal this one has
         // already replaced.
         drop(predecessor);
+        if let Some(ms) = rotation.ms() {
+            tracing::event!(
+                name: "rotation_tail_ms",
+                target: TARGET,
+                LEVEL,
+                kind = ?self.id.kind,
+                role = ?self.id.role,
+                key = %hex(&self.id.key),
+                generation = self.id.generation,
+                frames = retired_frames,
+                bytes = retired_bytes,
+                checkpoint_bytes = checkpoint.len(),
+                ms,
+            );
+        }
         outcome
     }
 
@@ -842,7 +906,28 @@ impl Journal {
 
     fn write_frame(&mut self, frame: &[u8]) -> Result<(), JournalError> {
         self.file.write_all(frame)?;
+        // `fsync_tail_ms`: the sync itself, and not the write before it.
+        // It is the tail of one append — the part a caller waits on
+        // before it may release the bytes the append records — and §4's
+        // `Wresp` counts three of them. A sync that fails emits nothing:
+        // the frame did not reach the disk, so there is no append here
+        // to have taken any time at all.
+        let fsync = Timing::start();
         self.file.sync_all()?;
+        if let Some(ms) = fsync.ms() {
+            tracing::event!(
+                name: "fsync_tail_ms",
+                target: TARGET,
+                LEVEL,
+                kind = ?self.id.kind,
+                role = ?self.id.role,
+                key = %hex(&self.id.key),
+                generation = self.id.generation,
+                seq = self.next_seq,
+                bytes = frame.len(),
+                ms,
+            );
+        }
         Ok(())
     }
 

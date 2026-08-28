@@ -2854,6 +2854,7 @@ impl ChannelStore {
             .into());
         }
         let key = channel_key(&channel).into_bytes();
+        let replayed = crate::observe::Timing::start();
         let (journal, replay) = Journal::open_latest(
             root,
             &format!("channel-{}", hex(&key)),
@@ -2878,6 +2879,7 @@ impl ChannelStore {
             .job
             .as_ref()
             .is_some_and(|job| job.phase == JobPhase::Running);
+        journal.observe_replay(replayed, replay.records.len());
         let store = Self {
             journal,
             state,

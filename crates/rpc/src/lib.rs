@@ -44,6 +44,7 @@ pub mod call;
 pub mod evaluate;
 #[cfg(feature = "fetch")]
 pub mod fetch;
+pub mod observe;
 #[cfg(feature = "execute")]
 pub mod open;
 #[cfg(feature = "fetch")]

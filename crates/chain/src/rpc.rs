@@ -25,6 +25,7 @@ use hellas_kernel::{
     pending_payment_close_slot,
 };
 use hellas_rpc::SubmitTxOutcome;
+use hellas_rpc::observe::{LEVEL, TARGET, Timing};
 
 /// In-process [`LightClient`] backed by the local application handle.
 #[derive(Clone)]
@@ -162,7 +163,24 @@ impl LocalLightClient {
         }
 
         let verifier = crate::execution::ChainVerifier::new();
-        if check_response(&response, context, &verifier, &batch).is_err() {
+        // `validation_ms`: the extracted response validator, the one §4
+        // adds to a validator's RPC and its worker. Both an admitted and
+        // a rejected response paid for it, so both are sampled — the
+        // rejection is validation that ran, not validation that did not.
+        let validated = Timing::start();
+        let admissible = check_response(&response, context, &verifier, &batch).is_ok();
+        if let Some(ms) = validated.ms() {
+            tracing::event!(
+                name: "validation_ms",
+                target: TARGET,
+                LEVEL,
+                edge = ?incoming_edge,
+                start_id = ?response.start_id(),
+                admissible,
+                ms,
+            );
+        }
+        if !admissible {
             return Ok(SubmitTxOutcome::ValidationRejected);
         }
 
@@ -1942,6 +1960,74 @@ mod tests {
             ));
             let qmdb_root = database.read().await.root();
             assert_ne!(skewed_index.cursor().state_root, qmdb_root);
+        });
+    }
+
+    /// The extracted validator is sampled for every response it judged,
+    /// and for nothing it did not judge.
+    ///
+    /// `validation_ms` is §4's third per-validator addend. An admitted
+    /// response and a rejected one both paid for it — a rejection is
+    /// validation that ran — so both are samples, and the `admissible`
+    /// field is what lets a reader separate them without a second seam.
+    /// General traffic reaches no validator here and emits nothing.
+    #[test]
+    fn every_judged_response_is_one_validation_sample() {
+        use hellas_rpc::observe::Samples;
+        use tracing::instrument::WithSubscriber as _;
+
+        run_qmdb(|runtime| async move {
+            let fixture = response_fixture(runtime, "validation_seam").await;
+            let samples = std::sync::Arc::new(Samples::new());
+
+            assert_eq!(
+                fixture
+                    .client
+                    .submit_tx(response_transaction(fixture.valid))
+                    .with_subscriber(samples.clone())
+                    .await
+                    .expect("a live response is an admission outcome"),
+                SubmitTxOutcome::Enqueued,
+            );
+            assert_eq!(
+                fixture
+                    .client
+                    .submit_tx(response_transaction(fixture.bad_action))
+                    .with_subscriber(samples.clone())
+                    .await
+                    .expect("a bad action signature is an admission outcome"),
+                SubmitTxOutcome::ValidationRejected,
+            );
+            let general = Transaction::Kernel(
+                hellas_kernel::test_support::valid_open_tx().expect("general tx fixture"),
+            );
+            assert_eq!(
+                fixture
+                    .client
+                    .submit_tx(general)
+                    .with_subscriber(samples.clone())
+                    .await
+                    .expect("general submission has an outcome"),
+                SubmitTxOutcome::Enqueued,
+            );
+
+            let judged = samples.of("validation_ms");
+            assert_eq!(
+                judged.len(),
+                2,
+                "two responses were judged; general traffic is judged by nothing here",
+            );
+            assert_eq!(judged[0].field("admissible"), Some("true"));
+            assert_eq!(judged[1].field("admissible"), Some("false"));
+            assert_ne!(
+                judged[0].field("start_id"),
+                None,
+                "each sample names the contest it judged",
+            );
+            assert!(
+                judged.iter().all(|sample| sample.ms >= 0.0),
+                "every sample carries the duration it is a sample of",
+            );
         });
     }
 }

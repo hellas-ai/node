@@ -31,6 +31,7 @@ use hellas_rpc::evaluate::{
     EvaluateOutputTranscriptBuilder, EvaluateStopReason, EvaluateTerminal, EvaluateUsage,
     input_commitment,
 };
+use hellas_rpc::observe::Samples;
 use hellas_rpc::pb::work::{
     AcceptWorkRequest, WorkRefusalCode, accept_work_response::Outcome as AcceptOutcome,
 };
@@ -3824,12 +3825,7 @@ async fn a_contested_channel_mounts_a_close_capable_service() {
 async fn a_close_only_mount_without_a_bond_closes_its_payment_edge() {
     let fixture = paid_job().await;
     let payment = payment_object();
-    match descriptor().check_ready(&observed(
-        CURSOR,
-        None,
-        Some(&payment),
-        PendingSlot::Absent,
-    )) {
+    match descriptor().check_ready(&observed(CURSOR, None, Some(&payment), PendingSlot::Absent)) {
         Err(WorkSetupError::NotLive { object }) => assert_eq!(object, "the bond edge"),
         other => panic!("a channel whose bond is gone admits no new work: {other:?}"),
     }
@@ -3840,8 +3836,9 @@ async fn a_close_only_mount_without_a_bond_closes_its_payment_edge() {
         .prepare_close()
         .expect("a paid channel closes without a readiness decision");
     assert_eq!(
-        start.certificate().map(|(earned, _)| earned
-            .earned_cumulative()),
+        start
+            .certificate()
+            .map(|(earned, _)| earned.earned_cumulative()),
         Some(PRICE),
         "the start spends the certificate the journal holds",
     );
@@ -3853,7 +3850,10 @@ async fn a_close_only_mount_without_a_bond_closes_its_payment_edge() {
     };
     match watcher.provider.advance_close(&empty, &sink).await {
         Ok(CloseProgress::Submitted { valid_through, .. }) => {
-            assert_eq!(valid_through, CURSOR + payment_terms().start_validity_blocks);
+            assert_eq!(
+                valid_through,
+                CURSOR + payment_terms().start_validity_blocks
+            );
         }
         other => panic!("the retained start is handed to consensus: {other:?}"),
     }
@@ -3956,5 +3956,222 @@ async fn a_close_only_service_admits_work_only_once_a_readiness_arrives() {
             .with_state(|state| state.job().is_some())
             .expect("the endpoint is reachable"),
         "and the accepted job is on the disk",
+    );
+}
+
+// ── The measurement seams §4's budgets are made of ────────────────────
+
+/// The close path samples the tip it read, each block it fetched, and
+/// the fsync that retained its start — one sample per piece of work.
+///
+/// `Wstart` adds `fresh_tip_ms` to `close_prepared_fsync_ms`; `Wresp`
+/// counts `one_block_fetch_ms` once, because §5's loop applies one block
+/// before it asks for another. So what a reader must be able to
+/// reconstruct is *which* fetch each sample was, and that is what the
+/// per-height identity below is for. A seam that summed the backlog
+/// would report one number and the deadline would be spent against the
+/// wrong one.
+#[tokio::test]
+async fn a_close_step_samples_its_tip_its_blocks_and_its_prepared_fsync() {
+    use tracing::instrument::WithSubscriber as _;
+
+    let fixture = paid_job().await;
+    let mut watcher = restarted(fixture);
+    let provider = &mut watcher.provider;
+    let samples = std::sync::Arc::new(Samples::new());
+
+    let Ok(start) = tracing::subscriber::with_default(samples.clone(), || provider.prepare_close())
+    else {
+        panic!("a paid channel closes");
+    };
+    assert_eq!(
+        samples.of("close_prepared_fsync_ms").len(),
+        1,
+        "one start retained, one fsync sampled",
+    );
+    let prepared = samples.of("close_prepared_fsync_ms");
+    assert_eq!(
+        prepared[0].field("valid_through"),
+        Some(start.valid_through_height().to_string().as_str()),
+    );
+    assert!(
+        !samples.of("fsync_tail_ms").is_empty(),
+        "the journal's own append is sampled under it, as its own term",
+    );
+
+    // Called again the retained start is handed back, and nothing
+    // reaches the disk — so there is no second sample of a fsync that
+    // did not happen.
+    let _ = tracing::subscriber::with_default(samples.clone(), || provider.prepare_close());
+    assert_eq!(
+        samples.of("close_prepared_fsync_ms").len(),
+        1,
+        "a start that is offered again is not retained again",
+    );
+
+    let heights: Vec<u64> = ((CURSOR + 1)..=(CURSOR + 3)).collect();
+    let quiet = Chain {
+        blocks: heights.iter().map(|h| block(*h, Vec::new())).collect(),
+        withheld: None,
+    };
+    let sink = Mempool::default();
+    let step = samples.clone();
+    let progress = provider
+        .advance_close(&quiet, &sink)
+        .with_subscriber(step)
+        .await;
+    assert!(
+        matches!(progress, Ok(CloseProgress::Submitted { .. })),
+        "the step runs: {progress:?}",
+    );
+
+    let tips = samples.of("fresh_tip_ms");
+    assert_eq!(tips.len(), 1, "one step asks the tip once");
+    assert_eq!(
+        tips[0].field("height"),
+        Some((CURSOR + 3).to_string().as_str()),
+    );
+
+    let fetches = samples.of("one_block_fetch_ms");
+    let fetched: Vec<Option<&str>> = fetches
+        .iter()
+        .map(|sample| sample.field("height"))
+        .collect();
+    let expected: Vec<String> = heights.iter().map(u64::to_string).collect();
+    assert_eq!(
+        fetched,
+        expected
+            .iter()
+            .map(String::as_str)
+            .map(Some)
+            .collect::<Vec<_>>(),
+        "three blocks fetched, three samples, each saying which block it was",
+    );
+}
+
+/// A restart samples the replay it actually ran, with the frames and the
+/// bytes it walked.
+///
+/// §4's `R` divides `restart_replay_ms_at_cap` by a block time, and "at
+/// cap" is a property of the file the restart happened to find. The seam
+/// cannot know whether the replay it ran was a full one, so it reports
+/// what it walked and leaves that judgement to whoever is building the
+/// distribution — which is why `frames`, `bytes` and `records` are in
+/// the sample and no threshold is.
+#[tokio::test]
+async fn a_restart_samples_the_replay_it_ran() {
+    let fixture = paid_job().await;
+    let samples = std::sync::Arc::new(Samples::new());
+    let watcher = tracing::subscriber::with_default(samples.clone(), || restarted(fixture));
+
+    let replays = samples.of("restart_replay_ms_at_cap");
+    assert_eq!(replays.len(), 1, "one journal reopened, one replay sampled");
+    let replay = &replays[0];
+    assert_eq!(replay.field("kind"), Some("Channel"));
+    assert_eq!(replay.field("role"), Some("Provider"));
+    assert_eq!(replay.field("generation"), Some("0"));
+
+    let number = |name: &str| match replay.field(name).map(str::parse::<u64>) {
+        Some(Ok(value)) => value,
+        other => panic!("{name} is a number: {other:?}"),
+    };
+    let frames = number("frames");
+    assert!(frames > 0, "a paid job leaves records to replay");
+    assert_eq!(
+        number("records"),
+        frames,
+        "generation zero holds no checkpoint, so every frame was replayed",
+    );
+    assert!(
+        number("bytes") > frames,
+        "the physical size of what was walked, not a frame count again",
+    );
+    drop(watcher);
+}
+
+/// Building an answer is sampled, and refusing to build one is not.
+///
+/// `response_build_ms` is `Wresp`'s signing term and nothing else: the
+/// record that fixes the answer is counted separately, as one of the
+/// three fsyncs. A contest this endpoint cannot answer is refused before
+/// anything is built, and a term nothing spent time on contributes
+/// nothing.
+#[tokio::test]
+async fn an_answer_that_is_built_is_sampled_and_one_that_is_refused_is_not() {
+    let fixture = paid_job().await;
+    let ready = fixture.ready.clone();
+    let inclusion = CURSOR + 1;
+    let bond = bond_object();
+    let payment_edge_object = payment_object();
+
+    let Ok(understated) = close_start(
+        ready.channel(),
+        hellas_kernel::Party::Maker,
+        CURSOR,
+        None,
+        &client(),
+    ) else {
+        panic!("a client opens a close");
+    };
+    let id = contest_id(&ready, &understated, inclusion);
+
+    let mut watcher = restarted(fixture);
+    let provider = &mut watcher.provider;
+    if let Err(error) = provider.observe_finalized(&block(
+        inclusion,
+        vec![hellas_kernel::Tx::move_action(
+            hellas_kernel::Move::StartPaymentClose(understated),
+        )],
+    )) {
+        panic!("the block applies: {error}");
+    }
+
+    let deadline = inclusion + payment_terms().omit_response_blocks;
+    let open = Contest::opened(id, deadline, 0);
+    let read_at = |height: u64, record: &Contest| ObservedChannel {
+        height,
+        bond: Some(&bond),
+        payment: Some(&payment_edge_object),
+        lease: lease_over(bond_edge(), payment_edge()),
+        pending: pending_slot(record),
+    };
+
+    let samples = std::sync::Arc::new(Samples::new());
+    if let Err(error) = tracing::subscriber::with_default(samples.clone(), || {
+        provider.respond_to_close(&read_at(deadline - 1, &open))
+    }) {
+        panic!("an understated contest is answered: {error}");
+    }
+    let built = samples.of("response_build_ms");
+    assert_eq!(built.len(), 1, "one answer, one sample");
+    assert_eq!(
+        built[0].field("start_id"),
+        Some(
+            id.to_bytes()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+                .as_str()
+        ),
+        "the sample names the contest it answered",
+    );
+
+    // The one answer is already given, so the second call refuses before
+    // it builds anything.
+    let mut settled = Contest::opened(id, deadline, 0);
+    settled.final_cumulative = PRICE;
+    settled.responded = true;
+    settled.penalty_due = true;
+    let refused = tracing::subscriber::with_default(samples.clone(), || {
+        provider.respond_to_close(&read_at(deadline - 1, &settled))
+    });
+    assert!(
+        matches!(refused, Err(CloseError::AlreadyResponded)),
+        "there is one answer: {refused:?}",
+    );
+    assert_eq!(
+        samples.of("response_build_ms").len(),
+        1,
+        "an answer that was not built is not an answer that took any time",
     );
 }

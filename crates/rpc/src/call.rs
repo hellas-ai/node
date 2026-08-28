@@ -20,6 +20,8 @@ use hellas_wire::transport::{
     MethodMarker, RecvHalf, SendHalf, Stream as WireStream, StreamTransport,
 };
 
+use crate::observe::{LEVEL, TARGET, Timing};
+
 /// Unary call: send one request, receive one response.
 pub async fn unary<T, M>(
     transport: &T,
@@ -710,12 +712,27 @@ where
         .map_err(|error| TransportError::Io(format!("close-with-status: {error}")))?;
         return Ok(());
     };
-    dispatch_unary_with_context_and_limit::<T, M, _, _, _>(
+    // `general_worker_ms`: everything this route does once it holds one
+    // of its 48 permits — receive the body, check the raw cap, decode,
+    // and run the handler. A submission refused for want of a permit is
+    // not a worker that ran, so it emits nothing.
+    let worked = Timing::start();
+    let outcome = dispatch_unary_with_context_and_limit::<T, M, _, _, _>(
         inbound,
         Some(max_request_bytes),
         handler,
     )
-    .await
+    .await;
+    if let Some(ms) = worked.ms() {
+        tracing::event!(
+            name: "general_worker_ms",
+            target: TARGET,
+            LEVEL,
+            method = M::NAME,
+            ms,
+        );
+    }
+    outcome
 }
 
 /// The dedicated work-response route: reserve one of sixteen request slots
@@ -760,10 +777,28 @@ where
         return Ok(());
     }
 
+    // `response_worker_ms`: the wait for one of the four workers, plus
+    // the decode and the handler that worker then runs. The queueing is
+    // deliberately inside it — under the load §4 measures at, waiting
+    // for a worker *is* most of what a response costs — and the encode
+    // and send after it are deliberately outside, being transport
+    // rather than worker.
+    let worked = Timing::start();
     let _worker = route.workers.acquire().await;
     let request = M::Request::decode(&req_bytes[..])
         .map_err(|error| TransportError::Protocol(format!("prost decode: {error}")))?;
-    match handler(request).await {
+    let handled = handler(request).await;
+    if let Some(ms) = worked.ms() {
+        tracing::event!(
+            name: "response_worker_ms",
+            target: TARGET,
+            LEVEL,
+            method = M::NAME,
+            bytes = req_bytes.len(),
+            ms,
+        );
+    }
+    match handled {
         Ok(result) => {
             let WithTrailer { response, metadata } = result.into();
             let mut buf = BytesMut::with_capacity(response.encoded_len());
@@ -1564,5 +1599,104 @@ mod streaming_call_tests {
             task.await.unwrap().unwrap();
         }
         assert_eq!(entered.load(Ordering::SeqCst), 5);
+    }
+
+    /// Each dispatch through either bounded route is its own worker
+    /// sample, and a request refused for want of a permit is none.
+    ///
+    /// §4 adds `response_worker_ms` and `general_worker_ms` to a
+    /// validator's RPC, and maximises the sum over six validators. The
+    /// maximum is the reader's arithmetic: one node emits one sample per
+    /// request it actually worked on, and a request that never reached a
+    /// worker is not a worker that was slow.
+    #[tokio::test]
+    async fn each_bounded_route_samples_the_work_it_did_and_not_the_work_it_refused() {
+        use crate::observe::Samples;
+        use tracing::instrument::WithSubscriber as _;
+
+        let samples = std::sync::Arc::new(Samples::new());
+        let request = BytesMsg {
+            payload: vec![7; 32],
+        };
+        let mut encoded = BytesMut::new();
+        request.encode(&mut encoded).unwrap();
+        let encoded = encoded.freeze();
+
+        let response_route = WorkResponseRoute::default();
+        let (inbound, _state) = route_inbound(Some(encoded.clone()), false, None);
+        dispatch_work_response_bounded::<MockTransport, MockMethod, _, _, BytesMsg>(
+            inbound,
+            &response_route,
+            65_536,
+            |_| async { Ok(BytesMsg::default()) },
+        )
+        .with_subscriber(samples.clone())
+        .await
+        .expect("the response is dispatched");
+
+        let general_route = GeneralSubmitRoute::default();
+        let (inbound, _state) = route_inbound(Some(encoded.clone()), false, None);
+        dispatch_general_submit_bounded::<MockTransport, MockMethod, _, _, BytesMsg>(
+            inbound,
+            &general_route,
+            65_536,
+            |_, _| async { Ok(BytesMsg::default()) },
+        )
+        .with_subscriber(samples.clone())
+        .await
+        .expect("the general submission is dispatched");
+
+        let workers = samples.of("response_worker_ms");
+        assert_eq!(workers.len(), 1, "one response, one worker sample");
+        assert_eq!(workers[0].field("method"), Some("Route"));
+        assert_eq!(
+            workers[0].field("bytes"),
+            Some(encoded.len().to_string().as_str()),
+            "the sample says how much work it was a sample of",
+        );
+        let general = samples.of("general_worker_ms");
+        assert_eq!(general.len(), 1, "one submission, one worker sample");
+        assert_eq!(general[0].field("method"), Some("Route"));
+
+        // A route with no permit refuses before it reads a body, and a
+        // refusal is not a duration.
+        let full_response = WorkResponseRoute {
+            permits: PermitPool::new(0),
+            workers: PermitPool::new(4),
+        };
+        let (inbound, _state) = route_inbound(Some(encoded.clone()), false, None);
+        dispatch_work_response_bounded::<MockTransport, MockMethod, _, _, BytesMsg>(
+            inbound,
+            &full_response,
+            65_536,
+            |_| async { Ok(BytesMsg::default()) },
+        )
+        .with_subscriber(samples.clone())
+        .await
+        .expect("saturation is a wire trailer");
+        let full_general = GeneralSubmitRoute {
+            permits: PermitPool::new(0),
+        };
+        let (inbound, _state) = route_inbound(Some(encoded), false, None);
+        dispatch_general_submit_bounded::<MockTransport, MockMethod, _, _, BytesMsg>(
+            inbound,
+            &full_general,
+            65_536,
+            |_, _| async { Ok(BytesMsg::default()) },
+        )
+        .with_subscriber(samples.clone())
+        .await
+        .expect("saturation is a wire trailer");
+
+        assert_eq!(
+            samples.of("response_worker_ms").len(),
+            1,
+            "a response that never reached a worker is not sampled",
+        );
+        assert_eq!(
+            samples.of("general_worker_ms").len(),
+            1,
+            "a submission that never got a permit is not sampled",
+        );
     }
 }
