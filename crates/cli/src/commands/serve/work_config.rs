@@ -54,6 +54,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::{Context as _, bail};
@@ -240,7 +241,8 @@ pub enum PaidWorkDuties {
     /// This is a node before its bootstrap run, not a broken one.
     NotFound,
     /// The file at the configured path is not the one
-    /// `artifact.digest` pins: §4's *changed* evidence.
+    /// `artifact.digest` pins, or the pinned artifact records another
+    /// measuring binary: §4's *changed* evidence.
     Changed,
     /// The pinned artifact was read and §4's measured floor does not
     /// hold over it. This node countersigns nothing and holds no policy
@@ -330,8 +332,8 @@ impl PaidWorkDuties {
                  recovery and the close duty still run"
                 .to_string(),
             Self::Changed => {
-                "no paid admission: the artifact at the configured path is not the one \
-                 artifact.digest pins; recovery and the close duty still run"
+                "no paid admission: the artifact misses its configured digest or records \
+                 another measuring binary; recovery and the close duty still run"
                     .to_string()
             }
             Self::Refused(refusal) => format!(
@@ -373,9 +375,16 @@ pub struct MeasuredEvidence {
 ///
 /// A measurement is a statement about a binary on a machine under a
 /// configuration, and an artifact that does not say which is a number
-/// with no subject. None of this is compared to anything here: this node
-/// has no clock in this path and builds none, so the timestamp is read
-/// and carried and never checked against a now.
+/// with no subject. The binary is compared with the executable loading
+/// the artifact. The configuration digest cannot honestly be compared:
+/// the probe hashes the configuration before its output digest is put
+/// into that same file, so installing `artifact.digest` necessarily
+/// changes the recorded bytes. Nor can the operator's `--machine` label
+/// be reconstructed, because serve is given no corresponding label.
+/// Those two identities are therefore read and carried, not claimed as
+/// deployment checks. This node also has no clock in this path and
+/// builds none, so the timestamps are checked against one another and
+/// against the samples, but never against a now.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[allow(
     dead_code,
@@ -431,7 +440,9 @@ pub fn load_work_config(path: &Path) -> CliResult<WorkConfig> {
 /// not the pinned one, still owes every open contest a response, and
 /// refusing to start is the one thing that guarantees the response is
 /// never made. So missing and changed evidence turn admission off and
-/// leave the node running.
+/// leave the node running. A pinned artifact produced by a different
+/// executable is changed evidence too: measurements made by that binary
+/// are not measurements of this one.
 ///
 /// What *is* an error is the pinned file being unreadable as an artifact.
 /// Its digest is compared before its contents are interpreted: bytes
@@ -444,8 +455,8 @@ pub fn load_work_config(path: &Path) -> CliResult<WorkConfig> {
 /// # Errors
 ///
 /// A pinned file that does not parse, an unknown or missing field, a
-/// digest or machine name that is not one, and a label its sample count
-/// contradicts.
+/// digest or machine name that is not one, a label its sample count
+/// contradicts, and a running executable whose bytes cannot be read.
 pub fn load_paid_work_duties(config: &WorkConfig) -> CliResult<PaidWorkDuties> {
     let Some(identity) = config.measured_artifact() else {
         return Ok(PaidWorkDuties::NotConfigured);
@@ -470,7 +481,29 @@ pub fn load_paid_work_duties(config: &WorkConfig) -> CliResult<PaidWorkDuties> {
     let artifact = file
         .into_artifact()
         .with_context(|| format!("invalid artifact {}", identity.path.display()))?;
+    if artifact.provenance.binary != running_binary_digest()? {
+        return Ok(PaidWorkDuties::Changed);
+    }
     Ok(config.duties(artifact))
+}
+
+/// Identifies the executable whose paid-work duties are being loaded,
+/// by the same bytes and hash the bootstrap probe records.
+fn running_binary_digest() -> CliResult<Digest> {
+    static DIGEST: OnceLock<Result<Digest, String>> = OnceLock::new();
+    match DIGEST.get_or_init(|| {
+        let result = || -> CliResult<Digest> {
+            let path =
+                std::env::current_exe().context("failed to locate the running executable")?;
+            let bytes = fs::read(&path)
+                .with_context(|| format!("failed to read running executable {}", path.display()))?;
+            Ok(Digest::hash(&bytes))
+        };
+        result().map_err(|error| format!("{error:#}"))
+    }) {
+        Ok(digest) => Ok(*digest),
+        Err(error) => Err(anyhow::anyhow!(error.clone())),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1687,9 +1720,10 @@ mod tests {
     /// number measured, and every number one this fixture's terms are
     /// priced by.
     fn artifact() -> serde_json::Value {
+        let binary = running_binary_digest().expect("the test executable identifies itself");
         serde_json::json!({
             "provenance": {
-                "binary": hex32(0x21),
+                "binary": hex::encode(binary.as_bytes()),
                 "config": hex32(0x22),
                 "machine": "bootstrap-1",
                 "started_at_unix_ms": RUN_STARTED_AT,
@@ -1882,7 +1916,7 @@ mod tests {
         assert_eq!(
             evidence.provenance,
             ArtifactProvenance {
-                binary: Digest::from_bytes([0x21; 32]),
+                binary: running_binary_digest().expect("the test executable identifies itself"),
                 config: Digest::from_bytes([0x22; 32]),
                 machine: "bootstrap-1".to_string(),
                 started_at_unix_ms: RUN_STARTED_AT,
@@ -2142,6 +2176,32 @@ mod tests {
         assert!(duties.payment_admission().is_none());
         assert!(
             duties.summary().contains("no paid admission"),
+            "unexpected summary: {}",
+            duties.summary(),
+        );
+    }
+
+    /// A byte-for-byte pinned artifact is still evidence about the
+    /// binary that measured it, not whichever binary happens to read
+    /// it later.
+    #[test]
+    fn an_artifact_measured_by_another_binary_is_changed() {
+        let mut foreign = artifact();
+        let binary = Digest::from_bytes([0x21; 32]);
+        assert_ne!(
+            running_binary_digest().expect("the test executable identifies itself"),
+            binary,
+            "the fixture must name another binary",
+        );
+        foreign["provenance"]["binary"] = serde_json::json!(hex::encode(binary.as_bytes()));
+
+        let duties = duties_for(&foreign, None)
+            .expect("another measuring binary is changed evidence, not a startup failure");
+
+        assert_eq!(duties, PaidWorkDuties::Changed);
+        assert!(duties.payment_admission().is_none());
+        assert!(
+            duties.summary().contains("another measuring binary"),
             "unexpected summary: {}",
             duties.summary(),
         );
