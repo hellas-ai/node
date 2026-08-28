@@ -28,16 +28,25 @@
 //! unknown fields, which is what turns that into an error naming the
 //! field.
 //!
-//! The **floor arithmetic** is not here either: the `64 >= T`
-//! inequality and the Clopper–Pearson confidence test consume timings no
-//! producer in this tree yet emits. What is here is the artifact those
-//! timings will be written into, and the labelling that lets a node with
-//! none of them say so out loud. Every number in the artifact carries
-//! `measured` or `assumed`; one `assumed` field is a node that
-//! countersigns no new channel; and no number is invented to fill a gap.
-//! [`load_paid_work_duties`] is how the serve path asks which of §4's
-//! four evidence cases it started in, and every one of them still
-//! answers a contest.
+//! # The floor, and where it is decided
+//!
+//! §4-B's arithmetic is not spelled here either — it is
+//! [`hellas_rpc::protocol::mount`], so that the startup check below and
+//! [`ProviderChannelPolicy::admit`] run the same formulas over the same
+//! samples. What is here is the artifact those samples are written into,
+//! the labelling that lets a node with none of them say so out loud, and
+//! the two judgements a reader makes rather than trusts: the raw
+//! observations are reduced to §4's terms *here*, by this node, and the
+//! Clopper–Pearson grading of the response probability is recomputed
+//! *here* from the trials the artifact reports. An artifact cannot talk
+//! its way into admission by writing a flattering summary or a
+//! flattering bound; it can only report what it saw.
+//!
+//! Every number in the artifact carries `measured` or `assumed`; one
+//! `assumed` field is a node that countersigns no new channel; and no
+//! number is invented to fill a gap. [`load_paid_work_duties`] is how
+//! the serve path asks which of §4's evidence cases it started in, and
+//! every one of them still answers a contest.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -47,6 +56,9 @@ use anyhow::{Context as _, bail};
 use hellas_kernel::{EdgeValues, Fees, NetworkId};
 use hellas_rpc::ContentId;
 use hellas_rpc::protocol::Digest;
+use hellas_rpc::protocol::mount::{
+    FloorError, MountBudget, MountFloor, clopper_pearson_upper_ppb, grade_response_probability,
+};
 use hellas_rpc::protocol::work::{
     PaidChannelPolicyV1, PaidExecutionPolicyV1, check_execution_policy,
 };
@@ -102,29 +114,51 @@ impl WorkConfig {
     /// Returns the measured artifact, or `None` when this node admits no
     /// paid work.
     ///
-    /// The floor arithmetic that would *grade* the artifact is not
-    /// implemented, and this does not pretend otherwise: it answers
-    /// which of the two configurations this is, and a `None` is the
-    /// fail-closed one. Recovery is unaffected either way — §4 disables
-    /// setup and new work on missing evidence, never recovery.
+    /// It answers which of the two configurations this is, and a `None`
+    /// is the fail-closed one. Recovery is unaffected either way — §4
+    /// disables setup and new work on missing evidence, never recovery.
     #[must_use]
     pub const fn measured_artifact(&self) -> Option<&ArtifactIdentity> {
         self.artifact.as_ref()
     }
 
     /// The provider policy this configuration and one read artifact
-    /// make together.
+    /// make together, or the floor's refusal.
     ///
     /// The four fields a provider fixes for itself come from the
     /// configuration; the two it can only have measured come from the
-    /// artifact. Which variant it lands in is the artifact's weakest
-    /// label and nothing else — the numbers are identical either way,
-    /// which is the point: what turns admission off is the absence of
-    /// evidence, not a value that failed a test.
+    /// artifact; and the floor is computed here, by this node, over the
+    /// artifact's raw samples.
+    ///
+    /// The floor is asked first and it is a refusal rather than a label.
+    /// A missing or `assumed` number is a node that has not measured
+    /// something yet — §4 leaves it setup and its close duty and takes
+    /// away only its countersignature. A budget that does not clear
+    /// `64 ≥ T`, or whose blocks take no time, or whose configured alarm
+    /// fires later than the budget needs, is not weak evidence: it is a
+    /// measurement of a deployment in which a start authorization
+    /// expires before the channel it authorises can be reached. Such a
+    /// node holds no policy at all, which is the same answer as naming
+    /// no artifact, and its recovery and close duty are untouched
+    /// because those are built from a journal and a key.
+    ///
+    /// Past the floor, which variant it lands in is the artifact's
+    /// weakest label and nothing else — the numbers are identical either
+    /// way, which is the point: what turns admission off there is the
+    /// absence of evidence, not a value that failed a test.
     fn duties(&self, artifact: MeasuredArtifact) -> PaidWorkDuties {
+        let floor = match artifact.budget.floor().and_then(|floor| {
+            floor.check_start_span()?;
+            floor.check_alarm_margin(self.response_alarm_margin_blocks)?;
+            Ok(floor)
+        }) {
+            Ok(floor) => floor,
+            Err(refusal) => return PaidWorkDuties::Refused(refusal),
+        };
         let evidence = Box::new(MeasuredEvidence {
             provenance: artifact.provenance,
             samples: artifact.samples,
+            floor,
             policy: ProviderChannelPolicy {
                 network: self.chain.network,
                 policy_salt: self.policy_salt,
@@ -132,6 +166,7 @@ impl WorkConfig {
                 execution_policy: self.execution_policy,
                 expected_payment_values: artifact.expected_payment_values,
                 omission: artifact.omission,
+                floor,
             },
         });
         match artifact.evidence {
@@ -222,6 +257,11 @@ pub enum PaidWorkDuties {
     /// pins: §4's *changed* evidence, from another binary, another
     /// configuration or another machine.
     Changed,
+    /// The pinned artifact was read and §4's measured floor does not
+    /// hold over it. This node countersigns nothing and holds no policy
+    /// to countersign with; its recovery and close duty are built from a
+    /// journal and a key and still run.
+    Refused(FloorError),
 }
 
 impl PaidWorkDuties {
@@ -255,7 +295,7 @@ impl PaidWorkDuties {
             Self::Assumed(evidence) => Some(PaymentAdmission::Proposes(Box::new(
                 evidence.policy.clone(),
             ))),
-            Self::NotConfigured | Self::NotFound | Self::Changed => None,
+            Self::NotConfigured | Self::NotFound | Self::Changed | Self::Refused(_) => None,
         }
     }
 
@@ -268,7 +308,7 @@ impl PaidWorkDuties {
     pub const fn evidence(&self) -> Option<&MeasuredEvidence> {
         match self {
             Self::Admits(evidence) | Self::Assumed(evidence) => Some(evidence),
-            Self::NotConfigured | Self::NotFound | Self::Changed => None,
+            Self::NotConfigured | Self::NotFound | Self::Changed | Self::Refused(_) => None,
         }
     }
 
@@ -286,27 +326,33 @@ impl PaidWorkDuties {
     /// that is the fact an operator is looking for, and then says which
     /// of the four cases produced it.
     #[must_use]
-    pub const fn summary(&self) -> &'static str {
+    pub fn summary(&self) -> String {
         match self {
-            Self::Admits(_) => {
-                "paid admission is on: every field of the pinned artifact is measured"
-            }
+            Self::Admits(evidence) => format!(
+                "paid admission is on: every field of the pinned artifact is measured, \
+                 and its floor needs T={} of the 64-block start span",
+                evidence.floor.t(),
+            ),
             Self::Assumed(_) => {
                 "no paid admission: the pinned artifact carries at least one assumed field; \
                  setup, recovery and the close duty still run"
+                    .to_string()
             }
-            Self::NotConfigured => {
-                "no paid admission: no measured artifact is configured; \
+            Self::NotConfigured => "no paid admission: no measured artifact is configured; \
                  recovery and the close duty still run"
-            }
-            Self::NotFound => {
-                "no paid admission: no artifact was found at the configured path; \
+                .to_string(),
+            Self::NotFound => "no paid admission: no artifact was found at the configured path; \
                  recovery and the close duty still run"
-            }
+                .to_string(),
             Self::Changed => {
                 "no paid admission: the artifact at the configured path is not the one \
                  artifact.digest pins; recovery and the close duty still run"
+                    .to_string()
             }
+            Self::Refused(refusal) => format!(
+                "no paid admission: the measured floor refuses this deployment: {refusal}; \
+                 recovery and the close duty still run"
+            ),
         }
     }
 }
@@ -330,6 +376,10 @@ pub struct MeasuredEvidence {
     /// whenever any field is `assumed`, because an assumed field rests
     /// on none — so this is the weakest link and not an average.
     pub samples: u64,
+    /// §4's floor over this artifact's raw samples, as this node
+    /// computed it. The same value the policy carries, kept here too so
+    /// an operator can read `T` back without opening a policy.
+    pub floor: MountFloor,
     /// The policy a setup endpoint is built over.
     pub policy: ProviderChannelPolicy,
 }
@@ -353,6 +403,12 @@ pub struct ArtifactProvenance {
     pub config: Digest,
     /// The machine it measured on, as the operator names it.
     pub machine: String,
+    /// When the run began, in milliseconds since the Unix epoch, as the
+    /// artifact records it. The pair with
+    /// [`Self::measured_at_unix_ms`] bounds every raw sample in the
+    /// file, which is what makes a sample's own timestamp checkable
+    /// against something.
+    pub started_at_unix_ms: u64,
     /// When the run finished, in milliseconds since the Unix epoch, as
     /// the artifact records it.
     pub measured_at_unix_ms: u64,
@@ -752,10 +808,10 @@ impl Evidence {
 /// measurement, and an `assumed` number reporting samples is a
 /// measurement wearing the wrong label. Both are refused, by name.
 ///
-/// Nothing here grades the number. The `64 >= T` floor and the
-/// confidence bound are §4-B's and consume timings this tree does not
-/// yet emit; this is the honest label they will one day be computed
-/// from.
+/// Nothing here grades the number. The `64 >= T` floor is computed from
+/// [`BudgetFile`]'s raw samples and the confidence bound from
+/// [`TrialsFile`]'s trials; this is the honest label those two answer
+/// to.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MeasuredU64 {
@@ -778,11 +834,13 @@ impl MeasuredU64 {
     }
 }
 
-/// One artifact, read and folded into the two values a policy needs.
+/// One artifact, read and folded into the values a policy needs.
 struct MeasuredArtifact {
     provenance: ArtifactProvenance,
     omission: OmissionMeasurements,
     expected_payment_values: EdgeValues,
+    /// §4's terms, reduced from the file's raw samples by this node.
+    budget: MountBudget,
     evidence: Evidence,
     samples: u64,
 }
@@ -793,6 +851,7 @@ struct ArtifactBodyFile {
     provenance: ProvenanceFile,
     omission: OmissionFile,
     expected_payment_values: PaymentValuesFile,
+    budget: BudgetFile,
 }
 
 impl ArtifactBodyFile {
@@ -847,13 +906,70 @@ impl ArtifactBodyFile {
             samples = samples.min(field.samples);
         }
 
+        // §4's grading, recomputed here rather than believed. The
+        // artifact reports the trials and the bound it drew from them;
+        // this node draws the bound again and refuses a file whose two
+        // disagree, then applies the rule to the trials themselves. A
+        // run that does not clear both halves leaves the response
+        // probability `assumed` whatever the file called it, which is
+        // §4's own "otherwise the field is assumed" and not a second
+        // policy.
+        let trials = &self.omission.response_trials;
+        let bound = clopper_pearson_upper_ppb(trials.trials, trials.misses);
+        if bound != trials.miss_upper_ppb {
+            bail!(
+                "omission.response_trials.miss_upper_ppb is {}, and {} trials with {} misses \
+                 bound the miss rate at {bound} parts per billion",
+                trials.miss_upper_ppb,
+                trials.trials,
+                trials.misses,
+            );
+        }
+        match grade_response_probability(trials.trials, trials.misses) {
+            Some(q) => {
+                if self.omission.response_probability.evidence == Evidence::Measured {
+                    if self.omission.response_probability.value != q {
+                        bail!(
+                            "omission.response_probability is {} and {} trials with {} misses \
+                             earn {q}",
+                            self.omission.response_probability.value,
+                            trials.trials,
+                            trials.misses,
+                        );
+                    }
+                    if self.omission.response_probability.samples != trials.trials {
+                        bail!(
+                            "omission.response_probability rests on {} samples and \
+                             omission.response_trials reports {} trials",
+                            self.omission.response_probability.samples,
+                            trials.trials,
+                        );
+                    }
+                }
+            }
+            None => evidence = Evidence::Assumed,
+        }
+
+        // The run before its samples, because the run's window is what
+        // every sample's own timestamp is checked against.
+        let provenance = self.provenance.into_provenance()?;
+        let (budget, budget_samples, budget_evidence) = self.budget.into_budget(&provenance)?;
+        evidence = evidence.weakest(budget_evidence);
+        samples = samples.min(budget_samples);
+        if evidence == Evidence::Assumed {
+            // §4's own accounting: an assumed field rests on no samples,
+            // so an artifact carrying one reports none.
+            samples = 0;
+        }
+
         Ok(MeasuredArtifact {
-            provenance: self.provenance.into_provenance()?,
+            provenance,
             omission: OmissionMeasurements {
                 response_probability: self.omission.response_probability.value,
                 response_blocks: self.omission.response_blocks.value,
                 response_cost_cap: self.omission.response_cost_cap.value,
             },
+            budget,
             expected_payment_values: EdgeValues::new(
                 self.expected_payment_values.value.value,
                 self.expected_payment_values.reserve.value,
@@ -876,6 +992,7 @@ struct ProvenanceFile {
     binary: String,
     config: String,
     machine: String,
+    started_at_unix_ms: u64,
     measured_at_unix_ms: u64,
 }
 
@@ -884,10 +1001,22 @@ impl ProvenanceFile {
         if self.machine.trim().is_empty() {
             bail!("provenance.machine must name a machine");
         }
+        // The run's own window, checked for being one. A finish before
+        // its start is a file assembled by hand or a clock that moved
+        // under the run, and either way every timestamp inside it means
+        // something other than what it says.
+        if self.measured_at_unix_ms < self.started_at_unix_ms {
+            bail!(
+                "provenance.measured_at_unix_ms {} is before provenance.started_at_unix_ms {}",
+                self.measured_at_unix_ms,
+                self.started_at_unix_ms,
+            );
+        }
         Ok(ArtifactProvenance {
             binary: parse_digest("provenance.binary", &self.binary)?,
             config: parse_digest("provenance.config", &self.config)?,
             machine: self.machine,
+            started_at_unix_ms: self.started_at_unix_ms,
             measured_at_unix_ms: self.measured_at_unix_ms,
         })
     }
@@ -905,6 +1034,26 @@ struct OmissionFile {
     response_probability: MeasuredU64,
     response_blocks: MeasuredU64,
     response_cost_cap: MeasuredU64,
+    response_trials: TrialsFile,
+}
+
+/// The contest trials behind `response_probability`, raw.
+///
+/// A probability is a summary and §4 will not take a summary for this
+/// one: what it wants is how many contests were raised, how many were
+/// missed, and the one-sided bound those two imply. All three are
+/// present because the reader recomputes the third from the first two
+/// and refuses a file whose own arithmetic does not close.
+///
+/// A run that raised no contests writes zeroes here, and zero trials
+/// grade `assumed` — which is what a bootstrap that cannot fund 2,995
+/// contests honestly reports.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TrialsFile {
+    trials: u64,
+    misses: u64,
+    miss_upper_ppb: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -922,6 +1071,208 @@ struct CloseFeesFile {
     slot: MeasuredU64,
     proof: MeasuredU64,
     lifetime: MeasuredU64,
+}
+
+/// Every §4 term the two waits are built from, as observations rather
+/// than as answers.
+///
+/// One field per name in §4's two formulas, spelled exactly as §4 spells
+/// it, plus the two the block counts divide and multiply by. Nothing is
+/// optional and nothing defaults: a term left out of a bootstrap run is
+/// a term the operator writes `assumed` and a node that admits no work,
+/// which is a decision somebody made rather than a zero that quietly
+/// made the floor smaller.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BudgetFile {
+    fsync_tail_ms: BudgetTermFile,
+    rotation_tail_ms: BudgetTermFile,
+    response_build_ms: BudgetTermFile,
+    one_block_fetch_ms: BudgetTermFile,
+    fresh_tip_ms: BudgetTermFile,
+    close_prepared_fsync_ms: BudgetTermFile,
+    rpc_ms: BudgetTermFile,
+    response_worker_ms: BudgetTermFile,
+    general_worker_ms: BudgetTermFile,
+    validation_ms: BudgetTermFile,
+    restart_replay_ms_at_cap: BudgetTermFile,
+    restart_downtime_ms: BudgetTermFile,
+    lower_tail_block_ms: BudgetTermFile,
+    general_inclusion_blocks: BudgetTermFile,
+}
+
+/// Which end of a term's observations is the conservative one.
+///
+/// Not a preference: every term of §4 enters the floor either as a
+/// numerator, where longer is worse, or as the divisor
+/// `lower_tail_block_ms`, where *shorter* is worse because a shorter
+/// block buys less time per block. Naming the two ends here means the
+/// reduction of each term is written down beside the term rather than
+/// inferred from its units.
+#[derive(Clone, Copy, Debug)]
+enum Tail {
+    /// The longest observation: every wait, and `Ig`.
+    Longest,
+    /// The shortest observation: `lower_tail_block_ms`, the one term a
+    /// small value makes the floor larger.
+    Shortest,
+}
+
+/// One §4 term: what the run saw, or what an operator wrote instead.
+///
+/// The same honesty rule [`MeasuredU64`] carries, in the shape a raw
+/// sample set needs. `measured` means `samples` is non-empty and there
+/// is no `value` to contradict them; `assumed` means a `value` and no
+/// samples. There is no third shape, and in particular no way to write
+/// down a number and a sample set that does not produce it: the reader
+/// reduces the samples itself.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BudgetTermFile {
+    evidence: Evidence,
+    #[serde(default)]
+    value: Option<u64>,
+    #[serde(default)]
+    samples: Vec<RawSampleFile>,
+}
+
+/// One observation, as the seam emitted it and the collector timestamped
+/// it.
+///
+/// Whole units, because §4's terms are whole milliseconds and blocks and
+/// the probe rounds a duration up on the way in. The timestamp is what
+/// makes this a sample of a run rather than a number in a list.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSampleFile {
+    at_unix_ms: u64,
+    value: u64,
+}
+
+impl BudgetTermFile {
+    /// The one number this term contributes, and how many observations
+    /// it rests on.
+    ///
+    /// # Errors
+    ///
+    /// A label its samples contradict, in either direction, and an
+    /// `assumed` term that names no value.
+    fn reduce(&self, field: &str, tail: Tail, run: &ArtifactProvenance) -> CliResult<(u64, u64)> {
+        for sample in &self.samples {
+            // A sample stamped outside the run that claims it is not a
+            // sample of that run. It is the previous artifact, or a
+            // hand-edited file, or a clock that moved — and a floor
+            // computed over one would be a floor for a machine nobody
+            // named.
+            if sample.at_unix_ms < run.started_at_unix_ms
+                || sample.at_unix_ms > run.measured_at_unix_ms
+            {
+                bail!(
+                    "budget.{field} carries a sample stamped {} outside the run's own \
+                     {}..={} window",
+                    sample.at_unix_ms,
+                    run.started_at_unix_ms,
+                    run.measured_at_unix_ms,
+                );
+            }
+        }
+        match (self.evidence, self.value, self.samples.len()) {
+            (Evidence::Measured, _, 0) => {
+                bail!("budget.{field} is labelled measured and rests on no samples")
+            }
+            (Evidence::Measured, Some(value), _) => bail!(
+                "budget.{field} is labelled measured and writes {value} down beside its samples"
+            ),
+            (Evidence::Assumed, _, count) if count != 0 => {
+                bail!("budget.{field} is labelled assumed and reports {count} samples")
+            }
+            (Evidence::Assumed, None, _) => {
+                bail!("budget.{field} is labelled assumed and names no value")
+            }
+            (Evidence::Assumed, Some(value), _) => Ok((value, 0)),
+            (Evidence::Measured, None, count) => {
+                let values = self.samples.iter().map(|sample| sample.value);
+                let reduced = match tail {
+                    Tail::Longest => values.max(),
+                    Tail::Shortest => values.min(),
+                };
+                let Some(reduced) = reduced else {
+                    bail!("budget.{field} is labelled measured and rests on no samples")
+                };
+                Ok((reduced, count as u64))
+            }
+        }
+    }
+}
+
+impl BudgetFile {
+    /// Reduces every term to the number it contributes, and reports the
+    /// weakest label and the fewest samples any of them rests on.
+    ///
+    /// The list is written out rather than derived for
+    /// [`ArtifactBodyFile::into_artifact`]'s reason: a term added to
+    /// [`MountBudget`] and left out here is a term that stops
+    /// compiling, not a term whose samples are silently never read.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`BudgetTermFile::reduce`] raises, naming the term.
+    fn into_budget(self, run: &ArtifactProvenance) -> CliResult<(MountBudget, u64, Evidence)> {
+        let mut samples = u64::MAX;
+        let mut evidence = Evidence::Measured;
+        let mut term = |field: &str, entry: &BudgetTermFile, tail: Tail| -> CliResult<u64> {
+            let (value, count) = entry.reduce(field, tail, run)?;
+            samples = samples.min(count);
+            evidence = evidence.weakest(entry.evidence);
+            Ok(value)
+        };
+        let budget = MountBudget {
+            fsync_tail_ms: term("fsync_tail_ms", &self.fsync_tail_ms, Tail::Longest)?,
+            rotation_tail_ms: term("rotation_tail_ms", &self.rotation_tail_ms, Tail::Longest)?,
+            response_build_ms: term("response_build_ms", &self.response_build_ms, Tail::Longest)?,
+            one_block_fetch_ms: term(
+                "one_block_fetch_ms",
+                &self.one_block_fetch_ms,
+                Tail::Longest,
+            )?,
+            fresh_tip_ms: term("fresh_tip_ms", &self.fresh_tip_ms, Tail::Longest)?,
+            close_prepared_fsync_ms: term(
+                "close_prepared_fsync_ms",
+                &self.close_prepared_fsync_ms,
+                Tail::Longest,
+            )?,
+            rpc_ms: term("rpc_ms", &self.rpc_ms, Tail::Longest)?,
+            response_worker_ms: term(
+                "response_worker_ms",
+                &self.response_worker_ms,
+                Tail::Longest,
+            )?,
+            general_worker_ms: term("general_worker_ms", &self.general_worker_ms, Tail::Longest)?,
+            validation_ms: term("validation_ms", &self.validation_ms, Tail::Longest)?,
+            restart_replay_ms_at_cap: term(
+                "restart_replay_ms_at_cap",
+                &self.restart_replay_ms_at_cap,
+                Tail::Longest,
+            )?,
+            restart_downtime_ms: term(
+                "restart_downtime_ms",
+                &self.restart_downtime_ms,
+                Tail::Longest,
+            )?,
+            // The one term whose conservative end is the small one.
+            lower_tail_block_ms: term(
+                "lower_tail_block_ms",
+                &self.lower_tail_block_ms,
+                Tail::Shortest,
+            )?,
+            general_inclusion_blocks: term(
+                "general_inclusion_blocks",
+                &self.general_inclusion_blocks,
+                Tail::Longest,
+            )?,
+        };
+        Ok((budget, samples, evidence))
+    }
 }
 
 fn parse_hex(field: &str, raw: &str) -> CliResult<Vec<u8>> {
@@ -1012,7 +1363,8 @@ mod tests {
                 },
             },
             "poll_ms": 250,
-            "response_alarm_margin_blocks": 12,
+            // F+G+I+S+R+1 over the fixture budget below, exactly.
+            "response_alarm_margin_blocks": 16,
             "artifact": {
                 "path": "/var/lib/hellas/work/artifact.json",
                 "digest": hex32(0x77),
@@ -1071,7 +1423,7 @@ mod tests {
         assert_eq!(loaded.execution_policy.fixed_price, 10);
         assert_eq!(loaded.execution_policy.max_stop_token_ids, 4);
         assert_eq!(loaded.poll, Duration::from_millis(250));
-        assert_eq!(loaded.response_alarm_margin_blocks, 12);
+        assert_eq!(loaded.response_alarm_margin_blocks, 16);
         assert_eq!(
             loaded.measured_artifact().map(|artifact| artifact.digest),
             Some(Digest::from_bytes([0x77; 32])),
@@ -1282,7 +1634,9 @@ mod tests {
         Payout, Secp256k1Signer, Secp256k1Verifier, Terms, Tx, WorkPaymentTerms,
         WorkStakeBondTerms,
     };
+    use hellas_rpc::protocol::mount::MountBudget;
     use hellas_rpc::protocol::work::private_policy_commitment;
+    use hellas_rpc::protocol::work_setup::WorkSetupError;
     use hellas_rpc::work_handshake::SetupEndpoint;
     use hellas_rpc::work_store::{Role, SetupScan, SetupStore};
 
@@ -1300,12 +1654,70 @@ mod tests {
         network
     }
 
+    /// The window the run's own timestamps sit inside.
+    const RUN_STARTED_AT: u64 = 1_756_339_000_000;
+    const RUN_FINISHED_AT: u64 = 1_756_339_200_000;
+
+    /// The clean run behind the fixture's `q`: the fewest independent
+    /// contests §4 admits, and none of them missed.
+    const TRIALS: u64 = hellas_rpc::protocol::mount::TRIAL_FLOOR;
+
     fn measured(value: u64) -> serde_json::Value {
         serde_json::json!({ "value": value, "evidence": "measured", "samples": 3_000 })
     }
 
     fn assumed(value: u64) -> serde_json::Value {
         serde_json::json!({ "value": value, "evidence": "assumed", "samples": 0 })
+    }
+
+    /// One §4 budget term, as the observations behind it rather than as
+    /// an answer. The reader takes the tail itself.
+    fn observed(values: &[u64]) -> serde_json::Value {
+        let samples: Vec<serde_json::Value> = values
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                serde_json::json!({
+                    "at_unix_ms": RUN_STARTED_AT + index as u64,
+                    "value": value,
+                })
+            })
+            .collect();
+        serde_json::json!({ "evidence": "measured", "samples": samples })
+    }
+
+    /// One §4 budget term nobody observed.
+    fn written_down(value: u64) -> serde_json::Value {
+        serde_json::json!({ "evidence": "assumed", "value": value })
+    }
+
+    /// The budget a completed bootstrap run leaves behind.
+    ///
+    /// Small explicit sample sets, so the tail of each term is visible
+    /// at a glance and the floor over them is hand-checkable. Every
+    /// value is a plausible one for a node with an SSD and a
+    /// half-second block, and none of them is round: a term dropped
+    /// from a formula shows up as a wrong total rather than as a wash.
+    fn budget() -> serde_json::Value {
+        serde_json::json!({
+            "fsync_tail_ms": observed(&[2, 5, 3]),
+            "rotation_tail_ms": observed(&[9, 12]),
+            "response_build_ms": observed(&[3, 4]),
+            "one_block_fetch_ms": observed(&[18, 25]),
+            "fresh_tip_ms": observed(&[11, 14]),
+            "close_prepared_fsync_ms": observed(&[4, 6]),
+            "rpc_ms": observed(&[30, 44]),
+            "response_worker_ms": observed(&[7, 9]),
+            "general_worker_ms": observed(&[5, 8]),
+            "validation_ms": observed(&[2, 3]),
+            "restart_replay_ms_at_cap": observed(&[430, 520]),
+            "restart_downtime_ms": observed(&[820, 900]),
+            // The one term whose tail is the small end: a short block
+            // buys less time, so 480 is the conservative reading of
+            // these three.
+            "lower_tail_block_ms": observed(&[520, 480, 505]),
+            "general_inclusion_blocks": observed(&[2, 3]),
+        })
     }
 
     /// The artifact a completed bootstrap run leaves behind: every
@@ -1317,12 +1729,26 @@ mod tests {
                 "binary": hex32(0x21),
                 "config": hex32(0x22),
                 "machine": "bootstrap-1",
-                "measured_at_unix_ms": 1_756_339_200_000_u64,
+                "started_at_unix_ms": RUN_STARTED_AT,
+                "measured_at_unix_ms": RUN_FINISHED_AT,
             },
             "omission": {
-                "response_probability": measured(999_000),
+                // 2,995 clean trials bound the miss rate at 999_745
+                // parts per billion, which is 1_000 parts per million
+                // of miss and so 999_000 of availability. The value is
+                // not written here so much as earned.
+                "response_probability": {
+                    "value": 999_000,
+                    "evidence": "measured",
+                    "samples": TRIALS,
+                },
                 "response_blocks": measured(WINDOW),
                 "response_cost_cap": measured(1),
+                "response_trials": {
+                    "trials": TRIALS,
+                    "misses": 0,
+                    "miss_upper_ppb": 999_745,
+                },
             },
             "expected_payment_values": {
                 "value": measured(PAYMENT_VALUE),
@@ -1334,7 +1760,15 @@ mod tests {
                     "lifetime": measured(0),
                 },
             },
+            "budget": budget(),
         })
+    }
+
+    /// The same artifact with one budget term replaced.
+    fn artifact_with(term: &str, entry: serde_json::Value) -> serde_json::Value {
+        let mut value = artifact();
+        value["budget"][term] = entry;
+        value
     }
 
     /// Writes one artifact beside a configuration that pins it, and
@@ -1488,10 +1922,14 @@ mod tests {
                 binary: Digest::from_bytes([0x21; 32]),
                 config: Digest::from_bytes([0x22; 32]),
                 machine: "bootstrap-1".to_string(),
-                measured_at_unix_ms: 1_756_339_200_000,
+                started_at_unix_ms: RUN_STARTED_AT,
+                measured_at_unix_ms: RUN_FINISHED_AT,
             },
         );
-        assert_eq!(evidence.samples, 3_000);
+        // The weakest link and not an average: the budget's shortest
+        // sample set is `rotation_tail_ms` at two observations, and two
+        // is what the whole artifact rests on.
+        assert_eq!(evidence.samples, 2);
         assert_eq!(
             evidence.policy.omission,
             OmissionMeasurements {
@@ -1512,7 +1950,8 @@ mod tests {
         assert_eq!(evidence.policy.execution_policy.fixed_price, 10);
         assert_eq!(
             duties.summary(),
-            "paid admission is on: every field of the pinned artifact is measured",
+            "paid admission is on: every field of the pinned artifact is measured, \
+             and its floor needs T=11 of the 64-block start span",
         );
     }
 
@@ -1763,6 +2202,502 @@ mod tests {
             .expect("the endpoint signs and journals its bond proposal");
 
         assert_eq!(state.revision(), Some(1));
+    }
+
+    // ── §4-B: the floor, and the grading ──────────────────────────────
+
+    /// The floor this artifact yields, hand-checked term by term.
+    ///
+    /// Every number below is arithmetic over [`budget`]'s sample sets
+    /// and nothing else, so a coefficient dropped or a term summed into
+    /// the wrong wait fails here rather than in a deployment:
+    ///
+    /// tails: `fsync 5, rotation 12, build 4, fetch 25, tip 14,`
+    /// `close-fsync 6, rpc 44, resp-worker 9, gen-worker 8,`
+    /// `validation 3, replay 520, downtime 900`, and the *shortest*
+    /// block, `480`, with `Ig = 3`.
+    ///
+    /// `Wresp  = 3×5 + 12 + 4 + 25 + (44+9+3) = 15+12+4+25+56 = 112`
+    /// `S      = ceil(112/480) = 1`
+    /// `Wstart = 14 + 6 + 12 + (44+8+3) = 14+6+12+55 = 87`
+    /// `Sg     = ceil(87/480) = 1`
+    /// `R      = ceil((900+520)/480) = ceil(1420/480) = 3`
+    /// `T      = 2 + 1 + 3 + 1 + 3 + 1 = 11`
+    /// `omit   = 2 + 4 + 1 + 8 + 1 + 3 + 1 = 20`
+    /// `alarm  = 2 + 1 + 8 + 1 + 3 + 1 = 16`
+    #[test]
+    fn the_floor_over_this_artifact_is_the_hand_checked_one() {
+        let duties = duties_for(&artifact(), None).expect("the fixture artifact loads");
+        let floor = duties
+            .evidence()
+            .expect("a read artifact is evidence")
+            .floor;
+
+        assert_eq!(floor.wresp_ms(), 112);
+        assert_eq!(floor.s(), 1);
+        assert_eq!(floor.wstart_ms(), 87);
+        assert_eq!(floor.sg(), 1);
+        assert_eq!(floor.r(), 3);
+        assert_eq!(floor.t(), 11);
+        assert_eq!(floor.min_omit_response_blocks(), 20);
+        assert_eq!(floor.alarm_margin_blocks(), 16);
+        // The two the configuration and the terms are held to, met
+        // exactly rather than comfortably: the fixture's window is
+        // `MIN_OMIT_RESPONSE_BLOCKS + 4 = 20` and its alarm margin 16.
+        assert_eq!(floor.min_omit_response_blocks(), WINDOW);
+        assert_eq!(
+            floor.alarm_margin_blocks(),
+            load(config())
+                .expect("the fixture config loads")
+                .response_alarm_margin_blocks,
+        );
+    }
+
+    /// `64 >= T` admits and `T > 64` refuses — at startup, and again at
+    /// provider admission over the very same policy.
+    ///
+    /// The two are separate gates on purpose. Startup is where an
+    /// operator learns; admission is where a counterparty is told. A
+    /// node whose artifact was swapped under it between the two still
+    /// countersigns nothing.
+    #[test]
+    fn a_budget_that_does_not_fit_the_start_span_refuses_at_startup_and_at_admission() {
+        // T = F + G + Ig + Sg + R + 1 = 2 + 1 + Ig + 1 + 3 + 1, so Ig
+        // is what carries it across the span.
+        let admits = duties_for(
+            &artifact_with("general_inclusion_blocks", observed(&[56])),
+            None,
+        )
+        .expect("the artifact loads");
+        assert!(admits.admits_paid_work());
+        assert_eq!(
+            admits.evidence().expect("evidence").floor.t(),
+            64,
+            "the largest budget the fixed start span admits",
+        );
+
+        let refuses = duties_for(
+            &artifact_with("general_inclusion_blocks", observed(&[57])),
+            None,
+        )
+        .expect("a refusing floor is an answer, not a startup failure");
+
+        assert_eq!(
+            refuses,
+            PaidWorkDuties::Refused(FloorError::StartSpanTooShort { t: 65, span: 64 }),
+        );
+        assert!(!refuses.admits_paid_work());
+        assert!(
+            refuses.payment_admission().is_none(),
+            "a node that cannot fit the start span holds no policy to countersign with",
+        );
+        assert!(
+            refuses.summary().contains("no paid admission"),
+            "unexpected summary: {}",
+            refuses.summary(),
+        );
+
+        // And the same refusal at provider admission, over a policy
+        // that is otherwise the admitting one to the byte.
+        let mut policy = admits.evidence().expect("evidence").policy.clone();
+        policy.floor = over_the_span();
+        assert_eq!(
+            policy.admit(payment_edge(), payment_terms()),
+            Err(WorkSetupError::Floor(FloorError::StartSpanTooShort {
+                t: 65,
+                span: 64,
+            })),
+        );
+    }
+
+    /// A floor whose `T` is one past the fixed start span.
+    fn over_the_span() -> MountFloor {
+        let mut over = MountBudget {
+            fsync_tail_ms: 5,
+            rotation_tail_ms: 12,
+            response_build_ms: 4,
+            one_block_fetch_ms: 25,
+            fresh_tip_ms: 14,
+            close_prepared_fsync_ms: 6,
+            rpc_ms: 44,
+            response_worker_ms: 9,
+            general_worker_ms: 8,
+            validation_ms: 3,
+            restart_replay_ms_at_cap: 520,
+            restart_downtime_ms: 900,
+            lower_tail_block_ms: 480,
+            general_inclusion_blocks: 3,
+        };
+        over.general_inclusion_blocks = 57;
+        match over.floor() {
+            Ok(floor) => floor,
+            Err(error) => panic!("a positive lower tail prices every wait: {error}"),
+        }
+    }
+
+    /// Terms that leave less time to answer than the measured floor
+    /// needs are refused at provider admission, by both numbers.
+    ///
+    /// The kernel's own `MIN_OMIT_RESPONSE_BLOCKS` is 16 and would take
+    /// these terms; the measured floor is 20, because this deployment's
+    /// own seek and restart cost `S = 1` and `R = 3` blocks the kernel
+    /// constant cannot know about.
+    #[test]
+    fn terms_under_the_measured_response_window_are_refused_at_admission() {
+        let duties = duties_for(&artifact(), None).expect("the fixture artifact loads");
+        let policy = &duties.evidence().expect("evidence").policy;
+        let mut short = payment_terms();
+        short.omit_response_blocks = WINDOW - 1;
+
+        assert!(
+            short.omit_response_blocks > hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
+            "the kernel's own floor would take these terms",
+        );
+        assert_eq!(
+            policy.admit(payment_edge(), short),
+            Err(WorkSetupError::Floor(
+                FloorError::ResponseWindowBelowFloor {
+                    window: WINDOW - 1,
+                    floor: 20,
+                }
+            )),
+        );
+    }
+
+    /// A configured alarm that fires later than the budget needs is a
+    /// refusal, not a warning.
+    #[test]
+    fn an_alarm_margin_under_the_measured_floor_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("artifact.json");
+        let bytes = artifact().to_string();
+        fs::write(&path, &bytes).unwrap();
+        let loaded = load(with(
+            with(
+                config(),
+                "response_alarm_margin_blocks",
+                serde_json::json!(15),
+            ),
+            "artifact",
+            serde_json::json!({
+                "path": path.display().to_string(),
+                "digest": hex::encode(Digest::hash(bytes.as_bytes()).as_bytes()),
+            }),
+        ))
+        .expect("a configuration with a short alarm margin still loads");
+
+        let duties = load_paid_work_duties(&loaded).expect("the pinned artifact is read");
+
+        assert_eq!(
+            duties,
+            PaidWorkDuties::Refused(FloorError::AlarmMarginBelowFloor {
+                margin: 15,
+                floor: 16,
+            }),
+        );
+        assert!(duties.payment_admission().is_none());
+    }
+
+    /// A block that takes no time refuses admission, by §4's name for
+    /// it.
+    ///
+    /// The tail taken for `lower_tail_block_ms` is the *shortest*
+    /// sample, so one zero in the set is enough — which is the point:
+    /// a run that observed one instantaneous block observed a clock
+    /// nobody can price a wait against.
+    #[test]
+    fn a_non_positive_lower_tail_block_time_refuses() {
+        let duties = duties_for(
+            &artifact_with("lower_tail_block_ms", observed(&[520, 0, 505])),
+            None,
+        )
+        .expect("the artifact still loads");
+
+        assert_eq!(duties, PaidWorkDuties::Refused(FloorError::NoLowerTail));
+        assert!(!duties.admits_paid_work());
+        assert!(duties.payment_admission().is_none());
+    }
+
+    /// Under 2,995 trials the response probability is `assumed`,
+    /// whatever the file labelled it, and one assumed field is a node
+    /// that countersigns nothing.
+    #[test]
+    fn a_run_short_of_the_trial_floor_is_assumed() {
+        let mut thin = artifact();
+        thin["omission"]["response_trials"] = serde_json::json!({
+            "trials": TRIALS - 1,
+            "misses": 0,
+            // The bound one trial short of the floor: 1_000_079 parts
+            // per billion, which is worse than 0.001 and is exactly why
+            // the floor is 2,995 and not a round number.
+            "miss_upper_ppb": 1_000_079,
+        });
+        thin["omission"]["response_probability"] = serde_json::json!({
+            "value": 999_000,
+            "evidence": "measured",
+            "samples": TRIALS - 1,
+        });
+
+        let duties = duties_for(&thin, None).expect("a thin artifact still loads");
+
+        assert!(
+            !duties.admits_paid_work(),
+            "2,994 clean trials do not earn q = 0.999",
+        );
+        assert!(matches!(duties, PaidWorkDuties::Assumed(_)));
+        assert_eq!(
+            duties.evidence().expect("evidence").samples,
+            0,
+            "an assumed field rests on no samples",
+        );
+    }
+
+    /// Enough trials and a bound that misses is still `assumed`: the
+    /// count and the bound are two rules, and the second one bites.
+    #[test]
+    fn a_bound_above_the_admitted_miss_rate_is_assumed() {
+        let mut missed = artifact();
+        missed["omission"]["response_trials"] = serde_json::json!({
+            "trials": 3_000,
+            "misses": 1,
+            // 3,000 trials with one miss bound the miss rate at
+            // 1_580_302 parts per billion — over 0.001, on more trials
+            // than the floor asks for.
+            "miss_upper_ppb": 1_580_302,
+        });
+        missed["omission"]["response_probability"] = serde_json::json!({
+            "value": 999_000,
+            "evidence": "measured",
+            "samples": 3_000,
+        });
+
+        let duties = duties_for(&missed, None).expect("the artifact still loads");
+
+        assert!(matches!(duties, PaidWorkDuties::Assumed(_)));
+        assert!(!duties.admits_paid_work());
+    }
+
+    /// An artifact whose own bound does not follow from its own trials
+    /// is refused, and so is one claiming an availability its trials
+    /// did not earn. Neither is a label: both are arithmetic.
+    #[test]
+    fn an_artifact_that_misreports_its_own_grading_is_refused() {
+        let mut flattered = artifact();
+        flattered["omission"]["response_trials"]["miss_upper_ppb"] = serde_json::json!(1);
+        let error = format!("{:?}", duties_for(&flattered, None).unwrap_err());
+        assert!(
+            error.contains("999745") || error.contains("999_745") || error.contains("999745"),
+            "the refusal does not say what the trials actually bound: {error}",
+        );
+
+        let mut overclaimed = artifact();
+        overclaimed["omission"]["response_probability"]["value"] = serde_json::json!(999_999);
+        let error = format!("{:?}", duties_for(&overclaimed, None).unwrap_err());
+        assert!(
+            error.contains("response_probability") && error.contains("999000"),
+            "the refusal does not name what the trials earn: {error}",
+        );
+    }
+
+    /// A budget term's label answers to its samples, exactly as every
+    /// other artifact number's does — and a term that names a value
+    /// beside its samples is refused, because only one of the two would
+    /// ever be read.
+    #[test]
+    fn a_budget_term_whose_label_its_samples_contradict_is_refused_by_name() {
+        for (entry, expected) in [
+            (
+                serde_json::json!({ "evidence": "measured", "samples": [] }),
+                "no samples",
+            ),
+            (
+                serde_json::json!({ "evidence": "assumed", "value": 7, "samples": [
+                    { "at_unix_ms": RUN_STARTED_AT, "value": 5 },
+                ] }),
+                "reports 1 samples",
+            ),
+            (
+                serde_json::json!({ "evidence": "assumed" }),
+                "names no value",
+            ),
+            (
+                serde_json::json!({
+                    "evidence": "measured",
+                    "value": 7,
+                    "samples": [{ "at_unix_ms": RUN_STARTED_AT, "value": 5 }],
+                }),
+                "writes 7 down beside its samples",
+            ),
+        ] {
+            let error = format!(
+                "{:?}",
+                duties_for(&artifact_with("rpc_ms", entry), None)
+                    .expect_err("a contradicted budget label is refused"),
+            );
+            assert!(
+                error.contains("budget.rpc_ms") && error.contains(expected),
+                "unexpected refusal: {error}",
+            );
+        }
+    }
+
+    /// A sample stamped outside the run that claims it is not a sample
+    /// of that run, and a floor computed over one would be a floor for
+    /// a machine nobody named.
+    #[test]
+    fn a_sample_from_outside_the_run_is_refused() {
+        let stray = serde_json::json!({
+            "evidence": "measured",
+            "samples": [
+                { "at_unix_ms": RUN_STARTED_AT, "value": 30 },
+                { "at_unix_ms": RUN_FINISHED_AT + 1, "value": 44 },
+            ],
+        });
+
+        let error = format!(
+            "{:?}",
+            duties_for(&artifact_with("rpc_ms", stray), None)
+                .expect_err("a sample outside the run window is refused"),
+        );
+
+        assert!(
+            error.contains("budget.rpc_ms") && error.contains("outside the run"),
+            "unexpected refusal: {error}",
+        );
+    }
+
+    /// An `assumed` budget term keeps setup and the close duty and
+    /// takes away the countersignature, exactly as an assumed omission
+    /// number does. The floor is still computed over it — a written
+    /// number is still a number the arithmetic has to hold for.
+    #[test]
+    fn an_assumed_budget_term_refuses_admission_and_keeps_the_floor() {
+        let duties = duties_for(&artifact_with("validation_ms", written_down(3)), None)
+            .expect("an artifact with one written-down term still loads");
+
+        assert!(!duties.admits_paid_work());
+        assert!(matches!(duties, PaidWorkDuties::Assumed(_)));
+        let evidence = duties.evidence().expect("a read artifact is evidence");
+        assert_eq!(evidence.samples, 0);
+        assert_eq!(
+            evidence.floor.t(),
+            11,
+            "the written-down 3 is the same 3 the run would have measured",
+        );
+        assert!(matches!(
+            duties.payment_admission(),
+            Some(PaymentAdmission::Proposes(_)),
+        ));
+    }
+
+    /// The probe writes an artifact this loader reads — and grades
+    /// exactly as honestly as the run deserves.
+    ///
+    /// This is the whole of what §4-A was missing: before it, nothing
+    /// in the tree could produce an artifact at all, and the only
+    /// `measured` one anywhere was a fixture. What the operator path
+    /// produces here is a *real* one — three terms from real fsyncs,
+    /// real rotations and real replays on a real journal, and eleven
+    /// written down — and the answer is `assumed`, which is a node that
+    /// countersigns nothing. The fixture above is what a run whose
+    /// evidence supports `measured` loads as; this is what a run on this
+    /// tree today actually earns, and the two are deliberately different
+    /// answers.
+    #[test]
+    fn the_probe_writes_an_artifact_this_loader_reads_and_grades() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = write(&dir, &config());
+        let assume_path = dir.path().join("assume.json");
+        // A slow block and a quick restart, so the terms the run does
+        // measure cannot carry `T` anywhere near the start span
+        // whatever this machine's disk does.
+        fs::write(
+            &assume_path,
+            serde_json::json!({
+                "budget": {
+                    "response_build_ms": 4,
+                    "one_block_fetch_ms": 25,
+                    "fresh_tip_ms": 14,
+                    "close_prepared_fsync_ms": 6,
+                    "rpc_ms": 44,
+                    "response_worker_ms": 9,
+                    "general_worker_ms": 8,
+                    "validation_ms": 3,
+                    "restart_downtime_ms": 100,
+                    "lower_tail_block_ms": 5_000,
+                    "general_inclusion_blocks": 3,
+                },
+                "omission": {
+                    "response_probability": 999_000,
+                    "response_blocks": WINDOW,
+                    "response_cost_cap": 1,
+                },
+                "expected_payment_values": {
+                    "value": PAYMENT_VALUE,
+                    "reserve": PAYMENT_RESERVE,
+                    "base": 0,
+                    "slot": 0,
+                    "proof": 0,
+                    "lifetime": 0,
+                },
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let out = dir.path().join("artifact.json");
+
+        crate::commands::serve::run_probe(crate::commands::serve::ProbeOptions {
+            work_config: config_path,
+            journal_root: dir.path().join("journals"),
+            machine: "bootstrap-1".to_string(),
+            assume: assume_path,
+            out: out.clone(),
+        })
+        .expect("the bootstrap run completes and writes its artifact");
+
+        // Pinned by the digest of the bytes the probe wrote, which is
+        // what the probe told the operator to pin.
+        let bytes = fs::read(&out).expect("the artifact is on the disk");
+        let loaded = load(with(
+            config(),
+            "artifact",
+            serde_json::json!({
+                "path": out.display().to_string(),
+                "digest": hex::encode(Digest::hash(&bytes).as_bytes()),
+            }),
+        ))
+        .expect("the configuration pinning the probe's artifact loads");
+
+        let duties = load_paid_work_duties(&loaded).expect("the probe's artifact parses");
+
+        assert!(
+            matches!(duties, PaidWorkDuties::Assumed(_)),
+            "eleven written-down terms and no contest is not a measured deployment: {duties:?}",
+        );
+        assert!(!duties.admits_paid_work());
+        let evidence = duties.evidence().expect("the artifact was read");
+        assert_eq!(evidence.samples, 0, "an assumed field rests on no samples");
+        assert_eq!(evidence.provenance.machine, "bootstrap-1");
+        assert!(
+            evidence.provenance.started_at_unix_ms <= evidence.provenance.measured_at_unix_ms,
+            "the run's own window is one",
+        );
+        // The three terms the run genuinely observed are the journal's,
+        // and the floor is computed over what they came to.
+        let artifact: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        for term in [
+            "fsync_tail_ms",
+            "rotation_tail_ms",
+            "restart_replay_ms_at_cap",
+        ] {
+            assert_eq!(artifact["budget"][term]["evidence"], "measured", "{term}");
+        }
+        assert_eq!(artifact["omission"]["response_trials"]["trials"], 0);
+        assert!(
+            evidence.floor.t() <= 64,
+            "the probe's own floor fits the start span: T={}",
+            evidence.floor.t(),
+        );
     }
 
     /// A restarted node rebuilds the endpoint from what serve holds: the

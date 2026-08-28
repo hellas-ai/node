@@ -822,6 +822,7 @@ mod tests {
         BoundTermId, InputAddressed as _, OutputAddressed as _, PreparedPaidInputV1, SourceRef,
         TextArtifact, TextExecution, TextPolicy, TokenIds,
     };
+    use hellas_rpc::protocol::mount::{MountBudget, MountFloor};
     use hellas_rpc::protocol::work::{
         JobDeadlines, PaidChannelPolicyV1, PaidExecutionPolicyV1, PaidJobAuthorizationV1,
         encode_transcript, next_payment, payment_binding_digest, private_policy_commitment,
@@ -1030,6 +1031,34 @@ mod tests {
     /// Which of §4's evidence cases produces which admission is
     /// `work_config`'s to decide and its tests' to check; what the runner
     /// is handed is one of the three values below, and this is them.
+    /// The floor these fixtures run under: a budget in which no wait
+    /// takes any time, so §4's `S` and `R` are zero, its response-window
+    /// floor is the kernel's own `MIN_OMIT_RESPONSE_BLOCKS`, and `T` is
+    /// four. What each test below observes is therefore its own gate and
+    /// never this one.
+    fn floor() -> MountFloor {
+        let instant = MountBudget {
+            fsync_tail_ms: 0,
+            rotation_tail_ms: 0,
+            response_build_ms: 0,
+            one_block_fetch_ms: 0,
+            fresh_tip_ms: 0,
+            close_prepared_fsync_ms: 0,
+            rpc_ms: 0,
+            response_worker_ms: 0,
+            general_worker_ms: 0,
+            validation_ms: 0,
+            restart_replay_ms_at_cap: 0,
+            restart_downtime_ms: 0,
+            lower_tail_block_ms: 1,
+            general_inclusion_blocks: 0,
+        };
+        match instant.floor() {
+            Ok(floor) => floor,
+            Err(error) => panic!("a one-millisecond block prices every wait: {error}"),
+        }
+    }
+
     fn provider_policy() -> ProviderChannelPolicy {
         ProviderChannelPolicy {
             network: network(),
@@ -1042,6 +1071,7 @@ mod tests {
                 response_blocks: MIN_OMIT_RESPONSE_BLOCKS,
                 response_cost_cap: 1,
             },
+            floor: floor(),
         }
     }
 

@@ -91,6 +91,18 @@ pub struct Sample {
     pub quantity: &'static str,
     /// How long the work took.
     pub ms: f64,
+    /// When the collector took delivery of it, in milliseconds since the
+    /// Unix epoch.
+    ///
+    /// §4 asks an artifact for raw samples *and* timestamps, and a
+    /// duration is not a time. The clock is read here rather than at the
+    /// seam on purpose: a seam that is not being collected from reads no
+    /// clock at all, and one that is has already paid for a lock and an
+    /// allocation, so a second clock read changes nothing it measures.
+    /// A machine whose clock is not monotone yields a sample out of
+    /// order, which is a fact about the run and is recorded as one
+    /// rather than smoothed.
+    pub at_unix_ms: u64,
     /// The identity fields the seam carried, in emission order.
     pub fields: Vec<(&'static str, String)>,
 }
@@ -182,6 +194,7 @@ impl tracing::Subscriber for Samples {
         self.lock().push(Sample {
             quantity: event.metadata().name(),
             ms,
+            at_unix_ms: unix_ms(),
             fields: visitor.fields,
         });
     }
@@ -189,6 +202,22 @@ impl tracing::Subscriber for Samples {
     fn enter(&self, _: &tracing::span::Id) {}
 
     fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// Milliseconds since the Unix epoch, or zero on a machine whose clock
+/// is set before it.
+///
+/// Zero rather than a panic: a sample is evidence, and losing the whole
+/// run because one timestamp is unrepresentable would lose more evidence
+/// than the timestamp is worth. An artifact full of zero timestamps is
+/// also a legible complaint about the machine that produced it.
+#[must_use]
+pub fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+        })
 }
 
 /// Keeps one dispatcher alive for the rest of the process, so that a

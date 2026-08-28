@@ -88,22 +88,26 @@ pub const MAX_OMIT_RESPONSE_BLOCKS: u64 = 4096;
 // proposer majority — no finite floor restores the theorem, and this
 // bound does not pretend otherwise.
 
-/// `F`: blocks between a transaction's inclusion and its appearance in a
-/// finalized view. Threshold-simplex finalizes the block it notarizes,
-/// so this is the notarize/finalize round trip plus one block of slack.
-const RESPONSE_FINALIZATION_BLOCKS: u64 = 2;
+/// `F`: blocks between inclusion and a finalized view.
+///
+/// Threshold-simplex finalizes the block it notarizes, so this is the
+/// notarize/finalize round trip plus one block of slack.
+pub const RESPONSE_FINALIZATION_BLOCKS: u64 = 2;
 
 /// `POLL`: longest interval an endpoint may leave between finalized-view
-/// reads. Endpoints poll for the terminal window rather than performing a
+/// reads.
+///
+/// Endpoints poll for the terminal window rather than performing a
 /// finalized read before every off-chain acknowledgement.
-const RESPONSE_POLL_BLOCKS: u64 = 4;
+pub const RESPONSE_POLL_BLOCKS: u64 = 4;
 
 /// `G`: blocks a submitted response may spend propagating to a proposer.
-const RESPONSE_PROPAGATION_BLOCKS: u64 = 1;
+pub const RESPONSE_PROPAGATION_BLOCKS: u64 = 1;
 
-/// `I`: blocks a fee-paying response may wait for inclusion, at the
-/// deployment's measured censorship quantile.
-const RESPONSE_INCLUSION_BLOCKS: u64 = 8;
+/// `I`: blocks a fee-paying response may wait for inclusion.
+///
+/// At the deployment's measured censorship quantile.
+pub const RESPONSE_INCLUSION_BLOCKS: u64 = 8;
 
 /// Smallest response window a work-payment channel may commit.
 ///

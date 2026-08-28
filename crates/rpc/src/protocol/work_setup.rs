@@ -55,6 +55,7 @@ use hellas_kernel::{
     WorkPaymentTerms, work_payment_settlement,
 };
 
+use crate::protocol::mount::{FloorError, MountFloor};
 use crate::protocol::work::{
     PaidChannel, PaidChannelPolicyV1, PaidExecutionPolicyV1, PaidWorkError, PrivateRecord,
     check_execution_policy,
@@ -181,6 +182,10 @@ pub enum WorkSetupError {
     /// A persisted close descriptor was not its one canonical encoding.
     #[error("the close descriptor is not canonical")]
     DescriptorMalformed,
+    /// §4's measured floor does not hold for this deployment or these
+    /// terms.
+    #[error(transparent)]
+    Floor(#[from] FloorError),
 }
 
 /// What the bond's two lease slots held, without the record itself.
@@ -353,6 +358,15 @@ pub struct ProviderChannelPolicy {
     pub expected_payment_values: EdgeValues,
     /// What the provider measured about its own watcher.
     pub omission: OmissionMeasurements,
+    /// §4's measured floor for this deployment, over the artifact's raw
+    /// samples.
+    ///
+    /// Here and not in [`WorkChannelConfig`] because it is a statement
+    /// about the *node*, not about the channel: the same floor governs
+    /// every channel this provider admits, and §4 puts it at startup and
+    /// at provider admission — both of which are this type — rather than
+    /// at every place a configured descriptor is opened.
+    pub floor: MountFloor,
 }
 
 impl ProviderChannelPolicy {
@@ -406,16 +420,32 @@ impl ProviderChannelPolicy {
     /// against *this* provider's salt and credit policy, so terms
     /// committing to any other policy are refused rather than signed.
     ///
+    /// §4's floor is checked here and nowhere below, because it is the
+    /// provider's judgement about its own deployment and not a property
+    /// of the configured channel: `64 ≥ T` first, so a node whose
+    /// measured budget cannot fit the fixed start span countersigns
+    /// nothing whatever terms it is offered, and then the proposed
+    /// `omit_response_blocks` against `F+POLL+G+I+S+R+1`. The second is
+    /// strictly stronger than the kernel's own
+    /// `MIN_OMIT_RESPONSE_BLOCKS`, which is the same sum with `S` and
+    /// `R` left out — this deployment's measured seek and restart cost
+    /// are exactly what the kernel constant cannot know.
+    ///
     /// # Errors
     ///
-    /// Whatever [`WorkChannelDescriptor::open`] raises: the commitment,
-    /// the execution policy, the settleability of the expected funding,
-    /// and the omission economics.
+    /// [`WorkSetupError::Floor`] when the measured budget does not fit
+    /// the start span or the terms leave less time to answer than it
+    /// needs, and then whatever [`WorkChannelDescriptor::open`] raises:
+    /// the commitment, the execution policy, the settleability of the
+    /// expected funding, and the omission economics.
     pub fn admit(
         &self,
         payment_edge: EdgeId,
         payment_terms: WorkPaymentTerms,
     ) -> Result<WorkChannelDescriptor, WorkSetupError> {
+        self.floor.check_start_span()?;
+        self.floor
+            .check_response_window(payment_terms.omit_response_blocks)?;
         WorkChannelDescriptor::open(WorkChannelConfig {
             network: self.network,
             payment_edge,
