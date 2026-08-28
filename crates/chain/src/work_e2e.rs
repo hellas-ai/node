@@ -64,9 +64,10 @@
 //!    and real method routing, no network.
 //!
 //! Nothing else is stood in for. In particular no balance, no payout, no
-//! certificate and no edge value below is written by this file: every
-//! number asserted is read back out of a node's owner index after the
-//! block that produced it was finalized.
+//! certificate and no edge value below is written by this file. The final
+//! coin values that prove settlement are read from a node's finalized QMDB;
+//! whole-owner assertions also refuse unless the owner-index projection
+//! names exactly the same fixture coins and values as those QMDB reads.
 //!
 //! # What the §1 fan-out gap costs this test
 //!
@@ -143,7 +144,9 @@ use tokio::sync::mpsc;
 use crate::HellasBlock;
 use crate::app::Mempool;
 use crate::config::{Genesis, GenesisEntry, GenesisValidator, ValidatorConfig};
-use crate::domain::{KERNEL_FEES, SettlementKey, TEST_NETWORK, genesis_object_id};
+use crate::domain::{
+    KERNEL_FEES, Object, SettlementKey, TEST_NETWORK, coin_object_id, genesis_object_id,
+};
 use crate::execution::store::{UtxoDatabase, utxo_db_config};
 use crate::execution::test_support::{
     ConsensusFixture, consensus_fixture_of, finalization, index_block, index_genesis, run_qmdb,
@@ -671,8 +674,13 @@ impl Devnet {
         }
     }
 
-    /// Every coin one owner holds at the finalized tip, as that node's
-    /// owner index reports it.
+    /// Every coin this fixture can mint for one owner at the finalized
+    /// tip, read from that node's executed QMDB state.
+    ///
+    /// QMDB has no full-object iterator, so the fixed transaction graph's
+    /// complete coin-id set is probed directly. Projected ids are added to
+    /// that set so an index-only extra is also caught, and the projection
+    /// must then equal the coins and values actually read from QMDB.
     async fn coins(&self, node: usize, owner: SettlementKey) -> Vec<(CoinId, u64)> {
         let Some(held) = self
             .light_client(node)
@@ -682,13 +690,57 @@ impl Devnet {
         else {
             panic!("the owner index has a finalized cursor");
         };
-        let mut coins = held
+        let projected_root = held.snapshot.state_root;
+        let mut projected = held
             .coins
             .into_iter()
             .map(|(id, value)| (CoinId::from_bytes(id.into()), value))
             .collect::<Vec<_>>();
-        coins.sort_by_key(|(_, value)| *value);
-        coins
+        projected.sort_by_key(|(id, value)| (*value, *id));
+
+        let (earnings, refund) = payment_close_coins(&self.allocations);
+        let mut ids = BTreeSet::from([
+            genesis_coin(&self.allocations, client_key()),
+            genesis_coin(&self.allocations, provider_key()),
+            earnings,
+            refund,
+        ]);
+        ids.extend(
+            KernelTx::close_output_ids(bond_edge(&self.allocations), &bond_terms().timeout_outputs)
+                .iter()
+                .copied(),
+        );
+        ids.extend(projected.iter().map(|(id, _)| *id));
+
+        let reader = self.nodes[node].database.read().await;
+        assert_eq!(
+            reader.root(),
+            projected_root,
+            "the owner projection and executed reads name the same finalized state",
+        );
+        let mut executed = Vec::new();
+        for id in ids {
+            match reader
+                .get(&coin_object_id(id))
+                .await
+                .expect("the finalized QMDB answers a coin read")
+            {
+                Some(Object::Coin(coin)) if coin.owner == owner => {
+                    executed.push((id, coin.value));
+                }
+                Some(Object::Coin(_)) | None => {}
+                Some(object) => panic!(
+                    "fixture coin id {id:?} resolved to a {} in finalized QMDB",
+                    object.kind(),
+                ),
+            }
+        }
+        executed.sort_by_key(|(id, value)| (*value, *id));
+        assert_eq!(
+            projected, executed,
+            "the owner-index projection agrees with the executed coin state",
+        );
+        executed
     }
 
     async fn value_of(&self, node: usize, owner: SettlementKey, coin: CoinId) -> Option<u64> {
@@ -1453,7 +1505,7 @@ async fn return_the_stake(devnet: &mut Devnet) -> CoinId {
 /// its value (`crates/kernel/src/tx/payout.rs:66`), so naming a coin
 /// this way says *which* payout it is and asserts nothing about how much
 /// it is worth. That is why every amount below is a separate assertion
-/// against what the owner index read back. The order — provider first,
+/// against what the finalized QMDB stores. The order — provider first,
 /// client second — is `split_payouts`' own
 /// (`crates/kernel/src/work.rs:266-278`).
 fn payment_close_coins(allocations: &[(SettlementKey, u64)]) -> (CoinId, CoinId) {
@@ -1470,9 +1522,9 @@ fn payment_close_coins(allocations: &[(SettlementKey, u64)]) -> (CoinId, CoinId)
 /// by exactly the job price, and its returned stake principal is a
 /// different coin from a different close, asserted separately.
 ///
-/// The numbers, all of them read back out of a validator's owner index
-/// after finality, never computed by this test and asserted against
-/// itself:
+/// The settlement numbers are read back out of a validator's finalized
+/// QMDB, with its owner-index projection required to agree, never computed
+/// by this test and asserted against itself:
 ///
 /// - the provider earns `10` — the certificate amount, and the price the
 ///   client's own authorization fixed;
@@ -1565,7 +1617,7 @@ fn one_paid_job_earns_the_price_and_returns_the_stake_separately() {
                 .value_of(CLIENT_NODE, provider_key(), earnings_coin)
                 .await,
             Some(PRICE),
-            "and a second validator's own index says the same",
+            "and a second validator's finalized QMDB says the same",
         );
         assert_eq!(
             devnet.coins(PROVIDER_NODE, provider_key()).await,
