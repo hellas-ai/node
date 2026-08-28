@@ -15,7 +15,9 @@ use std::time::Duration;
 use anyhow::Context;
 use hellas_chain::client::VerifiedRemoteLightClient;
 use hellas_chain::work_blocks::advance_paid_work_clock;
-use hellas_chain::{ConsensusInfo, ConsensusVerifier, FinalizedWorkView, WorkBlocks};
+use hellas_chain::{
+    ConsensusInfo, ConsensusVerifier, FinalizedWorkView, WorkBlocks, WorkChannelQuery,
+};
 #[cfg(feature = "evaluate")]
 use hellas_executor::ArtifactStoreConfig;
 use hellas_executor::{
@@ -32,6 +34,7 @@ use hellas_rpc::pb::work::{
 };
 use hellas_rpc::peers::{PeerDirectory, PeerId, PeerManager};
 use hellas_rpc::policy::ExecutePolicy;
+use hellas_rpc::protocol::work_setup::{ProviderChannelPolicy, WorkChannelDescriptor};
 use hellas_rpc::serve::AccountingDispatcher;
 use hellas_rpc::services::node::{Node, NodeServer};
 use hellas_rpc::services::work::{Work, WorkHandler, WorkServer};
@@ -47,12 +50,14 @@ use hellas_rpc::{Assurance, ProducerSigningKey};
 use hellas_wire::iroh::IrohTransport;
 use hellas_wire::{Dispatcher, ServiceMarker, StreamTransport, TransportContext, WireStatus};
 use iroh::{Endpoint, EndpointId, SecretKey, endpoint::Connection, endpoint::presets};
-use tokio::sync::oneshot;
+use tokio::sync::{Mutex as AsyncMutex, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use super::node_handler::NodeHandlerImpl;
 use crate::commands::discovery::{DiscoveryAdvertiser, served_alpns, start_server_advertising};
+
+type ProductionWorkSource = WorkBlocks<VerifiedRemoteLightClient>;
 
 pub(super) struct NodeHandle {
     node_id: EndpointId,
@@ -212,10 +217,11 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
     //    and given the same mount slot the accept loop reads: the runner
     //    publishes the channel it is handed, and `Work` is answered from
     //    it from that moment on.
-    let mount = MountedWork::default();
+    let work_mount: MountedWork<ProductionWorkSource> = MountedWork::default();
+    let setup_mount = MountedSetup::default();
     let work = config.work.map(|work| {
         let poll = work.poll;
-        let runner = WorkRunner::discover(work, mount.clone());
+        let runner = WorkRunner::discover(work, work_mount.clone(), setup_mount.clone());
         let (stop, stopped) = oneshot::channel();
         let task = tokio::spawn(async move {
             match runner {
@@ -230,7 +236,8 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
         info!(poll_ms = poll.as_millis(), "the paid-work clock is running");
         WorkWatcher { stop, task }
     });
-    let serves_work = work.is_some().then(|| mount.clone());
+    let serves_work = work.is_some().then(|| work_mount.clone());
+    let serves_setup = work.is_some().then(|| setup_mount.clone());
 
     // -- Accept loop: one task per inbound Connection; per-Connection
     //    dispatch routed by ALPN to the matching service handler.
@@ -251,6 +258,7 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
             let node_handler_for_conn = node_handler.clone();
             let manager_for_conn = directory.manager();
             let work_for_conn = serves_work.clone();
+            let setup_for_conn = serves_setup.clone();
             tokio::spawn(async move {
                 let conn = match accepting.await {
                     Ok(c) => c,
@@ -265,6 +273,7 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
                     conn,
                     node_handler_for_conn,
                     manager_for_conn,
+                    setup_for_conn,
                     work_for_conn,
                 )
                 .await
@@ -286,13 +295,17 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
 
 /// Per-connection serve: each inbound substream is dispatched to the
 /// service selected by the connection's negotiated ALPN.
-async fn serve_connection(
+async fn serve_connection<S>(
     alpn: Vec<u8>,
     conn: Connection,
     node_handler: NodeHandlerImpl,
     manager: PeerManager,
-    work: Option<MountedWork>,
-) -> anyhow::Result<()> {
+    setup: Option<MountedSetup>,
+    work: Option<MountedWork<S>>,
+) -> anyhow::Result<()>
+where
+    S: FinalizedBlocks + FinalizedWorkView + Sync,
+{
     let transport = IrohTransport::new(conn);
 
     // Every generated `XServer` is wrapped in `AccountingDispatcher`
@@ -304,14 +317,24 @@ async fn serve_connection(
     if alpn == <Node as ServiceMarker>::ALPN.as_bytes() {
         let server = AccountingDispatcher::new(NodeServer(node_handler), manager);
         serve_loop(&transport, &server).await
-    } else if work.is_some() && alpn == <WorkSetup as ServiceMarker>::ALPN.as_bytes() {
-        let server = AccountingDispatcher::new(WorkSetupServer(UnmountedWork), manager);
-        serve_loop(&transport, &server).await
+    } else if let Some(setup) =
+        setup.filter(|_| alpn == <WorkSetup as ServiceMarker>::ALPN.as_bytes())
+    {
+        match setup.service() {
+            Some(mounted) => {
+                let server = AccountingDispatcher::new(WorkSetupServer(mounted), manager);
+                serve_loop(&transport, &server).await
+            }
+            None => {
+                let server = AccountingDispatcher::new(WorkSetupServer(UnmountedWork), manager);
+                serve_loop(&transport, &server).await
+            }
+        }
     } else if let Some(work) = work.filter(|_| alpn == <Work as ServiceMarker>::ALPN.as_bytes()) {
         // The mounted channel answers for itself. Until the runner has
         // been handed one there is no channel to answer from, and this
         // is still the bounded retryable `NotReady` §3 left here.
-        match work.service() {
+        match work.handler() {
             Some(mounted) => {
                 let server = AccountingDispatcher::new(WorkServer(mounted), manager);
                 serve_loop(&transport, &server).await
@@ -439,13 +462,148 @@ pub(super) struct WorkRunnerConfig {
 /// handed one.
 ///
 /// Written by the runner and read by the accept loop. What crosses is a
-/// clone of a service that is itself two `Arc`s, so the lock is held for
-/// a clone and never across a request: the dispatch path never waits on
-/// the clock, and the clock never waits on a request.
-#[derive(Clone, Debug, Default)]
-pub(super) struct MountedWork(Arc<Mutex<Option<WorkService>>>);
+/// clone of a handler whose mutable pieces are themselves behind `Arc`s,
+/// so the lock is held for a clone and never across a request: the
+/// dispatch path never waits while holding the mount, and the clock never
+/// waits on a request.
+#[derive(Clone)]
+pub(super) struct MountedWork<S>(Arc<Mutex<Option<MountedWorkService<S>>>>);
 
-impl MountedWork {
+impl<S> Default for MountedWork<S> {
+    fn default() -> Self {
+        Self(Arc::new(Mutex::new(None)))
+    }
+}
+
+/// One mounted channel's served handler.
+///
+/// `source` is replaceable because the runner redials a failed validator.
+/// The request path copies the current source under the plain mutex and
+/// drops that guard before its coherent read awaits. `accepting` spans the
+/// complete fresh-read-to-signature sequence, so two acceptance attempts
+/// cannot each refresh and then race to consume the same channel credit.
+#[derive(Clone)]
+struct MountedWorkService<S> {
+    bond_edge: EdgeId,
+    service: WorkService,
+    descriptor: Option<WorkChannelDescriptor>,
+    source: Arc<Mutex<S>>,
+    accepting: Arc<AsyncMutex<()>>,
+}
+
+impl<S> MountedWorkService<S>
+where
+    S: FinalizedBlocks + FinalizedWorkView + Sync,
+{
+    /// Re-establishes admission from one fresh coherent read.
+    ///
+    /// The service is the exact clone the runner drives. Its cursor is
+    /// checked after readiness, and that same service receives the fresh
+    /// decision before the raw handler is reached. A missing policy,
+    /// failed read, failed predicate, lagging cursor, or endpoint failure
+    /// therefore leaves the request on the retryable `NotReady` side.
+    async fn refresh_admission(&self) -> anyhow::Result<()> {
+        let Some(descriptor) = self.descriptor.as_ref() else {
+            anyhow::bail!("this channel has no measured admission policy");
+        };
+        let query = WorkChannelQuery {
+            bond_edge: descriptor.bond_edge(),
+            payment_edge: descriptor.channel().payment_edge(),
+            funding: Default::default(),
+        };
+        // A `std::sync::MutexGuard` is deliberately confined to this
+        // block. Holding the source-slot guard across the read would make
+        // this handler's future non-`Send` and is not a valid dispatch.
+        let source = {
+            let held = self
+                .source
+                .lock()
+                .map_err(|_| anyhow::anyhow!("the finalized source lock is poisoned"))?;
+            held.clone()
+        };
+        let Some(snapshot) = source
+            .work_channel_snapshot(query.clone())
+            .await
+            .context("the fresh coherent channel read failed")?
+        else {
+            anyhow::bail!("no finalized channel snapshot is available");
+        };
+        if snapshot.query() != &query {
+            anyhow::bail!("the finalized source answered for another channel");
+        }
+        let ready = descriptor
+            .check_ready(&snapshot.observed_channel())
+            .context("the fresh channel snapshot is not ready")?;
+        let cursor = self
+            .service
+            .with_state(|state| state.cursor().0)
+            .context("the mounted channel cursor is unavailable")?;
+        ready
+            .check_caught_up(cursor)
+            .context("the mounted channel has not caught up to the fresh snapshot")?;
+        self.service
+            .admit_new_work(ready)
+            .context("the driven work service refused its fresh readiness")
+    }
+}
+
+impl<S> WorkHandler for MountedWorkService<S>
+where
+    S: FinalizedBlocks + FinalizedWorkView + Sync,
+{
+    fn accept_work(
+        &self,
+        request: AcceptWorkRequest,
+        _context: TransportContext,
+    ) -> impl core::future::Future<
+        Output = Result<
+            impl Into<hellas_rpc::call::WithTrailer<AcceptWorkResponse>> + Send,
+            WireStatus,
+        >,
+    > + Send {
+        async move {
+            let _accepting = self.accepting.lock().await;
+            if let Err(error) = self.refresh_admission().await {
+                debug!(%error, "an acceptance attempt found no fresh channel readiness");
+                return Ok(AcceptWorkResponse {
+                    outcome: Some(accept_work_response::Outcome::Refused(WorkRefused {
+                        code: WorkRefusalCode::NotReady as i32,
+                        reason: "fresh channel readiness is unavailable".to_string(),
+                    })),
+                });
+            }
+            Ok(self.service.accept(&request))
+        }
+    }
+
+    fn deliver_result(
+        &self,
+        request: DeliverResultRequest,
+        context: TransportContext,
+    ) -> impl core::future::Future<
+        Output = Result<
+            impl Into<hellas_rpc::call::WithTrailer<DeliverResultResponse>> + Send,
+            WireStatus,
+        >,
+    > + Send {
+        self.service.deliver_result(request, context)
+    }
+
+    fn admit_certificate(
+        &self,
+        request: AdmitCertificateRequest,
+        context: TransportContext,
+    ) -> impl core::future::Future<
+        Output = Result<
+            impl Into<hellas_rpc::call::WithTrailer<AdmitCertificateResponse>> + Send,
+            WireStatus,
+        >,
+    > + Send {
+        self.service.admit_certificate(request, context)
+    }
+}
+
+impl<S: Clone> MountedWork<S> {
     /// Serves `Work` from `service` from now on, and says whether it
     /// took the slot.
     ///
@@ -453,28 +611,123 @@ impl MountedWork {
     /// — an authorization naming another is refused by the endpoint and
     /// never routed — so a second mounted channel is still driven and is
     /// not served, and the operator is told which.
-    fn mount(&self, service: &WorkService) -> bool {
+    fn mount(
+        &self,
+        bond_edge: EdgeId,
+        service: &WorkService,
+        descriptor: Option<WorkChannelDescriptor>,
+        source: &S,
+    ) -> bool {
         match self.0.lock() {
             Ok(mut held) if held.is_none() => {
-                *held = Some(service.clone());
+                *held = Some(MountedWorkService {
+                    bond_edge,
+                    service: service.clone(),
+                    descriptor,
+                    source: Arc::new(Mutex::new(source.clone())),
+                    accepting: Arc::new(AsyncMutex::new(())),
+                });
                 true
             }
             _ => false,
         }
     }
 
-    /// The mounted channel's service, when the runner has mounted one.
-    fn service(&self) -> Option<WorkService> {
+    /// The mounted channel's served handler, when the runner has mounted
+    /// one.
+    fn handler(&self) -> Option<MountedWorkService<S>> {
         self.0.lock().ok().and_then(|held| held.clone())
     }
 
-    /// Stops serving `Work` from a channel.
+    /// The exact mounted service, for the clock and its state checks.
+    fn service(&self) -> Option<WorkService> {
+        self.handler().map(|mounted| mounted.service)
+    }
+
+    /// Replaces the finalized source for the matching driven channel.
+    ///
+    /// A reconnect reaches handlers already cloned by live connections,
+    /// because they share this inner source slot. Neither mount lock is
+    /// held across a source request.
+    fn refresh_source(&self, bond_edge: EdgeId, source: &S) {
+        let source_slot = self.0.lock().ok().and_then(|held| {
+            held.as_ref()
+                .filter(|mounted| mounted.bond_edge == bond_edge)
+                .map(|mounted| Arc::clone(&mounted.source))
+        });
+        if let Some(source_slot) = source_slot {
+            if let Ok(mut held) = source_slot.lock() {
+                *held = source.clone();
+            }
+        }
+    }
+
+    /// Stops serving `Work` from every channel.
     ///
     /// The clock's last act. A channel nobody is advancing is not a
     /// channel to answer from — its journal is closed the moment the
     /// runner drops it, and a handler still holding it open would be the
     /// one thing keeping the files this process no longer owns.
-    fn clear(&self) {
+    fn clear_all(&self) {
+        if let Ok(mut held) = self.0.lock() {
+            *held = None;
+        }
+    }
+}
+
+/// The one provider setup this node answers `WorkSetup` from.
+///
+/// Written by discovery and read by the accept loop, beside
+/// [`MountedWork`]. The clone in this slot is the exact [`SetupService`]
+/// stored in [`Driven::Setup`], so serving and driving share one exclusive
+/// journal rather than attempting to reopen it.
+#[derive(Clone, Debug, Default)]
+pub(super) struct MountedSetup(Arc<Mutex<Option<MountedSetupService>>>);
+
+#[derive(Clone, Debug)]
+struct MountedSetupService {
+    bond_edge: EdgeId,
+    service: SetupService,
+}
+
+impl MountedSetup {
+    /// Serves one setup, only while the slot is empty.
+    fn mount(&self, bond_edge: EdgeId, service: &SetupService) -> bool {
+        match self.0.lock() {
+            Ok(mut held) if held.is_none() => {
+                *held = Some(MountedSetupService {
+                    bond_edge,
+                    service: service.clone(),
+                });
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The exact setup service discovery mounted, cloned without holding
+    /// the slot across dispatch.
+    fn service(&self) -> Option<SetupService> {
+        self.0
+            .lock()
+            .ok()
+            .and_then(|held| held.as_ref().map(|mounted| mounted.service.clone()))
+    }
+
+    /// Stops serving only the setup that made this transition.
+    fn clear(&self, bond_edge: EdgeId) {
+        if let Ok(mut held) = self.0.lock() {
+            if held
+                .as_ref()
+                .is_some_and(|mounted| mounted.bond_edge == bond_edge)
+            {
+                *held = None;
+            }
+        }
+    }
+
+    /// Stops serving every setup during runner shutdown.
+    fn clear_all(&self) {
         if let Ok(mut held) = self.0.lock() {
             *held = None;
         }
@@ -491,8 +744,13 @@ impl MountedWork {
 /// second step would open a second journal on the same file.
 enum Driven {
     /// This node holds an admission, so the journal is driven behind the
-    /// setup service that answers for it.
-    Setup(SetupService),
+    /// setup service that answers for it. Only an `Admits` policy is
+    /// retained: it is the provider authority from which the full channel
+    /// descriptor is rebuilt after the setup reveals its actual terms.
+    Setup {
+        service: SetupService,
+        policy: Option<ProviderChannelPolicy>,
+    },
     /// §4's missing, changed or unconfigured evidence: there is no
     /// admission and therefore no setup endpoint to build. Recovery is
     /// not disabled by any of those, so the journal itself is driven —
@@ -515,7 +773,9 @@ impl Driven {
         S: SetupView + FinalizedBlocks + TxSink + Sync + ?Sized,
     {
         match self {
-            Self::Setup(service) => Some(service.advance_setup(source, source, source).await),
+            Self::Setup { service, .. } => {
+                Some(service.advance_setup(source, source, source).await)
+            }
             Self::Recovery(store) => Some(
                 advance_setup(
                     source,
@@ -547,7 +807,13 @@ impl SetupClock {
     /// validator that stopped answering is dialled again rather than
     /// asked forever. Everything else is this journal's own business and
     /// is logged where it happens.
-    async fn tick<S>(&mut self, source: &S, signer: &Secp256k1Signer, mount: &MountedWork) -> bool
+    async fn tick<S>(
+        &mut self,
+        source: &S,
+        signer: &Secp256k1Signer,
+        work_mount: &MountedWork<S>,
+        setup_mount: &MountedSetup,
+    ) -> bool
     where
         S: SetupView + FinalizedBlocks + FinalizedWorkView + TxSink + Sync,
     {
@@ -557,7 +823,12 @@ impl SetupClock {
             match step {
                 Ok(SetupAdvance { progress, mounted }) => {
                     if let Some(store) = mounted {
-                        self.take_mount(store, signer, mount, &bond);
+                        let policy = match &self.driven {
+                            Driven::Setup { policy, .. } => policy.clone(),
+                            Driven::Recovery(_) | Driven::Channel(_) | Driven::Done => None,
+                        };
+                        setup_mount.clear(self.bond_edge);
+                        self.take_mount(store, signer, policy.as_ref(), source, work_mount, &bond);
                     } else if matches!(
                         progress,
                         SetupProgress::Aborted(_) | SetupProgress::Faulted(_)
@@ -575,6 +846,7 @@ impl SetupClock {
             }
         }
         if let Driven::Channel(service) = &self.driven {
+            work_mount.refresh_source(self.bond_edge, source);
             match advance_paid_work_clock(service, source).await {
                 Ok(progress) => debug!(bond, ?progress, "the channel advanced"),
                 Err(error) => {
@@ -592,17 +864,36 @@ impl SetupClock {
     /// second `ChannelStore::open` on the same file is a refusal rather
     /// than a second view, and the settlement and origin this one
     /// carries are the ones the completing read established.
-    fn take_mount(
+    fn take_mount<S: Clone>(
         &mut self,
         store: ChannelStore,
         signer: &Secp256k1Signer,
-        mount: &MountedWork,
+        policy: Option<&ProviderChannelPolicy>,
+        source: &S,
+        mount: &MountedWork<S>,
         bond: &str,
     ) {
+        // The setup's retained policy supplies the provider-controlled
+        // fields, while the mounted channel supplies the payment edge and
+        // complete terms the two parties actually signed. This is a full
+        // descriptor reconstruction, not a mount-time readiness cache.
+        let descriptor = policy.and_then(|policy| {
+            let channel = store.state().channel();
+            match policy.admit(
+                channel.payment_edge(),
+                channel.payment_terms().clone(),
+            ) {
+                Ok(descriptor) => Some(descriptor),
+                Err(error) => {
+                    warn!(bond, %error, "the mounted channel no longer satisfies its admission policy");
+                    None
+                }
+            }
+        });
         match CloseEndpoint::new(store, signer.clone()) {
             Ok(close) => {
                 let service = WorkService::close_only(close);
-                if mount.mount(&service) {
+                if mount.mount(self.bond_edge, &service, descriptor, source) {
                     info!(
                         bond,
                         "this node now answers Work from the channel it mounted"
@@ -628,16 +919,20 @@ impl SetupClock {
 }
 
 /// The clock, over every paid-work journal this node owns.
-pub(super) struct WorkRunner {
+pub(super) struct WorkRunner<S> {
     clocks: Vec<SetupClock>,
     signer: Secp256k1Signer,
-    mount: MountedWork,
+    work_mount: MountedWork<S>,
+    setup_mount: MountedSetup,
     poll: Duration,
     validators: Vec<String>,
     consensus_verifier: ConsensusVerifier,
 }
 
-impl WorkRunner {
+impl<S> WorkRunner<S>
+where
+    S: SetupView + FinalizedBlocks + FinalizedWorkView + TxSink + Sync,
+{
     /// Opens every setup journal under the configured root.
     ///
     /// The root and the network are the whole of what a restarting node
@@ -650,7 +945,15 @@ impl WorkRunner {
     /// # Errors
     ///
     /// When the root itself cannot be enumerated.
-    pub(super) fn discover(config: WorkRunnerConfig, mount: MountedWork) -> anyhow::Result<Self> {
+    /// `WorkSetup` has no selector in its empty first request, so exactly
+    /// one discovered provider journal is the only unambiguous offer. If
+    /// there are several, all are still driven for recovery and close
+    /// duty, but none is served as an arbitrary answer to that request.
+    pub(super) fn discover(
+        config: WorkRunnerConfig,
+        work_mount: MountedWork<S>,
+        setup_mount: MountedSetup,
+    ) -> anyhow::Result<Self> {
         let consensus_verifier = ConsensusVerifier::new(&ConsensusInfo {
             validators: config.validators.clone(),
             threshold_identity: config.threshold_identity,
@@ -669,6 +972,18 @@ impl WorkRunner {
                 path = %unnamed.path.display(),
                 reason = %unnamed.reason,
                 "a setup journal under the work root could not be named",
+            );
+        }
+        let provider_setups = found
+            .setups
+            .iter()
+            .filter(|setup| setup.role == Role::Provider)
+            .count();
+        let setup_is_unambiguous = provider_setups == 1;
+        if provider_setups > 1 {
+            warn!(
+                provider_setups,
+                "more than one provider setup journal was discovered; WorkSetup is not served",
             );
         }
         let mut clocks = Vec::with_capacity(found.setups.len());
@@ -699,11 +1014,28 @@ impl WorkRunner {
                 }
             };
             let driven = match config.admission.clone() {
-                Some(admission) => Driven::Setup(SetupService::new(SetupEndpoint::new(
-                    store,
-                    config.settlement_key.clone(),
-                    admission,
-                ))),
+                Some(admission) => {
+                    let policy = match &admission {
+                        PaymentAdmission::Admits(policy) => Some(policy.as_ref().clone()),
+                        PaymentAdmission::Proposes(_) => None,
+                    };
+                    let service = SetupService::new(SetupEndpoint::new(
+                        store,
+                        config.settlement_key.clone(),
+                        admission,
+                    ));
+                    if setup_is_unambiguous {
+                        if setup_mount.mount(setup.bond_edge, &service) {
+                            info!(
+                                bond,
+                                "this node now answers WorkSetup from its driven setup"
+                            );
+                        } else {
+                            warn!(bond, "the unambiguous provider setup could not be mounted");
+                        }
+                    }
+                    Driven::Setup { service, policy }
+                }
                 None => Driven::Recovery(Box::new(store)),
             };
             clocks.push(SetupClock {
@@ -714,7 +1046,8 @@ impl WorkRunner {
         Ok(Self {
             clocks,
             signer: config.settlement_key,
-            mount,
+            work_mount,
+            setup_mount,
             poll: config.poll,
             validators: config.validators,
             consensus_verifier,
@@ -723,28 +1056,14 @@ impl WorkRunner {
 
     /// Takes one step of every journal, and says whether the chain
     /// answered all of them.
-    async fn tick<S>(&mut self, source: &S) -> bool
-    where
-        S: SetupView + FinalizedBlocks + FinalizedWorkView + TxSink + Sync,
-    {
+    async fn tick(&mut self, source: &S) -> bool {
         let mut answered = true;
         for clock in &mut self.clocks {
-            answered &= clock.tick(source, &self.signer, &self.mount).await;
+            answered &= clock
+                .tick(source, &self.signer, &self.work_mount, &self.setup_mount)
+                .await;
         }
         answered
-    }
-
-    /// Ticks until told to stop, over the validators the configuration
-    /// names.
-    async fn run(self, stop: oneshot::Receiver<()>) {
-        let validators = self.validators.clone();
-        let verifier = self.consensus_verifier.clone();
-        self.run_over(stop, move || {
-            let validators = validators.clone();
-            let verifier = verifier.clone();
-            async move { connect_chain(&validators, verifier).await }
-        })
-        .await;
     }
 
     /// The loop, over whatever chain `dial` produces.
@@ -752,14 +1071,15 @@ impl WorkRunner {
     /// One tick of every journal per period, and a chain that stopped
     /// answering is dialled again rather than asked forever. The whole
     /// of the cadence is here, and none of the decisions are.
-    async fn run_over<S, D, F>(mut self, mut stop: oneshot::Receiver<()>, dial: D)
+    async fn run_over<D, F>(mut self, mut stop: oneshot::Receiver<()>, dial: D)
     where
-        S: SetupView + FinalizedBlocks + FinalizedWorkView + TxSink + Sync,
         D: Fn() -> F,
         F: core::future::Future<Output = Option<S>>,
     {
         if self.clocks.is_empty() {
             info!("no provider setup journal under the work root; the clock has nothing to drive");
+            self.work_mount.clear_all();
+            self.setup_mount.clear_all();
             return;
         }
         let mut chain = None;
@@ -776,8 +1096,24 @@ impl WorkRunner {
                 chain = Some(source);
             }
         }
-        self.mount.clear();
+        self.work_mount.clear_all();
+        self.setup_mount.clear_all();
         info!("the paid-work clock stopped, and its journals are closed");
+    }
+}
+
+impl WorkRunner<ProductionWorkSource> {
+    /// Ticks until told to stop, over the validators the configuration
+    /// names.
+    async fn run(self, stop: oneshot::Receiver<()>) {
+        let validators = self.validators.clone();
+        let verifier = self.consensus_verifier.clone();
+        self.run_over(stop, move || {
+            let validators = validators.clone();
+            let verifier = verifier.clone();
+            async move { connect_chain(&validators, verifier).await }
+        })
+        .await;
     }
 }
 
@@ -791,7 +1127,7 @@ impl WorkRunner {
 async fn connect_chain(
     validators: &[String],
     verifier: ConsensusVerifier,
-) -> Option<WorkBlocks<VerifiedRemoteLightClient>> {
+) -> Option<ProductionWorkSource> {
     for url in validators {
         match VerifiedRemoteLightClient::connect(url.clone(), verifier.clone()).await {
             Ok(client) => {
@@ -1691,7 +2027,11 @@ mod tests {
     /// The runner a node starts with: the configured root, the stored
     /// identity, and whichever of §4's three admissions this node's
     /// evidence produced.
-    fn runner(root: &Path, admission: Option<PaymentAdmission>, mount: &MountedWork) -> WorkRunner {
+    fn runner(
+        root: &Path,
+        admission: Option<PaymentAdmission>,
+        mount: &MountedWork<TestChain>,
+    ) -> WorkRunner<TestChain> {
         match WorkRunner::discover(
             WorkRunnerConfig {
                 network: network(),
@@ -1703,6 +2043,7 @@ mod tests {
                 admission,
             },
             mount.clone(),
+            MountedSetup::default(),
         ) {
             Ok(runner) => runner,
             Err(error) => panic!("the configured root enumerates: {error}"),
