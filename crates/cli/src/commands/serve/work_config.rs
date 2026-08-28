@@ -1888,7 +1888,8 @@ mod tests {
     /// The commitment is opened against the *configuration's* own salt
     /// and credit policy, because that is what a provider's admission
     /// re-derives: terms committing to any other policy are refused
-    /// rather than countersigned.
+    /// rather than countersigned. The Start span is the profile's fixed
+    /// maximum, so tests aimed at later admission gates reach them.
     fn payment_terms() -> WorkPaymentTerms {
         WorkPaymentTerms {
             bond_edge: bond_edge(),
@@ -1902,7 +1903,7 @@ mod tests {
                 },
             ),
             omit_response_blocks: WINDOW,
-            start_validity_blocks: 8,
+            start_validity_blocks: hellas_kernel::MAX_START_VALIDITY_BLOCKS,
             omission_bond: OMISSION_BOND,
         }
     }
