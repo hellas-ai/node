@@ -143,7 +143,7 @@ fn payment_terms(bond_edge: EdgeId) -> WorkPaymentTerms {
         // policy before it will countersign.
         private_policy_commitment: private_policy_commitment(network(), &SALT, &channel_policy()),
         omit_response_blocks: WINDOW,
-        start_validity_blocks: 8,
+        start_validity_blocks: hellas_kernel::MAX_START_VALIDITY_BLOCKS,
         omission_bond: OMISSION_BOND,
     }
 }
@@ -486,10 +486,8 @@ async fn two_endpoints_that_have_never_met_open_a_channel() {
 /// Terms the provider's own configuration refuses are terms it does not
 /// countersign — and it writes nothing when it refuses them.
 ///
-/// Three of the four fields revision 2 leaves to the client, each moved
-/// on its own with the other two at the fixture's admitted values. The
-/// fourth, `start_validity_blocks`, is not gated here and no assertion
-/// below claims it is: nothing in the descriptor reads it.
+/// Each of the four fields revision 2 leaves to the client, moved on its
+/// own with the other three at the fixture's admitted values.
 ///
 /// What each case checks is the same two facts — the refusal is
 /// `Declined`, and the provider's reopened journal is still at revision
@@ -502,7 +500,7 @@ async fn two_endpoints_that_have_never_met_open_a_channel() {
 #[tokio::test]
 async fn a_provider_does_not_countersign_terms_its_own_policy_refuses() {
     let base = payment_terms(bond_edge());
-    let refused: [(&str, WorkPaymentTerms); 3] = [
+    let refused: [(&str, WorkPaymentTerms); 4] = [
         (
             "a credit policy that is not this provider's",
             WorkPaymentTerms {
@@ -525,6 +523,13 @@ async fn a_provider_does_not_countersign_terms_its_own_policy_refuses() {
             "a response window shorter than the one the probability was measured over",
             WorkPaymentTerms {
                 omit_response_blocks: WINDOW - 1,
+                ..base.clone()
+            },
+        ),
+        (
+            "a Start span below this profile's fixed span",
+            WorkPaymentTerms {
+                start_validity_blocks: hellas_kernel::MAX_START_VALIDITY_BLOCKS - 1,
                 ..base.clone()
             },
         ),
@@ -582,7 +587,7 @@ async fn a_provider_does_not_countersign_terms_its_own_policy_refuses() {
         );
     }
 
-    // The same three fields at the values this provider admits complete
+    // The same four fields at the values this provider admits complete
     // the handshake, which is what says the refusals above were the
     // mutations and not the fixture.
     let provider_root = tempfile::tempdir().expect("a temp dir");

@@ -421,12 +421,13 @@ impl ProviderChannelPolicy {
     /// committing to any other policy are refused rather than signed.
     ///
     /// §4's floor is checked here and nowhere below, because it is the
-    /// provider's judgement about its own deployment and not a property
-    /// of the configured channel: `64 ≥ T` first, so a node whose
-    /// measured budget cannot fit the fixed start span countersigns
-    /// nothing whatever terms it is offered, and then the proposed
-    /// `omit_response_blocks` against `F+POLL+G+I+S+R+1`. The second is
-    /// strictly stronger than the kernel's own
+    /// provider's judgement about its own deployment and the terms it
+    /// is asked to sign: `64 ≥ T` first, so a node whose measured budget
+    /// cannot fit the fixed start span countersigns nothing whatever
+    /// terms it is offered; then the signed `start_validity_blocks` must
+    /// be exactly that fixed 64; and finally the proposed
+    /// `omit_response_blocks` is checked against
+    /// `F+POLL+G+I+S+R+1`. The last is strictly stronger than the kernel's own
     /// `MIN_OMIT_RESPONSE_BLOCKS`, which is the same sum with `S` and
     /// `R` left out — this deployment's measured seek and restart cost
     /// are exactly what the kernel constant cannot know.
@@ -434,8 +435,9 @@ impl ProviderChannelPolicy {
     /// # Errors
     ///
     /// [`WorkSetupError::Floor`] when the measured budget does not fit
-    /// the start span or the terms leave less time to answer than it
-    /// needs, and then whatever [`WorkChannelDescriptor::open`] raises:
+    /// the start span, the signed terms do not carry the fixed span, or
+    /// the terms leave less time to answer than it needs, and then
+    /// whatever [`WorkChannelDescriptor::open`] raises:
     /// the commitment, the execution policy, the settleability of the
     /// expected funding, and the omission economics.
     pub fn admit(
@@ -443,7 +445,8 @@ impl ProviderChannelPolicy {
         payment_edge: EdgeId,
         payment_terms: WorkPaymentTerms,
     ) -> Result<WorkChannelDescriptor, WorkSetupError> {
-        self.floor.check_start_span()?;
+        self.floor
+            .check_terms_start_span(payment_terms.start_validity_blocks)?;
         self.floor
             .check_response_window(payment_terms.omit_response_blocks)?;
         WorkChannelDescriptor::open(WorkChannelConfig {

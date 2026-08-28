@@ -126,7 +126,7 @@ fn payment_terms(bond_edge: EdgeId) -> WorkPaymentTerms {
         bond_terms: bond_terms(),
         private_policy_commitment: private_policy_commitment(network(), &SALT, &channel_policy()),
         omit_response_blocks: hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
-        start_validity_blocks: 8,
+        start_validity_blocks: hellas_kernel::MAX_START_VALIDITY_BLOCKS,
         omission_bond: 4,
     }
 }

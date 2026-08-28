@@ -164,6 +164,15 @@ pub enum FloorError {
         /// [`MAX_START_VALIDITY_BLOCKS`].
         span: u64,
     },
+    /// The signed terms do not carry the fixed start span this profile
+    /// admits.
+    #[error("the terms' start span is {span} blocks, not the fixed {fixed}")]
+    StartSpanNotFixed {
+        /// `start_validity_blocks`, as the signed terms fix it.
+        span: u64,
+        /// [`MAX_START_VALIDITY_BLOCKS`], the profile's fixed span.
+        fixed: u64,
+    },
     /// The proposed terms give the watcher fewer blocks to answer in
     /// than the measured floor needs.
     #[error(
@@ -322,11 +331,12 @@ impl MountFloor {
 
     /// `64 ≥ T`, or the refusal.
     ///
-    /// The one gate §4 puts at both startup and provider admission. It
-    /// is a refusal and not a warning: a `T` above the fixed start span
-    /// is a deployment in which a signed start expires before the
-    /// channel it authorises could be reached, and a node that
-    /// countersigned anyway would be selling a channel it cannot settle.
+    /// The deployment half of the gate §4 puts at startup and provider
+    /// admission. It is a refusal and not a warning: a `T` above the
+    /// fixed start span is a deployment in which a signed start expires
+    /// before the channel it authorises could be reached, and a node
+    /// that countersigned anyway would be selling a channel it cannot
+    /// settle.
     ///
     /// # Errors
     ///
@@ -338,6 +348,33 @@ impl MountFloor {
             Err(FloorError::StartSpanTooShort {
                 t: self.t,
                 span: MAX_START_VALIDITY_BLOCKS,
+            })
+        }
+    }
+
+    /// Checks both the measured floor and the span the parties actually
+    /// signed.
+    ///
+    /// The kernel supplies only an upper bound. This profile fixes the
+    /// span at that bound, so a smaller value is not admitted merely
+    /// because it happens to clear this deployment's current `T`: it is
+    /// a different term from the one the profile offers.
+    ///
+    /// # Errors
+    ///
+    /// [`FloorError::StartSpanTooShort`] when this deployment does not
+    /// fit the fixed span, or [`FloorError::StartSpanNotFixed`] when the
+    /// signed terms carry any other span.
+    pub const fn check_terms_start_span(&self, span: u64) -> Result<(), FloorError> {
+        if let Err(error) = self.check_start_span() {
+            return Err(error);
+        }
+        if span == MAX_START_VALIDITY_BLOCKS {
+            Ok(())
+        } else {
+            Err(FloorError::StartSpanNotFixed {
+                span,
+                fixed: MAX_START_VALIDITY_BLOCKS,
             })
         }
     }
@@ -572,6 +609,30 @@ mod tests {
         assert_eq!(
             refuses.check_start_span(),
             Err(FloorError::StartSpanTooShort { t: 65, span: 64 }),
+        );
+    }
+
+    /// Admission binds the span in the signed terms and does not turn
+    /// the profile's fixed 64 into a per-deployment minimum.
+    #[test]
+    fn the_signed_start_span_is_fixed_not_merely_sufficient() {
+        let Ok(floor) = budget().floor() else {
+            panic!("a positive lower tail prices every wait")
+        };
+        assert_eq!(floor.t(), 12);
+        assert_eq!(floor.check_terms_start_span(64), Ok(()));
+        assert_eq!(
+            floor.check_terms_start_span(63),
+            Err(FloorError::StartSpanNotFixed {
+                span: 63,
+                fixed: 64,
+            }),
+            "a span well above T is still not this profile's fixed span",
+        );
+        assert_eq!(
+            floor.check_terms_start_span(8),
+            Err(FloorError::StartSpanNotFixed { span: 8, fixed: 64 }),
+            "the signed span below T is refused by the value the parties signed",
         );
     }
 

@@ -382,7 +382,7 @@ mod tests {
                 &channel_policy(),
             ),
             omit_response_blocks: WINDOW,
-            start_validity_blocks: 8,
+            start_validity_blocks: hellas_kernel::MAX_START_VALIDITY_BLOCKS,
             omission_bond: OMISSION_BOND,
         }
     }
