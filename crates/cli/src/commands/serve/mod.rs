@@ -176,6 +176,7 @@ async fn run_with_store(
         // not a flag the runner re-derives.
         work_runner = Some(node::WorkRunnerConfig {
             network: work.chain.network,
+            threshold_identity: work.chain.threshold_identity.clone(),
             journal_root: work.journal_root.clone(),
             validators: work.validators.clone(),
             poll: work.poll,

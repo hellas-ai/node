@@ -13,8 +13,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Context;
-use hellas_chain::WorkBlocks;
-use hellas_chain::client::RemoteLightClient;
+use hellas_chain::client::VerifiedRemoteLightClient;
+use hellas_chain::{ConsensusInfo, ConsensusVerifier, WorkBlocks};
 #[cfg(feature = "evaluate")]
 use hellas_executor::ArtifactStoreConfig;
 use hellas_executor::{
@@ -419,6 +419,8 @@ impl WorkHandler for UnmountedWork {
 pub(super) struct WorkRunnerConfig {
     /// The network the journals are keyed and the signatures bound to.
     pub(super) network: NetworkId,
+    /// The threshold identity finalized blocks must authenticate under.
+    pub(super) threshold_identity: Vec<u8>,
     /// The configured root the setup journals live under.
     pub(super) journal_root: PathBuf,
     /// The validator RPCs a read and a submission go to.
@@ -631,6 +633,7 @@ pub(super) struct WorkRunner {
     mount: MountedWork,
     poll: Duration,
     validators: Vec<String>,
+    consensus_verifier: ConsensusVerifier,
 }
 
 impl WorkRunner {
@@ -647,7 +650,13 @@ impl WorkRunner {
     ///
     /// When the root itself cannot be enumerated.
     pub(super) fn discover(config: WorkRunnerConfig, mount: MountedWork) -> anyhow::Result<Self> {
-        let verifier = Secp256k1Verifier::new();
+        let consensus_verifier = ConsensusVerifier::new(&ConsensusInfo {
+            validators: config.validators.clone(),
+            threshold_identity: config.threshold_identity,
+            network_id: config.network.as_str().to_owned(),
+        })
+        .context("the configured threshold identity is not usable")?;
+        let settlement_verifier = Secp256k1Verifier::new();
         let found = discover_setups(&config.journal_root, config.network).with_context(|| {
             format!(
                 "failed to enumerate the work journals under {}",
@@ -680,7 +689,7 @@ impl WorkRunner {
                 config.network,
                 setup.bond_edge,
                 setup.role,
-                &verifier,
+                &settlement_verifier,
             ) {
                 Ok(store) => store,
                 Err(error) => {
@@ -707,6 +716,7 @@ impl WorkRunner {
             mount,
             poll: config.poll,
             validators: config.validators,
+            consensus_verifier,
         })
     }
 
@@ -727,9 +737,11 @@ impl WorkRunner {
     /// names.
     async fn run(self, stop: oneshot::Receiver<()>) {
         let validators = self.validators.clone();
+        let verifier = self.consensus_verifier.clone();
         self.run_over(stop, move || {
             let validators = validators.clone();
-            async move { connect_chain(&validators).await }
+            let verifier = verifier.clone();
+            async move { connect_chain(&validators, verifier).await }
         })
         .await;
     }
@@ -775,9 +787,12 @@ impl WorkRunner {
 /// is a submission strategy with an outcome rule, and neither exists in
 /// this tree yet; inventing one here would be the runner deciding what
 /// a submission means.
-async fn connect_chain(validators: &[String]) -> Option<WorkBlocks<RemoteLightClient>> {
+async fn connect_chain(
+    validators: &[String],
+    verifier: ConsensusVerifier,
+) -> Option<WorkBlocks<VerifiedRemoteLightClient>> {
     for url in validators {
-        match RemoteLightClient::connect(url.clone()).await {
+        match VerifiedRemoteLightClient::connect(url.clone(), verifier.clone()).await {
             Ok(client) => {
                 info!(validator = %url, "the paid-work clock reads and submits here");
                 return Some(WorkBlocks::new(client));
@@ -925,6 +940,17 @@ mod tests {
             panic!("a short ascii id is a network id");
         };
         network
+    }
+
+    /// A threshold identity consensus accepts: the compressed BLS12-381 G1
+    /// generator used by the configuration loader's fixture too.
+    fn threshold_identity() -> Vec<u8> {
+        vec![
+            0x97, 0xf1, 0xd3, 0xa7, 0x31, 0x97, 0xd7, 0x94, 0x26, 0x95, 0x63, 0x8c, 0x4f, 0xa9,
+            0xac, 0x0f, 0xc3, 0x68, 0x8c, 0x4f, 0x97, 0x74, 0xb9, 0x05, 0xa1, 0x4e, 0x3a, 0x3f,
+            0x17, 0x1b, 0xac, 0x58, 0x6c, 0x55, 0xe8, 0x3f, 0xf9, 0x7a, 0x1a, 0xef, 0xfb, 0x3a,
+            0xf0, 0x0a, 0xdb, 0x22, 0xc6, 0xbb,
+        ]
     }
 
     fn signer(byte: u8) -> Secp256k1Signer {
@@ -1546,6 +1572,7 @@ mod tests {
         match WorkRunner::discover(
             WorkRunnerConfig {
                 network: network(),
+                threshold_identity: threshold_identity(),
                 journal_root: root.to_path_buf(),
                 validators: Vec::new(),
                 poll: Duration::from_millis(1),

@@ -29,6 +29,18 @@ pub struct RemoteLightClient {
     verifier: Option<ConsensusVerifier>,
 }
 
+/// Wire-backed light client whose finalized snapshots are always verified.
+///
+/// Unlike [`RemoteLightClient`], this type has no unverified state. It is the
+/// client for a caller whose decisions require an authenticated finalized
+/// history, while callers that deliberately trust their endpoint can keep
+/// using [`RemoteLightClient`] unchanged.
+#[derive(Clone)]
+pub struct VerifiedRemoteLightClient {
+    client: LightClientClientImpl<MuxTransport>,
+    verifier: ConsensusVerifier,
+}
+
 impl RemoteLightClient {
     pub fn new(transport: MuxTransport) -> Self {
         Self {
@@ -40,27 +52,7 @@ impl RemoteLightClient {
     /// Connect to a WebSocket endpoint.
     pub async fn connect(addr: impl Into<String>) -> Result<Self, QueryError> {
         let addr = addr.into();
-        #[cfg(target_family = "wasm")]
-        {
-            let transport = hellas_wire::ws::wasm::connect(&addr)
-                .await
-                .map_err(|e| QueryError::Connect(e.to_string()))?;
-            Ok(Self::new(transport))
-        }
-        #[cfg(all(not(target_family = "wasm"), feature = "client"))]
-        {
-            let transport = hellas_wire::ws::connect(&addr)
-                .await
-                .map_err(|e| QueryError::Connect(e.to_string()))?;
-            Ok(Self::new(transport))
-        }
-        #[cfg(all(not(target_family = "wasm"), not(feature = "client")))]
-        {
-            let _ = addr;
-            Err(QueryError::Connect(
-                "the wasm-client feature can only connect on a wasm target".to_string(),
-            ))
-        }
+        Ok(Self::new(connect_transport(&addr).await?))
     }
 
     /// Configure this client to verify finalized snapshots.
@@ -91,9 +83,82 @@ impl RemoteLightClient {
     }
 }
 
-impl LightClient for RemoteLightClient {
+impl VerifiedRemoteLightClient {
+    /// Build a client that requires `verifier` for every finalized snapshot.
+    pub fn new(transport: MuxTransport, verifier: ConsensusVerifier) -> Self {
+        Self {
+            client: LightClientClientImpl::new(transport),
+            verifier,
+        }
+    }
+
+    /// Connect to a WebSocket endpoint with a required consensus verifier.
+    pub async fn connect(
+        addr: impl Into<String>,
+        verifier: ConsensusVerifier,
+    ) -> Result<Self, QueryError> {
+        let addr = addr.into();
+        Ok(Self::new(connect_transport(&addr).await?, verifier))
+    }
+}
+
+async fn connect_transport(addr: &str) -> Result<MuxTransport, QueryError> {
+    #[cfg(target_family = "wasm")]
+    {
+        hellas_wire::ws::wasm::connect(addr)
+            .await
+            .map_err(|error| QueryError::Connect(error.to_string()))
+    }
+    #[cfg(all(not(target_family = "wasm"), feature = "client"))]
+    {
+        hellas_wire::ws::connect(addr)
+            .await
+            .map_err(|error| QueryError::Connect(error.to_string()))
+    }
+    #[cfg(all(not(target_family = "wasm"), not(feature = "client")))]
+    {
+        let _ = addr;
+        Err(QueryError::Connect(
+            "the wasm-client feature can only connect on a wasm target".to_string(),
+        ))
+    }
+}
+
+/// The shared wire operations of the optional and required-verifier clients.
+///
+/// Keeping this private leaves the public distinction structural: only the
+/// two client types above can select whether snapshot verification exists.
+trait RemoteClientState: Clone + Send + Sync + 'static {
+    fn rpc_client(&self) -> &LightClientClientImpl<MuxTransport>;
+    fn consensus_verifier(&self) -> Option<&ConsensusVerifier>;
+}
+
+impl RemoteClientState for RemoteLightClient {
+    fn rpc_client(&self) -> &LightClientClientImpl<MuxTransport> {
+        &self.client
+    }
+
+    fn consensus_verifier(&self) -> Option<&ConsensusVerifier> {
+        self.verifier.as_ref()
+    }
+}
+
+impl RemoteClientState for VerifiedRemoteLightClient {
+    fn rpc_client(&self) -> &LightClientClientImpl<MuxTransport> {
+        &self.client
+    }
+
+    fn consensus_verifier(&self) -> Option<&ConsensusVerifier> {
+        Some(&self.verifier)
+    }
+}
+
+impl<C> LightClient for C
+where
+    C: RemoteClientState,
+{
     fn get_state_root(&self) -> impl Future<Output = Result<Option<Digest>, QueryError>> + Send {
-        let client = self.client.clone();
+        let client = self.rpc_client().clone();
         async move {
             let response = client
                 .get_state_root(GetStateRootRequest {})
@@ -115,7 +180,7 @@ impl LightClient for RemoteLightClient {
         &self,
         object_id: ObjectId,
     ) -> impl Future<Output = Result<Option<Vec<u8>>, QueryError>> + Send {
-        let client = self.client.clone();
+        let client = self.rpc_client().clone();
         async move {
             let response = client
                 .get_proof(GetProofRequest {
@@ -132,7 +197,7 @@ impl LightClient for RemoteLightClient {
         payload: Digest,
         object_id: ObjectId,
     ) -> impl Future<Output = Result<Option<Coin>, QueryError>> + Send {
-        let client = self.client.clone();
+        let client = self.rpc_client().clone();
         async move {
             let response = client
                 .get_coin(GetCoinRequest {
@@ -166,7 +231,7 @@ impl LightClient for RemoteLightClient {
         payload: Digest,
         object_id: ObjectId,
     ) -> impl Future<Output = Result<Option<EdgeLookup>, QueryError>> + Send {
-        let client = self.client.clone();
+        let client = self.rpc_client().clone();
         async move {
             let response = client
                 .get_edge(GetEdgeRequest {
@@ -183,7 +248,7 @@ impl LightClient for RemoteLightClient {
         &self,
         payload: Digest,
     ) -> impl Future<Output = Result<Option<Vec<u8>>, QueryError>> + Send {
-        let client = self.client.clone();
+        let client = self.rpc_client().clone();
         async move {
             let response = client
                 .get_finalization(GetFinalizationRequest {
@@ -198,8 +263,8 @@ impl LightClient for RemoteLightClient {
     fn get_latest_block(
         &self,
     ) -> impl Future<Output = Result<Option<LatestBlock>, QueryError>> + Send {
-        let client = self.client.clone();
-        let verifier = self.verifier.clone();
+        let client = self.rpc_client().clone();
+        let verifier = self.consensus_verifier().cloned();
         async move {
             let response = client
                 .get_latest_block(GetLatestBlockRequest {})
@@ -216,8 +281,8 @@ impl LightClient for RemoteLightClient {
         &self,
         query: FinalizedBlockQuery,
     ) -> impl Future<Output = Result<Option<FinalizedBlock>, QueryError>> + Send {
-        let client = self.client.clone();
-        let verifier = self.verifier.clone();
+        let client = self.rpc_client().clone();
+        let verifier = self.consensus_verifier().cloned();
         async move {
             let response = client
                 .get_finalized_block(finalized_block_query_to_proto(query))
@@ -234,7 +299,7 @@ impl LightClient for RemoteLightClient {
         &self,
         tx: Transaction,
     ) -> impl Future<Output = Result<DomainSubmitTxOutcome, QueryError>> + Send {
-        let client = self.client.clone();
+        let client = self.rpc_client().clone();
         async move {
             // `rpc_ms`: one submission to one validator, measured where a
             // submitter actually waits — the whole call, not the part of
@@ -287,7 +352,7 @@ impl LightClient for RemoteLightClient {
     }
 
     fn get_validators(&self) -> impl Future<Output = Result<Vec<String>, QueryError>> + Send {
-        let client = self.client.clone();
+        let client = self.rpc_client().clone();
         async move {
             let resp = client
                 .get_validators(GetValidatorsRequest {})
@@ -298,7 +363,7 @@ impl LightClient for RemoteLightClient {
     }
 
     fn get_consensus_info(&self) -> impl Future<Output = Result<ConsensusInfo, QueryError>> + Send {
-        let client = self.client.clone();
+        let client = self.rpc_client().clone();
         async move {
             let resp = client
                 .get_consensus_info(GetConsensusInfoRequest {})
@@ -324,8 +389,8 @@ impl LightClient for RemoteLightClient {
         &self,
         owner: SettlementKey,
     ) -> impl Future<Output = Result<Option<OwnerCoins>, QueryError>> + Send {
-        let client = self.client.clone();
-        let verifier = self.verifier.clone();
+        let client = self.rpc_client().clone();
+        let verifier = self.consensus_verifier().cloned();
         async move {
             let resp = client
                 .get_coins_by_owner(GetCoinsByOwnerRequest {
@@ -360,8 +425,8 @@ impl LightClient for RemoteLightClient {
         &self,
         owner: SettlementKey,
     ) -> impl Future<Output = Result<Option<OwnerEdges>, QueryError>> + Send {
-        let client = self.client.clone();
-        let verifier = self.verifier.clone();
+        let client = self.rpc_client().clone();
+        let verifier = self.consensus_verifier().cloned();
         async move {
             let resp = client
                 .get_edges_by_owner(GetEdgesByOwnerRequest {
@@ -425,13 +490,16 @@ fn owner_edges_from_proto(
     Ok(Some(OwnerEdges { snapshot, edges }))
 }
 
-impl FinalizedWorkView for RemoteLightClient {
+impl<C> FinalizedWorkView for C
+where
+    C: RemoteClientState,
+{
     fn work_channel_snapshot(
         &self,
         query: WorkChannelQuery,
     ) -> impl Future<Output = Result<Option<WorkChannelSnapshot>, QueryError>> + Send {
-        let client = self.client.clone();
-        let verifier = self.verifier.clone();
+        let client = self.rpc_client().clone();
+        let verifier = self.consensus_verifier().cloned();
         async move {
             let response = client
                 .get_work_channel_snapshot(GetWorkChannelSnapshotRequest {
