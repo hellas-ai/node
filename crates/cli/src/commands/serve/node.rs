@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Context;
+use futures::future::BoxFuture;
 use hellas_chain::client::VerifiedRemoteLightClient;
 use hellas_chain::work_blocks::advance_paid_work_clock;
 use hellas_chain::{
@@ -34,12 +35,20 @@ use hellas_rpc::pb::work::{
 };
 use hellas_rpc::peers::{PeerDirectory, PeerId, PeerManager};
 use hellas_rpc::policy::ExecutePolicy;
-use hellas_rpc::protocol::work_setup::{ProviderChannelPolicy, WorkChannelDescriptor};
+use hellas_rpc::protocol::Digest;
+use hellas_rpc::protocol::work::{
+    PaidJobAuthorizationV1, PrivateRecord as _, work_id as accepted_work_id,
+};
+use hellas_rpc::protocol::work_setup::{
+    ProviderChannelPolicy, ReadyChannel, WorkChannelDescriptor,
+};
 use hellas_rpc::serve::AccountingDispatcher;
 use hellas_rpc::services::node::{Node, NodeServer};
 use hellas_rpc::services::work::{Work, WorkHandler, WorkServer};
 use hellas_rpc::services::work_setup::{WorkSetup, WorkSetupHandler, WorkSetupServer};
-use hellas_rpc::work::{CloseEndpoint, WorkService};
+use hellas_rpc::work::{
+    CloseEndpoint, PaidEvaluateBackend, RunError, RunOutcome, WorkService, run_accepted_work,
+};
 use hellas_rpc::work_close::{FinalizedBlocks, TxSink};
 use hellas_rpc::work_handshake::{PaymentAdmission, SetupEndpoint, SetupService};
 use hellas_rpc::work_open::{
@@ -217,7 +226,10 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
     //    and given the same mount slot the accept loop reads: the runner
     //    publishes the channel it is handed, and `Work` is answered from
     //    it from that moment on.
-    let work_mount: MountedWork<ProductionWorkSource> = MountedWork::default();
+    // The paid driver owns the executor handle from here on. Its clones
+    // live in the mount and every mounted handler, so preloading is not
+    // the last operation the executor actor can receive.
+    let work_mount: MountedWork<ProductionWorkSource> = MountedWork::with_backend(handle);
     let setup_mount = MountedSetup::default();
     let work = config.work.map(|work| {
         let poll = work.poll;
@@ -467,11 +479,97 @@ pub(super) struct WorkRunnerConfig {
 /// dispatch path never waits while holding the mount, and the clock never
 /// waits on a request.
 #[derive(Clone)]
-pub(super) struct MountedWork<S>(Arc<Mutex<Option<MountedWorkService<S>>>>);
+pub(super) struct MountedWork<S> {
+    mounted: Arc<Mutex<Option<MountedWorkService<S>>>>,
+    driver: Option<AcceptedWorkDriver>,
+}
 
 impl<S> Default for MountedWork<S> {
     fn default() -> Self {
-        Self(Arc::new(Mutex::new(None)))
+        Self {
+            mounted: Arc::new(Mutex::new(None)),
+            driver: None,
+        }
+    }
+}
+
+/// A cloneable, type-erased owner of the backend that runs accepted work.
+///
+/// The production value owns an [`hellas_executor::ExecutorHandle`].
+/// Keeping the backend behind this narrow local seam means the clock and
+/// ALPN dispatcher stay parameterized only over their finalized source;
+/// neither has a second opinion about paid admission or execution failure.
+#[derive(Clone)]
+struct AcceptedWorkDriver(Arc<dyn DriveAcceptedWork>);
+
+trait DriveAcceptedWork: Send + Sync {
+    fn run(
+        &self,
+        service: WorkService,
+        ready: ReadyChannel,
+        work_id: Digest,
+    ) -> BoxFuture<'static, Result<RunOutcome, RunError>>;
+}
+
+struct BackendWorkDriver<B> {
+    backend: Arc<B>,
+}
+
+impl<B> DriveAcceptedWork for BackendWorkDriver<B>
+where
+    B: PaidEvaluateBackend + Send + Sync + 'static,
+{
+    fn run(
+        &self,
+        service: WorkService,
+        ready: ReadyChannel,
+        work_id: Digest,
+    ) -> BoxFuture<'static, Result<RunOutcome, RunError>> {
+        let backend = Arc::clone(&self.backend);
+        Box::pin(
+            async move { run_accepted_work(&service, &ready, backend.as_ref(), work_id).await },
+        )
+    }
+}
+
+impl AcceptedWorkDriver {
+    fn new<B>(backend: B) -> Self
+    where
+        B: PaidEvaluateBackend + Send + Sync + 'static,
+    {
+        Self(Arc::new(BackendWorkDriver {
+            backend: Arc::new(backend),
+        }))
+    }
+
+    /// Starts one accepted job without lending its lifetime to either the
+    /// request path or the close clock.
+    fn spawn(&self, service: WorkService, ready: ReadyChannel, work_id: Digest) {
+        let running = self.0.run(service, ready, work_id);
+        tokio::spawn(async move {
+            match running.await {
+                Ok(RunOutcome::Completed { .. }) => {
+                    debug!(?work_id, "the accepted paid job completed")
+                }
+                Ok(RunOutcome::Ready { .. }) => {
+                    debug!(?work_id, "the accepted paid job was already complete")
+                }
+                Ok(RunOutcome::Running) => {
+                    debug!(?work_id, "the accepted paid job was already running")
+                }
+                Ok(RunOutcome::Indeterminate) => {
+                    warn!(
+                        ?work_id,
+                        "the accepted paid job is indeterminate after restart"
+                    )
+                }
+                // `run_accepted_work` has already made backend and
+                // transcript faults terminal before returning them. The
+                // remaining errors have no node-local terminal policy;
+                // keep the exact failure visible to the operator.
+                Err(error) => warn!(?work_id, %error, "the accepted paid job did not complete"),
+            }
+        });
     }
 }
 
@@ -489,6 +587,7 @@ struct MountedWorkService<S> {
     descriptor: Option<WorkChannelDescriptor>,
     source: Arc<Mutex<S>>,
     accepting: Arc<AsyncMutex<()>>,
+    driver: Option<AcceptedWorkDriver>,
 }
 
 impl<S> MountedWorkService<S>
@@ -502,7 +601,7 @@ where
     /// decision before the raw handler is reached. A missing policy,
     /// failed read, failed predicate, lagging cursor, or endpoint failure
     /// therefore leaves the request on the retryable `NotReady` side.
-    async fn refresh_admission(&self) -> anyhow::Result<()> {
+    async fn refresh_admission(&self) -> anyhow::Result<ReadyChannel> {
         let Some(descriptor) = self.descriptor.as_ref() else {
             anyhow::bail!("this channel has no measured admission policy");
         };
@@ -542,8 +641,9 @@ where
             .check_caught_up(cursor)
             .context("the mounted channel has not caught up to the fresh snapshot")?;
         self.service
-            .admit_new_work(ready)
-            .context("the driven work service refused its fresh readiness")
+            .admit_new_work(ready.clone())
+            .context("the driven work service refused its fresh readiness")?;
+        Ok(ready)
     }
 }
 
@@ -563,16 +663,47 @@ where
     > + Send {
         async move {
             let _accepting = self.accepting.lock().await;
-            if let Err(error) = self.refresh_admission().await {
-                debug!(%error, "an acceptance attempt found no fresh channel readiness");
-                return Ok(AcceptWorkResponse {
-                    outcome: Some(accept_work_response::Outcome::Refused(WorkRefused {
-                        code: WorkRefusalCode::NotReady as i32,
-                        reason: "fresh channel readiness is unavailable".to_string(),
-                    })),
-                });
+            let ready = match self.refresh_admission().await {
+                Ok(ready) => ready,
+                Err(error) => {
+                    debug!(%error, "an acceptance attempt found no fresh channel readiness");
+                    return Ok(AcceptWorkResponse {
+                        outcome: Some(accept_work_response::Outcome::Refused(WorkRefused {
+                            code: WorkRefusalCode::NotReady as i32,
+                            reason: "fresh channel readiness is unavailable".to_string(),
+                        })),
+                    });
+                }
+            };
+            // Derive the id from the request while the accepted response
+            // is still only a possibility. The response carries only the
+            // provider signature, and consulting `state.job()` after it
+            // leaves would race the clock terminalizing that same job.
+            let work_id = self
+                .service
+                .with_state(|state| {
+                    PaidJobAuthorizationV1::decode(&request.authorization)
+                        .ok()
+                        .map(|authorization| accepted_work_id(state.channel(), &authorization))
+                })
+                .ok()
+                .flatten();
+            let response = self.service.accept(&request);
+            if matches!(
+                response.outcome.as_ref(),
+                Some(accept_work_response::Outcome::Accepted(_))
+            ) {
+                match (self.driver.as_ref(), work_id) {
+                    (Some(driver), Some(work_id)) => {
+                        driver.spawn(self.service.clone(), ready, work_id);
+                    }
+                    (None, Some(work_id)) => {
+                        warn!(?work_id, "accepted paid work has no execution backend")
+                    }
+                    (_, None) => warn!("accepted paid work has no mounted job to execute"),
+                }
             }
-            Ok(self.service.accept(&request))
+            Ok(response)
         }
     }
 
@@ -604,6 +735,16 @@ where
 }
 
 impl<S: Clone> MountedWork<S> {
+    fn with_backend<B>(backend: B) -> Self
+    where
+        B: PaidEvaluateBackend + Send + Sync + 'static,
+    {
+        Self {
+            mounted: Arc::new(Mutex::new(None)),
+            driver: Some(AcceptedWorkDriver::new(backend)),
+        }
+    }
+
     /// Serves `Work` from `service` from now on, and says whether it
     /// took the slot.
     ///
@@ -618,7 +759,7 @@ impl<S: Clone> MountedWork<S> {
         descriptor: Option<WorkChannelDescriptor>,
         source: &S,
     ) -> bool {
-        match self.0.lock() {
+        match self.mounted.lock() {
             Ok(mut held) if held.is_none() => {
                 *held = Some(MountedWorkService {
                     bond_edge,
@@ -626,6 +767,7 @@ impl<S: Clone> MountedWork<S> {
                     descriptor,
                     source: Arc::new(Mutex::new(source.clone())),
                     accepting: Arc::new(AsyncMutex::new(())),
+                    driver: self.driver.clone(),
                 });
                 true
             }
@@ -636,7 +778,7 @@ impl<S: Clone> MountedWork<S> {
     /// The mounted channel's served handler, when the runner has mounted
     /// one.
     fn handler(&self) -> Option<MountedWorkService<S>> {
-        self.0.lock().ok().and_then(|held| held.clone())
+        self.mounted.lock().ok().and_then(|held| held.clone())
     }
 
     /// The exact mounted service, for the clock and its state checks.
@@ -650,7 +792,7 @@ impl<S: Clone> MountedWork<S> {
     /// because they share this inner source slot. Neither mount lock is
     /// held across a source request.
     fn refresh_source(&self, bond_edge: EdgeId, source: &S) {
-        let source_slot = self.0.lock().ok().and_then(|held| {
+        let source_slot = self.mounted.lock().ok().and_then(|held| {
             held.as_ref()
                 .filter(|mounted| mounted.bond_edge == bond_edge)
                 .map(|mounted| Arc::clone(&mounted.source))
@@ -669,7 +811,7 @@ impl<S: Clone> MountedWork<S> {
     /// runner drops it, and a handler still holding it open would be the
     /// one thing keeping the files this process no longer owns.
     fn clear_all(&self) {
-        if let Ok(mut held) = self.0.lock() {
+        if let Ok(mut held) = self.mounted.lock() {
             *held = None;
         }
     }
@@ -1159,6 +1301,7 @@ where
 mod tests {
     use std::collections::BTreeSet;
     use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use hellas_chain::{LatestBlock, QueryError, WorkChannelQuery, WorkChannelSnapshot};
     use hellas_kernel::{
@@ -1182,16 +1325,17 @@ mod tests {
     };
     use hellas_rpc::protocol::work::{
         JobDeadlines, PaidChannelPolicyV1, PaidExecutionPolicyV1, PaidJobAuthorizationV1,
-        PrivateRecord as _, encode_transcript, generation_policy_digest, identity_source_digest,
-        next_payment, payment_binding_digest, private_policy_commitment, propose_authorization,
-        result_digest, signing_hash, terminal_result, work_id,
+        PrivateRecord as _, decode_transcript, delivery_request_digest, encode_transcript,
+        generation_policy_digest, identity_source_digest, next_payment, payment_binding_digest,
+        private_policy_commitment, propose_authorization, result_digest, signing_hash,
+        terminal_result, work_id,
     };
     use hellas_rpc::protocol::work_bundle::WorkChannelSetupBundleV1;
     use hellas_rpc::protocol::work_setup::{OmissionMeasurements, ProviderChannelPolicy};
     use hellas_rpc::protocol::{ContentId, Digest};
     use hellas_rpc::services::work::WorkClientImpl;
     use hellas_rpc::services::work_setup::WorkSetupClientImpl;
-    use hellas_rpc::work::WorkRefusal;
+    use hellas_rpc::work::{BackendFault, WorkRefusal};
     use hellas_rpc::work_close::{BlockSourceError, FinalizedWork};
     use hellas_rpc::work_handshake::{apply_setup_exchange, prepare_setup_exchange};
     use hellas_rpc::work_open::{FinalizedSetup, SetupQuery};
@@ -1872,6 +2016,70 @@ mod tests {
         }) {
             Ok(events) => events,
             Err(error) => panic!("the fixture transcript finishes: {error}"),
+        }
+    }
+
+    /// The executor-side seam in the node proof. The paid gate still
+    /// rebuilds the request from its journal; this backend supplies only
+    /// the terminal that a real executor would stream back.
+    #[derive(Clone)]
+    struct AnsweringPaidBackend {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl PaidEvaluateBackend for AnsweringPaidBackend {
+        async fn evaluate(
+            &self,
+            request: EvaluateRequest,
+        ) -> Result<Vec<OutputEventEnvelope>, BackendFault> {
+            assert_eq!(
+                request.text_execution,
+                evaluate_request().text_execution,
+                "the paid gate dispatches the request retained in the accepted bundle",
+            );
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(answer_transcript())
+        }
+    }
+
+    /// A paid backend whose call outlives the request-path assertion.
+    #[derive(Clone)]
+    struct BlockingPaidBackend {
+        entered: Arc<Semaphore>,
+        release: Arc<Semaphore>,
+    }
+
+    impl BlockingPaidBackend {
+        fn new() -> Self {
+            Self {
+                entered: Arc::new(Semaphore::new(0)),
+                release: Arc::new(Semaphore::new(0)),
+            }
+        }
+
+        async fn wait_for_call(&self) {
+            match self.entered.acquire().await {
+                Ok(permit) => permit.forget(),
+                Err(error) => panic!("the blocking backend stays open: {error}"),
+            }
+        }
+
+        fn finish(&self) {
+            self.release.add_permits(1);
+        }
+    }
+
+    impl PaidEvaluateBackend for BlockingPaidBackend {
+        async fn evaluate(
+            &self,
+            _request: EvaluateRequest,
+        ) -> Result<Vec<OutputEventEnvelope>, BackendFault> {
+            self.entered.add_permits(1);
+            match self.release.acquire().await {
+                Ok(permit) => permit.forget(),
+                Err(error) => return Err(BackendFault::new(error.to_string())),
+            }
+            Ok(answer_transcript())
         }
     }
 
@@ -2590,12 +2798,16 @@ mod tests {
         stop: Option<oneshot::Sender<()>>,
         setup_mount: MountedSetup,
         work_mount: MountedWork<NodeChain>,
+        execution_calls: Arc<AtomicUsize>,
     }
 
     impl RunningPaidNode {
         async fn start(root: &Path, admission: PaymentAdmission, source: NodeChain) -> Self {
             let setup_mount = MountedSetup::default();
-            let work_mount = MountedWork::default();
+            let execution_calls = Arc::new(AtomicUsize::new(0));
+            let work_mount = MountedWork::with_backend(AnsweringPaidBackend {
+                calls: Arc::clone(&execution_calls),
+            });
             let runner = match WorkRunner::discover(
                 WorkRunnerConfig {
                     network: network(),
@@ -2716,6 +2928,7 @@ mod tests {
                 stop: Some(stop),
                 setup_mount,
                 work_mount,
+                execution_calls,
             }
         }
 
@@ -2755,6 +2968,90 @@ mod tests {
             drop(client);
             connection.close(0_u32.into(), b"work request complete");
             response
+        }
+
+        async fn deliver_result(&self, work_id: Digest) -> DeliverResultResponse {
+            let (transport, connection) =
+                self.connect(<Work as ServiceMarker>::ALPN.as_bytes()).await;
+            let exporter = match transport.open_exporter() {
+                Ok(exporter) => exporter,
+                Err(error) => panic!("the client derives this Work connection's exporter: {error}"),
+            };
+            let request = DeliverResultRequest {
+                work_id: work_id.as_bytes().to_vec(),
+                client_signature: client()
+                    .sign(signing_hash(delivery_request_digest(
+                        descriptor().channel(),
+                        work_id,
+                        &exporter,
+                    )))
+                    .as_bytes()
+                    .to_vec(),
+            };
+            let client = WorkClientImpl::new(transport);
+            let response = match client.deliver_result(request).await {
+                Ok(response) => response,
+                Err(error) => panic!("Work delivery reaches the node: {error}"),
+            };
+            drop(client);
+            connection.close(0_u32.into(), b"work delivery complete");
+            response
+        }
+
+        /// Polls through the wire's retryable `NotReady` until the detached
+        /// invocation has made its signed terminal durable.
+        async fn wait_for_result(&self, work_id: Digest) -> Vec<OutputEventEnvelope> {
+            let delivered = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let response = self.deliver_result(work_id).await;
+                    match response.outcome {
+                        Some(deliver_result_response::Outcome::Delivered(delivered)) => {
+                            break delivered;
+                        }
+                        Some(deliver_result_response::Outcome::Refused(refusal))
+                            if refusal.code == WorkRefusalCode::NotReady as i32 =>
+                        {
+                            tokio::task::yield_now().await;
+                        }
+                        outcome => panic!(
+                            "the accepted job remains retryable until its result is ready, got {outcome:?}",
+                        ),
+                    }
+                }
+            })
+            .await;
+            let delivered = match delivered {
+                Ok(delivered) => delivered,
+                Err(_) => panic!("the accepted job's result reaches the client"),
+            };
+            let expected = match terminal_result(
+                descriptor().channel(),
+                &authorization(),
+                &answer_transcript(),
+            ) {
+                Ok(result) => result,
+                Err(error) => panic!("the expected terminal result derives: {error}"),
+            };
+            assert_eq!(
+                delivered.result,
+                expected.encode(),
+                "the client receives the result the retained invocation produced",
+            );
+            assert_eq!(
+                delivered.provider_signature,
+                provider()
+                    .sign(signing_hash(result_digest(
+                        descriptor().channel(),
+                        &expected,
+                    )))
+                    .as_bytes(),
+                "the result reaches the client with this provider's signature",
+            );
+            let budget = usize::try_from(execution_policy().max_spool_bytes).unwrap_or(usize::MAX);
+            match decode_transcript(&delivered.transcript, budget) {
+                Ok(transcript) => transcript,
+                Err(error) => panic!("the delivered transcript decodes: {error}"),
+            }
         }
 
         async fn wait_for_mount(&self) {
@@ -2894,6 +3191,18 @@ mod tests {
             panic!(
                 "the valid proposal must reach the freshly admitted driven service, got {:?}",
                 response.outcome,
+            );
+        } else {
+            let id = work_id(descriptor().channel(), &authorization());
+            assert_eq!(
+                node.wait_for_result(id).await,
+                answer_transcript(),
+                "the real delivery seam returns the executed transcript",
+            );
+            assert_eq!(
+                node.execution_calls.load(Ordering::SeqCst),
+                1,
+                "the node invokes its retained executor exactly once",
             );
         }
         node.shutdown().await;
@@ -3180,9 +3489,11 @@ mod tests {
     async fn the_clock_does_not_starve_the_request_path() {
         let dir = temp();
         write_setup_journal(dir.path());
-        let mount = MountedWork::default();
+        let backend = BlockingPaidBackend::new();
+        let mount = MountedWork::with_backend(backend.clone());
         let mut runner = runner(dir.path(), Some(admits()), &mount);
         let chain = TestChain::slow();
+        chain.set_snapshot(ready_channel_snapshot(ORIGIN, None));
 
         let ticking = {
             let chain = chain.clone();
@@ -3193,23 +3504,36 @@ mod tests {
         // The dispatch path's own two steps, both taken while the clock
         // is inside the chain read: resolve the handler for this ALPN,
         // and answer with it.
-        let dispatch = mount.clone();
-        let answered = tokio::time::timeout(
-            Duration::from_secs(5),
-            tokio::task::spawn_blocking(move || {
-                dispatch
-                    .service()
-                    .map(|service| service.accept(&AcceptWorkRequest::default()))
-            }),
-        )
+        let Some(dispatch) = mount.handler() else {
+            panic!("the channel is mounted before the chain is read")
+        };
+        let answered = tokio::time::timeout(Duration::from_secs(5), async move {
+            let response = dispatch
+                .accept_work(signed_accept_request(), TransportContext::default())
+                .await?;
+            Ok::<WithTrailer<AcceptWorkResponse>, WireStatus>(response.into())
+        })
         .await;
         match answered {
-            Ok(Ok(Some(_))) => {}
-            Ok(Ok(None)) => panic!("the channel is mounted before the chain is read"),
+            Ok(Ok(response)) => {
+                assert!(
+                    matches!(
+                        response.response.outcome,
+                        Some(accept_work_response::Outcome::Accepted(_))
+                    ),
+                    "the request is accepted while the close clock is waiting",
+                );
+            }
             Ok(Err(error)) => panic!("the request path is reachable: {error}"),
             Err(_) => panic!("an inbound request waited on the clock's chain read"),
         }
+        let entered = tokio::time::timeout(Duration::from_secs(5), backend.wait_for_call()).await;
+        assert!(
+            entered.is_ok(),
+            "the accepted job reaches its executor without joining the close clock",
+        );
 
+        backend.finish();
         chain.release();
         if let Err(error) = ticking.await {
             panic!("the tick finishes once the chain answers: {error}");
