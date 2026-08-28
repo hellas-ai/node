@@ -2716,34 +2716,51 @@ mod tests {
     /// `measured` one anywhere was a fixture. What the operator path
     /// produces here is a *real* one — three terms from real fsyncs,
     /// real rotations and real replays on a real journal, and eleven
-    /// written down — and the answer is `assumed`, which is a node that
-    /// countersigns nothing. The fixture above is what a run whose
-    /// evidence supports `measured` loads as; this is what a run on this
-    /// tree today actually earns, and the two are deliberately different
-    /// answers.
+    /// written down. Those eleven make a floor that fits this deployment
+    /// `assumed`; a machine whose measured waits do not fit is `refused`
+    /// by that exact floor instead. The assertion below derives which
+    /// answer this run earned from its raw samples, so machine speed can
+    /// change the grade but cannot change whether the correspondence
+    /// passes.
     #[test]
     fn the_probe_writes_an_artifact_this_loader_reads_and_grades() {
         let dir = tempfile::tempdir().unwrap();
         let config_path = write(&dir, &config());
         let assume_path = dir.path().join("assume.json");
-        // A slow block and a quick restart, so the terms the run does
-        // measure cannot carry `T` anywhere near the start span
-        // whatever this machine's disk does.
+        // The three measured slots are overwritten from the artifact
+        // before this becomes a budget; they are not assumptions the
+        // probe is handed.
+        let assumed_budget = MountBudget {
+            fsync_tail_ms: 0,
+            rotation_tail_ms: 0,
+            response_build_ms: 4,
+            one_block_fetch_ms: 25,
+            fresh_tip_ms: 14,
+            close_prepared_fsync_ms: 6,
+            rpc_ms: 44,
+            response_worker_ms: 9,
+            general_worker_ms: 8,
+            validation_ms: 3,
+            restart_replay_ms_at_cap: 0,
+            restart_downtime_ms: 100,
+            lower_tail_block_ms: 5_000,
+            general_inclusion_blocks: 3,
+        };
         fs::write(
             &assume_path,
             serde_json::json!({
                 "budget": {
-                    "response_build_ms": 4,
-                    "one_block_fetch_ms": 25,
-                    "fresh_tip_ms": 14,
-                    "close_prepared_fsync_ms": 6,
-                    "rpc_ms": 44,
-                    "response_worker_ms": 9,
-                    "general_worker_ms": 8,
-                    "validation_ms": 3,
-                    "restart_downtime_ms": 100,
-                    "lower_tail_block_ms": 5_000,
-                    "general_inclusion_blocks": 3,
+                    "response_build_ms": assumed_budget.response_build_ms,
+                    "one_block_fetch_ms": assumed_budget.one_block_fetch_ms,
+                    "fresh_tip_ms": assumed_budget.fresh_tip_ms,
+                    "close_prepared_fsync_ms": assumed_budget.close_prepared_fsync_ms,
+                    "rpc_ms": assumed_budget.rpc_ms,
+                    "response_worker_ms": assumed_budget.response_worker_ms,
+                    "general_worker_ms": assumed_budget.general_worker_ms,
+                    "validation_ms": assumed_budget.validation_ms,
+                    "restart_downtime_ms": assumed_budget.restart_downtime_ms,
+                    "lower_tail_block_ms": assumed_budget.lower_tail_block_ms,
+                    "general_inclusion_blocks": assumed_budget.general_inclusion_blocks,
                 },
                 "omission": {
                     "response_probability": 999_000,
@@ -2786,23 +2803,45 @@ mod tests {
         ))
         .expect("the configuration pinning the probe's artifact loads");
 
-        let duties = load_paid_work_duties(&loaded).expect("the probe's artifact parses");
-
-        assert!(
-            matches!(duties, PaidWorkDuties::Assumed(_)),
-            "eleven written-down terms and no contest is not a measured deployment: {duties:?}",
-        );
-        assert!(!duties.admits_paid_work());
-        let evidence = duties.evidence().expect("the artifact was read");
-        assert_eq!(evidence.samples, 0, "an assumed field rests on no samples");
-        assert_eq!(evidence.provenance.machine, "bootstrap-1");
-        assert!(
-            evidence.provenance.started_at_unix_ms <= evidence.provenance.measured_at_unix_ms,
-            "the run's own window is one",
-        );
-        // The three terms the run genuinely observed are the journal's,
-        // and the floor is computed over what they came to.
+        // Derive the grade from the bytes before asking the loader for
+        // it. A loaded floor answers to the durations this run actually
+        // saw; no duration here is a test threshold.
         let artifact: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let longest = |term: &str| {
+            artifact["budget"][term]["samples"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{term} carries raw samples"))
+                .iter()
+                .map(|sample| {
+                    sample["value"]
+                        .as_u64()
+                        .unwrap_or_else(|| panic!("{term} carries a whole-millisecond sample"))
+                })
+                .max()
+                .unwrap_or_else(|| panic!("{term} carries at least one sample"))
+        };
+        let measured_budget = MountBudget {
+            fsync_tail_ms: longest("fsync_tail_ms"),
+            rotation_tail_ms: longest("rotation_tail_ms"),
+            restart_replay_ms_at_cap: longest("restart_replay_ms_at_cap"),
+            ..assumed_budget
+        };
+        let expected_grade = measured_budget.floor().and_then(|floor| {
+            floor.check_start_span()?;
+            floor.check_alarm_margin(loaded.response_alarm_margin_blocks)?;
+            Ok(floor)
+        });
+
+        let duties = load_paid_work_duties(&loaded).expect("the probe's artifact parses");
+        assert!(!duties.admits_paid_work());
+        assert_eq!(artifact["provenance"]["machine"], "bootstrap-1");
+        let started_at = artifact["provenance"]["started_at_unix_ms"]
+            .as_u64()
+            .expect("the probe writes a whole-millisecond start");
+        let measured_at = artifact["provenance"]["measured_at_unix_ms"]
+            .as_u64()
+            .expect("the probe writes a whole-millisecond finish");
+        assert!(started_at <= measured_at, "the run's own window is one",);
         for term in [
             "fsync_tail_ms",
             "rotation_tail_ms",
@@ -2810,12 +2849,35 @@ mod tests {
         ] {
             assert_eq!(artifact["budget"][term]["evidence"], "measured", "{term}");
         }
+        for term in [
+            "response_build_ms",
+            "one_block_fetch_ms",
+            "fresh_tip_ms",
+            "close_prepared_fsync_ms",
+            "rpc_ms",
+            "response_worker_ms",
+            "general_worker_ms",
+            "validation_ms",
+            "restart_downtime_ms",
+            "lower_tail_block_ms",
+            "general_inclusion_blocks",
+        ] {
+            assert_eq!(artifact["budget"][term]["evidence"], "assumed", "{term}");
+        }
         assert_eq!(artifact["omission"]["response_trials"]["trials"], 0);
-        assert!(
-            evidence.floor.t() <= 64,
-            "the probe's own floor fits the start span: T={}",
-            evidence.floor.t(),
-        );
+        match (expected_grade, duties) {
+            (Ok(expected_floor), PaidWorkDuties::Assumed(evidence)) => {
+                assert_eq!(evidence.samples, 0, "an assumed field rests on no samples");
+                assert_eq!(evidence.provenance.machine, "bootstrap-1");
+                assert_eq!(evidence.floor, expected_floor);
+            }
+            (Err(expected), PaidWorkDuties::Refused(actual)) => {
+                assert_eq!(actual, expected, "the loader grades this run's own floor");
+            }
+            (expected, actual) => {
+                panic!("the loader graded the probe as {actual:?}, expected {expected:?}")
+            }
+        }
     }
 
     /// A restarted node rebuilds the endpoint from what serve holds: the
