@@ -156,7 +156,7 @@ async fn run_with_store(
         info!(
             network = %work.chain.network,
             validators = work.validators.len(),
-            journal_root = %work.journal.root.display(),
+            journal_root = %work.journal_root.display(),
             poll_ms = work.poll.as_millis(),
             response_alarm_margin_blocks = work.response_alarm_margin_blocks,
             // Said back because it is the party the chain will see: an
@@ -176,7 +176,7 @@ async fn run_with_store(
         // not a flag the runner re-derives.
         work_runner = Some(node::WorkRunnerConfig {
             network: work.chain.network,
-            journal_root: work.journal.root.clone(),
+            journal_root: work.journal_root.clone(),
             validators: work.validators.clone(),
             poll: work.poll,
             settlement_key: options.settlement_key.clone(),

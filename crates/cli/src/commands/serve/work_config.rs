@@ -5,7 +5,7 @@
 //! whose contents were never opened. A node cannot mount a channel from
 //! a path, so this is the schema and the loader for what is in it: the
 //! three-part chain cross-check, the six validator URLs a write is
-//! fanned to, the journal root and its caps, the two policies this
+//! fanned to, the journal root, the two policies this
 //! provider works under, the watcher's poll cadence, the response
 //! alarm's margin, and the identity of the measured artifact.
 //!
@@ -21,12 +21,16 @@
 //!
 //! # What is deliberately not here
 //!
-//! There is no Start-span field and no mutual-margin field. Both were
-//! deleted: the Start span is fixed at 64 and a work-payment edge has no
-//! Mutual route, so either one appearing in a file is an operator
-//! configuring something that does not exist. Every struct below denies
-//! unknown fields, which is what turns that into an error naming the
-//! field.
+//! There is no Start-span field, no mutual-margin field, and no journal
+//! cap. All were deleted: the Start span is fixed at 64, a work-payment
+//! edge has no Mutual route, and the journal's active and checkpoint
+//! ceilings are constants it enforces on itself
+//! ([`MAX_ACTIVE_JOURNAL_BYTES`]), so any of them appearing in a file is
+//! an operator configuring something that does not exist. Every struct
+//! below denies unknown fields, which is what turns that into an error
+//! naming the field.
+//!
+//! [`MAX_ACTIVE_JOURNAL_BYTES`]: hellas_rpc::work_store::journal::MAX_ACTIVE_JOURNAL_BYTES
 //!
 //! # The floor, and where it is decided
 //!
@@ -64,7 +68,6 @@ use hellas_rpc::protocol::work::{
 };
 use hellas_rpc::protocol::work_setup::{OmissionMeasurements, ProviderChannelPolicy};
 use hellas_rpc::work_handshake::PaymentAdmission;
-use hellas_rpc::work_store::journal::MAX_RECORD_BYTES;
 use serde::Deserialize;
 
 use crate::commands::CliResult;
@@ -94,8 +97,8 @@ pub struct WorkConfig {
     pub chain: ChainCrossCheck,
     /// The six validator RPC URLs every write is fanned to.
     pub validators: Vec<String>,
-    /// Where the work journals live, and how large they may grow.
-    pub journal: JournalLimits,
+    /// Directory holding the setup and channel journals.
+    pub journal_root: PathBuf,
     /// Salt of the private credit-policy commitment.
     pub policy_salt: [u8; 32],
     /// The credit policy this provider will work under.
@@ -189,23 +192,6 @@ pub struct ChainCrossCheck {
     pub genesis_payload_digest: Digest,
     /// The threshold identity finalized blocks are verified under.
     pub threshold_identity: Vec<u8>,
-}
-
-/// Where the work journals live and how large they may grow.
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(
-    dead_code,
-    reason = "the fields a mount consumes are read by the node runner; loading and checking them is this half"
-)]
-pub struct JournalLimits {
-    /// Directory holding the setup and channel journals.
-    pub root: PathBuf,
-    /// Soft cap on one active journal file.
-    pub max_active_bytes: u64,
-    /// Soft cap on frames in one active journal file.
-    pub max_active_frames: u64,
-    /// Largest checkpoint a rotation may write.
-    pub max_checkpoint_bytes: u64,
 }
 
 /// Which measured artifact this node's admission rests on.
@@ -427,9 +413,9 @@ pub struct ArtifactProvenance {
 /// digest that is not thirty-two bytes, a threshold identity consensus
 /// cannot decode, a validator list that is not exactly
 /// [`VALIDATOR_COUNT`] URLs with distinct normalised forms, an execution
-/// policy the protocol's own [`check_execution_policy`] rejects, a
-/// journal cap of zero or one larger than the journal's own record
-/// ceiling, a zero poll cadence, and a zero response-alarm margin.
+/// policy the protocol's own [`check_execution_policy`] rejects, an
+/// empty journal root, a zero poll cadence, and a zero response-alarm
+/// margin.
 pub fn load_work_config(path: &Path) -> CliResult<WorkConfig> {
     let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
     let file: WorkConfigFile = serde_json::from_slice(&bytes)
@@ -527,7 +513,7 @@ impl WorkConfigFile {
         })
         .map_err(|error| anyhow::anyhow!("chain.threshold_identity is not usable: {error}"))?;
 
-        let journal = self.journal.into_limits()?;
+        let journal_root = self.journal.into_root()?;
         let policies = self.policies.into_policies()?;
         if self.poll_ms == 0 {
             bail!("poll_ms must be greater than zero");
@@ -546,7 +532,7 @@ impl WorkConfigFile {
                 threshold_identity,
             },
             validators,
-            journal,
+            journal_root,
             policy_salt: policies.0,
             channel_policy: policies.1,
             execution_policy: policies.2,
@@ -607,53 +593,24 @@ struct ChainFile {
     threshold_identity: String,
 }
 
+/// Where the work journals live.
+///
+/// A root and nothing else. How large a journal may grow is not an
+/// operator's to say: the active and checkpoint ceilings are constants
+/// the journal enforces on itself, so a cap here would be a number
+/// written down and ignored.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct JournalFile {
     root: PathBuf,
-    max_active_bytes: u64,
-    max_active_frames: u64,
-    max_checkpoint_bytes: u64,
 }
 
 impl JournalFile {
-    fn into_limits(self) -> CliResult<JournalLimits> {
+    fn into_root(self) -> CliResult<PathBuf> {
         if self.root.as_os_str().is_empty() {
             bail!("journal.root must be a path");
         }
-        for (name, value) in [
-            ("journal.max_active_bytes", self.max_active_bytes),
-            ("journal.max_active_frames", self.max_active_frames),
-            ("journal.max_checkpoint_bytes", self.max_checkpoint_bytes),
-        ] {
-            if value == 0 {
-                bail!("{name} must be greater than zero");
-            }
-        }
-        // A checkpoint is one journal record, so a configured ceiling
-        // above the journal's own is a ceiling the journal will refuse
-        // to write at. That refusal would arrive at a rotation, which is
-        // the one moment a duty cannot absorb it.
-        let record_ceiling = MAX_RECORD_BYTES as u64;
-        if self.max_checkpoint_bytes > record_ceiling {
-            bail!(
-                "journal.max_checkpoint_bytes {} exceeds the {record_ceiling}-byte journal record ceiling",
-                self.max_checkpoint_bytes,
-            );
-        }
-        if self.max_checkpoint_bytes > self.max_active_bytes {
-            bail!(
-                "journal.max_checkpoint_bytes {} does not fit journal.max_active_bytes {}",
-                self.max_checkpoint_bytes,
-                self.max_active_bytes,
-            );
-        }
-        Ok(JournalLimits {
-            root: self.root,
-            max_active_bytes: self.max_active_bytes,
-            max_active_frames: self.max_active_frames,
-            max_checkpoint_bytes: self.max_checkpoint_bytes,
-        })
+        Ok(self.root)
     }
 }
 
@@ -1336,9 +1293,6 @@ mod tests {
             "validators": validators(),
             "journal": {
                 "root": "/var/lib/hellas/work",
-                "max_active_bytes": 67_108_864_u64,
-                "max_active_frames": 4_096_u64,
-                "max_checkpoint_bytes": 4_194_304_u64,
             },
             "policies": {
                 "policy_salt": hex32(0x5a),
@@ -1416,8 +1370,7 @@ mod tests {
         );
         assert_eq!(loaded.chain.threshold_identity, THRESHOLD_IDENTITY.to_vec());
         assert_eq!(loaded.validators.len(), VALIDATOR_COUNT);
-        assert_eq!(loaded.journal.root, PathBuf::from("/var/lib/hellas/work"));
-        assert_eq!(loaded.journal.max_active_frames, 4_096);
+        assert_eq!(loaded.journal_root, PathBuf::from("/var/lib/hellas/work"));
         assert_eq!(loaded.policy_salt, [0x5a; 32]);
         assert_eq!(loaded.channel_policy.compute_credit_limit, 40);
         assert_eq!(loaded.execution_policy.fixed_price, 10);
@@ -1439,7 +1392,7 @@ mod tests {
             (&[][..], "validators"),
             (&["chain"][..], "threshold_identity"),
             (&["chain"][..], "genesis_payload_digest"),
-            (&["journal"][..], "max_checkpoint_bytes"),
+            (&["journal"][..], "root"),
             (&["policies"][..], "policy_salt"),
             (&["policies", "execution"][..], "fixed_price"),
         ] {
@@ -1463,6 +1416,37 @@ mod tests {
             let error = format!(
                 "{:?}",
                 load(with(config(), field, serde_json::json!(64))).unwrap_err(),
+            );
+            assert!(
+                error.contains(field),
+                "the refusal for {field} does not name it: {error}",
+            );
+        }
+    }
+
+    /// The three journal caps the journal fixes for itself cannot be
+    /// configured back into existence.
+    ///
+    /// [`MAX_ACTIVE_JOURNAL_BYTES`], [`MAX_ACTIVE_FRAMES`] and
+    /// [`MAX_CHECKPOINT_BYTES`] are constants the journal enforces on
+    /// itself. A file still naming them is an operator writing 128 MiB
+    /// and getting 64 with nothing said, so the loader refuses it by the
+    /// name they wrote.
+    ///
+    /// [`MAX_ACTIVE_JOURNAL_BYTES`]: hellas_rpc::work_store::journal::MAX_ACTIVE_JOURNAL_BYTES
+    /// [`MAX_ACTIVE_FRAMES`]: hellas_rpc::work_store::journal::MAX_ACTIVE_FRAMES
+    /// [`MAX_CHECKPOINT_BYTES`]: hellas_rpc::work_store::journal::MAX_CHECKPOINT_BYTES
+    #[test]
+    fn a_journal_cap_the_journal_fixes_is_refused_by_name() {
+        for field in [
+            "max_active_bytes",
+            "max_active_frames",
+            "max_checkpoint_bytes",
+        ] {
+            let error = format!(
+                "{:?}",
+                load(with_unknown(config(), &["journal"], field))
+                    .expect_err("a cap the journal fixes is not an operator's to set"),
             );
             assert!(
                 error.contains(field),
@@ -1596,24 +1580,6 @@ mod tests {
         let error = format!("{:?}", load(with(config(), "chain", chain)).unwrap_err());
         assert!(
             error.contains("threshold_identity"),
-            "unexpected error: {error}",
-        );
-    }
-
-    #[test]
-    fn a_checkpoint_larger_than_a_journal_record_is_refused() {
-        let journal = serde_json::json!({
-            "root": "/var/lib/hellas/work",
-            "max_active_bytes": 67_108_864_u64,
-            "max_active_frames": 4_096_u64,
-            "max_checkpoint_bytes": (MAX_RECORD_BYTES as u64) + 1,
-        });
-        let error = format!(
-            "{:?}",
-            load(with(config(), "journal", journal)).unwrap_err()
-        );
-        assert!(
-            error.contains("max_checkpoint_bytes"),
             "unexpected error: {error}",
         );
     }
@@ -2723,12 +2689,7 @@ mod tests {
             with(
                 config(),
                 "journal",
-                serde_json::json!({
-                    "root": root.display().to_string(),
-                    "max_active_bytes": 67_108_864_u64,
-                    "max_active_frames": 4_096_u64,
-                    "max_checkpoint_bytes": 4_194_304_u64,
-                }),
+                serde_json::json!({ "root": root.display().to_string() }),
             ),
             "artifact",
             serde_json::json!({
@@ -2752,7 +2713,7 @@ mod tests {
         // root, staking the bond this node's own key is the maker of.
         {
             let store = SetupStore::open(
-                &loaded.journal.root,
+                &loaded.journal_root,
                 loaded.chain.network,
                 bond_edge,
                 Role::Provider,
@@ -2778,7 +2739,7 @@ mod tests {
         // The restart: the root and the network, and no bond edge or
         // role anywhere in the configuration to be told them by.
         let found =
-            hellas_rpc::work_store::discover_setups(&loaded.journal.root, loaded.chain.network)
+            hellas_rpc::work_store::discover_setups(&loaded.journal_root, loaded.chain.network)
                 .expect("the configured root enumerates");
         assert!(found.unidentified.is_empty(), "{:?}", found.unidentified);
         let [discovered] = found.setups.as_slice() else {
@@ -2788,7 +2749,7 @@ mod tests {
         assert_eq!(discovered.role, Role::Provider);
 
         let store = SetupStore::open(
-            &loaded.journal.root,
+            &loaded.journal_root,
             loaded.chain.network,
             discovered.bond_edge,
             discovered.role,
