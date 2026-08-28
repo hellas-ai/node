@@ -239,9 +239,8 @@ pub enum PaidWorkDuties {
     /// The configuration names an artifact and there is no file there.
     /// This is a node before its bootstrap run, not a broken one.
     NotFound,
-    /// A well-formed artifact that is not the one `artifact.digest`
-    /// pins: §4's *changed* evidence, from another binary, another
-    /// configuration or another machine.
+    /// The file at the configured path is not the one
+    /// `artifact.digest` pins: §4's *changed* evidence.
     Changed,
     /// The pinned artifact was read and §4's measured floor does not
     /// hold over it. This node countersigns nothing and holds no policy
@@ -434,20 +433,18 @@ pub fn load_work_config(path: &Path) -> CliResult<WorkConfig> {
 /// never made. So missing and changed evidence turn admission off and
 /// leave the node running.
 ///
-/// What *is* an error is a file that is present and is not an artifact.
-/// An operator writes this by hand until the bootstrap run writes it, so
-/// the field that is wrong is named, at startup, exactly as
-/// [`load_work_config`] names a configuration field.
-///
-/// The pin is compared after the parse and not before, for that reason:
-/// a typo in a file whose digest also differs would otherwise be
-/// reported as somebody else's artifact, and the operator would never
-/// learn which field they got wrong.
+/// What *is* an error is the pinned file being unreadable as an artifact.
+/// Its digest is compared before its contents are interpreted: bytes
+/// that do not match the pin were never this node's evidence to grade,
+/// however malformed they are. Once the bytes match, a malformed field
+/// is a corruption of the exact artifact the operator pinned and is
+/// named at startup, exactly as [`load_work_config`] names a
+/// configuration field.
 ///
 /// # Errors
 ///
-/// A file that does not parse, an unknown or missing field, a digest or
-/// machine name that is not one, and a label its sample count
+/// A pinned file that does not parse, an unknown or missing field, a
+/// digest or machine name that is not one, and a label its sample count
 /// contradicts.
 pub fn load_paid_work_duties(config: &WorkConfig) -> CliResult<PaidWorkDuties> {
     let Some(identity) = config.measured_artifact() else {
@@ -465,14 +462,14 @@ pub fn load_paid_work_duties(config: &WorkConfig) -> CliResult<PaidWorkDuties> {
             )));
         }
     };
+    if Digest::hash(&bytes) != identity.digest {
+        return Ok(PaidWorkDuties::Changed);
+    }
     let file: ArtifactBodyFile = serde_json::from_slice(&bytes)
         .with_context(|| format!("failed to parse artifact {}", identity.path.display()))?;
     let artifact = file
         .into_artifact()
         .with_context(|| format!("invalid artifact {}", identity.path.display()))?;
-    if Digest::hash(&bytes) != identity.digest {
-        return Ok(PaidWorkDuties::Changed);
-    }
     Ok(config.duties(artifact))
 }
 
@@ -2148,6 +2145,34 @@ mod tests {
             "unexpected summary: {}",
             duties.summary(),
         );
+    }
+
+    /// Bytes that do not match the pin are not this node's evidence to
+    /// interpret. Even an unparseable stale file is therefore changed
+    /// evidence, not a startup failure that prevents the close duty.
+    #[test]
+    fn a_mismatching_unparseable_artifact_is_changed_before_it_is_parsed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("artifact.json");
+        let bytes = b"this is not an artifact";
+        fs::write(&path, bytes).unwrap();
+        let pin = Digest::from_bytes([0x77; 32]);
+        assert_ne!(Digest::hash(bytes), pin, "the fixture must miss its pin");
+        let loaded = load(with(
+            config(),
+            "artifact",
+            serde_json::json!({
+                "path": path.display().to_string(),
+                "digest": hex::encode(pin.as_bytes()),
+            }),
+        ))
+        .expect("a configuration pinning stale bytes still loads");
+
+        let duties = load_paid_work_duties(&loaded)
+            .expect("mismatching bytes are changed evidence before they are parsed");
+
+        assert_eq!(duties, PaidWorkDuties::Changed);
+        assert!(duties.payment_admission().is_none());
     }
 
     /// A `ProviderChannelPolicy` is built from a configuration and its
