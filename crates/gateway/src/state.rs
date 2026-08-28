@@ -226,25 +226,22 @@ impl GatewayState {
     /// reach is named at every call site rather than defaulted.
     ///
     /// The property that makes it safe is *who can reach it*, and that
-    /// is a deployment decision, not a code one:
+    /// is no longer only a deployment decision:
     ///
-    /// - `hellas gateway` binds `127.0.0.1` by default, and there is no
-    ///   inbound authentication anywhere in this crate. Loopback is the
-    ///   entire access control.
-    /// - `--host 0.0.0.0`, a container port publish, or a reverse proxy
-    ///   in front of it hands every caller that can reach the port a
-    ///   remote fetch primitive: the model id comes from the request
-    ///   body, so a caller names a 700 GB repository and this process
-    ///   downloads it. That is the same door the quote path closed, one
-    ///   storey down.
-    /// - `--force-model` is the only thing in the tree that shuts it:
-    ///   it replaces the request's model before it reaches here, so
-    ///   callers can no longer choose what gets fetched.
-    ///
-    /// Unchanged deliberately, because no evidence says the gateway is
-    /// exposed today. If it is ever deployed to untrusted callers it
-    /// wants the executor's treatment — a local-reach mode, or a model
-    /// allowlist — and that is a decision, not a cleanup.
+    /// - `hellas gateway` refuses to bind anywhere but loopback
+    ///   ([`crate::access::loopback_addr`]), so `--host 0.0.0.0` is an
+    ///   error rather than an exposure, and every route in front of this
+    ///   requires the run's credential ([`crate::access::BearerLayer`]).
+    ///   A caller that cannot present it never names a model.
+    /// - A container port publish or a reverse proxy pointed at the
+    ///   loopback port still puts the port within someone else's reach.
+    ///   What it does not hand them is the fetch primitive: without the
+    ///   credential, which lives only in this process's memory and on
+    ///   the operator's terminal, the request is refused before the
+    ///   model id in its body is read.
+    /// - `--force-model` remains the way to take the choice away from
+    ///   callers who *are* credentialled: it replaces the request's model
+    ///   before it reaches here.
     async fn model_assets(&self, model: &str) -> anyhow::Result<Arc<ModelAssets>> {
         {
             let cache = self.model_cache.read().await;

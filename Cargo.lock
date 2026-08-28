@@ -3526,6 +3526,7 @@ dependencies = [
  "hellas-wire",
  "iroh",
  "prometheus-client",
+ "rand 0.10.2",
  "reqwest 0.13.1",
  "serde",
  "serde_json",

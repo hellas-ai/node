@@ -1,6 +1,7 @@
 #[macro_use]
 extern crate tracing;
 
+mod access;
 mod anthropic;
 mod backend;
 mod dispatch;
@@ -88,24 +89,35 @@ pub enum ResponsesBackend {
 pub async fn run(options: GatewayOptions) -> anyhow::Result<()> {
     let state = Arc::new(GatewayState::from_options(&options).await?);
 
+    // Every route below reaches an executor, so every route below is
+    // behind this run's credential. The layer goes on last, which in axum
+    // puts it outermost: a request without the credential is answered
+    // before a handler, the provenance layer, or the executor sees it.
+    let bearer = Arc::new(access::Bearer::generate());
     let app = Router::new()
         .route("/v1/chat/completions", post(openai::handle))
         .route("/v1/responses", post(responses::handle))
         .route("/v1/messages", post(anthropic::handle))
         .route("/v1/completions", post(plain::handle))
         .with_state(state.clone())
-        .layer(provenance_layer::ProvenanceLayer);
+        .layer(provenance_layer::ProvenanceLayer)
+        .layer(access::BearerLayer::new(bearer.clone()));
 
     let listener = bind_gateway(&options.host, options.port).await?;
     let bound_addr = listener
         .local_addr()
         .context("listener has no local address")?;
     info!("gateway listening on {bound_addr}");
+    bearer.announce();
 
     if let Some(metrics_port) = options.metrics_port {
         let registry = Arc::new(prometheus_client::registry::Registry::default());
         let bundle = crate::metrics::MetricsBundle::new(registry);
-        crate::metrics::spawn_metrics_server(metrics_port, bundle);
+        crate::metrics::spawn_metrics_server(
+            metrics_port,
+            bundle,
+            access::BearerLayer::new(bearer.clone()),
+        );
     }
 
     #[cfg(feature = "evaluate")]
@@ -133,16 +145,16 @@ pub async fn run(options: GatewayOptions) -> anyhow::Result<()> {
     }
 
     let wrap_child = if let Some(cmd) = options.wrap.as_deref() {
-        // Wrapped commands talk to us over loopback, so an unspecified bind
-        // address (0.0.0.0 / ::) becomes 127.0.0.1 in the URLs they see.
-        let host = if options.host == "0.0.0.0" || options.host == "::" {
-            "127.0.0.1"
-        } else {
-            options.host.as_str()
-        };
-        let base = format!("http://{host}:{}", bound_addr.port());
+        // The listener is loopback by construction, so the address we
+        // bound is the address the wrapped command can dial.
+        let base = format!("http://{bound_addr}");
         info!("wrapping `{cmd}` with gateway base {base}");
-        Some(wrap::spawn(cmd, &options.wrap_args, &base)?)
+        Some(wrap::spawn(
+            cmd,
+            &options.wrap_args,
+            &base,
+            &bearer.child_credential(),
+        )?)
     } else {
         None
     };
@@ -185,24 +197,27 @@ pub async fn run(options: GatewayOptions) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Bind the gateway listener. With `--port`, fail loud on conflict (the user
-/// asked for that exact port). Without it, try 8080 first and fall back to
-/// an OS-assigned port on EADDRINUSE so a stray dev gateway doesn't block a
+/// Bind the gateway listener. The host is resolved and required to be
+/// loopback before anything is bound — these routes reach the executor,
+/// so the listener does not come up on an address other machines can
+/// dial. With `--port`, fail loud on conflict (the user asked for that
+/// exact port). Without it, try 8080 first and fall back to an
+/// OS-assigned port on EADDRINUSE so a stray dev gateway doesn't block a
 /// fresh one.
 async fn bind_gateway(host: &str, port: Option<u16>) -> anyhow::Result<tokio::net::TcpListener> {
     if let Some(p) = port {
-        let addr = format!("{host}:{p}");
-        return tokio::net::TcpListener::bind(&addr)
+        let addr = access::loopback_addr(host, p).await?;
+        return tokio::net::TcpListener::bind(addr)
             .await
             .with_context(|| format!("failed to bind gateway on {addr}"));
     }
-    let preferred = format!("{host}:{DEFAULT_HTTP_PORT}");
-    match tokio::net::TcpListener::bind(&preferred).await {
+    let preferred = access::loopback_addr(host, DEFAULT_HTTP_PORT).await?;
+    match tokio::net::TcpListener::bind(preferred).await {
         Ok(listener) => Ok(listener),
         Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
-            let fallback = format!("{host}:0");
+            let fallback = SocketAddr::new(preferred.ip(), 0);
             info!("failed to bind {preferred}; attempting to bind {fallback}");
-            tokio::net::TcpListener::bind(&fallback)
+            tokio::net::TcpListener::bind(fallback)
                 .await
                 .with_context(|| format!("failed to bind gateway on {fallback}"))
         }

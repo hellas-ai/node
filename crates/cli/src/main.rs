@@ -389,16 +389,16 @@ enum Commands {
     #[cfg(feature = "gateway")]
     /// Run HTTP gateway exposing OpenAI/Anthropic/plain APIs over Hellas network
     ///
-    /// The gateway is a client-side process with no inbound
-    /// authentication, and it downloads any model a request names so it
-    /// can tokenize for it. Loopback is the whole of its access control.
-    /// Binding it anywhere else, or putting a proxy in front of it, lets
-    /// every caller that can reach the port choose what this machine
-    /// downloads; `--force-model` is what takes that choice away.
+    /// The gateway's routes reach an executor, so it binds loopback only
+    /// and every route requires a credential drawn fresh at startup and
+    /// printed once to your terminal. Send it as
+    /// `Authorization: Bearer <token>`; a restart draws a new one. It
+    /// still downloads any model a credentialled request names so it can
+    /// tokenize for it — `--force-model` is what takes that choice away.
     Gateway {
-        /// Host interface to bind. Anything but loopback exposes an
-        /// unauthenticated port whose callers choose which models this
-        /// machine downloads — pair it with `--force-model`.
+        /// Host interface to bind. Must resolve to a loopback address;
+        /// anything else is refused, because these routes reach an
+        /// executor.
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
         /// Port to listen on. Omit to try 8080 with fallback to an OS-assigned port.
