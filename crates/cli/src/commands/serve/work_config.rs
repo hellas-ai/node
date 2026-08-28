@@ -58,7 +58,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::{Context as _, bail};
-use hellas_kernel::{EdgeValues, Fees, NetworkId};
+use hellas_kernel::{EdgeValues, Fees, NetworkId, RESPONSE_POLL_BLOCKS};
 use hellas_rpc::ContentId;
 use hellas_rpc::protocol::Digest;
 use hellas_rpc::protocol::mount::{
@@ -146,19 +146,42 @@ impl WorkConfig {
     /// no artifact, and its recovery and close duty are untouched
     /// because those are built from a journal and a key.
     ///
-    /// Past the floor, which variant it lands in is the artifact's
+    /// A configured poll cadence is different: it controls the watcher
+    /// that performs the close duty, and a cadence outside the four
+    /// blocks the response window prices is an unusable configuration,
+    /// not evidence that merely disables new admission.
+    ///
+    /// Past those gates, which variant it lands in is the artifact's
     /// weakest label and nothing else — the numbers are identical either
     /// way, which is the point: what turns admission off there is the
     /// absence of evidence, not a value that failed a test.
-    fn duties(&self, artifact: MeasuredArtifact) -> PaidWorkDuties {
-        let floor = match artifact.budget.floor().and_then(|floor| {
-            floor.check_start_span()?;
-            floor.check_alarm_margin(self.response_alarm_margin_blocks)?;
-            Ok(floor)
-        }) {
+    ///
+    /// # Errors
+    ///
+    /// `poll_ms` exceeds [`RESPONSE_POLL_BLOCKS`] at the artifact's own
+    /// `lower_tail_block_ms`.
+    fn duties(&self, artifact: MeasuredArtifact) -> CliResult<PaidWorkDuties> {
+        let floor = match artifact.budget.floor() {
             Ok(floor) => floor,
-            Err(refusal) => return PaidWorkDuties::Refused(refusal),
+            Err(refusal) => return Ok(PaidWorkDuties::Refused(refusal)),
         };
+        let priced_poll_ms =
+            u128::from(RESPONSE_POLL_BLOCKS) * u128::from(artifact.budget.lower_tail_block_ms);
+        if self.poll.as_millis() > priced_poll_ms {
+            bail!(
+                "poll_ms {} exceeds the {priced_poll_ms} ms priced by \
+                 RESPONSE_POLL_BLOCKS={RESPONSE_POLL_BLOCKS} at the artifact's \
+                 lower_tail_block_ms={}",
+                self.poll.as_millis(),
+                artifact.budget.lower_tail_block_ms,
+            );
+        }
+        if let Err(refusal) = floor
+            .check_start_span()
+            .and_then(|()| floor.check_alarm_margin(self.response_alarm_margin_blocks))
+        {
+            return Ok(PaidWorkDuties::Refused(refusal));
+        }
         let evidence = Box::new(MeasuredEvidence {
             provenance: artifact.provenance,
             samples: artifact.samples,
@@ -173,10 +196,10 @@ impl WorkConfig {
                 floor,
             },
         });
-        match artifact.evidence {
+        Ok(match artifact.evidence {
             Evidence::Measured => PaidWorkDuties::Admits(evidence),
             Evidence::Assumed => PaidWorkDuties::Assumed(evidence),
-        }
+        })
     }
 }
 
@@ -456,7 +479,8 @@ pub fn load_work_config(path: &Path) -> CliResult<WorkConfig> {
 ///
 /// A pinned file that does not parse, an unknown or missing field, a
 /// digest or machine name that is not one, a label its sample count
-/// contradicts, and a running executable whose bytes cannot be read.
+/// contradicts, a running executable whose bytes cannot be read, and a
+/// `poll_ms` slower than the artifact's four priced blocks.
 pub fn load_paid_work_duties(config: &WorkConfig) -> CliResult<PaidWorkDuties> {
     let Some(identity) = config.measured_artifact() else {
         return Ok(PaidWorkDuties::NotConfigured);
@@ -484,7 +508,7 @@ pub fn load_paid_work_duties(config: &WorkConfig) -> CliResult<PaidWorkDuties> {
     if artifact.provenance.binary != running_binary_digest()? {
         return Ok(PaidWorkDuties::Changed);
     }
-    Ok(config.duties(artifact))
+    config.duties(artifact)
 }
 
 /// Identifies the executable whose paid-work duties are being loaded,
@@ -1776,13 +1800,22 @@ mod tests {
     /// the matching one in exactly the field under test and in nothing
     /// else.
     fn duties_for(artifact: &serde_json::Value, pin: Option<String>) -> CliResult<PaidWorkDuties> {
+        duties_for_config(config(), artifact, pin)
+    }
+
+    /// The same load with an explicitly chosen work configuration.
+    fn duties_for_config(
+        config: serde_json::Value,
+        artifact: &serde_json::Value,
+        pin: Option<String>,
+    ) -> CliResult<PaidWorkDuties> {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("artifact.json");
         let bytes = artifact.to_string();
         fs::write(&path, &bytes).unwrap();
         let digest = pin.unwrap_or_else(|| hex::encode(Digest::hash(bytes.as_bytes()).as_bytes()));
         let loaded = load(with(
-            config(),
+            config,
             "artifact",
             serde_json::json!({ "path": path.display().to_string(), "digest": digest }),
         ))?;
@@ -2301,6 +2334,39 @@ mod tests {
             load(config())
                 .expect("the fixture config loads")
                 .response_alarm_margin_blocks,
+        );
+    }
+
+    /// The watcher may consume the four blocks the response floor
+    /// prices for polling, but not one millisecond more at this
+    /// artifact's own conservative block tail.
+    #[test]
+    fn the_poll_cadence_fits_inside_the_artifacts_priced_blocks() {
+        let artifact = artifact_with("lower_tail_block_ms", observed(&[520, 500, 505]));
+        let priced_poll_ms = RESPONSE_POLL_BLOCKS * 500;
+        let at_limit = duties_for_config(
+            with(config(), "poll_ms", serde_json::json!(priced_poll_ms)),
+            &artifact,
+            None,
+        )
+        .expect("the exact four-block cadence is priced");
+        assert!(at_limit.admits_paid_work());
+
+        let error = format!(
+            "{:#}",
+            duties_for_config(
+                with(config(), "poll_ms", serde_json::json!(priced_poll_ms + 1)),
+                &artifact,
+                None,
+            )
+            .expect_err("one millisecond beyond four blocks is not priced"),
+        );
+        assert!(
+            error.contains("poll_ms 2001")
+                && error.contains("2000 ms")
+                && error.contains("RESPONSE_POLL_BLOCKS=4")
+                && error.contains("lower_tail_block_ms=500"),
+            "unexpected refusal: {error}",
         );
     }
 
