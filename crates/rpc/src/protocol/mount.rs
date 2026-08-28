@@ -156,6 +156,13 @@ pub enum FloorError {
     /// infinitely many blocks. §4 refuses admission on it by name.
     #[error("lower_tail_block_ms is zero, so no wait can be priced in blocks")]
     NoLowerTail,
+    /// A wait or block-count formula does not fit the `u64` carried by
+    /// [`MountFloor`].
+    #[error("checked arithmetic overflowed computing {field}")]
+    Overflow {
+        /// Formula whose result did not fit.
+        field: &'static str,
+    },
     /// `T` does not fit the fixed 64-block start span.
     #[error("the measured budget needs T={t} blocks and the start span is {span}")]
     StartSpanTooShort {
@@ -220,33 +227,97 @@ impl MountBudget {
     /// # Errors
     ///
     /// [`FloorError::NoLowerTail`] when `lower_tail_block_ms` is not
-    /// positive. That is the one input the arithmetic cannot proceed
-    /// past — every other term is a numerator — and §4 makes it refuse
-    /// admission rather than produce a floor of zero blocks.
+    /// positive, or [`FloorError::Overflow`] when a wait or block-count
+    /// formula does not fit the floor's `u64` fields. Both refuse rather
+    /// than invent a smaller floor.
     pub const fn floor(&self) -> Result<MountFloor, FloorError> {
         if self.lower_tail_block_ms == 0 {
             return Err(FloorError::NoLowerTail);
         }
         let block = self.lower_tail_block_ms;
 
+        // Widen before doing any artifact arithmetic. The largest
+        // expression below has nine `u64` terms, so every `u128` result
+        // is exact; each bound check can therefore refuse before the
+        // corresponding value is narrowed back into the floor.
+
         // Wresp: §5 acts before reading the next backlog block, so the
         // three fsyncs, the rotation, the build and the one block fetch
         // are all in front of the answer, and the validator-side addend
         // is on top of them.
-        let wresp_ms = 3 * self.fsync_tail_ms
-            + self.rotation_tail_ms
-            + self.response_build_ms
-            + self.one_block_fetch_ms
-            + max6(self.rpc_ms, self.response_worker_ms, self.validation_ms);
+        let response_validator_wide =
+            self.rpc_ms as u128 + self.response_worker_ms as u128 + self.validation_ms as u128;
+        if response_validator_wide > u64::MAX as u128 {
+            return Err(FloorError::Overflow { field: "Wresp" });
+        }
+        // The wide check proves every non-negative partial sum in
+        // `max6` fits too, so its reader-facing arithmetic cannot wrap.
+        let response_validator_ms = max6(self.rpc_ms, self.response_worker_ms, self.validation_ms);
+        let wresp_wide = 3 * self.fsync_tail_ms as u128
+            + self.rotation_tail_ms as u128
+            + self.response_build_ms as u128
+            + self.one_block_fetch_ms as u128
+            + response_validator_ms as u128;
+        if wresp_wide > u64::MAX as u128 {
+            return Err(FloorError::Overflow { field: "Wresp" });
+        }
+        let wresp_ms = wresp_wide as u64;
         let s = wresp_ms.div_ceil(block);
 
-        let wstart_ms = self.fresh_tip_ms
-            + self.close_prepared_fsync_ms
-            + self.rotation_tail_ms
-            + max6(self.rpc_ms, self.general_worker_ms, self.validation_ms);
+        let general_validator_wide =
+            self.rpc_ms as u128 + self.general_worker_ms as u128 + self.validation_ms as u128;
+        if general_validator_wide > u64::MAX as u128 {
+            return Err(FloorError::Overflow { field: "Wstart" });
+        }
+        let general_validator_ms = max6(self.rpc_ms, self.general_worker_ms, self.validation_ms);
+        let wstart_wide = self.fresh_tip_ms as u128
+            + self.close_prepared_fsync_ms as u128
+            + self.rotation_tail_ms as u128
+            + general_validator_ms as u128;
+        if wstart_wide > u64::MAX as u128 {
+            return Err(FloorError::Overflow { field: "Wstart" });
+        }
+        let wstart_ms = wstart_wide as u64;
         let sg = wstart_ms.div_ceil(block);
 
-        let r = (self.restart_downtime_ms + self.restart_replay_ms_at_cap).div_ceil(block);
+        let restart_wide = self.restart_downtime_ms as u128 + self.restart_replay_ms_at_cap as u128;
+        if restart_wide > u64::MAX as u128 {
+            return Err(FloorError::Overflow { field: "R" });
+        }
+        let r = (restart_wide as u64).div_ceil(block);
+
+        let t_wide = RESPONSE_FINALIZATION_BLOCKS as u128
+            + RESPONSE_PROPAGATION_BLOCKS as u128
+            + self.general_inclusion_blocks as u128
+            + sg as u128
+            + r as u128
+            + 1;
+        if t_wide > u64::MAX as u128 {
+            return Err(FloorError::Overflow { field: "T" });
+        }
+        let response_floor_wide = RESPONSE_FINALIZATION_BLOCKS as u128
+            + RESPONSE_POLL_BLOCKS as u128
+            + RESPONSE_PROPAGATION_BLOCKS as u128
+            + RESPONSE_INCLUSION_BLOCKS as u128
+            + s as u128
+            + r as u128
+            + 1;
+        if response_floor_wide > u64::MAX as u128 {
+            return Err(FloorError::Overflow {
+                field: "response-window floor",
+            });
+        }
+        let alarm_floor_wide = RESPONSE_FINALIZATION_BLOCKS as u128
+            + RESPONSE_PROPAGATION_BLOCKS as u128
+            + RESPONSE_INCLUSION_BLOCKS as u128
+            + s as u128
+            + r as u128
+            + 1;
+        if alarm_floor_wide > u64::MAX as u128 {
+            return Err(FloorError::Overflow {
+                field: "alarm-margin floor",
+            });
+        }
 
         Ok(MountFloor {
             wresp_ms,
@@ -254,25 +325,9 @@ impl MountBudget {
             wstart_ms,
             sg,
             r,
-            t: RESPONSE_FINALIZATION_BLOCKS
-                + RESPONSE_PROPAGATION_BLOCKS
-                + self.general_inclusion_blocks
-                + sg
-                + r
-                + 1,
-            min_omit_response_blocks: RESPONSE_FINALIZATION_BLOCKS
-                + RESPONSE_POLL_BLOCKS
-                + RESPONSE_PROPAGATION_BLOCKS
-                + RESPONSE_INCLUSION_BLOCKS
-                + s
-                + r
-                + 1,
-            alarm_margin_blocks: RESPONSE_FINALIZATION_BLOCKS
-                + RESPONSE_PROPAGATION_BLOCKS
-                + RESPONSE_INCLUSION_BLOCKS
-                + s
-                + r
-                + 1,
+            t: t_wide as u64,
+            min_omit_response_blocks: response_floor_wide as u64,
+            alarm_margin_blocks: alarm_floor_wide as u64,
         })
     }
 }
@@ -586,6 +641,15 @@ mod tests {
         let mut budget = budget();
         budget.lower_tail_block_ms = 0;
         assert_eq!(budget.floor(), Err(FloorError::NoLowerTail));
+    }
+
+    /// An artifact can carry every positive `u64`; one too large for a
+    /// floor formula is a refusal in debug and release alike.
+    #[test]
+    fn a_measurement_that_overflows_the_floor_is_refused() {
+        let mut budget = budget();
+        budget.fsync_tail_ms = u64::MAX;
+        assert_eq!(budget.floor(), Err(FloorError::Overflow { field: "Wresp" }));
     }
 
     /// `64 ≥ T` admits and `T > 64` refuses, and the refusal names both
