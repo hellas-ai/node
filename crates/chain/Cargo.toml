@@ -193,6 +193,13 @@ hellas-kernel = { workspace = true, features = ["test-support"] }
 # consensus is asked to accept. As a runtime dependency `hellas-rpc`
 # arrives without the work protocol; the settlement suite needs it.
 hellas-rpc = { workspace = true, features = ["work"] }
+# The end-to-end money test signs a payment only after the client's own
+# re-execution reproduced the provider's answer, and that gate — the
+# `Reproducer` seam and the matched/refuted journal transition around it
+# — lives in `hellas-client`. Re-deriving it here would be a second
+# opinion about the very thing under test. `hellas-client` does not
+# depend on `hellas-chain`, so this edge is test-only and acyclic.
+hellas-client = { workspace = true, features = ["work"] }
 ed25519-dalek.workspace = true
 itf = "0.4"
 proptest = "1.11"

@@ -36,6 +36,9 @@ pub mod server;
 pub mod validator;
 #[cfg(feature = "work-watcher")]
 pub mod work_blocks;
+/// The end-to-end money claim, against a real chain. Test-only.
+#[cfg(all(test, feature = "validator", feature = "work-watcher"))]
+mod work_e2e;
 #[cfg(any(feature = "client-core", feature = "server"))]
 pub mod work_view;
 
