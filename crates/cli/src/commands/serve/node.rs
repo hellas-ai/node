@@ -14,7 +14,8 @@ use std::time::Duration;
 
 use anyhow::Context;
 use hellas_chain::client::VerifiedRemoteLightClient;
-use hellas_chain::{ConsensusInfo, ConsensusVerifier, WorkBlocks};
+use hellas_chain::work_blocks::advance_paid_work_clock;
+use hellas_chain::{ConsensusInfo, ConsensusVerifier, FinalizedWorkView, WorkBlocks};
 #[cfg(feature = "evaluate")]
 use hellas_executor::ArtifactStoreConfig;
 use hellas_executor::{
@@ -36,7 +37,7 @@ use hellas_rpc::services::node::{Node, NodeServer};
 use hellas_rpc::services::work::{Work, WorkHandler, WorkServer};
 use hellas_rpc::services::work_setup::{WorkSetup, WorkSetupHandler, WorkSetupServer};
 use hellas_rpc::work::{CloseEndpoint, WorkService};
-use hellas_rpc::work_close::{CatchUpError, FinalizedBlocks, TxSink};
+use hellas_rpc::work_close::{FinalizedBlocks, TxSink};
 use hellas_rpc::work_handshake::{PaymentAdmission, SetupEndpoint, SetupService};
 use hellas_rpc::work_open::{
     SetupAdvance, SetupDriveError, SetupProgress, SetupView, advance_setup,
@@ -548,7 +549,7 @@ impl SetupClock {
     /// is logged where it happens.
     async fn tick<S>(&mut self, source: &S, signer: &Secp256k1Signer, mount: &MountedWork) -> bool
     where
-        S: SetupView + FinalizedBlocks + TxSink + Sync + ?Sized,
+        S: SetupView + FinalizedBlocks + FinalizedWorkView + TxSink + Sync,
     {
         let bond = hex::encode(self.bond_edge.to_bytes());
         let mut answered = true;
@@ -574,10 +575,10 @@ impl SetupClock {
             }
         }
         if let Driven::Channel(service) = &self.driven {
-            match service.advance_close(source, source).await {
+            match advance_paid_work_clock(service, source).await {
                 Ok(progress) => debug!(bond, ?progress, "the channel advanced"),
                 Err(error) => {
-                    answered &= !matches!(error, CatchUpError::Source(_));
+                    answered &= !error.source_failed();
                     warn!(bond, %error, "this channel's close did not advance");
                 }
             }
@@ -724,7 +725,7 @@ impl WorkRunner {
     /// answered all of them.
     async fn tick<S>(&mut self, source: &S) -> bool
     where
-        S: SetupView + FinalizedBlocks + TxSink + Sync + ?Sized,
+        S: SetupView + FinalizedBlocks + FinalizedWorkView + TxSink + Sync,
     {
         let mut answered = true;
         for clock in &mut self.clocks {
@@ -753,7 +754,7 @@ impl WorkRunner {
     /// of the cadence is here, and none of the decisions are.
     async fn run_over<S, D, F>(mut self, mut stop: oneshot::Receiver<()>, dial: D)
     where
-        S: SetupView + FinalizedBlocks + TxSink + Sync,
+        S: SetupView + FinalizedBlocks + FinalizedWorkView + TxSink + Sync,
         D: Fn() -> F,
         F: core::future::Future<Output = Option<S>>,
     {
@@ -823,10 +824,12 @@ mod tests {
     use std::collections::BTreeSet;
     use std::path::Path;
 
+    use hellas_chain::{LatestBlock, QueryError, WorkChannelQuery, WorkChannelSnapshot};
     use hellas_kernel::{
-        Auth, BlockHeight, CoinId, EdgeValues, Fees, Funding, LeaseSlots, List, MAX_EDGE_OUTPUTS,
-        MAX_PARTY_INPUTS, MIN_OMIT_RESPONSE_BLOCKS, Move, Parties, Party, Payout, StartId, Terms,
-        Tx, WorkPaymentSettlement, WorkPaymentTerms, WorkStakeBondTerms,
+        Auth, BlockHeight, CoinId, Decode as _, EdgeValues, Fees, Funding, LeaseSlots, List,
+        MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, MIN_OMIT_RESPONSE_BLOCKS, Move, Parties, Party, Payout,
+        PendingPaymentClose, Proof, RegistryChunk, RegistryNamespace, RegistryRecordTag, StartId,
+        Terms, Tx, WorkPaymentSettlement, WorkPaymentTerms, WorkStakeBondTerms,
     };
     use hellas_rpc::call::WithTrailer;
     use hellas_rpc::evaluate::{
@@ -1461,6 +1464,67 @@ mod tests {
         start_id
     }
 
+    /// The coherent finalized view the clock asks this fixture chain for.
+    fn channel_snapshot(height: u64, pending: Option<RegistryChunk>) -> WorkChannelSnapshot {
+        WorkChannelSnapshot::new(
+            WorkChannelQuery {
+                bond_edge: bond_edge(),
+                payment_edge: payment_edge(),
+                funding: BTreeSet::new(),
+            },
+            LatestBlock {
+                height,
+                payload: hellas_chain::domain::Digest::from(payload_at(height)),
+                state_root: hellas_chain::domain::Digest::from([0xd0; 32]),
+                finalization: Vec::new(),
+            },
+            None,
+            None,
+            [None, None],
+            pending,
+            BTreeSet::new(),
+        )
+    }
+
+    /// Canonical pending-close bytes for the fixture contest.
+    ///
+    /// Written field by field because the kernel deliberately exposes the
+    /// consensus record for reading, not for callers to manufacture. The
+    /// decode at the end proves this literal is its canonical shape.
+    fn pending_contest(responded: bool) -> RegistryChunk {
+        let mut value = Vec::with_capacity(PendingPaymentClose::ENCODED_SIZE);
+        value.extend_from_slice(&[1, 23, 2]); // envelope and work-close version
+        value.extend_from_slice(payment_edge().as_bytes());
+        value.push(Party::Maker.tag());
+        value.extend_from_slice(&[0x7c; StartId::LENGTH]);
+        value.extend_from_slice(&RESPONSE_DEADLINE.to_be_bytes());
+        value.extend_from_slice(&0_u64.to_be_bytes());
+        let final_cumulative = if responded {
+            execution_policy().fixed_price
+        } else {
+            0
+        };
+        value.extend_from_slice(&final_cumulative.to_be_bytes());
+        value.push(u8::from(responded));
+        value.push(u8::from(responded));
+        value.extend_from_slice(&OMISSION_BOND.to_be_bytes());
+        assert_eq!(value.len(), PendingPaymentClose::ENCODED_SIZE);
+        let record = match PendingPaymentClose::decode_exact(&value) {
+            Ok(record) => record,
+            Err(error) => panic!("the fixture pending-close bytes decode: {error:?}"),
+        };
+        assert_eq!(record.responded(), responded);
+        match RegistryChunk::split(
+            RegistryNamespace::PaymentClose,
+            RegistryRecordTag::PaymentPending,
+            &value,
+            0,
+        ) {
+            Some(chunk) => chunk,
+            None => panic!("one pending close fits one registry chunk"),
+        }
+    }
+
     // ── The chain a test writes down ──────────────────────────────────
 
     /// One coherent finalized read, a tip that never moves, and a sink
@@ -1471,6 +1535,8 @@ mod tests {
     struct ChainState {
         /// Everything a driver submitted, in the order it did.
         submitted: Mutex<Vec<Tx>>,
+        /// The one coherent finalized channel read this chain answers with.
+        snapshot: Mutex<WorkChannelSnapshot>,
         /// One permit added as `latest_height` is entered.
         entered: Semaphore,
         /// One permit the test adds to let `latest_height` out again.
@@ -1492,6 +1558,7 @@ mod tests {
         fn with(slow: bool) -> Self {
             Self(Arc::new(ChainState {
                 submitted: Mutex::new(Vec::new()),
+                snapshot: Mutex::new(channel_snapshot(ORIGIN, None)),
                 entered: Semaphore::new(0),
                 release: Semaphore::new(0),
                 slow,
@@ -1502,6 +1569,13 @@ mod tests {
             match self.0.submitted.lock() {
                 Ok(held) => held.clone(),
                 Err(error) => panic!("the fixture sink is reachable: {error}"),
+            }
+        }
+
+        fn set_snapshot(&self, snapshot: WorkChannelSnapshot) {
+            match self.0.snapshot.lock() {
+                Ok(mut held) => *held = snapshot,
+                Err(error) => panic!("the fixture snapshot is reachable: {error}"),
             }
         }
 
@@ -1535,6 +1609,28 @@ mod tests {
                 lease: LeaseSlots::Absent,
                 live_funding: BTreeSet::new(),
             }))
+        }
+    }
+
+    impl FinalizedWorkView for TestChain {
+        async fn work_channel_snapshot(
+            &self,
+            query: WorkChannelQuery,
+        ) -> Result<Option<WorkChannelSnapshot>, QueryError> {
+            let snapshot = match self.0.snapshot.lock() {
+                Ok(held) => held.clone(),
+                Err(error) => {
+                    return Err(QueryError::StateUnavailable(format!(
+                        "the fixture snapshot lock failed: {error}",
+                    )));
+                }
+            };
+            if snapshot.query() != &query {
+                return Err(QueryError::StateUnavailable(
+                    "the fixture was asked for another work channel".to_string(),
+                ));
+            }
+            Ok(Some(snapshot))
         }
     }
 
@@ -1600,6 +1696,23 @@ mod tests {
         response.start_id()
     }
 
+    fn adjudicated_payment_closes(chain: &TestChain) -> usize {
+        chain
+            .submitted()
+            .iter()
+            .filter(|tx| {
+                matches!(
+                    tx,
+                    Tx::Close {
+                        input,
+                        proof: Proof::Adjudicated { .. },
+                        ..
+                    } if *input == payment_edge()
+                )
+            })
+            .count()
+    }
+
     /// A restart with an open contest is answered by the clock, before
     /// the deadline, without a single library call from this file.
     ///
@@ -1643,6 +1756,52 @@ mod tests {
             responded.map(|contest| contest.start_id),
             Some(start_id),
             "the answer is on the disk before it reaches a sink",
+        );
+    }
+
+    #[tokio::test]
+    async fn the_paid_work_clock_submits_adjudication_when_consensus_makes_it_due_and_not_before() {
+        let dir = temp();
+        write_setup_journal(dir.path());
+        let start_id = write_contested_channel(dir.path());
+        let mount = MountedWork::default();
+        let mut runner = runner(dir.path(), Some(admits()), &mount);
+        let chain = TestChain::new();
+        chain.set_snapshot(channel_snapshot(ORIGIN, Some(pending_contest(false))));
+
+        assert!(runner.tick(&chain).await, "the first coherent read answers");
+        assert_eq!(
+            adjudicated_payment_closes(&chain),
+            0,
+            "an unresponded contest below its deadline is not final",
+        );
+        let Some(service) = mount.service() else {
+            panic!("the first tick mounts the contested channel")
+        };
+        assert_eq!(
+            service
+                .with_state(|state| state.close_responded().map(|held| held.start_id))
+                .unwrap_or_else(|error| panic!("the mounted channel is readable: {error}")),
+            Some(start_id),
+            "the response is chosen and fsynced locally",
+        );
+
+        assert!(
+            runner.tick(&chain).await,
+            "the second coherent read answers"
+        );
+        assert_eq!(
+            adjudicated_payment_closes(&chain),
+            0,
+            "a local CloseResponded is not consensus response evidence",
+        );
+
+        chain.set_snapshot(channel_snapshot(ORIGIN, Some(pending_contest(true))));
+        assert!(runner.tick(&chain).await, "the responded read answers");
+        assert_eq!(
+            adjudicated_payment_closes(&chain),
+            1,
+            "consensus response makes exactly one adjudicated payment close due",
         );
     }
 

@@ -43,7 +43,11 @@
 //! one from a snapshot that asked about other coins.
 
 use hellas_kernel::Tx;
-use hellas_rpc::work_close::{BlockSourceError, FinalizedBlocks, FinalizedWork, TxSink};
+use hellas_rpc::work::WorkService;
+use hellas_rpc::work_close::{
+    BlockSourceError, CatchUpError, CloseError, CloseProgress, FinalizedBlocks, FinalizedWork,
+    TxSink,
+};
 use hellas_rpc::work_open::{FinalizedSetup, SetupQuery, SetupView};
 
 use crate::SubmitTxOutcome;
@@ -56,11 +60,116 @@ use crate::work_view::{FinalizedWorkView, WorkChannelQuery, WorkChannelSnapshot}
 #[derive(Clone, Debug)]
 pub struct WorkBlocks<C>(C);
 
+/// What one production clock step did for a mounted paid channel.
+#[derive(Debug)]
+pub struct PaidWorkClockAdvance {
+    /// The journaled start-or-response drive that ran first.
+    pub close: CloseProgress,
+    /// Submission outcome for a due adjudicated payment close.
+    pub adjudication: Option<SubmitTxOutcome>,
+}
+
+/// Why one production clock step could not finish.
+#[derive(Debug, thiserror::Error)]
+pub enum PaidWorkClockError {
+    /// The journaled close drive failed.
+    #[error("the journaled close drive failed: {0}")]
+    CloseDrive(#[source] CatchUpError),
+    /// The coherent finalized channel read failed.
+    #[error("the coherent finalized channel read failed: {0}")]
+    Snapshot(#[source] QueryError),
+    /// The endpoint could not derive the close consensus permits.
+    #[error("the mounted endpoint could not derive its close: {0}")]
+    Decision(#[source] CloseError),
+    /// The connected transaction sink failed.
+    #[error("the connected transaction sink failed: {0}")]
+    Submission(#[source] BlockSourceError),
+}
+
+impl PaidWorkClockError {
+    /// Returns whether the connected chain should be replaced before retry.
+    #[must_use]
+    pub const fn source_failed(&self) -> bool {
+        matches!(
+            self,
+            Self::CloseDrive(CatchUpError::Source(_)) | Self::Snapshot(_) | Self::Submission(_)
+        )
+    }
+}
+
 impl<C: LightClient> WorkBlocks<C> {
     /// Reads finalized blocks for a watcher through `client`.
     pub const fn new(client: C) -> Self {
         Self(client)
     }
+}
+
+/// Advances one mounted paid channel on the production clock.
+///
+/// The journaled close drive runs first. The endpoint is then borrowed
+/// synchronously only long enough to copy the two edge ids. One coherent
+/// finalized snapshot from `source` decides the permissionless payment
+/// close through [`WorkService::adjudicated_close`].
+///
+/// `NoContest`, `OtherContest`, and `ResponseWindowOpen` are clock states,
+/// not failures. They leave adjudication absent from the returned advance
+/// and are reconsidered from a fresh snapshot on the next tick.
+///
+/// # Errors
+///
+/// Returns the failed journal drive, snapshot, decision, or submission.
+pub async fn advance_paid_work_clock<S>(
+    service: &WorkService,
+    source: &S,
+) -> Result<PaidWorkClockAdvance, PaidWorkClockError>
+where
+    S: FinalizedBlocks + FinalizedWorkView + TxSink + Sync,
+{
+    let close = service
+        .advance_close(source, source)
+        .await
+        .map_err(PaidWorkClockError::CloseDrive)?;
+    let query = service
+        .with_state(|state| {
+            let channel = state.channel();
+            let payment_terms = channel.payment_terms();
+            WorkChannelQuery {
+                bond_edge: payment_terms.bond_edge,
+                payment_edge: channel.payment_edge(),
+                funding: Default::default(),
+            }
+        })
+        .map_err(|error| PaidWorkClockError::Decision(CloseError::Endpoint(error)))?;
+    let Some(snapshot) = source
+        .work_channel_snapshot(query)
+        .await
+        .map_err(PaidWorkClockError::Snapshot)?
+    else {
+        return Ok(PaidWorkClockAdvance {
+            close,
+            adjudication: None,
+        });
+    };
+
+    let adjudication = match service.adjudicated_close(&snapshot.observed_channel()) {
+        Ok(tx) => Some(
+            source
+                .submit(tx)
+                .await
+                .map_err(PaidWorkClockError::Submission)?,
+        ),
+        Err(
+            CloseError::NoContest
+            | CloseError::OtherContest
+            | CloseError::ResponseWindowOpen { .. },
+        ) => None,
+        Err(error) => return Err(PaidWorkClockError::Decision(error)),
+    };
+
+    Ok(PaidWorkClockAdvance {
+        close,
+        adjudication,
+    })
 }
 
 /// Returns a payload digest as the 32 bytes a journal records.
