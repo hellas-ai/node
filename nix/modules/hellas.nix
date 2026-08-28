@@ -246,6 +246,11 @@ rec {
         default = null;
         description = "Remote node id used as the verification shadow.";
       };
+      provider = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        description = "Out-of-band ContentId pin on the enrollment bundle of the provider this gateway dials. Required whenever it dials one: with nodeId, verifyNodeId, or responsesBackend = \"fetch\".";
+      };
       queueSize = mkOption {
         type = types.nullOr types.ints.positive;
         default = null;
@@ -454,6 +459,7 @@ rec {
     ++ lib.optionals gateway.local [ "--local" ]
     ++ lib.optionals gateway.verifyLocal [ "--verify-local" ]
     ++ optArg "--verify" gateway.verifyNodeId
+    ++ optArg "--provider" gateway.provider
     ++ optArg "--queue-size" gateway.queueSize
     ++ optArg "--retries" gateway.retries
     ++ optArg "--default-max-tokens" gateway.defaultMaxTokens

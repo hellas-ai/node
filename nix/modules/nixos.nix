@@ -74,6 +74,12 @@ in
         assertion = gateway.verifyNodeId == null || gateway.nodeId != null;
         message = "services.hellas.gateway.verifyNodeId requires services.hellas.gateway.nodeId.";
       }
+      {
+        assertion =
+          gateway.provider != null
+          || (gateway.nodeId == null && gateway.verifyNodeId == null && gateway.responsesBackend != "fetch");
+        message = "services.hellas.gateway.provider is required by nodeId, verifyNodeId, and responsesBackend = \"fetch\", each of which dials a provider.";
+      }
     ];
 
     systemd.services.hellas = mkIf cfg.enable {

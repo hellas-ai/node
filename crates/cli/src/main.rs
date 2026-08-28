@@ -174,6 +174,42 @@ impl From<GatewayResponsesBackend> for hellas_gateway::ResponsesBackend {
     }
 }
 
+/// The trust anchor this gateway's remote routes are built from, or
+/// `None` for a gateway that has none to build.
+///
+/// A `--node-id` or a `--verify` shadow names a provider to dial, and a
+/// Fetch responses backend dials one for every request it serves. Each
+/// makes `--provider` required, and its absence is refused here, before
+/// anything binds. A gateway that names none of them is not owed one:
+/// it builds no remote route, and asking it to configure a provider it
+/// cannot reach is asking for configuration to satisfy a code path that
+/// does not run. Supplying `--provider` anyway still builds the anchor,
+/// so a discovery gateway keeps the routes it always had.
+#[cfg(feature = "gateway")]
+fn gateway_provider_trust(
+    node_id: Option<EndpointId>,
+    verify: Option<EndpointId>,
+    responses_backend: GatewayResponsesBackend,
+    expected_genesis: Option<hellas_rpc::ContentId>,
+    assurance: hellas_rpc::Assurance,
+    apple_app_attest_app_id: Option<String>,
+    apple_app_attest_cdhashes: Vec<[u8; 32]>,
+) -> anyhow::Result<Option<hellas_client::ProviderTrustAnchor>> {
+    let dials_provider = node_id.is_some()
+        || verify.is_some()
+        || responses_backend == GatewayResponsesBackend::Fetch;
+    if !dials_provider && expected_genesis.is_none() {
+        return Ok(None);
+    }
+    identity::provider_trust(
+        expected_genesis,
+        assurance,
+        apple_app_attest_app_id,
+        apple_app_attest_cdhashes,
+    )
+    .map(Some)
+}
+
 /// Default `--dtype` preference list for `llm`, resolved at dispatch.
 ///
 /// This is what the client *asks a provider for*. It is not a
@@ -907,7 +943,10 @@ async fn main() {
             wrap_args,
         } => {
             async {
-                let provider_trust = identity::provider_trust(
+                let provider_trust = gateway_provider_trust(
+                    node_id,
+                    verify,
+                    responses_backend,
                     expected_provider_genesis,
                     assurance,
                     apple_app_attest_app_id.clone(),
@@ -1200,6 +1239,76 @@ mod tests {
         ]);
 
         assert!(result.is_err());
+    }
+
+    /// The anchor `hellas gateway <args>` would run with.
+    #[cfg(feature = "gateway")]
+    fn gateway_trust(args: &[&str]) -> anyhow::Result<Option<hellas_client::ProviderTrustAnchor>> {
+        let cli = Cli::try_parse_from(["hellas", "gateway"].iter().chain(args).copied())
+            .expect("valid gateway arguments");
+        let Commands::Gateway {
+            node_id,
+            verify,
+            responses_backend,
+            ..
+        } = cli.command
+        else {
+            panic!("expected gateway command");
+        };
+        gateway_provider_trust(
+            node_id,
+            verify,
+            responses_backend,
+            cli.provider_genesis,
+            cli.assurance,
+            cli.apple_app_attest_app_id,
+            cli.apple_app_attest_cdhashes,
+        )
+    }
+
+    #[cfg(feature = "gateway")]
+    #[test]
+    fn gateway_demands_a_provider_anchor_exactly_where_it_dials_one() {
+        const NODE: &str = "bb18ebc065d836ecc7e1f33972d2c17eac9894cd33ce4916f66cb1165ccc7550";
+        const SHADOW: &str = "edfadcefb3917925de1111087f11925542c97e14ab00cf42b9447f7567a25b62";
+        const PROVIDER: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+        const ENVIRONMENT: &str =
+            "0909090909090909090909090909090909090909090909090909090909090909";
+
+        // Names no provider: no anchor is built, and none is demanded.
+        assert!(gateway_trust(&[]).unwrap().is_none());
+        assert!(
+            gateway_trust(&["--responses-backend", "proxy"])
+                .unwrap()
+                .is_none()
+        );
+
+        // Names one: `--provider` is required, and its absence is refused
+        // by the flag that would supply it.
+        for dialling in [
+            vec!["--node-id", NODE],
+            vec!["--node-id", NODE, "--verify", SHADOW],
+            vec![
+                "--responses-backend",
+                "fetch",
+                "--responses-fetch-execution-environment",
+                ENVIRONMENT,
+            ],
+        ] {
+            let refusal = gateway_trust(&dialling).unwrap_err().to_string();
+            assert!(refusal.contains("--provider <content-id>"), "{refusal}");
+        }
+
+        // Named with its pin: the anchor carries the provider it pins.
+        let anchor = gateway_trust(&["--node-id", NODE, "--provider", PROVIDER])
+            .unwrap()
+            .expect("a dialling gateway carries an anchor");
+        assert_eq!(
+            anchor.expected_genesis,
+            hellas_rpc::ContentId::from_bytes([0x11; 32])
+        );
+        // A discovery gateway given one keeps the routes it always had.
+        assert!(gateway_trust(&["--provider", PROVIDER]).unwrap().is_some());
     }
 
     #[cfg(feature = "evaluate")]

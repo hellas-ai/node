@@ -107,6 +107,35 @@ let
     HTTPServer(("127.0.0.1", 18080), Handler).serve_forever()
   '';
 
+  # The gateway's routes require this run's credential, which it draws at
+  # startup, keeps in memory, and hands out in exactly one other place:
+  # the environment of a command it wraps. So the caller that exercises
+  # them is a wrapped child. It waits for the upstream mock, writes what
+  # the gateway answered into the unit's state directory — the private
+  # /tmp of a DynamicUser unit is not the test's /tmp — and then stays up,
+  # so the unit and its port remain observable for the rest of the test.
+  gatewayProbe = pkgs.writeShellScript "gateway-proxy-probe" ''
+    set -eu
+    until ${pkgs.curl}/bin/curl -sS -o /dev/null -X POST \
+      -H 'content-type: application/json' \
+      -H 'authorization: Bearer proxy-secret' \
+      -d '{"model":"probe","input":"hi"}' \
+      http://127.0.0.1:18080/v1/responses
+    do
+      ${pkgs.coreutils}/bin/sleep 1
+    done
+    ${pkgs.curl}/bin/curl -sS -X POST -H 'content-type: application/json' \
+      -H "authorization: Bearer $OPENAI_API_KEY" \
+      -d '{"model":"llama-local","input":"hello"}' \
+      "$OPENAI_BASE_URL/responses" > response.json
+    ${pkgs.curl}/bin/curl -sS -N -X POST -H 'content-type: application/json' \
+      -H "authorization: Bearer $OPENAI_API_KEY" \
+      -d '{"model":"llama-local","input":"hello","stream":true}' \
+      "$OPENAI_BASE_URL/responses" > stream.txt
+    ${pkgs.coreutils}/bin/touch probed
+    exec ${pkgs.coreutils}/bin/sleep infinity
+  '';
+
   mkBaseNode = hellasPackage: {
     networking.firewall = {
       enable = true;
@@ -241,7 +270,6 @@ in
             port = executorPort;
             openFirewall = true;
             executePolicy = "skip";
-            assurance = "apple-app-attest";
             queueSize = 2;
             fetchMaxInFlight = 2;
             fetchQueueSize = 3;
@@ -284,6 +312,12 @@ in
               responsesBackend = "proxy";
               responsesProxyUrl = "http://127.0.0.1:18080/v1/responses";
               responsesProxyApiKeyEnv = "OPENAI_API_KEY";
+              # No nodeId, no verifyNodeId: this gateway dials no provider,
+              # so it needs no provider trust anchor to start.
+              extraArgs = [
+                "--wrap"
+                "${gatewayProbe}"
+              ];
             };
           };
         }
@@ -296,15 +330,24 @@ in
       gateway.wait_until_succeeds("curl -sS -o /dev/null -X POST -H 'content-type: application/json' -H 'authorization: Bearer proxy-secret' -d '{\"model\":\"probe\",\"input\":\"hi\"}' http://127.0.0.1:18080/v1/responses")
       gateway.wait_for_unit("hellas-gateway.service")
       gateway.wait_for_open_port(${toString gatewayPort})
-      response = gateway.succeed("curl -sS -X POST -H 'content-type: application/json' -d '{\"model\":\"llama-local\",\"input\":\"hello\"}' http://127.0.0.1:${toString gatewayPort}/v1/responses")
+      gateway.wait_until_succeeds("test -e /var/lib/hellas-gateway/probed")
+
+      response = gateway.succeed("cat /var/lib/hellas-gateway/response.json")
       print(response)
       assert "proxied-ok" in response
-      stream = gateway.succeed("curl -sS -N -X POST -H 'content-type: application/json' -d '{\"model\":\"llama-local\",\"input\":\"hello\",\"stream\":true}' http://127.0.0.1:${toString gatewayPort}/v1/responses")
+      stream = gateway.succeed("cat /var/lib/hellas-gateway/stream.txt")
       print(stream)
       assert "stream-proxied-ok" in stream
       assert "response.output_text.delta" in stream
       assert '"output_index":0' in stream
       assert '"content_index":0' in stream
+
+      # The same route, reached without the run's credential, is refused
+      # before the proxy is asked for anything.
+      refused = gateway.succeed("curl -sS -X POST -H 'content-type: application/json' -d '{\"model\":\"llama-local\",\"input\":\"hello\"}' http://127.0.0.1:${toString gatewayPort}/v1/responses")
+      print(refused)
+      assert "per-run credential" in refused
+      assert "proxied-ok" not in refused
     '';
   };
 

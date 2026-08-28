@@ -10,7 +10,7 @@ use hellas_adaptors::{
     ContentPart as WireContentPart, ExecutionRequest as WireExecutionRequest, Input, InputItem,
     Message as WireMessage,
 };
-use hellas_client::{ExecutionRoute, ProducerTrust, ProviderTrustAnchor, RemoteNodeTarget};
+use hellas_client::{ExecutionRoute, ProducerTrust, RemoteNodeTarget};
 #[cfg(feature = "evaluate")]
 use hellas_executor::Executor;
 use hellas_models::{ChatMessage, ModelAssets, PreparedPrompt, Reach};
@@ -22,7 +22,6 @@ use hellas_rpc::provenance::ExecutionProvenance;
 use iroh::EndpointId;
 use std::collections::HashMap;
 use std::error::Error as StdError;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::Duration;
@@ -33,14 +32,11 @@ pub(super) const DEFAULT_INFERENCE_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Clone)]
 pub(super) struct GatewayState {
-    pub(super) node_id: Option<EndpointId>,
-    pub(super) node_addrs: Vec<SocketAddr>,
     #[cfg(feature = "evaluate")]
     pub(super) local: bool,
     #[cfg(feature = "evaluate")]
     pub(super) verify_local: bool,
     pub(super) verify_node_id: Option<EndpointId>,
-    pub(super) retries: usize,
     default_max_tokens: u32,
     pub(super) force_model: Option<String>,
     pub(super) inference_timeout: Duration,
@@ -50,9 +46,65 @@ pub(super) struct GatewayState {
     pub(super) responses_fetch: Option<Arc<super::fetch_backend::ResponsesFetchBackend>>,
     runner_key: Arc<hellas_rpc::ProducerSigningKey>,
     assurance: hellas_rpc::Assurance,
-    provider_trust: ProviderTrustAnchor,
+    /// The one strategy every request runs, settled at startup by
+    /// [`configured_strategy`]. The dial targets it was built from are
+    /// deliberately not kept: there is no second place a route could be
+    /// assembled, and so no place one could be assembled without an anchor.
+    strategy: Option<ExecutionStrategy>,
     model_cache: Arc<RwLock<HashMap<String, Arc<ModelAssets>>>>,
     model_load_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+}
+
+/// The execution strategy these options describe, or `None` when they
+/// describe none.
+///
+/// A trust anchor is required exactly where one can be used. Every
+/// remote constructor below — [`ExecutionRoute::remote`] and
+/// [`RemoteNodeTarget::direct`] — takes a [`hellas_client::ProviderTrustAnchor`] by
+/// value, so the `?` on the anchor is the only way past them: without
+/// one there is no remote route to run, and a gateway with no route
+/// refuses a request rather than dialling a provider it cannot verify.
+/// Local execution answers to nobody remote and needs no anchor, so it
+/// is built either way.
+fn configured_strategy(options: &GatewayOptions) -> Option<ExecutionStrategy> {
+    #[cfg(feature = "evaluate")]
+    let primary = if options.local {
+        ExecutionRoute::Local
+    } else {
+        ExecutionRoute::remote(
+            options.node_id,
+            options.node_addrs.clone(),
+            options.retries,
+            options.provider_trust.clone()?,
+        )
+    };
+    #[cfg(not(feature = "evaluate"))]
+    let primary = ExecutionRoute::remote(
+        options.node_id,
+        options.node_addrs.clone(),
+        options.retries,
+        options.provider_trust.clone()?,
+    );
+
+    #[cfg(feature = "evaluate")]
+    if options.verify_local {
+        return Some(ExecutionStrategy::Verify {
+            primary,
+            shadow: ExecutionRoute::Local,
+        });
+    }
+
+    if let Some(node_id) = options.verify {
+        return Some(ExecutionStrategy::Verify {
+            primary,
+            shadow: ExecutionRoute::RemoteDirect(RemoteNodeTarget::direct(
+                node_id,
+                options.provider_trust.clone()?,
+            )),
+        });
+    }
+
+    Some(ExecutionStrategy::Run(primary))
 }
 
 pub(super) struct PreparedGeneration {
@@ -123,7 +175,13 @@ impl GatewayState {
                         options.node_id,
                         options.node_addrs.clone(),
                         options.retries,
-                        options.provider_trust.clone(),
+                        // This backend dials a provider for every request
+                        // it serves, so it is built only where the anchor
+                        // that provider will be checked against exists.
+                        options
+                            .provider_trust
+                            .clone()
+                            .context("fetch responses backend requires a provider trust anchor")?,
                     ),
                     (
                         &options.responses_fetch_route_service,
@@ -146,14 +204,11 @@ impl GatewayState {
         };
 
         Ok(Self {
-            node_id: options.node_id,
-            node_addrs: options.node_addrs.clone(),
             #[cfg(feature = "evaluate")]
             local: options.local,
             #[cfg(feature = "evaluate")]
             verify_local: options.verify_local,
             verify_node_id: options.verify,
-            retries: options.retries,
             default_max_tokens: options.default_max_tokens,
             force_model: options.force_model.clone(),
             inference_timeout: DEFAULT_INFERENCE_TIMEOUT,
@@ -163,7 +218,7 @@ impl GatewayState {
             responses_fetch,
             runner_key,
             assurance: options.assurance,
-            provider_trust: options.provider_trust.clone(),
+            strategy: configured_strategy(options),
             model_cache: Arc::new(RwLock::new(HashMap::new())),
             model_load_locks: Arc::new(Mutex::new(HashMap::new())),
         })
@@ -175,41 +230,15 @@ impl GatewayState {
             .unwrap_or_else(|| request_model.to_string())
     }
 
-    fn execution_route(&self) -> ExecutionRoute {
-        #[cfg(feature = "evaluate")]
-        if self.local {
-            return ExecutionRoute::Local;
-        }
-        ExecutionRoute::remote(
-            self.node_id,
-            self.node_addrs.clone(),
-            self.retries,
-            self.provider_trust.clone(),
-        )
-    }
-
-    fn execution_strategy(&self) -> ExecutionStrategy {
-        let primary = self.execution_route();
-
-        #[cfg(feature = "evaluate")]
-        if self.verify_local {
-            return ExecutionStrategy::Verify {
-                primary,
-                shadow: ExecutionRoute::Local,
-            };
-        }
-
-        if let Some(node_id) = self.verify_node_id {
-            return ExecutionStrategy::Verify {
-                primary,
-                shadow: ExecutionRoute::RemoteDirect(RemoteNodeTarget::direct(
-                    node_id,
-                    self.provider_trust.clone(),
-                )),
-            };
-        }
-
-        ExecutionStrategy::Run(primary)
+    /// The strategy this request runs under, or the refusal of a gateway
+    /// that was given no anchor and so holds no route to run it.
+    fn execution_strategy(&self) -> Result<ExecutionStrategy, HttpError> {
+        self.strategy.clone().ok_or_else(|| HttpError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: "this gateway has no provider trust anchor, so it has no execution route; \
+                      restart it with --provider <content-id>"
+                .to_string(),
+        })
     }
 
     /// This model's tokenizer and template, downloading them if this
@@ -301,7 +330,7 @@ impl GatewayState {
                 assurance: self.assurance,
                 retention,
             },
-            self.execution_strategy(),
+            self.execution_strategy()?,
             self.runner_key.as_ref().clone(),
         )
         .map_err(|err| HttpError {
@@ -508,9 +537,10 @@ impl IntoResponse for HttpError {
     }
 }
 
-#[cfg(all(test, feature = "evaluate"))]
+#[cfg(test)]
 mod tests {
     use super::*;
+    use hellas_client::ProviderTrustAnchor;
     use std::str::FromStr;
 
     fn endpoint(byte: u8) -> EndpointId {
@@ -527,74 +557,125 @@ mod tests {
         }
     }
 
-    fn state(local: bool, verify_local: bool, verify_node_id: Option<EndpointId>) -> GatewayState {
-        let provider_trust = ProviderTrustAnchor {
+    fn anchor() -> ProviderTrustAnchor {
+        ProviderTrustAnchor {
             expected_genesis: hellas_rpc::ContentId::from_bytes([9; 32]),
             required_assurance: hellas_rpc::Assurance::ProducerSigned,
             apple_app_attest: None,
-        };
-        GatewayState {
-            node_id: Some(endpoint(1)),
-            node_addrs: Vec::new(),
-            local,
-            verify_local,
-            verify_node_id,
-            retries: 2,
-            default_max_tokens: 128,
-            force_model: None,
-            inference_timeout: DEFAULT_INFERENCE_TIMEOUT,
-            dtype: Dtype::F32,
-            runtime: CliRuntime::default(),
-            responses_proxy: None,
-            responses_fetch: None,
-            runner_key: Arc::new(
-                hellas_rpc::ProducerSigningKey::from_secret_bytes([3; 32]).expect("valid test key"),
-            ),
-            assurance: hellas_rpc::Assurance::ProducerSigned,
-            provider_trust,
-            model_cache: Arc::default(),
-            model_load_locks: Arc::default(),
         }
     }
 
+    /// A gateway pointed at one node, which callers then vary.
+    fn options(provider_trust: Option<ProviderTrustAnchor>) -> GatewayOptions {
+        GatewayOptions {
+            host: "127.0.0.1".to_string(),
+            port: None,
+            node_id: Some(endpoint(1)),
+            node_addrs: Vec::new(),
+            #[cfg(feature = "evaluate")]
+            local: false,
+            #[cfg(feature = "evaluate")]
+            verify_local: false,
+            verify: None,
+            #[cfg(feature = "evaluate")]
+            queue_size: 1,
+            retries: 2,
+            default_max_tokens: 128,
+            force_model: None,
+            metrics_port: None,
+            dtype: Dtype::F32,
+            responses_backend: ResponsesBackend::Hellas,
+            responses_proxy_url: String::new(),
+            responses_proxy_api_key_env: String::new(),
+            responses_fetch_route_service: String::new(),
+            responses_fetch_route_method: String::new(),
+            responses_fetch_execution_environment: None,
+            responses_fetch_request_overrides: Default::default(),
+            trusted_producer_public_keys: Vec::new(),
+            provider_trust,
+            producer_key: hellas_rpc::ProducerSigningKey::from_secret_bytes([3; 32])
+                .expect("valid test key"),
+            #[cfg(feature = "evaluate")]
+            provider_genesis: Vec::new(),
+            assurance: hellas_rpc::Assurance::ProducerSigned,
+            secret_key: iroh::SecretKey::from([5; 32]),
+            wrap: None,
+            wrap_args: Vec::new(),
+        }
+    }
+
+    /// Fails the day a remote route becomes constructible without the
+    /// anchor the provider on it is verified against. Direct dial,
+    /// discovery, and the verification shadow are each a provider dialled
+    /// at run time, so each one alone is enough to withhold the strategy.
     #[test]
-    fn execution_strategy_uses_local_shadow_for_verify_local() {
-        let state = state(false, true, None);
-        let trust = state.provider_trust.clone();
-        assert_eq!(
-            state.execution_strategy(),
-            ExecutionStrategy::Verify {
-                primary: ExecutionRoute::RemoteDirect(
-                    RemoteNodeTarget::direct(endpoint(1), trust,)
-                ),
-                shadow: ExecutionRoute::Local,
-            }
-        );
+    fn every_remote_route_requires_a_provider_trust_anchor() {
+        let direct = options(None);
+        assert!(configured_strategy(&direct).is_none());
+
+        let mut discovery = options(None);
+        discovery.node_id = None;
+        assert!(configured_strategy(&discovery).is_none());
+
+        let mut verified = options(None);
+        verified.verify = Some(endpoint(2));
+        assert!(configured_strategy(&verified).is_none());
+
+        // The same three configurations, with an anchor to dial against.
+        assert!(configured_strategy(&options(Some(anchor()))).is_some());
+        discovery.provider_trust = Some(anchor());
+        assert!(configured_strategy(&discovery).is_some());
+        verified.provider_trust = Some(anchor());
+        assert!(configured_strategy(&verified).is_some());
     }
 
     #[test]
     fn execution_strategy_uses_remote_shadow_for_verify_node() {
-        let verify_node = endpoint(2);
-        let state = state(false, false, Some(verify_node));
-        let trust = state.provider_trust.clone();
+        let mut options = options(Some(anchor()));
+        options.verify = Some(endpoint(2));
         assert_eq!(
-            state.execution_strategy(),
-            ExecutionStrategy::Verify {
+            configured_strategy(&options),
+            Some(ExecutionStrategy::Verify {
                 primary: ExecutionRoute::RemoteDirect(RemoteNodeTarget::direct(
                     endpoint(1),
-                    trust.clone(),
+                    anchor(),
                 )),
-                shadow: ExecutionRoute::RemoteDirect(RemoteNodeTarget::direct(endpoint(2), trust)),
-            }
+                shadow: ExecutionRoute::RemoteDirect(RemoteNodeTarget::direct(
+                    endpoint(2),
+                    anchor(),
+                )),
+            })
         );
     }
 
+    #[cfg(feature = "evaluate")]
+    #[test]
+    fn execution_strategy_uses_local_shadow_for_verify_local() {
+        let mut options = options(Some(anchor()));
+        options.verify_local = true;
+        assert_eq!(
+            configured_strategy(&options),
+            Some(ExecutionStrategy::Verify {
+                primary: ExecutionRoute::RemoteDirect(RemoteNodeTarget::direct(
+                    endpoint(1),
+                    anchor(),
+                )),
+                shadow: ExecutionRoute::Local,
+            })
+        );
+    }
+
+    /// Local execution dials nobody, so it is the one route that runs
+    /// without an anchor.
+    #[cfg(feature = "evaluate")]
     #[test]
     fn execution_strategy_uses_local_run_when_local_is_enabled() {
-        let state = state(true, false, None);
+        let mut options = options(None);
+        options.node_id = None;
+        options.local = true;
         assert_eq!(
-            state.execution_strategy(),
-            ExecutionStrategy::Run(ExecutionRoute::Local)
+            configured_strategy(&options),
+            Some(ExecutionStrategy::Run(ExecutionRoute::Local))
         );
     }
 }

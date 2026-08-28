@@ -69,7 +69,11 @@ pub struct GatewayOptions {
     pub responses_fetch_execution_environment: Option<hellas_rpc::ContentId>,
     pub responses_fetch_request_overrides: JsonMap<String, JsonValue>,
     pub trusted_producer_public_keys: Vec<hellas_rpc::PublicKey>,
-    pub provider_trust: hellas_client::ProviderTrustAnchor,
+    /// The out-of-band anchor every remote route is verified against.
+    /// `None` is the absence of a *route*, never a route dialled without
+    /// an anchor: each remote constructor takes an anchor by value, so a
+    /// gateway given none has no remote route to run and says so.
+    pub provider_trust: Option<hellas_client::ProviderTrustAnchor>,
     pub producer_key: ProducerSigningKey,
     #[cfg(feature = "evaluate")]
     pub provider_genesis: Vec<u8>,
