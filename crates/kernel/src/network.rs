@@ -23,7 +23,7 @@
 //!
 //! [`NetworkId::new`] bounds the length and nothing else. The genesis
 //! document is the single authority on what a legal network id string
-//! is (`crate::genesis::Genesis::validate`); re-stating its token rule
+//! is (`hellas_chain::genesis::Genesis::validate`); re-stating its token rule
 //! here would be a second copy of a rule that must agree with the
 //! first. The kernel only needs bytes to separate domains with.
 

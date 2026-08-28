@@ -188,17 +188,12 @@
 //! };
 //! ```
 
-#[cfg(feature = "genesis")]
-extern crate alloc;
-
 mod block;
 mod canonical;
 pub(crate) mod consts;
 mod context;
 mod error;
 mod event;
-#[cfg(feature = "genesis")]
-pub mod genesis;
 mod lease;
 mod list;
 mod network;

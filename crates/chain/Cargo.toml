@@ -21,7 +21,6 @@ domain = [
     "dep:sha2",
     "dep:thiserror",
     "dep:url",
-    "hellas-kernel/genesis",
     "hellas-kernel/secp256k1",
 ]
 # Consensus wiring aliases in the domain module (threshold scheme types).
@@ -210,3 +209,8 @@ proptest = "1.11"
 serde = { workspace = true, features = ["derive"] }
 tempfile = "3"
 test-log = { version = "0.2", features = ["trace"] }
+# `genesis`'s round-trip test reads the document back out of TOML, which
+# is the format a validator config embeds it in. As a runtime dependency
+# `toml` arrives only with `validator`; the module compiles from `domain`
+# up, so its own suite has to ask for it unconditionally.
+toml.workspace = true

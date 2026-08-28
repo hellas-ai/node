@@ -5,27 +5,15 @@
 //! indexers, browsers, and deployment tooling. Cryptographic consumers decode
 //! and validate the key strings at their own boundary.
 //!
-//! It is the initial state of the state machine this crate defines, so it
-//! belongs to the protocol rather than to any one node: a relay or a browser
-//! that only needs to know which committee a network has can depend on the
-//! kernel and nothing else. It is feature-gated because it is the one part of
-//! the kernel that allocates — a document is parsed once at boot, never in a
-//! transition — so a build that does not ask for `genesis` is still the
-//! allocation-free `no_std` kernel it was.
+//! It sits under `domain`, the lowest feature that has a network at all, so
+//! everything above it — the light client, the server, the indexer, the
+//! validator — reads the same document type, and a `wasm-client` browser build
+//! carries the shipped documents exactly as it did when this was a crate.
 
-// The document is variable-length JSON handed to us from outside; it cannot be
-// expressed in the bounded caller-owned storage the transition core requires,
-// and it is never touched by a transition.
-#![allow(
-    clippy::disallowed_types,
-    reason = "the genesis document is parsed once at boot, outside the transition core, and its committee and allocation lists are sized by the operator rather than by the protocol"
-)]
-
-use alloc::{collections::BTreeSet, string::String, vec::Vec};
+use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
-/// The only genesis schema version this build understands.
 pub const GENESIS_SCHEMA_VERSION: u16 = 1;
 
 /// The in-tree development network's document.
@@ -96,23 +84,17 @@ const PUBLIC_KEY_HEX_BYTES: usize = 64;
 const MAX_NETWORK_ID_BYTES: usize = 63;
 const MAX_LABEL_BYTES: usize = 63;
 
-/// The initial state of one network, as every participant reads it.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Genesis {
-    /// Schema version of this document; only [`GENESIS_SCHEMA_VERSION`] is accepted.
     #[serde(default = "default_schema_version")]
     pub schema_version: u16,
-    /// The network id every signature in this network is domain-separated by.
     pub network_id: String,
-    /// The founding committee, in the order the document lists it.
     pub validators: Vec<GenesisValidator>,
-    /// Balances credited before the first block.
     #[serde(default)]
     pub allocations: Vec<GenesisAllocation>,
 }
 
-/// One member of the founding committee.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GenesisValidator {
@@ -122,85 +104,36 @@ pub struct GenesisValidator {
     pub label: String,
 }
 
-/// One balance credited before the first block.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GenesisAllocation {
-    /// The account the balance is credited to.
     pub address: String,
-    /// The amount credited.
     pub balance: u64,
 }
 
-/// Why a genesis document was refused.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum GenesisError {
-    /// The document declares a schema this build does not implement.
+    #[error("unsupported genesis schema version {0}")]
     UnsupportedSchema(u16),
-    /// The network id is not a bounded lowercase ASCII token.
+    #[error("network id must be 1..={MAX_NETWORK_ID_BYTES} lowercase ASCII token bytes")]
     InvalidNetworkId,
-    /// The committee is empty.
+    #[error("genesis must contain at least one validator")]
     EmptyCommittee,
-    /// A validator public key is not 64 lowercase hexadecimal characters.
+    #[error("validator public key must be exactly 64 lowercase hexadecimal characters")]
     InvalidValidatorKey,
-    /// Two validators declare the same public key.
+    #[error("duplicate validator public key {0}")]
     DuplicateValidatorKey(String),
-    /// A validator label is not a bounded lowercase ASCII token.
+    #[error("validator label must be 1..={MAX_LABEL_BYTES} lowercase ASCII token bytes")]
     InvalidValidatorLabel,
-    /// Two validators declare the same label.
+    #[error("duplicate validator label {0}")]
     DuplicateValidatorLabel(String),
-    /// An allocation names an empty address.
+    #[error("genesis allocation address must not be empty")]
     EmptyAllocationAddress,
-    /// Two allocations name the same address.
+    #[error("duplicate genesis allocation address {0}")]
     DuplicateAllocationAddress(String),
 }
 
-impl core::fmt::Display for GenesisError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::UnsupportedSchema(version) => {
-                write!(f, "unsupported genesis schema version {version}")
-            }
-            Self::InvalidNetworkId => write!(
-                f,
-                "network id must be 1..={MAX_NETWORK_ID_BYTES} lowercase ASCII token bytes"
-            ),
-            Self::EmptyCommittee => write!(f, "genesis must contain at least one validator"),
-            Self::InvalidValidatorKey => write!(
-                f,
-                "validator public key must be exactly 64 lowercase hexadecimal characters"
-            ),
-            Self::DuplicateValidatorKey(key) => {
-                write!(f, "duplicate validator public key {key}")
-            }
-            Self::InvalidValidatorLabel => write!(
-                f,
-                "validator label must be 1..={MAX_LABEL_BYTES} lowercase ASCII token bytes"
-            ),
-            Self::DuplicateValidatorLabel(label) => {
-                write!(f, "duplicate validator label {label}")
-            }
-            Self::EmptyAllocationAddress => {
-                write!(f, "genesis allocation address must not be empty")
-            }
-            Self::DuplicateAllocationAddress(address) => {
-                write!(f, "duplicate genesis allocation address {address}")
-            }
-        }
-    }
-}
-
-impl core::error::Error for GenesisError {}
-
 impl Genesis {
-    /// Checks every rule the document must satisfy before anything acts on it.
-    ///
-    /// # Errors
-    ///
-    /// Returns the first [`GenesisError`] the document violates: an
-    /// unsupported schema, a malformed or duplicated network id, validator
-    /// key, or label, an empty committee, or a malformed or duplicated
-    /// allocation address.
     pub fn validate(&self) -> Result<(), GenesisError> {
         if self.schema_version != GENESIS_SCHEMA_VERSION {
             return Err(GenesisError::UnsupportedSchema(self.schema_version));
@@ -252,7 +185,6 @@ impl Genesis {
         Ok(())
     }
 
-    /// Finds a committee member by its canonical public key string.
     #[must_use]
     pub fn validator(&self, public_key: &str) -> Option<&GenesisValidator> {
         self.validators
@@ -274,14 +206,8 @@ fn is_token(value: &str, max_len: usize) -> bool {
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::unwrap_used,
-    clippy::indexing_slicing,
-    reason = "the genesis suite asserts against fixed in-tree documents and a two-entry fixture"
-)]
 mod tests {
     use super::*;
-    use alloc::{string::ToString as _, vec};
 
     fn fixture() -> Genesis {
         Genesis {
@@ -374,7 +300,6 @@ mod tests {
     /// node that joined the wrong one has forked.
     #[test]
     fn shipped_documents_hash_to_the_bytes_that_were_reviewed() {
-        use core::fmt::Write as _;
         use sha2::{Digest as _, Sha256};
 
         for (json, expected) in [
@@ -388,10 +313,7 @@ mod tests {
             ),
         ] {
             let digest = Sha256::digest(json.as_bytes());
-            let hex = digest.iter().fold(String::new(), |mut hex, byte| {
-                write!(hex, "{byte:02x}").unwrap();
-                hex
-            });
+            let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
             assert_eq!(hex, expected);
         }
     }
