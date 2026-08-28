@@ -42,7 +42,7 @@
 //! `WorkChannelSnapshot::finalized_setup` is what refuses to produce
 //! one from a snapshot that asked about other coins.
 
-use hellas_kernel::Tx;
+use hellas_kernel::{Terms, Tx};
 use hellas_rpc::work::WorkService;
 use hellas_rpc::work_close::{
     BlockSourceError, CatchUpError, CloseError, CloseProgress, FinalizedBlocks, FinalizedWork,
@@ -67,6 +67,8 @@ pub struct PaidWorkClockAdvance {
     pub close: CloseProgress,
     /// Submission outcome for a due adjudicated payment close.
     pub adjudication: Option<SubmitTxOutcome>,
+    /// Submission outcome for a due completed-bond timeout.
+    pub bond_timeout: Option<SubmitTxOutcome>,
 }
 
 /// Why one production clock step could not finish.
@@ -84,6 +86,9 @@ pub enum PaidWorkClockError {
     /// The connected transaction sink failed.
     #[error("the connected transaction sink failed: {0}")]
     Submission(#[source] BlockSourceError),
+    /// The retained work-bond shape had no deterministic timeout payout.
+    #[error("the mounted channel's embedded bond terms have no timeout payout")]
+    TimeoutUnavailable,
 }
 
 impl PaidWorkClockError {
@@ -107,9 +112,11 @@ impl<C: LightClient> WorkBlocks<C> {
 /// Advances one mounted paid channel on the production clock.
 ///
 /// The journaled close drive runs first. The endpoint is then borrowed
-/// synchronously only long enough to copy the two edge ids. One coherent
-/// finalized snapshot from `source` decides the permissionless payment
-/// close through [`WorkService::adjudicated_close`].
+/// synchronously only long enough to copy the two edge ids and embedded
+/// bond terms. One coherent finalized snapshot from `source` decides both
+/// permissionless submissions: the payment close through
+/// [`WorkService::adjudicated_close`], and the bond timeout when that same
+/// read still contains the bond at or beyond its committed horizon.
 ///
 /// `NoContest`, `OtherContest`, and `ResponseWindowOpen` are clock states,
 /// not failures. They leave adjudication absent from the returned advance
@@ -118,6 +125,7 @@ impl<C: LightClient> WorkBlocks<C> {
 /// # Errors
 ///
 /// Returns the failed journal drive, snapshot, decision, or submission.
+/// A retained work-bond shape without a timeout payout is also refused.
 pub async fn advance_paid_work_clock<S>(
     service: &WorkService,
     source: &S,
@@ -129,17 +137,21 @@ where
         .advance_close(source, source)
         .await
         .map_err(PaidWorkClockError::CloseDrive)?;
-    let query = service
+    let (query, bond_terms) = service
         .with_state(|state| {
             let channel = state.channel();
             let payment_terms = channel.payment_terms();
-            WorkChannelQuery {
-                bond_edge: payment_terms.bond_edge,
-                payment_edge: channel.payment_edge(),
-                funding: Default::default(),
-            }
+            (
+                WorkChannelQuery {
+                    bond_edge: payment_terms.bond_edge,
+                    payment_edge: channel.payment_edge(),
+                    funding: Default::default(),
+                },
+                Terms::work_stake_bond(payment_terms.bond_terms.clone()),
+            )
         })
         .map_err(|error| PaidWorkClockError::Decision(CloseError::Endpoint(error)))?;
+    let bond_edge = query.bond_edge;
     let Some(snapshot) = source
         .work_channel_snapshot(query)
         .await
@@ -148,6 +160,7 @@ where
         return Ok(PaidWorkClockAdvance {
             close,
             adjudication: None,
+            bond_timeout: None,
         });
     };
 
@@ -166,9 +179,24 @@ where
         Err(error) => return Err(PaidWorkClockError::Decision(error)),
     };
 
+    let bond_timeout =
+        if snapshot.bond().is_some() && snapshot.block().height >= bond_terms.timeout().get() {
+            let tx = Tx::timeout_close(bond_edge, &bond_terms)
+                .ok_or(PaidWorkClockError::TimeoutUnavailable)?;
+            Some(
+                source
+                    .submit(tx)
+                    .await
+                    .map_err(PaidWorkClockError::Submission)?,
+            )
+        } else {
+            None
+        };
+
     Ok(PaidWorkClockAdvance {
         close,
         adjudication,
+        bond_timeout,
     })
 }
 

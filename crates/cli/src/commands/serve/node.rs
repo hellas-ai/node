@@ -826,10 +826,11 @@ mod tests {
 
     use hellas_chain::{LatestBlock, QueryError, WorkChannelQuery, WorkChannelSnapshot};
     use hellas_kernel::{
-        Auth, BlockHeight, CoinId, Decode as _, EdgeValues, Fees, Funding, LeaseSlots, List,
-        MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, MIN_OMIT_RESPONSE_BLOCKS, Move, Parties, Party, Payout,
-        PendingPaymentClose, Proof, RegistryChunk, RegistryNamespace, RegistryRecordTag, StartId,
-        Terms, Tx, WorkPaymentSettlement, WorkPaymentTerms, WorkStakeBondTerms,
+        Auth, BlockHeight, BufferWriter, CoinId, Decode as _, Edge, EdgeValues, Encode as _, Fees,
+        Funding, LeaseSlots, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, MIN_OMIT_RESPONSE_BLOCKS,
+        Move, Parties, Party, Payout, PendingPaymentClose, Proof, RegistryChunk, RegistryNamespace,
+        RegistryRecordTag, StartId, Terms, Tx, WorkPaymentSettlement, WorkPaymentTerms,
+        WorkStakeBondTerms, Writer as _,
     };
     use hellas_rpc::call::WithTrailer;
     use hellas_rpc::evaluate::{
@@ -1465,7 +1466,11 @@ mod tests {
     }
 
     /// The coherent finalized view the clock asks this fixture chain for.
-    fn channel_snapshot(height: u64, pending: Option<RegistryChunk>) -> WorkChannelSnapshot {
+    fn channel_snapshot(
+        height: u64,
+        bond: Option<Edge>,
+        pending: Option<RegistryChunk>,
+    ) -> WorkChannelSnapshot {
         WorkChannelSnapshot::new(
             WorkChannelQuery {
                 bond_edge: bond_edge(),
@@ -1478,7 +1483,7 @@ mod tests {
                 state_root: hellas_chain::domain::Digest::from([0xd0; 32]),
                 finalization: Vec::new(),
             },
-            None,
+            bond,
             None,
             [None, None],
             pending,
@@ -1525,6 +1530,28 @@ mod tests {
         }
     }
 
+    /// One readable live edge under the fixture bond's committed terms.
+    fn live_bond() -> Edge {
+        let terms = Terms::work_stake_bond(bond_terms());
+        let mut encoded = vec![0_u8; Edge::MAX_ENCODED_SIZE];
+        let written = {
+            let mut writer = BufferWriter::new(&mut encoded);
+            writer.write(&[1, 5]); // canonical Edge envelope
+            64_u64.encode_to(&mut writer);
+            0_u64.encode_to(&mut writer);
+            Fees::ZERO.encode_to(&mut writer);
+            terms.timeout().encode_to(&mut writer);
+            terms.parties().encode_to(&mut writer);
+            terms.hash().encode_to(&mut writer);
+            terms.allowed_closes().encode_to(&mut writer);
+            writer.position()
+        };
+        match Edge::decode_exact(&encoded[..written]) {
+            Ok(edge) => edge,
+            Err(error) => panic!("the fixture live bond decodes: {error:?}"),
+        }
+    }
+
     // ── The chain a test writes down ──────────────────────────────────
 
     /// One coherent finalized read, a tip that never moves, and a sink
@@ -1558,7 +1585,7 @@ mod tests {
         fn with(slow: bool) -> Self {
             Self(Arc::new(ChainState {
                 submitted: Mutex::new(Vec::new()),
-                snapshot: Mutex::new(channel_snapshot(ORIGIN, None)),
+                snapshot: Mutex::new(channel_snapshot(ORIGIN, None, None)),
                 entered: Semaphore::new(0),
                 release: Semaphore::new(0),
                 slow,
@@ -1767,7 +1794,7 @@ mod tests {
         let mount = MountedWork::default();
         let mut runner = runner(dir.path(), Some(admits()), &mount);
         let chain = TestChain::new();
-        chain.set_snapshot(channel_snapshot(ORIGIN, Some(pending_contest(false))));
+        chain.set_snapshot(channel_snapshot(ORIGIN, None, Some(pending_contest(false))));
 
         assert!(runner.tick(&chain).await, "the first coherent read answers");
         assert_eq!(
@@ -1796,13 +1823,48 @@ mod tests {
             "a local CloseResponded is not consensus response evidence",
         );
 
-        chain.set_snapshot(channel_snapshot(ORIGIN, Some(pending_contest(true))));
+        chain.set_snapshot(channel_snapshot(ORIGIN, None, Some(pending_contest(true))));
         assert!(runner.tick(&chain).await, "the responded read answers");
         assert_eq!(
             adjudicated_payment_closes(&chain),
             1,
             "consensus response makes exactly one adjudicated payment close due",
         );
+    }
+
+    #[tokio::test]
+    async fn the_paid_work_clock_returns_the_completed_bond_at_its_horizon() {
+        let dir = temp();
+        write_setup_journal(dir.path());
+        let mount = MountedWork::default();
+        let mut runner = runner(dir.path(), Some(admits()), &mount);
+        let chain = TestChain::new();
+        chain.set_snapshot(channel_snapshot(
+            bond_terms().timeout.get(),
+            Some(live_bond()),
+            None,
+        ));
+
+        assert!(runner.tick(&chain).await, "the horizon read answers");
+        let submitted = chain.submitted();
+        let timeouts = submitted
+            .iter()
+            .filter(|tx| {
+                matches!(
+                    tx,
+                    Tx::Close {
+                        input,
+                        proof: Proof::Timeout { .. },
+                        ..
+                    } if *input == bond_edge()
+                )
+            })
+            .count();
+        assert_eq!(
+            timeouts, 1,
+            "the live completed bond is returned by one deterministic timeout",
+        );
+        assert_eq!(submitted.len(), 1, "no other transaction is submitted");
     }
 
     /// §4's rule, driven: evidence that is `assumed` or absent turns
