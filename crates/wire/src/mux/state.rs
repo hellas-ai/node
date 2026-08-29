@@ -144,6 +144,17 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
         &self.config
     }
 
+    /// The generation currently seated in a slot, if the slot has ever
+    /// been used.
+    ///
+    /// A slot index is recycled, so an index on its own does not name a
+    /// stream — the `(index, generation)` pair does. That is already how
+    /// every frame on the wire is addressed; this lets everything above
+    /// the state machine address a stream the same way.
+    pub fn generation(&self, idx: SlotIndex) -> Option<u16> {
+        self.slot(idx).map(|slot| slot.generation)
+    }
+
     fn lowest_free(&self) -> Option<SlotIndex> {
         for (word_idx, word) in self.free_mask.iter().enumerate() {
             if *word != 0 {
