@@ -902,18 +902,18 @@ fn assert_response_corresponds<const C: usize, const E: usize, const R: usize>(
     expected_result: Option<ApplyError>,
     state: &mut State<FixedStore<C, E, R>>,
     context: Context,
-    response: PaymentCloseResponse,
+    response: &PaymentCloseResponse,
 ) {
     let mut validation_store = *state.store();
     let checked = {
         let batch = validation_store.begin();
-        check_response(&response, context, &FAKE_VERIFIER, &batch)
+        check_response(response, context, &FAKE_VERIFIER, &batch)
     };
     let before = *state.store();
     let applied = state.apply(
         context,
         &FAKE_VERIFIER,
-        &Tx::move_action(Move::RespondPaymentClose(response)),
+        &Tx::move_action(Move::RespondPaymentClose(*response)),
     );
 
     match (checked, applied) {
@@ -947,165 +947,254 @@ fn pending_response_state() -> (State<PaymentStore>, PendingPaymentClose) {
     (state, opened)
 }
 
-fn invalid_response(input: EdgeId, reason: InvalidMoveReason) -> Option<ApplyError> {
-    Some(ApplyError::InvalidMove { input, reason })
+const fn invalid_response(input: EdgeId, reason: InvalidMoveReason) -> ApplyError {
+    ApplyError::InvalidMove { input, reason }
+}
+
+/// A start id no contest here ever had. The cases naming it either have
+/// no contest to answer at all, or are answering one that is not theirs.
+const fn unknown_start() -> StartId {
+    StartId::from_bytes([9; StartId::LENGTH])
+}
+
+/// A response on a live work-stake bond: a real edge between the same two
+/// roles, committing no adjudicated exit.
+fn response_on_work_bond() -> PaymentCloseResponse {
+    let earned = EarnedCertificate::new(work_edge(), work_terms().hash(), 5);
+    PaymentCloseResponse::new(
+        work_edge(),
+        unknown_start(),
+        Party::Taker,
+        signed_certificate_by(MAKER, earned),
+        Sig::from_bytes([0; Sig::LENGTH]),
+    )
+}
+
+/// A certificate the client really signed, for another edge entirely.
+fn certificate_for_another_edge() -> (EarnedCertificate, Sig) {
+    let earned = EarnedCertificate::new(
+        EdgeId::from_bytes([0x77; EdgeId::LENGTH]),
+        payment_terms_hash(),
+        5,
+    );
+    signed_certificate_by(MAKER, earned)
+}
+
+/// A certificate the client really signed, on this edge but under terms
+/// that are not this channel's.
+fn certificate_for_other_terms() -> (EarnedCertificate, Sig) {
+    signed_certificate_by(MAKER, EarnedCertificate::new(payment_edge_id(), terms(), 5))
+}
+
+/// This channel's own certificate, signed by the provider instead of the
+/// client — the only party whose signature the kernel accepts on one.
+fn provider_signed_certificate() -> (EarnedCertificate, Sig) {
+    signed_certificate_by(TAKER, certificate(5))
+}
+
+/// The world one response meets: the store it is checked against, and the
+/// height it arrives at. Each case names one, and it is built afresh for
+/// that case alone, so no case can see what another wrote.
+#[derive(Clone, Copy, Debug)]
+enum Subject {
+    /// A posted bond, and no payment edge at all.
+    Bonded,
+    /// A live work-stake bond, which commits no adjudicated exit.
+    WorkBond,
+    /// A live payment channel carrying no contest.
+    Opened,
+    /// A contest whose one response has already been spent.
+    Answered,
+    /// A live contest, unanswered, well inside its window.
+    Pending,
+    /// That same live contest, met at the height its window shuts.
+    Late,
+}
+
+/// What the read-only check and the applying path both owe a case.
+#[derive(Clone, Copy, Debug)]
+enum Verdict {
+    /// Neither of them finds the edge the response names.
+    NoEdge,
+    /// Both refuse the response, on the edge it names, for this reason.
+    Bad(InvalidMoveReason),
+    /// Both accept it, and commit the same advanced record.
+    Good,
+}
+
+impl Verdict {
+    /// The exact result both paths owe a response naming `input`.
+    const fn expected(self, input: EdgeId) -> Option<ApplyError> {
+        match self {
+            Self::NoEdge => Some(ApplyError::MissingEdge { id: input }),
+            Self::Bad(reason) => Some(invalid_response(input, reason)),
+            Self::Good => None,
+        }
+    }
+}
+
+/// One predicate of the response check, and the verdict it is owed.
+#[derive(Clone, Copy, Debug)]
+struct Predicate {
+    /// What this case is called when it fails.
+    case: &'static str,
+    /// The world the response meets.
+    subject: Subject,
+    /// The response itself.
+    response: PaymentCloseResponse,
+    /// What both paths must say about it.
+    verdict: Verdict,
+}
+
+/// Every exit [`check_response`] has, in one place.
+///
+/// One row per predicate, and the array's own length pins how many there
+/// are: the four a response meets before there is a live contest to
+/// answer, the nine refusals of an answer to one, and the acceptance. A
+/// predicate added to the kernel and not to this list leaves the count
+/// short; a row that stops mattering leaves it long.
+fn response_predicates(start: StartId) -> [Predicate; 14] {
+    [
+        Predicate {
+            case: "missing edge",
+            subject: Subject::Bonded,
+            response: response(unknown_start(), 5),
+            verdict: Verdict::NoEdge,
+        },
+        Predicate {
+            case: "not a payment channel",
+            subject: Subject::WorkBond,
+            response: response_on_work_bond(),
+            verdict: Verdict::Bad(InvalidMoveReason::NotAPaymentChannel),
+        },
+        Predicate {
+            case: "pending contest missing",
+            subject: Subject::Opened,
+            response: response(unknown_start(), 5),
+            verdict: Verdict::Bad(InvalidMoveReason::ClosePendingMissing),
+        },
+        Predicate {
+            case: "already responded",
+            subject: Subject::Answered,
+            response: response(start, 6),
+            verdict: Verdict::Bad(InvalidMoveReason::AlreadyResponded),
+        },
+        Predicate {
+            case: "start id mismatch",
+            subject: Subject::Pending,
+            response: response(unknown_start(), 5),
+            verdict: Verdict::Bad(InvalidMoveReason::StartIdMismatch),
+        },
+        Predicate {
+            case: "responder is not beneficiary",
+            subject: Subject::Pending,
+            response: response_body(start, Party::Maker, signed_certificate(5), MAKER),
+            verdict: Verdict::Bad(InvalidMoveReason::ResponderNotBeneficiary),
+        },
+        Predicate {
+            case: "response window closed",
+            subject: Subject::Late,
+            response: response(start, 5),
+            verdict: Verdict::Bad(InvalidMoveReason::ResponseWindowClosed),
+        },
+        Predicate {
+            case: "certificate edge mismatch",
+            subject: Subject::Pending,
+            response: response_body(start, Party::Taker, certificate_for_another_edge(), TAKER),
+            verdict: Verdict::Bad(InvalidMoveReason::CertificateNotBound),
+        },
+        Predicate {
+            case: "certificate terms mismatch",
+            subject: Subject::Pending,
+            response: response_body(start, Party::Taker, certificate_for_other_terms(), TAKER),
+            verdict: Verdict::Bad(InvalidMoveReason::CertificateNotBound),
+        },
+        Predicate {
+            case: "certificate not increasing",
+            subject: Subject::Pending,
+            response: response(start, 3),
+            verdict: Verdict::Bad(InvalidMoveReason::CertificateNotIncreasing),
+        },
+        Predicate {
+            case: "certificate over capacity",
+            subject: Subject::Pending,
+            response: response(start, PAYMENT_CAPACITY + 1),
+            verdict: Verdict::Bad(InvalidMoveReason::CertificateOverCapacity),
+        },
+        Predicate {
+            case: "bad certificate signature",
+            subject: Subject::Pending,
+            response: response_body(start, Party::Taker, provider_signed_certificate(), TAKER),
+            verdict: Verdict::Bad(InvalidMoveReason::BadCertificateSignature),
+        },
+        Predicate {
+            case: "bad action signature",
+            subject: Subject::Pending,
+            response: response_body(start, Party::Taker, signed_certificate(5), MAKER),
+            verdict: Verdict::Bad(InvalidMoveReason::BadSignature),
+        },
+        Predicate {
+            case: "happy path",
+            subject: Subject::Pending,
+            response: response(start, 5),
+            verdict: Verdict::Good,
+        },
+    ]
+}
+
+/// Runs one predicate: the read-only check over a real batch snapshot,
+/// then the same response through the kernel, compared exactly.
+fn assert_predicate(predicate: &Predicate) {
+    let Predicate {
+        case,
+        subject,
+        response,
+        verdict,
+    } = predicate;
+    let expected = verdict.expected(response.payment_edge());
+    match subject {
+        Subject::Bonded => {
+            let mut state = bonded_state();
+            assert_response_corresponds(case, expected, &mut state, at(2), response);
+        }
+        Subject::WorkBond => {
+            let mut state = open_work_bond_state();
+            assert_response_corresponds(case, expected, &mut state, at(2), response);
+        }
+        Subject::Opened => {
+            let mut state = open_payment_state();
+            assert_response_corresponds(case, expected, &mut state, at(2), response);
+        }
+        Subject::Answered => {
+            let (mut state, opened) = pending_response_state();
+            apply_move(&mut state, at(2), &response_tx(opened.start_id(), 5));
+            assert_response_corresponds(case, expected, &mut state, at(2), response);
+        }
+        Subject::Pending => {
+            let (mut state, _) = pending_response_state();
+            assert_response_corresponds(case, expected, &mut state, at(2), response);
+        }
+        Subject::Late => {
+            let (mut state, _) = pending_response_state();
+            let shut = at(RESPONSE_DEADLINE);
+            assert_response_corresponds(case, expected, &mut state, shut, response);
+        }
+    }
 }
 
 /// The extracted predicate is the apply path's predicate, not a second
 /// model of it. Every read-only rejection branch is compared against a
 /// real kernel execution, and acceptance is compared against the record
 /// that execution actually commits.
+///
+/// The predicates live in [`response_predicates`] and nowhere else, and
+/// this iterates all of them: there is one list, so there is no second
+/// list to fall behind it.
 #[test]
 fn response_check_corresponds_to_apply_for_every_predicate() {
-    // Missing edge.
-    let mut state = bonded_state();
-    assert_response_corresponds(
-        "missing edge",
-        Some(ApplyError::MissingEdge {
-            id: payment_edge_id(),
-        }),
-        &mut state,
-        at(2),
-        response(StartId::from_bytes([0; StartId::LENGTH]), 5),
-    );
-
-    // Live edge, but not a payment channel.
-    let mut state = open_work_bond_state();
-    let earned = EarnedCertificate::new(work_edge(), work_terms().hash(), 5);
-    assert_response_corresponds(
-        "not a payment channel",
-        invalid_response(work_edge(), InvalidMoveReason::NotAPaymentChannel),
-        &mut state,
-        at(2),
-        PaymentCloseResponse::new(
-            work_edge(),
-            StartId::from_bytes([0; StartId::LENGTH]),
-            Party::Taker,
-            signed_certificate_by(MAKER, earned),
-            Sig::from_bytes([0; Sig::LENGTH]),
-        ),
-    );
-
-    // Payment edge with no pending contest.
-    let mut state = open_payment_state();
-    assert_response_corresponds(
-        "pending contest missing",
-        invalid_response(payment_edge_id(), InvalidMoveReason::ClosePendingMissing),
-        &mut state,
-        at(2),
-        response(StartId::from_bytes([0; StartId::LENGTH]), 5),
-    );
-
-    // The one response has already been consumed.
-    let (mut state, opened) = pending_response_state();
-    apply_move(&mut state, at(2), &response_tx(opened.start_id(), 5));
-    assert_response_corresponds(
-        "already responded",
-        invalid_response(payment_edge_id(), InvalidMoveReason::AlreadyResponded),
-        &mut state,
-        at(3),
-        response(opened.start_id(), 6),
-    );
-
-    // Every remaining predicate starts from the same live, unanswered
-    // contest. Each case gets a fresh state; the final case is accepted.
     let (_, opened) = pending_response_state();
-    let cases = [
-        (
-            "start id mismatch",
-            Some(InvalidMoveReason::StartIdMismatch),
-            at(2),
-            response(StartId::from_bytes([9; StartId::LENGTH]), 5),
-        ),
-        (
-            "responder is not beneficiary",
-            Some(InvalidMoveReason::ResponderNotBeneficiary),
-            at(2),
-            response_body(
-                opened.start_id(),
-                Party::Maker,
-                signed_certificate(5),
-                MAKER,
-            ),
-        ),
-        (
-            "response window closed",
-            Some(InvalidMoveReason::ResponseWindowClosed),
-            at(RESPONSE_DEADLINE),
-            response(opened.start_id(), 5),
-        ),
-        (
-            "certificate edge mismatch",
-            Some(InvalidMoveReason::CertificateNotBound),
-            at(2),
-            response_body(
-                opened.start_id(),
-                Party::Taker,
-                signed_certificate_by(
-                    MAKER,
-                    EarnedCertificate::new(
-                        EdgeId::from_bytes([0x77; EdgeId::LENGTH]),
-                        payment_terms_hash(),
-                        5,
-                    ),
-                ),
-                TAKER,
-            ),
-        ),
-        (
-            "certificate terms mismatch",
-            Some(InvalidMoveReason::CertificateNotBound),
-            at(2),
-            response_body(
-                opened.start_id(),
-                Party::Taker,
-                signed_certificate_by(MAKER, EarnedCertificate::new(payment_edge_id(), terms(), 5)),
-                TAKER,
-            ),
-        ),
-        (
-            "certificate not increasing",
-            Some(InvalidMoveReason::CertificateNotIncreasing),
-            at(2),
-            response(opened.start_id(), 3),
-        ),
-        (
-            "certificate over capacity",
-            Some(InvalidMoveReason::CertificateOverCapacity),
-            at(2),
-            response(opened.start_id(), PAYMENT_CAPACITY + 1),
-        ),
-        (
-            "bad certificate signature",
-            Some(InvalidMoveReason::BadCertificateSignature),
-            at(2),
-            response_body(
-                opened.start_id(),
-                Party::Taker,
-                signed_certificate_by(TAKER, certificate(5)),
-                TAKER,
-            ),
-        ),
-        (
-            "bad action signature",
-            Some(InvalidMoveReason::BadSignature),
-            at(2),
-            response_body(
-                opened.start_id(),
-                Party::Taker,
-                signed_certificate(5),
-                MAKER,
-            ),
-        ),
-        ("happy path", None, at(2), response(opened.start_id(), 5)),
-    ];
-    for (case, reason, context, response) in cases {
-        let (mut state, _) = pending_response_state();
-        let expected = reason.map(|reason| ApplyError::InvalidMove {
-            input: payment_edge_id(),
-            reason,
-        });
-        assert_response_corresponds(case, expected, &mut state, context, response);
+    for predicate in response_predicates(opened.start_id()) {
+        assert_predicate(&predicate);
     }
 }
 
@@ -1759,19 +1848,18 @@ fn round3_bad_action_signature_is_checked_first() {
     let mut validation_store = *state.store();
     let batch = validation_store.begin();
     let checks = Cell::new(0);
-    let error = check_response(
+    let checked = check_response(
         &response(opened.start_id(), 5),
         at(2),
         &CountingReject(&checks),
         &batch,
-    )
-    .expect_err("the action signature is rejected");
+    );
     assert_eq!(
-        error,
-        ApplyError::InvalidMove {
+        checked,
+        Err(ApplyError::InvalidMove {
             input: payment_edge_id(),
             reason: InvalidMoveReason::BadSignature,
-        }
+        }),
     );
     assert_eq!(checks.get(), 1, "certificate verification must not run");
 }

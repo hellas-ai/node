@@ -2144,7 +2144,7 @@ mod tests {
             ChannelRecord::JobTerminated {
                 outcome: TerminalOutcome::Certified {
                     certificate,
-                    binding,
+                    binding: Box::new(binding),
                     binding_signature: client()
                         .sign(signing_hash(payment_binding_digest(&channel, &binding))),
                     certificate_signature: client().sign(certificate.digest(network())),

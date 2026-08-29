@@ -1052,7 +1052,7 @@ impl ProviderEndpoint {
             ChannelRecord::JobTerminated {
                 outcome: TerminalOutcome::Certified {
                     certificate,
-                    binding,
+                    binding: Box::new(binding),
                     binding_signature,
                     certificate_signature,
                 },
@@ -3156,7 +3156,7 @@ impl ClientEndpoint {
             ChannelRecord::JobTerminated {
                 outcome: TerminalOutcome::Certified {
                     certificate,
-                    binding,
+                    binding: Box::new(binding),
                     binding_signature,
                     certificate_signature,
                 },

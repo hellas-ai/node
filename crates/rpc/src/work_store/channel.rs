@@ -364,7 +364,12 @@ pub enum TerminalOutcome {
         /// The scalar consensus will settle.
         certificate: EarnedCertificate,
         /// The private evidence of what it bought.
-        binding: PaymentBindingV1,
+        ///
+        /// Boxed because it is the widest field any of these five
+        /// variants carries, and a terminal is one value with five
+        /// shapes: the four unpaid endings would otherwise each be as
+        /// large as the paid one.
+        binding: Box<PaymentBindingV1>,
         /// The client's signature over the binding's digest.
         binding_signature: Sig,
         /// The client's signature over the kernel's earned digest.
@@ -894,7 +899,7 @@ fn take_outcome(cursor: &mut Cursor<'_>) -> Result<TerminalOutcome, ChannelState
     Ok(match cursor.byte().ok_or(ChannelStateError::Malformed)? {
         outcome_code::CERTIFIED => TerminalOutcome::Certified {
             certificate: certificate(cursor)?,
-            binding: private_record(cursor)?,
+            binding: Box::new(private_record(cursor)?),
             binding_signature: signature(cursor)?,
             certificate_signature: signature(cursor)?,
         },
@@ -1654,7 +1659,7 @@ impl ChannelState {
         Some(PaidCertificate {
             work_id: terminal.work_id,
             certificate: *certificate,
-            binding: *binding,
+            binding: **binding,
             binding_signature: *binding_signature,
             certificate_signature: *certificate_signature,
         })
@@ -2752,7 +2757,7 @@ impl ChannelState {
             phase: job.phase,
             outcome: TerminalOutcome::Certified {
                 certificate: *certificate,
-                binding: *binding,
+                binding: Box::new(*binding),
                 binding_signature,
                 certificate_signature,
             },

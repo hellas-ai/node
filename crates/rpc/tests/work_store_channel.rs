@@ -378,7 +378,7 @@ impl Job {
         ChannelRecord::JobTerminated {
             outcome: TerminalOutcome::Certified {
                 certificate: self.certificate,
-                binding: self.binding,
+                binding: Box::new(self.binding),
                 binding_signature: client()
                     .sign(payload(payment_binding_digest(channel, &self.binding))),
                 certificate_signature: client().sign(self.certificate.digest(channel.network())),
@@ -1288,7 +1288,7 @@ fn a_signature_from_the_wrong_party_is_not_evidence() {
             ChannelRecord::JobTerminated {
                 outcome: TerminalOutcome::Certified {
                     certificate: job.certificate,
-                    binding: job.binding,
+                    binding: Box::new(job.binding),
                     binding_signature: client().sign(payload(job.work_id)),
                     certificate_signature: client().sign(job.certificate.digest(network())),
                 },
@@ -1300,7 +1300,7 @@ fn a_signature_from_the_wrong_party_is_not_evidence() {
             ChannelRecord::JobTerminated {
                 outcome: TerminalOutcome::Certified {
                     certificate: job.certificate,
-                    binding: job.binding,
+                    binding: Box::new(job.binding),
                     binding_signature: client()
                         .sign(payload(payment_binding_digest(&channel, &job.binding))),
                     certificate_signature: provider().sign(job.certificate.digest(network())),
@@ -1381,7 +1381,7 @@ fn a_payment_must_be_the_one_this_position_admits() {
                 ChannelRecord::JobTerminated {
                     outcome: TerminalOutcome::Certified {
                         certificate: job.certificate,
-                        binding,
+                        binding: Box::new(binding),
                         binding_signature: client()
                             .sign(payload(payment_binding_digest(&channel, &binding))),
                         certificate_signature: client().sign(job.certificate.digest(network())),
@@ -1436,7 +1436,7 @@ fn a_payment_must_be_the_one_this_position_admits() {
                 ChannelRecord::JobTerminated {
                     outcome: TerminalOutcome::Certified {
                         certificate,
-                        binding: job.binding,
+                        binding: Box::new(job.binding),
                         binding_signature: client()
                             .sign(payload(payment_binding_digest(&channel, &job.binding))),
                         certificate_signature: client().sign(certificate.digest(network())),
@@ -2161,7 +2161,7 @@ fn the_record_codec_is_exact_and_ordered() {
     let swapped = ChannelRecord::JobTerminated {
         outcome: TerminalOutcome::Certified {
             certificate: job.certificate,
-            binding: job.binding,
+            binding: Box::new(job.binding),
             binding_signature: client().sign(job.certificate.digest(network())),
             certificate_signature: client()
                 .sign(payload(payment_binding_digest(&channel, &job.binding))),
