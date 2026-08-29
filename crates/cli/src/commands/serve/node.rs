@@ -807,10 +807,10 @@ impl<S: Clone> MountedWork<S> {
     /// A reconnect reaches handlers already cloned by live connections,
     /// because they share this inner source slot. Neither mount lock is
     /// held across a source request.
-    fn refresh_source(&self, bond_edge: EdgeId, source: &S) {
+    fn refresh_source(&self, peer: PeerId, bond_edge: EdgeId, source: &S) {
         let source_slot = self.mounted.lock().ok().and_then(|held| {
-            held.values()
-                .flatten()
+            held.get(&peer)?
+                .iter()
                 .find(|mounted| mounted.bond_edge == bond_edge)
                 .map(|mounted| Arc::clone(&mounted.source))
         });
@@ -880,12 +880,14 @@ impl MountedSetup {
     }
 
     /// Stops serving only the setup that made this transition.
-    fn clear(&self, bond_edge: EdgeId) {
-        if let Ok(mut held) = self.0.lock() {
-            held.retain(|_, mounted| {
-                mounted.retain(|mounted| mounted.bond_edge != bond_edge);
-                !mounted.is_empty()
-            });
+    fn clear(&self, peer: PeerId, bond_edge: EdgeId) {
+        if let Ok(mut held) = self.0.lock()
+            && let Some(mounted) = held.get_mut(&peer)
+        {
+            mounted.retain(|mounted| mounted.bond_edge != bond_edge);
+            if mounted.is_empty() {
+                held.remove(&peer);
+            }
         }
     }
 
@@ -969,6 +971,11 @@ impl Driven {
 struct SetupClock {
     /// The bond this journal stakes, so a log line names which one.
     bond_edge: EdgeId,
+    /// The authenticated peer whose configured route names this bond.
+    /// Together with `bond_edge`, this is the journal's route identity;
+    /// `None` keeps an unconfigured owned journal on its close clock
+    /// without making it a fallback service.
+    route_peer: Option<PeerId>,
     /// What is being driven for it.
     driven: Driven,
 }
@@ -987,7 +994,6 @@ impl SetupClock {
         signer: &Secp256k1Signer,
         work_mount: &MountedWork<S>,
         setup_mount: &MountedSetup,
-        route_peer: Option<PeerId>,
     ) -> bool
     where
         S: SetupView + FinalizedBlocks + FinalizedWorkView + TxSink + Sync,
@@ -1002,15 +1008,10 @@ impl SetupClock {
                             Driven::Setup { policy, .. } => policy.clone(),
                             Driven::Recovery(_) | Driven::Channel(_) | Driven::Done => None,
                         };
-                        setup_mount.clear(self.bond_edge);
-                        self.take_mount(
-                            store,
-                            signer,
-                            policy.as_deref(),
-                            source,
-                            work_mount,
-                            route_peer,
-                        );
+                        if let Some(peer) = self.route_peer {
+                            setup_mount.clear(peer, self.bond_edge);
+                        }
+                        self.take_mount(store, signer, policy.as_deref(), source, work_mount);
                     } else if matches!(
                         progress,
                         SetupProgress::Aborted(_) | SetupProgress::Faulted(_)
@@ -1028,7 +1029,9 @@ impl SetupClock {
             }
         }
         if let Driven::Channel(service) = &self.driven {
-            work_mount.refresh_source(self.bond_edge, source);
+            if let Some(peer) = self.route_peer {
+                work_mount.refresh_source(peer, self.bond_edge, source);
+            }
             match advance_paid_work_clock(service, source).await {
                 Ok(progress) => debug!(bond, ?progress, "the channel advanced"),
                 Err(error) => {
@@ -1053,7 +1056,6 @@ impl SetupClock {
         policy: Option<&ProviderChannelPolicy>,
         source: &S,
         mount: &MountedWork<S>,
-        route_peer: Option<PeerId>,
     ) {
         let bond = hex::encode(self.bond_edge.to_bytes());
         // The setup's retained policy supplies the provider-controlled
@@ -1076,7 +1078,7 @@ impl SetupClock {
         match CloseEndpoint::new(store, signer.clone()) {
             Ok(close) => {
                 let service = WorkService::close_only(close);
-                if route_peer.is_some_and(|peer| {
+                if self.route_peer.is_some_and(|peer| {
                     mount.mount(peer, self.bond_edge, &service, descriptor, source)
                 }) {
                     info!(
@@ -1106,7 +1108,6 @@ impl SetupClock {
 /// The clock, over every paid-work journal this node owns.
 pub(super) struct WorkRunner<S> {
     clocks: Vec<SetupClock>,
-    routes: WorkRoutes,
     signer: Secp256k1Signer,
     work_mount: MountedWork<S>,
     setup_mount: MountedSetup,
@@ -1163,6 +1164,11 @@ where
         let mut clocks = Vec::with_capacity(found.setups.len());
         for setup in found.setups {
             let bond = hex::encode(setup.bond_edge.to_bytes());
+            let route_peer = config
+                .routes
+                .iter()
+                .find(|route| route.bond == setup.bond_edge)
+                .map(|route| route.peer);
             // A close capability binds the provider half, and this
             // process holds the provider's key. A client journal beside
             // this node's own is another party's, and this runner has
@@ -1198,12 +1204,8 @@ where
                         config.settlement_key.clone(),
                         admission,
                     ));
-                    if let Some(route) = config
-                        .routes
-                        .iter()
-                        .find(|route| route.bond == setup.bond_edge)
-                    {
-                        if setup_mount.mount(route.peer, setup.bond_edge, &service) {
+                    if let Some(peer) = route_peer {
+                        if setup_mount.mount(peer, setup.bond_edge, &service) {
                             info!(
                                 bond,
                                 "this node now answers WorkSetup from its driven setup"
@@ -1220,12 +1222,12 @@ where
             };
             clocks.push(SetupClock {
                 bond_edge: setup.bond_edge,
+                route_peer,
                 driven,
             });
         }
         Ok(Self {
             clocks,
-            routes: config.routes,
             signer: config.settlement_key,
             work_mount,
             setup_mount,
@@ -1240,19 +1242,8 @@ where
     async fn tick(&mut self, source: &S) -> bool {
         let mut answered = true;
         for clock in &mut self.clocks {
-            let route_peer = self
-                .routes
-                .iter()
-                .find(|route| route.bond == clock.bond_edge)
-                .map(|route| route.peer);
             answered &= clock
-                .tick(
-                    source,
-                    &self.signer,
-                    &self.work_mount,
-                    &self.setup_mount,
-                    route_peer,
-                )
+                .tick(source, &self.signer, &self.work_mount, &self.setup_mount)
                 .await;
         }
         answered
@@ -1620,14 +1611,8 @@ mod tests {
     #[tokio::test]
     async fn two_vouched_peers_receive_their_distinct_configured_offers() {
         let dir = temp();
-        let first = OfferFixture {
-            client_seed: 0x21,
-            bond_coin: 0xa1,
-        };
-        let second = OfferFixture {
-            client_seed: 0x23,
-            bond_coin: 0xa2,
-        };
+        let first = OfferFixture::first();
+        let second = OfferFixture::second();
         first.seed_provider_offer(dir.path(), admits());
         second.seed_provider_offer(dir.path(), admits());
 
@@ -1738,6 +1723,277 @@ mod tests {
 
         drop(runner);
         server.close().await;
+    }
+
+    fn discover_two_route_runner(
+        root: &Path,
+        work_mount: &MountedWork<RoutedChain>,
+        setup_mount: &MountedSetup,
+    ) -> WorkRunner<RoutedChain> {
+        let first = OfferFixture::first();
+        let second = OfferFixture::second();
+        match WorkRunner::discover(
+            WorkRunnerConfig {
+                network: network(),
+                threshold_identity: threshold_identity(),
+                journal_root: root.to_path_buf(),
+                routes: configured_routes(&[
+                    (
+                        first_route_peer(),
+                        first.bond_edge(),
+                        first.client().party_key(),
+                    ),
+                    (
+                        second_route_peer(),
+                        second.bond_edge(),
+                        second.client().party_key(),
+                    ),
+                ]),
+                validators: Vec::new(),
+                poll: Duration::from_millis(1),
+                settlement_key: provider(),
+                admission: Some(admits()),
+            },
+            work_mount.clone(),
+            setup_mount.clone(),
+        ) {
+            Ok(runner) => runner,
+            Err(error) => panic!("both configured routes are discovered: {error}"),
+        }
+    }
+
+    async fn accept_mounted_route(
+        mount: &MountedWork<RoutedChain>,
+        peer: PeerId,
+        request: AcceptWorkRequest,
+    ) -> AcceptWorkResponse {
+        let context = vouched_context(peer);
+        let handler = mount
+            .handler(&context)
+            .expect("the configured peer has one mounted channel");
+        let response: WithTrailer<AcceptWorkResponse> = handler
+            .accept_work(request, context)
+            .await
+            .unwrap_or_else(|error| panic!("the mounted Work handler answers: {error}"))
+            .into();
+        response.response
+    }
+
+    /// Completing one setup moves only that route from WorkSetup to Work.
+    /// The other peer keeps its revision-one offer and cannot see the new
+    /// channel through either a global mount or the completing peer's key.
+    #[tokio::test]
+    async fn completion_clears_and_mounts_only_the_completing_route() {
+        let dir = temp();
+        let first = OfferFixture::first();
+        let second = OfferFixture::second();
+        first.write_completed_setup(dir.path());
+        second.seed_provider_offer(dir.path(), admits());
+        let source = RoutedChain::new([first.bond_edge()], [first.ready_snapshot(ORIGIN, None)]);
+        let work_mount = MountedWork::default();
+        let setup_mount = MountedSetup::default();
+        let mut runner = discover_two_route_runner(dir.path(), &work_mount, &setup_mount);
+
+        assert!(
+            runner.tick(&source).await,
+            "both journal steps are answered"
+        );
+        assert!(
+            setup_mount
+                .service(&vouched_context(first_route_peer()))
+                .is_none(),
+            "the completing setup route is cleared",
+        );
+        assert!(
+            work_mount
+                .handler(&vouched_context(second_route_peer()))
+                .is_none(),
+            "the waiting peer cannot reach the completing peer's channel",
+        );
+
+        let wrong = accept_mounted_route(
+            &work_mount,
+            first_route_peer(),
+            second.signed_accept_request(),
+        )
+        .await;
+        assert!(
+            !matches!(
+                wrong.outcome,
+                Some(accept_work_response::Outcome::Accepted(_))
+            ),
+            "A's route accepts no authorization for B's channel",
+        );
+        let accepted = accept_mounted_route(
+            &work_mount,
+            first_route_peer(),
+            first.signed_accept_request(),
+        )
+        .await;
+        assert!(
+            matches!(
+                accepted.outcome,
+                Some(accept_work_response::Outcome::Accepted(_))
+            ),
+            "A's route accepts A's authorization",
+        );
+
+        let second_setup = setup_mount
+            .service(&vouched_context(second_route_peer()))
+            .expect("B's setup route remains mounted");
+        let response: WithTrailer<ExchangeSetupResponse> = second_setup
+            .exchange_setup(
+                ExchangeSetupRequest::default(),
+                vouched_context(second_route_peer()),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("B's setup route answers: {error}"))
+            .into();
+        let proposal = advanced_setup_bundle(response.response);
+        assert_eq!(proposal.revision(), 1, "B remains at revision one");
+        assert_eq!(
+            proposal.bond_terms().parties.taker(),
+            second.client().party_key(),
+            "B still receives B's configured proposal",
+        );
+    }
+
+    /// Readiness is recomputed from the selected route's fresh coherent
+    /// snapshot before every signature. A contest on A invalidates only A;
+    /// B's independent snapshot and service remain ready.
+    #[tokio::test]
+    async fn fresh_readiness_is_per_request_and_per_routed_channel() {
+        let dir = temp();
+        let first = OfferFixture::first();
+        let second = OfferFixture::second();
+        first.write_completed_setup(dir.path());
+        second.write_completed_setup(dir.path());
+        let source = RoutedChain::new(
+            [first.bond_edge(), second.bond_edge()],
+            [
+                first.ready_snapshot(ORIGIN, None),
+                second.ready_snapshot(ORIGIN, None),
+            ],
+        );
+        let work_mount = MountedWork::default();
+        let setup_mount = MountedSetup::default();
+        let mut runner = discover_two_route_runner(dir.path(), &work_mount, &setup_mount);
+
+        assert!(runner.tick(&source).await, "both completed routes mount");
+        let first_request = first.signed_accept_request();
+        let accepted =
+            accept_mounted_route(&work_mount, first_route_peer(), first_request.clone()).await;
+        assert!(
+            matches!(
+                accepted.outcome,
+                Some(accept_work_response::Outcome::Accepted(_))
+            ),
+            "A's first fresh snapshot permits its signature",
+        );
+
+        source.set_snapshot(first.ready_snapshot(ORIGIN, Some(pending_contest(false))));
+        let refused = accept_mounted_route(&work_mount, first_route_peer(), first_request).await;
+        let Some(accept_work_response::Outcome::Refused(refusal)) = refused.outcome else {
+            panic!("A's finalized contest prevents another provider signature")
+        };
+        assert_retryable_not_ready(refusal);
+
+        let second_response = accept_mounted_route(
+            &work_mount,
+            second_route_peer(),
+            second.signed_accept_request(),
+        )
+        .await;
+        assert!(
+            matches!(
+                second_response.outcome,
+                Some(accept_work_response::Outcome::Accepted(_))
+            ),
+            "B remains ready from B's own fresh snapshot",
+        );
+    }
+
+    /// Connections are irrelevant to close duty. With neither peer dialled,
+    /// one tick still advances every owned journal and submits both unrelated
+    /// permissionless closes that their coherent snapshots make due.
+    #[tokio::test]
+    async fn one_tick_drives_every_owned_journal_without_connected_clients() {
+        let dir = temp();
+        let first = OfferFixture::first();
+        let second = OfferFixture::second();
+        first.write_completed_setup(dir.path());
+        second.write_completed_setup(dir.path());
+        let start_id = write_contested_channel(dir.path());
+        let source = RoutedChain::new(
+            [first.bond_edge(), second.bond_edge()],
+            [
+                first.channel_snapshot(ORIGIN, None, Some(pending_contest(true))),
+                second.channel_snapshot(
+                    second.bond_terms().timeout.get(),
+                    Some(second.live_bond()),
+                    None,
+                ),
+            ],
+        );
+        let work_mount = MountedWork::default();
+        let setup_mount = MountedSetup::default();
+        let mut runner = discover_two_route_runner(dir.path(), &work_mount, &setup_mount);
+
+        assert!(
+            runner.tick(&source).await,
+            "the one source answers both clocks"
+        );
+        let submitted = source.submitted();
+        let adjudications = submitted
+            .iter()
+            .filter(|tx| {
+                matches!(
+                    tx,
+                    Tx::Close {
+                        input,
+                        proof: Proof::Adjudicated { .. },
+                        ..
+                    } if *input == first.payment_edge()
+                )
+            })
+            .count();
+        let timeouts = submitted
+            .iter()
+            .filter(|tx| {
+                matches!(
+                    tx,
+                    Tx::Close {
+                        input,
+                        proof: Proof::Timeout { .. },
+                        ..
+                    } if *input == second.bond_edge()
+                )
+            })
+            .count();
+        let responses = submitted
+            .iter()
+            .filter(|tx| {
+                matches!(
+                    tx,
+                    Tx::Move {
+                        action: Move::RespondPaymentClose(response),
+                    } if response.start_id() == start_id
+                )
+            })
+            .count();
+        assert_eq!(responses, 1, "A's retained response is resubmitted");
+        assert_eq!(adjudications, 1, "A's adjudication is submitted");
+        assert_eq!(timeouts, 1, "B's bond timeout is submitted");
+        assert_eq!(
+            submitted.len(),
+            3,
+            "one tick submits all three exact duties"
+        );
+        assert_eq!(
+            runner.clocks.len(),
+            2,
+            "both journals remain on the clock without a client",
+        );
     }
 
     #[tokio::test]
@@ -1867,6 +2123,14 @@ mod tests {
 
     fn default_route_peer() -> PeerId {
         PeerId::from_bytes([0x31; 32])
+    }
+
+    fn first_route_peer() -> PeerId {
+        PeerId::from_bytes([0x41; 32])
+    }
+
+    fn second_route_peer() -> PeerId {
+        PeerId::from_bytes([0x42; 32])
     }
 
     fn vouched_context(peer: PeerId) -> TransportContext {
@@ -2912,6 +3176,128 @@ mod tests {
         }
     }
 
+    /// One finalized source with independent coherent snapshots for several
+    /// channels. It has no clients and no routing opinion: queries select only
+    /// by their signed channel identity, while every submission is retained so
+    /// one runner tick can be inspected as a whole.
+    #[derive(Clone)]
+    struct RoutedChain(Arc<Mutex<RoutedChainState>>);
+
+    struct RoutedChainState {
+        completed_setups: Vec<EdgeId>,
+        snapshots: Vec<WorkChannelSnapshot>,
+        submitted: Vec<Tx>,
+    }
+
+    impl RoutedChain {
+        fn new(
+            completed_setups: impl IntoIterator<Item = EdgeId>,
+            snapshots: impl IntoIterator<Item = WorkChannelSnapshot>,
+        ) -> Self {
+            Self(Arc::new(Mutex::new(RoutedChainState {
+                completed_setups: completed_setups.into_iter().collect(),
+                snapshots: snapshots.into_iter().collect(),
+                submitted: Vec::new(),
+            })))
+        }
+
+        fn set_snapshot(&self, snapshot: WorkChannelSnapshot) {
+            match self.0.lock() {
+                Ok(mut held) => {
+                    let query = snapshot.query().clone();
+                    if let Some(existing) = held
+                        .snapshots
+                        .iter_mut()
+                        .find(|existing| existing.query() == &query)
+                    {
+                        *existing = snapshot;
+                    } else {
+                        held.snapshots.push(snapshot);
+                    }
+                }
+                Err(error) => panic!("the routed source is reachable: {error}"),
+            }
+        }
+
+        fn submitted(&self) -> Vec<Tx> {
+            match self.0.lock() {
+                Ok(held) => held.submitted.clone(),
+                Err(error) => panic!("the routed sink is reachable: {error}"),
+            }
+        }
+    }
+
+    impl SetupView for RoutedChain {
+        async fn finalized_setup(
+            &self,
+            query: SetupQuery,
+        ) -> Result<Option<FinalizedSetup>, BlockSourceError> {
+            let known = self
+                .0
+                .lock()
+                .map_err(|error| BlockSourceError::new(format!("the setup lock failed: {error}")))?
+                .completed_setups
+                .contains(&query.bond_edge);
+            if !known {
+                return Err(BlockSourceError::new(
+                    "the routed source was asked for an unconfigured setup",
+                ));
+            }
+            Ok(Some(FinalizedSetup {
+                height: ORIGIN,
+                bond: None,
+                payment: None,
+                lease: LeaseSlots::Absent,
+                live_funding: BTreeSet::new(),
+            }))
+        }
+    }
+
+    impl FinalizedWorkView for RoutedChain {
+        async fn work_channel_snapshot(
+            &self,
+            query: WorkChannelQuery,
+        ) -> Result<Option<WorkChannelSnapshot>, QueryError> {
+            match self.0.lock() {
+                Ok(held) => held
+                    .snapshots
+                    .iter()
+                    .find(|snapshot| snapshot.query() == &query)
+                    .cloned()
+                    .map(Some)
+                    .ok_or_else(|| {
+                        QueryError::StateUnavailable(
+                            "the routed source was asked for another channel".to_string(),
+                        )
+                    }),
+                Err(error) => Err(QueryError::StateUnavailable(format!(
+                    "the routed snapshot lock failed: {error}",
+                ))),
+            }
+        }
+    }
+
+    impl FinalizedBlocks for RoutedChain {
+        async fn latest_height(&self) -> Result<Option<u64>, BlockSourceError> {
+            Ok(Some(ORIGIN))
+        }
+
+        async fn block_at(&self, _height: u64) -> Result<Option<FinalizedWork>, BlockSourceError> {
+            Ok(None)
+        }
+    }
+
+    impl TxSink for RoutedChain {
+        async fn submit(&self, tx: Tx) -> Result<SubmitTxOutcome, BlockSourceError> {
+            self.0
+                .lock()
+                .map_err(|error| BlockSourceError::new(format!("the sink lock failed: {error}")))?
+                .submitted
+                .push(tx);
+            Ok(SubmitTxOutcome::Enqueued)
+        }
+    }
+
     /// The injectable finalized source used by the ALPN proof. It starts
     /// at the scan floor, finalizes each setup Open handed to its sink in
     /// the next block, and exposes the resulting channel through the same
@@ -3217,9 +3603,26 @@ mod tests {
     struct OfferFixture {
         client_seed: u8,
         bond_coin: u8,
+        payment_coin: u8,
     }
 
     impl OfferFixture {
+        const fn first() -> Self {
+            Self {
+                client_seed: 0x21,
+                bond_coin: 0xa1,
+                payment_coin: 0xb1,
+            }
+        }
+
+        const fn second() -> Self {
+            Self {
+                client_seed: 0x23,
+                bond_coin: 0xa2,
+                payment_coin: 0xb2,
+            }
+        }
+
         fn client(self) -> Secp256k1Signer {
             signer(self.client_seed)
         }
@@ -3244,6 +3647,295 @@ mod tests {
             Tx::edge_id_of(
                 &self.bond_funding(),
                 &Terms::work_stake_bond(self.bond_terms()),
+            )
+        }
+
+        fn payment_funding(self) -> Funding {
+            Funding::new(coins(&[self.payment_coin]), coins(&[]))
+        }
+
+        fn payment_terms(self) -> WorkPaymentTerms {
+            WorkPaymentTerms {
+                bond_edge: self.bond_edge(),
+                bond_terms: self.bond_terms(),
+                private_policy_commitment: private_policy_commitment(
+                    network(),
+                    &SALT,
+                    &channel_policy(),
+                ),
+                omit_response_blocks: MIN_OMIT_RESPONSE_BLOCKS,
+                start_validity_blocks: MAX_START_VALIDITY_BLOCKS,
+                omission_bond: OMISSION_BOND,
+            }
+        }
+
+        fn payment_edge(self) -> EdgeId {
+            Tx::edge_id_of(
+                &self.payment_funding(),
+                &Terms::work_payment(self.payment_terms()),
+            )
+        }
+
+        fn proposed(self) -> WorkChannelSetupBundleV1 {
+            let hash = Tx::open_hash(
+                network(),
+                &self.bond_funding(),
+                &Terms::work_stake_bond(self.bond_terms()),
+            );
+            match WorkChannelSetupBundleV1::propose_bond(
+                network(),
+                self.bond_funding(),
+                self.bond_terms(),
+                Auth::native(provider().sign(hash)),
+            ) {
+                Ok(bundle) => bundle,
+                Err(error) => panic!("the routed bond proposes: {error}"),
+            }
+        }
+
+        fn countersigned(self, bundle: WorkChannelSetupBundleV1) -> WorkChannelSetupBundleV1 {
+            let bond_hash = bundle.bond_open_hash();
+            let payment_hash = Tx::open_hash(
+                network(),
+                &self.payment_funding(),
+                &Terms::work_payment(self.payment_terms()),
+            );
+            match bundle.countersign_bond_and_propose_payment(
+                Auth::native(self.client().sign(bond_hash)),
+                self.payment_funding(),
+                self.payment_terms(),
+                Auth::native(self.client().sign(payment_hash)),
+            ) {
+                Ok(bundle) => bundle,
+                Err(error) => panic!("the routed payment proposes: {error}"),
+            }
+        }
+
+        fn completed(self, bundle: WorkChannelSetupBundleV1) -> WorkChannelSetupBundleV1 {
+            let Some(hash) = bundle.payment_open_hash() else {
+                panic!("the routed payment has an open hash");
+            };
+            match bundle.countersign_payment(Auth::native(provider().sign(hash))) {
+                Ok(bundle) => bundle,
+                Err(error) => panic!("the routed payment countersigns: {error}"),
+            }
+        }
+
+        fn descriptor(self) -> hellas_rpc::protocol::work_setup::CloseDescriptor {
+            match provider_policy().describe_close(self.payment_edge(), self.payment_terms()) {
+                Ok(descriptor) => descriptor,
+                Err(error) => panic!("the routed close descriptor opens: {error}"),
+            }
+        }
+
+        fn write_completed_setup(self, root: &Path) {
+            let verifier = Secp256k1Verifier::new();
+            let mut store = match SetupStore::open(
+                root,
+                network(),
+                self.bond_edge(),
+                Role::Provider,
+                &verifier,
+            ) {
+                Ok(store) => store,
+                Err(error) => panic!("the routed setup journal opens: {error}"),
+            };
+            let one = self.proposed();
+            let two = self.countersigned(one.clone());
+            let three = self.completed(two.clone());
+            let close_descriptor = self.descriptor();
+            for record in [
+                SetupRecord::ScanArmed {
+                    height: FLOOR,
+                    payload: payload_at(FLOOR),
+                },
+                SetupRecord::Bundle {
+                    bundle: one.encode(),
+                },
+                SetupRecord::Bundle {
+                    bundle: two.encode(),
+                },
+                SetupRecord::ArmedBundle {
+                    bundle: three.encode(),
+                    close_descriptor: Box::new(close_descriptor),
+                },
+                SetupRecord::Complete {
+                    payment_edge: self.payment_edge(),
+                    origin_height: ORIGIN,
+                    origin_payload: payload_at(ORIGIN),
+                    origin_parent: payload_at(ORIGIN - 1),
+                },
+            ] {
+                if let Err(error) = store.commit(record, &verifier) {
+                    panic!("the routed setup record commits: {error}");
+                }
+            }
+        }
+
+        fn evaluate_request(self) -> EvaluateRequest {
+            EvaluateRequest {
+                text_execution: text_execution().input_id().digest(),
+                runner_public_key: PublicKey::Secp256k1(self.client().party_key().to_bytes()),
+                execution_environment: manifest().content_id(),
+                nonce: [self.client_seed; 32],
+                assurance: Assurance::ProducerSigned,
+                retain: true,
+            }
+        }
+
+        fn prepared_bundle(self) -> PreparedPaidInputV1 {
+            PreparedPaidInputV1::new(
+                &self.evaluate_request(),
+                &manifest(),
+                &text_execution(),
+                &prompt_tokens(),
+                &text_policy(),
+                &identity_artifact(),
+            )
+        }
+
+        fn authorization(self) -> PaidJobAuthorizationV1 {
+            match propose_authorization(
+                self.descriptor().channel(),
+                &execution_policy(),
+                &self.prepared_bundle(),
+                1,
+                deadlines(),
+            ) {
+                Ok(authorization) => authorization,
+                Err(error) => panic!("the routed authorization builds: {error}"),
+            }
+        }
+
+        fn signed_accept_request(self) -> AcceptWorkRequest {
+            let authorization = self.authorization();
+            let id = work_id(self.descriptor().channel(), &authorization);
+            AcceptWorkRequest {
+                authorization: authorization.encode(),
+                client_signature: self.client().sign(signing_hash(id)).as_bytes().to_vec(),
+                prepared_input: match self.prepared_bundle().encode() {
+                    Ok(bytes) => bytes,
+                    Err(error) => panic!("the routed prepared input encodes: {error}"),
+                },
+            }
+        }
+
+        fn live_bond(self) -> Edge {
+            let terms = Terms::work_stake_bond(self.bond_terms());
+            let mut encoded = vec![0_u8; Edge::MAX_ENCODED_SIZE];
+            let written = {
+                let mut writer = BufferWriter::new(&mut encoded);
+                writer.write(&[1, 5]);
+                64_u64.encode_to(&mut writer);
+                0_u64.encode_to(&mut writer);
+                Fees::ZERO.encode_to(&mut writer);
+                terms.timeout().encode_to(&mut writer);
+                terms.parties().encode_to(&mut writer);
+                terms.hash().encode_to(&mut writer);
+                terms.allowed_closes().encode_to(&mut writer);
+                writer.position()
+            };
+            match Edge::decode_exact(&encoded[..written]) {
+                Ok(edge) => edge,
+                Err(error) => panic!("the routed live bond decodes: {error:?}"),
+            }
+        }
+
+        fn live_payment(self) -> Edge {
+            let terms = Terms::work_payment(self.payment_terms());
+            let mut encoded = vec![0_u8; Edge::MAX_ENCODED_SIZE];
+            let written = {
+                let mut writer = BufferWriter::new(&mut encoded);
+                writer.write(&[1, 5]);
+                PAYMENT_VALUE.encode_to(&mut writer);
+                PAYMENT_RESERVE.encode_to(&mut writer);
+                Fees::ZERO.encode_to(&mut writer);
+                terms.timeout().encode_to(&mut writer);
+                terms.parties().encode_to(&mut writer);
+                terms.hash().encode_to(&mut writer);
+                terms.allowed_closes().encode_to(&mut writer);
+                writer.position()
+            };
+            match Edge::decode_exact(&encoded[..written]) {
+                Ok(edge) => edge,
+                Err(error) => panic!("the routed live payment decodes: {error:?}"),
+            }
+        }
+
+        fn live_lease_slots(self) -> [Option<RegistryChunk>; 2] {
+            let terms = self.payment_terms();
+            let mut value = vec![1, 31, 2];
+            value.extend_from_slice(&self.bond_edge().to_bytes());
+            value.extend_from_slice(&self.payment_edge().to_bytes());
+            value.extend_from_slice(Terms::work_payment(terms.clone()).hash().as_bytes());
+            value.extend_from_slice(&terms.private_policy_commitment);
+            value.extend_from_slice(&terms.admission_horizon().get().to_be_bytes());
+            let slots = [0, 1].map(|index| {
+                RegistryChunk::split(
+                    RegistryNamespace::BondLease,
+                    RegistryRecordTag::BondLease,
+                    &value,
+                    index,
+                )
+            });
+            assert!(
+                matches!(
+                    hellas_kernel::parse_bond_lease(slots, self.bond_edge()),
+                    LeaseSlots::Present(_)
+                ),
+                "the routed lease is canonical",
+            );
+            slots
+        }
+
+        fn channel_snapshot(
+            self,
+            height: u64,
+            bond: Option<Edge>,
+            pending: Option<RegistryChunk>,
+        ) -> WorkChannelSnapshot {
+            WorkChannelSnapshot::new(
+                WorkChannelQuery {
+                    bond_edge: self.bond_edge(),
+                    payment_edge: self.payment_edge(),
+                    funding: BTreeSet::new(),
+                },
+                LatestBlock {
+                    height,
+                    payload: hellas_chain::domain::Digest::from(payload_at(height)),
+                    state_root: hellas_chain::domain::Digest::from([0xd2; 32]),
+                    finalization: Vec::new(),
+                },
+                bond,
+                None,
+                [None, None],
+                pending,
+                BTreeSet::new(),
+            )
+        }
+
+        fn ready_snapshot(
+            self,
+            height: u64,
+            pending: Option<RegistryChunk>,
+        ) -> WorkChannelSnapshot {
+            WorkChannelSnapshot::new(
+                WorkChannelQuery {
+                    bond_edge: self.bond_edge(),
+                    payment_edge: self.payment_edge(),
+                    funding: BTreeSet::new(),
+                },
+                LatestBlock {
+                    height,
+                    payload: hellas_chain::domain::Digest::from(payload_at(height)),
+                    state_root: hellas_chain::domain::Digest::from([0xd3; 32]),
+                    finalization: Vec::new(),
+                },
+                Some(self.live_bond()),
+                Some(self.live_payment()),
+                self.live_lease_slots(),
+                pending,
+                BTreeSet::new(),
             )
         }
 
