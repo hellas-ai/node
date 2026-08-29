@@ -1,6 +1,6 @@
 //! Local implementation of the light-client query interface.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 
 use crate::domain::{
     Coin, Object, ObjectId, ObjectKind, SettlementKey, Transaction, coin_object_id, edge_object_id,
@@ -192,9 +192,9 @@ impl LocalLightClient {
             .values()
             .filter_map(|entry| payment_close_response(&entry.transaction).copied())
             .collect();
-        for candidate in residents.iter().copied() {
+        for candidate in residents.iter() {
             let edge_id = candidate.payment_edge();
-            if !batch.edges.contains_key(&edge_id) {
+            if let Entry::Vacant(slot) = batch.edges.entry(edge_id) {
                 match reader
                     .get(&edge_object_id(edge_id))
                     .await
@@ -202,7 +202,7 @@ impl LocalLightClient {
                         QueryError::StateUnavailable(format!("edge read failed: {error:?}"))
                     })? {
                     Some(Object::Edge(edge)) => {
-                        batch.edges.insert(edge_id, edge);
+                        slot.insert(edge);
                     }
                     Some(object) => {
                         return Err(QueryError::WrongObjectKind {
@@ -214,7 +214,7 @@ impl LocalLightClient {
                 }
             }
             let pending_id = pending_payment_close_slot(network, edge_id);
-            if !batch.registry.contains_key(&pending_id) {
+            if let Entry::Vacant(slot) = batch.registry.entry(pending_id) {
                 match reader
                     .get(&registry_chunk_object_id(pending_id))
                     .await
@@ -222,7 +222,7 @@ impl LocalLightClient {
                         QueryError::StateUnavailable(format!("registry read failed: {error:?}"))
                     })? {
                     Some(Object::RegistryChunk(chunk)) => {
-                        batch.registry.insert(pending_id, chunk);
+                        slot.insert(chunk);
                     }
                     Some(object) => {
                         return Err(QueryError::WrongObjectKind {
@@ -279,7 +279,7 @@ impl KernelBatch for ResponseAdmissionBatch {
         None
     }
     fn insert_coin(&mut self, _id: CoinId, _coin: KernelCoin) -> KernelResult<(), InsertError> {
-        Err(InsertError::Unavailable.into())
+        Err(InsertError::Unavailable)
     }
     fn remove_coin(&mut self, _id: CoinId) -> Option<KernelCoin> {
         None
@@ -288,7 +288,7 @@ impl KernelBatch for ResponseAdmissionBatch {
         self.edges.get(&id).copied()
     }
     fn insert_edge(&mut self, _id: EdgeId, _edge: Edge) -> KernelResult<(), InsertError> {
-        Err(InsertError::Unavailable.into())
+        Err(InsertError::Unavailable)
     }
     fn remove_edge(&mut self, _id: EdgeId) -> Option<Edge> {
         None
@@ -301,7 +301,7 @@ impl KernelBatch for ResponseAdmissionBatch {
         _id: RegistryChunkId,
         _chunk: RegistryChunk,
     ) -> KernelResult<(), InsertError> {
-        Err(InsertError::Unavailable.into())
+        Err(InsertError::Unavailable)
     }
     fn remove_registry_chunk(&mut self, _id: RegistryChunkId) -> Option<RegistryChunk> {
         None

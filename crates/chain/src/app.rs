@@ -1,6 +1,8 @@
 pub use crate::block::HellasBlock;
 
-use crate::domain::{Activity, PublicKey, Scheme, SettlementKey, Transaction};
+#[cfg(feature = "validator")]
+use crate::domain::Transaction;
+use crate::domain::{Activity, PublicKey, Scheme, SettlementKey};
 #[cfg(feature = "validator")]
 use crate::domain::{KERNEL_FEES, MAX_BLOCK_TX_BYTES, MAX_TXS_PER_BLOCK};
 use crate::execution::store::empty_state;
@@ -24,8 +26,11 @@ use commonware_consensus::{
 };
 #[cfg(feature = "validator")]
 use commonware_cryptography::Digestible;
+#[cfg(feature = "validator")]
 use commonware_cryptography::Hasher;
-use commonware_cryptography::sha256::{Digest, Sha256};
+use commonware_cryptography::sha256::Digest;
+#[cfg(feature = "validator")]
+use commonware_cryptography::sha256::Sha256;
 #[cfg(feature = "validator")]
 use commonware_glue::stateful::{
     Application as StatefulApplication, Proposed,
@@ -42,17 +47,19 @@ use commonware_utils::{SystemTimeExt, non_empty_range};
 #[cfg(feature = "validator")]
 use futures::{Stream, StreamExt};
 use hellas_kernel::NetworkId;
-#[cfg(test)]
+#[cfg(all(test, feature = "validator"))]
 use hellas_rpc::SubmitTxOutcome;
 #[cfg(feature = "validator")]
 use prometheus_client::metrics::gauge::Gauge;
 #[cfg(feature = "validator")]
 use rand::Rng;
-use std::{
-    collections::{BTreeMap, VecDeque},
-    sync::Arc,
-};
-use tokio::sync::{Mutex, broadcast};
+#[cfg(feature = "validator")]
+use std::collections::{BTreeMap, VecDeque};
+#[cfg(feature = "validator")]
+use std::sync::Arc;
+#[cfg(feature = "validator")]
+use tokio::sync::Mutex;
+use tokio::sync::broadcast;
 #[cfg(feature = "validator")]
 use tracing::{error, info, warn};
 
@@ -74,19 +81,34 @@ impl Default for ApplicationConfig {
     }
 }
 
+// A mempool is a validator's, so all of it compiles for one.
+//
+// The two things that put a transaction in it are `rpc.rs`, the submit
+// path, and `server.rs`, the socket in front of that path; the one thing
+// that takes transactions out is `StatefulApplication::propose` below.
+// All three are `validator`. A follower forwards what it is handed
+// upstream through its light client and proposes no block, so on an
+// `indexer` build this held nothing and nobody read it — the same reason
+// `Application` above keeps no `network` and no height gauge there.
+
 /// Maximum number of general transactions resident in the mempool.
+#[cfg(feature = "validator")]
 pub const GENERAL_MEMPOOL_CAPACITY: usize = 120;
 /// Maximum number of finalized-contest response slots resident at once.
+#[cfg(feature = "validator")]
 pub const RESPONSE_MEMPOOL_CAPACITY: usize = 64;
 /// Canonical chain encoding of one `PaymentCloseResponse` transaction.
+#[cfg(feature = "validator")]
 pub const RESPONSE_TRANSACTION_BYTES: usize = 274;
 
+#[cfg(feature = "validator")]
 #[derive(Clone)]
 pub(crate) struct MempoolEntry {
     pub(crate) digest: Digest,
     pub(crate) transaction: Transaction,
 }
 
+#[cfg(feature = "validator")]
 impl MempoolEntry {
     pub(crate) fn new(transaction: Transaction) -> Self {
         let digest = Sha256::hash(&transaction.encode());
@@ -97,8 +119,10 @@ impl MempoolEntry {
     }
 }
 
+#[cfg(feature = "validator")]
 pub(crate) type ResponseSlot = (hellas_kernel::EdgeId, hellas_kernel::StartId);
 
+#[cfg(feature = "validator")]
 #[derive(Default)]
 pub(crate) struct MempoolState {
     pub(crate) general: VecDeque<MempoolEntry>,
@@ -112,11 +136,13 @@ struct MempoolSnapshot {
     response_digests: BTreeMap<ResponseSlot, Digest>,
 }
 
+#[cfg(feature = "validator")]
 #[derive(Clone, Default)]
 pub struct Mempool {
     pub(crate) inner: Arc<Mutex<MempoolState>>,
 }
 
+#[cfg(feature = "validator")]
 impl Mempool {
     #[cfg(test)]
     pub(crate) async fn test_submit(&self, tx: Transaction) -> SubmitTxOutcome {
@@ -147,11 +173,9 @@ impl Mempool {
             .collect()
     }
 
-    /// Proposal-time only. A follower accepts submissions through its local
-    /// light client so it can forward them upstream, but it never drains its own mempool into
-    /// a block: that is `StatefulApplication::propose`, which is
-    /// `validator`-gated.
-    #[cfg(feature = "validator")]
+    /// Proposal-time only. The one caller is
+    /// `StatefulApplication::propose`, which is what makes this whole
+    /// file's mempool a validator's.
     async fn snapshot(&self) -> MempoolSnapshot {
         let mempool = self.inner.lock().await;
         let response_digests = mempool
@@ -173,7 +197,6 @@ impl Mempool {
         }
     }
 
-    #[cfg(feature = "validator")]
     async fn commit_snapshot(&self, snapshot: MempoolSnapshot, retained: Vec<Transaction>) {
         let mut mempool = self.inner.lock().await;
         for (slot, digest) in snapshot.response_digests {
@@ -203,6 +226,7 @@ impl Mempool {
     }
 }
 
+#[cfg(feature = "validator")]
 pub(crate) fn response_slot(transaction: &Transaction) -> Option<ResponseSlot> {
     let Transaction::Kernel(hellas_kernel::Tx::Move {
         action: hellas_kernel::Move::RespondPaymentClose(response),

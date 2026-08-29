@@ -50,9 +50,11 @@ pub mod work_view;
 pub const CONSENSUS_NAMESPACE: &[u8] = b"hellas";
 
 #[cfg(any(feature = "indexer", feature = "validator"))]
-pub use app::{
-    ActivityReporter, Application, ApplicationConfig, GENERAL_MEMPOOL_CAPACITY, Mempool,
-};
+pub use app::{ActivityReporter, Application, ApplicationConfig};
+/// The mempool and its bounds, which only a validator has: nothing on a
+/// follower build puts a transaction into one or takes one out.
+#[cfg(feature = "validator")]
+pub use app::{GENERAL_MEMPOOL_CAPACITY, Mempool};
 #[cfg(feature = "block-view")]
 pub use block::{HellasBlock, UtxoSyncTarget};
 #[cfg(feature = "block-view")]

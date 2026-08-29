@@ -651,60 +651,54 @@ impl<S> WorkHandler for MountedWorkService<S>
 where
     S: FinalizedBlocks + FinalizedWorkView + Sync,
 {
-    fn accept_work(
+    async fn accept_work(
         &self,
         request: AcceptWorkRequest,
         _context: TransportContext,
-    ) -> impl core::future::Future<
-        Output = Result<
-            impl Into<hellas_rpc::call::WithTrailer<AcceptWorkResponse>> + Send,
-            WireStatus,
-        >,
-    > + Send {
-        async move {
-            let _accepting = self.accepting.lock().await;
-            let ready = match self.refresh_admission().await {
-                Ok(ready) => ready,
-                Err(error) => {
-                    debug!(%error, "an acceptance attempt found no fresh channel readiness");
-                    return Ok(AcceptWorkResponse {
-                        outcome: Some(accept_work_response::Outcome::Refused(WorkRefused {
-                            code: WorkRefusalCode::NotReady as i32,
-                            reason: "fresh channel readiness is unavailable".to_string(),
-                        })),
-                    });
-                }
-            };
-            // Derive the id from the request while the accepted response
-            // is still only a possibility. The response carries only the
-            // provider signature, and consulting `state.job()` after it
-            // leaves would race the clock terminalizing that same job.
-            let work_id = self
-                .service
-                .with_state(|state| {
-                    PaidJobAuthorizationV1::decode(&request.authorization)
-                        .ok()
-                        .map(|authorization| accepted_work_id(state.channel(), &authorization))
-                })
-                .ok()
-                .flatten();
-            let response = self.service.accept(&request);
-            if matches!(
-                response.outcome.as_ref(),
-                Some(accept_work_response::Outcome::Accepted(_))
-            ) {
-                match (self.driver.as_ref(), work_id) {
-                    (Some(driver), Some(work_id)) => {
-                        driver.spawn(self.service.clone(), ready, work_id);
-                    }
-                    (None, Some(work_id)) => {
-                        warn!(?work_id, "accepted paid work has no execution backend")
-                    }
-                    (_, None) => warn!("accepted paid work has no mounted job to execute"),
-                }
+    ) -> Result<impl Into<hellas_rpc::call::WithTrailer<AcceptWorkResponse>> + Send, WireStatus>
+    {
+        let _accepting = self.accepting.lock().await;
+        let ready = match self.refresh_admission().await {
+            Ok(ready) => ready,
+            Err(error) => {
+                debug!(%error, "an acceptance attempt found no fresh channel readiness");
+                return Ok(AcceptWorkResponse {
+                    outcome: Some(accept_work_response::Outcome::Refused(WorkRefused {
+                        code: WorkRefusalCode::NotReady as i32,
+                        reason: "fresh channel readiness is unavailable".to_string(),
+                    })),
+                });
             }
-            Ok(response)
+        };
+        // Derive the id from the request while the accepted response
+        // is still only a possibility. The response carries only the
+        // provider signature, and consulting `state.job()` after it
+        // leaves would race the clock terminalizing that same job.
+        let work_id = self
+            .service
+            .with_state(|state| {
+                PaidJobAuthorizationV1::decode(&request.authorization)
+                    .ok()
+                    .map(|authorization| accepted_work_id(state.channel(), &authorization))
+            })
+            .ok()
+            .flatten();
+        let response = self.service.accept(&request);
+        if matches!(
+            response.outcome.as_ref(),
+            Some(accept_work_response::Outcome::Accepted(_))
+        ) {
+            match (self.driver.as_ref(), work_id) {
+                (Some(driver), Some(work_id)) => {
+                    driver.spawn(self.service.clone(), ready, work_id);
+                }
+                (None, Some(work_id)) => {
+                    warn!(?work_id, "accepted paid work has no execution backend")
+                }
+                (_, None) => warn!("accepted paid work has no mounted job to execute"),
+            }
         }
+        Ok(response)
     }
 
     fn deliver_result(
@@ -781,7 +775,16 @@ impl<S: Clone> MountedWork<S> {
         self.mounted.lock().ok().and_then(|held| held.clone())
     }
 
-    /// The exact mounted service, for the clock and its state checks.
+    /// The mounted channel's service, reached through the served
+    /// handler.
+    ///
+    /// Only the tests below ask for it. Serving takes [`Self::handler`],
+    /// and the clock drives the very same [`WorkService`] out of
+    /// [`Driven::Channel`] without asking the mount for it — so this
+    /// exists to let a test read the state of what the node is actually
+    /// answering from, and scoping it to `cfg(test)` is what keeps the
+    /// served slot to the one accessor that serves.
+    #[cfg(test)]
     fn service(&self) -> Option<WorkService> {
         self.handler().map(|mounted| mounted.service)
     }
@@ -797,10 +800,10 @@ impl<S: Clone> MountedWork<S> {
                 .filter(|mounted| mounted.bond_edge == bond_edge)
                 .map(|mounted| Arc::clone(&mounted.source))
         });
-        if let Some(source_slot) = source_slot {
-            if let Ok(mut held) = source_slot.lock() {
-                *held = source.clone();
-            }
+        if let Some(source_slot) = source_slot
+            && let Ok(mut held) = source_slot.lock()
+        {
+            *held = source.clone();
         }
     }
 
@@ -858,13 +861,12 @@ impl MountedSetup {
 
     /// Stops serving only the setup that made this transition.
     fn clear(&self, bond_edge: EdgeId) {
-        if let Ok(mut held) = self.0.lock() {
-            if held
+        if let Ok(mut held) = self.0.lock()
+            && held
                 .as_ref()
                 .is_some_and(|mounted| mounted.bond_edge == bond_edge)
-            {
-                *held = None;
-            }
+        {
+            *held = None;
         }
     }
 
@@ -890,8 +892,19 @@ enum Driven {
     /// retained: it is the provider authority from which the full channel
     /// descriptor is rebuilt after the setup reveals its actual terms.
     Setup {
+        /// The endpoint this journal is both driven and served behind.
         service: SetupService,
-        policy: Option<ProviderChannelPolicy>,
+        /// The retained provider authority, behind a pointer.
+        ///
+        /// Boxed because it is the widest thing this enum carries by a
+        /// long way — every other payload here is a handle or a store
+        /// pointer, one or two words each — and a journal is one value
+        /// with four shapes, so the three that hold no policy would
+        /// otherwise each be as large as the one that does.
+        /// [`PaymentAdmission`] already holds it behind the same
+        /// indirection, and this is built from that one, once per
+        /// journal at startup.
+        policy: Option<Box<ProviderChannelPolicy>>,
     },
     /// §4's missing, changed or unconfigured evidence: there is no
     /// admission and therefore no setup endpoint to build. Recovery is
@@ -970,7 +983,14 @@ impl SetupClock {
                             Driven::Recovery(_) | Driven::Channel(_) | Driven::Done => None,
                         };
                         setup_mount.clear(self.bond_edge);
-                        self.take_mount(store, signer, policy.as_ref(), source, work_mount, &bond);
+                        self.take_mount(
+                            store,
+                            signer,
+                            policy.as_deref(),
+                            source,
+                            work_mount,
+                            &bond,
+                        );
                     } else if matches!(
                         progress,
                         SetupProgress::Aborted(_) | SetupProgress::Faulted(_)
@@ -1158,7 +1178,7 @@ where
             let driven = match config.admission.clone() {
                 Some(admission) => {
                     let policy = match &admission {
-                        PaymentAdmission::Admits(policy) => Some(policy.as_ref().clone()),
+                        PaymentAdmission::Admits(policy) => Some(policy.clone()),
                         PaymentAdmission::Proposes(_) => None,
                     };
                     let service = SetupService::new(SetupEndpoint::new(
