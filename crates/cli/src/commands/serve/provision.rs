@@ -562,6 +562,7 @@ mod tests {
             },
             validators: Vec::new(),
             journal_root: root.to_path_buf(),
+            routes: Default::default(),
             policy_salt: [0x5a; 32],
             channel_policy: policy().channel_policy,
             execution_policy: policy().execution_policy,

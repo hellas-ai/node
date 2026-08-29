@@ -1868,6 +1868,7 @@ mod tests {
             },
             validators: Vec::new(),
             journal_root: root.join("unused-by-the-artifact-loader"),
+            routes: Default::default(),
             policy_salt: SALT,
             channel_policy: channel_policy(),
             execution_policy: execution_policy(),

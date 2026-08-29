@@ -311,6 +311,16 @@ impl WorkChannelSetupBundleV1 {
         )
     }
 
+    /// Returns the stake-bond terms fixed by the provider's first revision.
+    ///
+    /// These terms are present at every revision. In particular, startup can
+    /// verify a configured client's settlement key against their taker before
+    /// that client has answered the offer and before a payment leg exists.
+    #[must_use]
+    pub const fn bond_terms(&self) -> &WorkStakeBondTerms {
+        &self.bond_terms
+    }
+
     /// Returns the payment edge this setup will create, once the client
     /// has named its terms.
     #[must_use]

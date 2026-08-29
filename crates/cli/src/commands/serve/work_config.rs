@@ -5,9 +5,9 @@
 //! whose contents were never opened. A node cannot mount a channel from
 //! a path, so this is the schema and the loader for what is in it: the
 //! three-part chain cross-check, the six validator URLs a write is
-//! fanned to, the journal root, the two policies this
-//! provider works under, the watcher's poll cadence, the response
-//! alarm's margin, and the identity of the measured artifact.
+//! fanned to, the journal root, the bilateral route table, the two
+//! policies this provider works under, the watcher's poll cadence, the
+//! response alarm's margin, and the identity of the measured artifact.
 //!
 //! # The cross-check is not an anchor
 //!
@@ -52,14 +52,18 @@
 //! the serve path asks which of §4's evidence cases it started in, and
 //! every one of them still answers a contest.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::{Context as _, bail};
-use hellas_kernel::{EdgeValues, Fees, NetworkId, RESPONSE_POLL_BLOCKS};
+use hellas_kernel::{
+    EdgeId, EdgeValues, Fees, Key, NetworkId, RESPONSE_POLL_BLOCKS, Secp256k1Verifier,
+};
 use hellas_rpc::ContentId;
+use hellas_rpc::peers::PeerId;
 use hellas_rpc::protocol::Digest;
 use hellas_rpc::protocol::mount::{
     FloorError, MountBudget, MountFloor, clopper_pearson_upper_ppb, grade_response_probability,
@@ -69,6 +73,7 @@ use hellas_rpc::protocol::work::{
 };
 use hellas_rpc::protocol::work_setup::{OmissionMeasurements, ProviderChannelPolicy};
 use hellas_rpc::work_handshake::PaymentAdmission;
+use hellas_rpc::work_store::{Role, SetupStore, discover_setups};
 use serde::Deserialize;
 
 use crate::commands::CliResult;
@@ -81,11 +86,15 @@ use crate::commands::CliResult;
 /// deployment does not have.
 pub const VALIDATOR_COUNT: usize = 6;
 
-/// One operator's complete paid-work configuration, loaded and checked.
+/// One operator's complete paid-work configuration, loaded and structurally
+/// checked.
 ///
 /// A plain record with public fields, for [`WorkChannelConfig`]'s
-/// reason: this is the shape a file fills in, and every gate it has to
-/// pass has already been run by [`load_work_config`].
+/// reason: this is the shape a file fills in. Every file-local gate has
+/// already run in [`load_work_config`]; the serve path then runs
+/// [`validate_work_routes`] against the journals that must exist when it
+/// starts. Provisioning shares the file loader before it creates one, which is
+/// why disk agreement is not pretended to be a parse-time fact.
 ///
 /// [`WorkChannelConfig`]: hellas_rpc::protocol::work_setup::WorkChannelConfig
 #[derive(Clone, Debug)]
@@ -100,6 +109,8 @@ pub struct WorkConfig {
     pub validators: Vec<String>,
     /// Directory holding the setup and channel journals.
     pub journal_root: PathBuf,
+    /// Bilateral setup routes, keyed by the authenticated transport peer.
+    pub routes: WorkRoutes,
     /// Salt of the private credit-policy commitment.
     pub policy_salt: [u8; 32],
     /// The credit policy this provider will work under.
@@ -112,6 +123,72 @@ pub struct WorkConfig {
     pub response_alarm_margin_blocks: u64,
     /// The measured artifact this node's admission would rest on.
     pub artifact: Option<ArtifactIdentity>,
+}
+
+/// One bilateral setup route written in the paid-work configuration.
+///
+/// The bond names the provider setup journal under [`WorkConfig::journal_root`].
+/// The client key is repeated here deliberately: startup compares it with the
+/// taker committed inside that journal, turning a stale or mistyped route into
+/// a refusal before the node binds.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WorkRoute {
+    /// The transport-authenticated peer allowed to reach this bond.
+    pub peer: PeerId,
+    /// The bond whose provider setup journal this route names.
+    pub bond: EdgeId,
+    /// The settlement key the bond terms must name as taker.
+    pub client: Key,
+}
+
+/// Paid-work routes keyed by their authenticated peer.
+///
+/// Construction is private to the checked file loader. In particular, there
+/// is no insertion API through which a caller could recreate last-one-wins
+/// handling after duplicate peers and bonds have been refused.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct WorkRoutes {
+    by_peer: BTreeMap<PeerId, WorkRoute>,
+}
+
+impl WorkRoutes {
+    /// Returns every configured route in peer order.
+    pub fn iter(&self) -> impl Iterator<Item = &WorkRoute> {
+        self.by_peer.values()
+    }
+
+    /// Returns how many bilateral routes were configured.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.by_peer.len()
+    }
+
+    /// Returns whether no bilateral route was configured.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.by_peer.is_empty()
+    }
+
+    fn from_files(files: Vec<WorkRouteFile>) -> CliResult<Self> {
+        let mut by_peer = BTreeMap::new();
+        let mut bonds = BTreeSet::new();
+        for file in files {
+            let peer = PeerId::from_bytes(parse_fixed_hex("routes[].peer", &file.peer)?);
+            let bond = EdgeId::from_bytes(parse_fixed_hex("routes[].bond", &file.bond)?);
+            let client = Key::from_bytes(parse_fixed_hex("routes[].client", &file.client)?);
+            let route = WorkRoute { peer, bond, client };
+            if by_peer.insert(peer, route).is_some() {
+                bail!("routes names peer {peer:#} twice; one authenticated peer has one route");
+            }
+            if !bonds.insert(bond) {
+                bail!(
+                    "routes names bond {} twice; one provider journal has one route",
+                    hex::encode(bond.to_bytes()),
+                );
+            }
+        }
+        Ok(Self { by_peer })
+    }
 }
 
 impl WorkConfig {
@@ -445,7 +522,8 @@ pub struct ArtifactProvenance {
 /// cannot decode, a validator list that is not exactly
 /// [`VALIDATOR_COUNT`] URLs with distinct normalised forms, an execution
 /// policy the protocol's own [`check_execution_policy`] rejects, an
-/// empty journal root, a zero poll cadence, and a zero response-alarm
+/// empty journal root, a route field of the wrong width, duplicate peers or
+/// bonds in the route table, a zero poll cadence, and a zero response-alarm
 /// margin.
 pub fn load_work_config(path: &Path) -> CliResult<WorkConfig> {
     let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
@@ -453,6 +531,82 @@ pub fn load_work_config(path: &Path) -> CliResult<WorkConfig> {
         .with_context(|| format!("failed to parse {}", path.display()))?;
     file.into_config()
         .with_context(|| format!("invalid work config {}", path.display()))
+}
+
+/// Verifies that every configured route names this root's provider journal
+/// and the client settlement key committed by its bond terms.
+///
+/// This is a serve-startup check rather than part of [`load_work_config`]:
+/// provisioning uses the same configuration loader before it creates a
+/// journal, while a serving node must already have every journal it promises.
+/// Discovery comes first so [`SetupStore::open`] is never allowed to create a
+/// missing journal merely because a route named its bond.
+///
+/// # Errors
+///
+/// The root cannot be enumerated, a route's provider journal is absent from
+/// that root or cannot be opened, the journal holds no bond proposal, or its
+/// bond names a taker other than the route's configured client.
+pub(super) fn validate_work_routes(config: &WorkConfig) -> CliResult<()> {
+    if config.routes.is_empty() {
+        return Ok(());
+    }
+    let found = discover_setups(&config.journal_root, config.chain.network).with_context(|| {
+        format!(
+            "failed to enumerate configured work routes under journal.root {}",
+            config.journal_root.display(),
+        )
+    })?;
+    for route in config.routes.iter() {
+        if !found
+            .setups
+            .iter()
+            .any(|setup| setup.role == Role::Provider && setup.bond_edge == route.bond)
+        {
+            bail!(
+                "route for peer {:#} names bond {}, but its provider setup journal is not under \
+                 journal.root {}",
+                route.peer,
+                hex::encode(route.bond.to_bytes()),
+                config.journal_root.display(),
+            );
+        }
+        let store = SetupStore::open(
+            &config.journal_root,
+            config.chain.network,
+            route.bond,
+            Role::Provider,
+            &Secp256k1Verifier::new(),
+        )
+        .with_context(|| {
+            format!(
+                "route for peer {:#} could not open provider setup journal for bond {} under {}",
+                route.peer,
+                hex::encode(route.bond.to_bytes()),
+                config.journal_root.display(),
+            )
+        })?;
+        let Some(bundle) = store.state().bundle() else {
+            bail!(
+                "route for peer {:#} names provider setup journal for bond {}, but it holds no \
+                 bond proposal",
+                route.peer,
+                hex::encode(route.bond.to_bytes()),
+            );
+        };
+        let journal_client = bundle.bond_terms().parties.taker();
+        if journal_client != route.client {
+            bail!(
+                "route for peer {:#} expects client settlement key {}, but provider setup journal \
+                 for bond {} names {} as its taker",
+                route.peer,
+                hex::encode(route.client.to_bytes()),
+                hex::encode(route.bond.to_bytes()),
+                hex::encode(journal_client.to_bytes()),
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Reads the artifact a configuration pins, and decides what this node's
@@ -536,6 +690,7 @@ struct WorkConfigFile {
     chain: ChainFile,
     validators: Vec<String>,
     journal: JournalFile,
+    routes: Vec<WorkRouteFile>,
     policies: PoliciesFile,
     /// How often the watcher asks the chain for the next block.
     poll_ms: u64,
@@ -568,6 +723,7 @@ impl WorkConfigFile {
         .map_err(|error| anyhow::anyhow!("chain.threshold_identity is not usable: {error}"))?;
 
         let journal_root = self.journal.into_root()?;
+        let routes = WorkRoutes::from_files(self.routes)?;
         let policies = self.policies.into_policies()?;
         if self.poll_ms == 0 {
             bail!("poll_ms must be greater than zero");
@@ -587,6 +743,7 @@ impl WorkConfigFile {
             },
             validators,
             journal_root,
+            routes,
             policy_salt: policies.0,
             channel_policy: policies.1,
             execution_policy: policies.2,
@@ -595,6 +752,19 @@ impl WorkConfigFile {
             artifact: self.artifact.map(ArtifactFile::into_identity).transpose()?,
         })
     }
+}
+
+/// One bilateral route exactly as the operator writes it.
+///
+/// All three values are fixed-width lowercase-or-uppercase hexadecimal on
+/// input and canonical byte values after loading. A peer or bond written in a
+/// second spelling is therefore still the same key for duplicate detection.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkRouteFile {
+    peer: String,
+    bond: String,
+    client: String,
 }
 
 /// Parses the six validator RPC URLs, and refuses anything that is not
@@ -678,7 +848,7 @@ struct PoliciesFile {
 
 impl PoliciesFile {
     fn into_policies(self) -> CliResult<([u8; 32], PaidChannelPolicyV1, PaidExecutionPolicyV1)> {
-        let salt = parse_bytes32("policies.policy_salt", &self.policy_salt)?;
+        let salt = parse_fixed_hex("policies.policy_salt", &self.policy_salt)?;
         Ok((
             salt,
             PaidChannelPolicyV1 {
@@ -1294,16 +1464,16 @@ fn parse_hex(field: &str, raw: &str) -> CliResult<Vec<u8>> {
     Ok(bytes)
 }
 
-fn parse_bytes32(field: &str, raw: &str) -> CliResult<[u8; 32]> {
+fn parse_fixed_hex<const N: usize>(field: &str, raw: &str) -> CliResult<[u8; N]> {
     let bytes = parse_hex(field, raw)?;
-    let Ok(bytes) = <[u8; 32]>::try_from(bytes.as_slice()) else {
-        bail!("{field} must be 32 bytes, found {}", bytes.len());
+    let Ok(bytes) = <[u8; N]>::try_from(bytes.as_slice()) else {
+        bail!("{field} must be {N} bytes, found {}", bytes.len());
     };
     Ok(bytes)
 }
 
 fn parse_digest(field: &str, raw: &str) -> CliResult<Digest> {
-    Ok(Digest::from_bytes(parse_bytes32(field, raw)?))
+    Ok(Digest::from_bytes(parse_fixed_hex(field, raw)?))
 }
 
 #[cfg(test)]
@@ -1312,6 +1482,14 @@ mod tests {
 
     fn hex32(byte: u8) -> String {
         hex::encode([byte; 32])
+    }
+
+    fn route(peer: u8, bond: u8, client: u8) -> serde_json::Value {
+        serde_json::json!({
+            "peer": hex32(peer),
+            "bond": hex32(bond),
+            "client": hex::encode([client; 33]),
+        })
     }
 
     fn validators() -> Vec<serde_json::Value> {
@@ -1348,6 +1526,7 @@ mod tests {
             "journal": {
                 "root": "/var/lib/hellas/work",
             },
+            "routes": [route(0x31, 0x41, 0x02)],
             "policies": {
                 "policy_salt": hex32(0x5a),
                 "channel": {
@@ -1425,6 +1604,14 @@ mod tests {
         assert_eq!(loaded.chain.threshold_identity, THRESHOLD_IDENTITY.to_vec());
         assert_eq!(loaded.validators.len(), VALIDATOR_COUNT);
         assert_eq!(loaded.journal_root, PathBuf::from("/var/lib/hellas/work"));
+        let peer = PeerId::from_bytes([0x31; 32]);
+        let route = loaded
+            .routes
+            .iter()
+            .find(|route| route.peer == peer)
+            .expect("the bilateral route is loaded under its peer");
+        assert_eq!(route.bond, EdgeId::from_bytes([0x41; EdgeId::LENGTH]));
+        assert_eq!(route.client, Key::from_bytes([0x02; Key::LENGTH]));
         assert_eq!(loaded.policy_salt, [0x5a; 32]);
         assert_eq!(loaded.channel_policy.compute_credit_limit, 40);
         assert_eq!(loaded.execution_policy.fixed_price, 10);
@@ -1437,6 +1624,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn two_routes_cannot_name_the_same_peer() {
+        let routes = serde_json::json!([route(0x31, 0x41, 0x02), route(0x31, 0x42, 0x03),]);
+        let error = format!(
+            "{:?}",
+            load(with(config(), "routes", routes))
+                .expect_err("one authenticated peer cannot resolve to two routes"),
+        );
+        assert!(
+            error.contains("names peer") && error.contains("twice"),
+            "unexpected error: {error}",
+        );
+    }
+
+    #[test]
+    fn two_routes_cannot_name_the_same_bond() {
+        let routes = serde_json::json!([route(0x31, 0x41, 0x02), route(0x32, 0x41, 0x03),]);
+        let error = format!(
+            "{:?}",
+            load(with(config(), "routes", routes))
+                .expect_err("one provider journal cannot resolve from two peers"),
+        );
+        assert!(
+            error.contains("names bond") && error.contains("twice"),
+            "unexpected error: {error}",
+        );
+    }
+
     /// Every required field is required, and the refusal names it.
     #[test]
     fn a_missing_field_is_refused_by_name() {
@@ -1444,6 +1659,7 @@ mod tests {
             (&[][..], "poll_ms"),
             (&[][..], "response_alarm_margin_blocks"),
             (&[][..], "validators"),
+            (&[][..], "routes"),
             (&["chain"][..], "threshold_identity"),
             (&["chain"][..], "genesis_payload_digest"),
             (&["journal"][..], "root"),
@@ -1937,6 +2153,85 @@ mod tests {
             panic!("the fixture arms its immutable history floor: {error}");
         }
         endpoint
+    }
+
+    fn write_provider_offer(dir: &tempfile::TempDir) {
+        let duties = duties_for(&artifact(), None).expect("the route fixture's policy loads");
+        let admission = duties
+            .payment_admission()
+            .expect("the route fixture carries measured evidence");
+        let mut endpoint = setup_endpoint(dir, admission);
+        endpoint
+            .propose_bond(network(), bond_funding(), bond_terms())
+            .expect("the provider offer is durable");
+    }
+
+    fn config_for_route(root: &Path, client: Key) -> WorkConfig {
+        load(with(
+            with(
+                config(),
+                "journal",
+                serde_json::json!({ "root": root.display().to_string() }),
+            ),
+            "routes",
+            serde_json::json!([{
+                "peer": hex32(0x51),
+                "bond": hex::encode(bond_edge().to_bytes()),
+                "client": hex::encode(client.to_bytes()),
+            }]),
+        ))
+        .expect("the route fixture configuration loads")
+    }
+
+    #[test]
+    fn a_route_loads_and_verifies_its_journals_client_taker() {
+        let dir = tempfile::tempdir().unwrap();
+        write_provider_offer(&dir);
+        let loaded = config_for_route(dir.path(), signer(0x21).party_key());
+
+        validate_work_routes(&loaded)
+            .expect("the route and its provider journal name the same client");
+        assert_eq!(loaded.routes.len(), 1);
+    }
+
+    #[test]
+    fn a_route_is_refused_when_its_journal_names_another_client_taker() {
+        let dir = tempfile::tempdir().unwrap();
+        write_provider_offer(&dir);
+        let expected = signer(0x23).party_key();
+        let journal_client = signer(0x21).party_key();
+        let loaded = config_for_route(dir.path(), expected);
+
+        let error = format!(
+            "{:#}",
+            validate_work_routes(&loaded)
+                .expect_err("the configured client must be the bond terms' taker"),
+        );
+        assert!(
+            error.contains(&hex::encode(expected.to_bytes()))
+                && error.contains(&hex::encode(journal_client.to_bytes()))
+                && error.contains("taker"),
+            "unexpected error: {error}",
+        );
+    }
+
+    #[test]
+    fn a_route_is_refused_when_its_journal_is_not_under_the_configured_root() {
+        let elsewhere = tempfile::tempdir().unwrap();
+        write_provider_offer(&elsewhere);
+        let configured = tempfile::tempdir().unwrap();
+        let loaded = config_for_route(configured.path(), signer(0x21).party_key());
+
+        let error = format!(
+            "{:#}",
+            validate_work_routes(&loaded)
+                .expect_err("a route cannot reach a journal outside journal.root"),
+        );
+        assert!(
+            error.contains("not under journal.root")
+                && error.contains(&configured.path().display().to_string()),
+            "unexpected error: {error}",
+        );
     }
 
     /// The artifact round-trips: every labelled number arrives in the

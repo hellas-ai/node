@@ -155,10 +155,16 @@ async fn run_with_store(
     // startup refusal.
     let mut work_runner = None;
     if let Some(work) = options.work_config.as_ref() {
+        // A configured route is a promise about durable state, so verify all
+        // of them before the endpoint binds or advertises WorkSetup. This is
+        // intentionally later than parsing: provisioning shares the parser
+        // and is the command that may create the journal named here.
+        work_config::validate_work_routes(work)?;
         info!(
             network = %work.chain.network,
             validators = work.validators.len(),
             journal_root = %work.journal_root.display(),
+            routes = work.routes.len(),
             poll_ms = work.poll.as_millis(),
             response_alarm_margin_blocks = work.response_alarm_margin_blocks,
             // Said back because it is the party the chain will see: an
