@@ -270,10 +270,7 @@ in
               serviceName = "hellas-validator-${name}-node${toString index}";
               stateDirectory = "hellas-validator-${name}/node${toString index}";
               usesRuntimeConfig = validator.runtimeConfigFiles != [ ];
-              configFile =
-                if usesRuntimeConfig
-                then "%d/validator-config"
-                else mkConfigFile validator index;
+              configFile = if usesRuntimeConfig then "%d/validator-config" else mkConfigFile validator index;
             in
             {
               name = serviceName;

@@ -237,7 +237,10 @@ let
 
   kernelFixtureFreshness = mkModelApp {
     name = "hellas-kernel-fixture-freshness";
-    command = freshnessCommand "kernel" [ "l1" "l1_fees" ];
+    command = freshnessCommand "kernel" [
+      "l1"
+      "l1_fees"
+    ];
   };
 
   modelFixtures = mkModelApp {
