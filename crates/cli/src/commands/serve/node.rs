@@ -1366,6 +1366,7 @@ mod tests {
         Assurance, EvaluateProgramManifest, EvaluateRequest, OutputEventEnvelope,
         ProducerSigningKey, ProgramManifest, PublicKey, SubmitTxOutcome,
     };
+    use hellas_wire::{AuthLevel, PeerIdentity};
     use iroh::{EndpointAddr, TransportAddr};
     use tokio::sync::Semaphore;
 
@@ -1378,6 +1379,129 @@ mod tests {
         assert_eq!(refusal.code, WorkRefusalCode::NotReady as i32);
         assert!(WorkRefusal::NotReady.is_retryable());
         assert!(refusal.reason.len() <= 64);
+    }
+
+    #[derive(Clone, Debug)]
+    struct ContextWitness(Arc<Mutex<Option<TransportContext>>>);
+
+    impl WorkSetupHandler for ContextWitness {
+        fn exchange_setup(
+            &self,
+            _request: ExchangeSetupRequest,
+            context: TransportContext,
+        ) -> impl core::future::Future<
+            Output = Result<
+                impl Into<hellas_rpc::call::WithTrailer<ExchangeSetupResponse>> + Send,
+                WireStatus,
+            >,
+        > + Send {
+            if let Ok(mut observed) = self.0.lock() {
+                *observed = Some(context);
+            }
+            core::future::ready(Ok(ExchangeSetupResponse::default()))
+        }
+    }
+
+    /// The route identity is the peer iroh authenticated on this exact
+    /// connection, not a field a caller supplied in the request. Keeping the
+    /// raw context beside the derived route makes the authentication level an
+    /// assertion of its own rather than an inference from a populated peer.
+    #[tokio::test]
+    async fn work_setup_routes_only_the_vouched_dialling_peer() {
+        let observed = Arc::new(Mutex::new(None));
+        let witness = ContextWitness(Arc::clone(&observed));
+        let alpn = <WorkSetup as ServiceMarker>::ALPN.as_bytes();
+        let server = Endpoint::builder(presets::Minimal)
+            .secret_key(SecretKey::from_bytes(&[0x63; 32]))
+            .alpns(vec![alpn.to_vec()])
+            .bind_addr(
+                "127.0.0.1:0"
+                    .parse::<std::net::SocketAddr>()
+                    .expect("a loopback socket"),
+            )
+            .expect("the server has a valid bind address")
+            .bind()
+            .await
+            .expect("the server binds");
+        let target = EndpointAddr::from_parts(
+            server.id(),
+            server.bound_sockets().into_iter().map(TransportAddr::Ip),
+        );
+        let client = Endpoint::builder(presets::Minimal)
+            .secret_key(SecretKey::from_bytes(&[0x64; 32]))
+            .bind_addr(
+                "127.0.0.1:0"
+                    .parse::<std::net::SocketAddr>()
+                    .expect("a loopback socket"),
+            )
+            .expect("the client has a valid bind address")
+            .bind()
+            .await
+            .expect("the client binds");
+        let expected = PeerIdentity(*client.id().as_bytes());
+
+        let accepting_server = server.clone();
+        let (release_connection, released) = oneshot::channel();
+        let serving = tokio::spawn(async move {
+            let incoming = accepting_server
+                .accept()
+                .await
+                .expect("the server receives a dial");
+            let accepting = incoming.accept().expect("the server accepts the dial");
+            let connection = accepting.await.expect("the iroh handshake completes");
+            let transport = IrohTransport::new(connection);
+            let inbound = transport
+                .accept()
+                .await
+                .expect("the transport accepts the call")
+                .expect("the call has one inbound stream");
+            Dispatcher::<IrohTransport>::dispatch(&WorkSetupServer(witness), inbound)
+                .await
+                .expect("WorkSetup dispatches");
+            let _ = released.await;
+        });
+
+        let connection = client
+            .connect(target, alpn)
+            .await
+            .expect("the client dials the WorkSetup ALPN");
+        WorkSetupClientImpl::new(IrohTransport::new(connection))
+            .exchange_setup(ExchangeSetupRequest::default())
+            .await
+            .expect("the genuine WorkSetup call completes");
+        let _ = release_connection.send(());
+        serving.await.expect("the server task completes");
+
+        let context = observed
+            .lock()
+            .expect("the witness lock remains usable")
+            .clone()
+            .expect("the handler receives a transport context");
+        assert_eq!(context.peer, Some(expected));
+        assert_eq!(context.auth_level, AuthLevel::Vouched);
+        assert_eq!(context.vouched_peer(), Some(expected));
+
+        assert_eq!(
+            None::<&TransportContext>.and_then(TransportContext::vouched_peer),
+            None,
+            "an absent context has no route",
+        );
+        assert_eq!(
+            TransportContext::default().vouched_peer(),
+            None,
+            "a default context has no route",
+        );
+        assert_eq!(
+            TransportContext {
+                peer: Some(expected),
+                ..TransportContext::default()
+            }
+            .vouched_peer(),
+            None,
+            "a populated peer the transport does not vouch for has no route",
+        );
+        client.close().await;
+        server.close().await;
     }
 
     #[tokio::test]

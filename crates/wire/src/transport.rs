@@ -77,6 +77,22 @@ impl std::fmt::Debug for TransportContext {
     }
 }
 
+impl TransportContext {
+    /// Returns the peer identity only when the transport vouches for it.
+    ///
+    /// A populated peer field is not by itself an authenticated identity:
+    /// transports may carry a claimed or otherwise untrusted peer while
+    /// leaving [`Self::auth_level`] at [`AuthLevel::None`]. Connection-bound
+    /// routing must use this pair as one fact and fail closed on either half.
+    #[must_use]
+    pub const fn vouched_peer(&self) -> Option<PeerIdentity> {
+        match (self.auth_level, self.peer) {
+            (AuthLevel::Vouched, Some(peer)) => Some(peer),
+            _ => None,
+        }
+    }
+}
+
 pub struct Inbound<S> {
     pub method_id: u32,
     pub headers: Metadata,
