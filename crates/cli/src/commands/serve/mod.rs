@@ -186,6 +186,7 @@ async fn run_with_store(
             network: work.chain.network,
             threshold_identity: work.chain.threshold_identity.clone(),
             journal_root: work.journal_root.clone(),
+            routes: work.routes.clone(),
             validators: work.validators.clone(),
             poll: work.poll,
             settlement_key: options.settlement_key.clone(),

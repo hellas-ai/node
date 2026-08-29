@@ -8,6 +8,7 @@
 //! owned by the service-discovery path and is not started from this
 //! bootstrap.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -64,6 +65,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use super::node_handler::NodeHandlerImpl;
+use super::work_config::WorkRoutes;
 use crate::commands::discovery::{DiscoveryAdvertiser, served_alpns, start_server_advertising};
 
 type ProductionWorkSource = WorkBlocks<VerifiedRemoteLightClient>;
@@ -319,6 +321,7 @@ where
     S: FinalizedBlocks + FinalizedWorkView + Sync,
 {
     let transport = IrohTransport::new(conn);
+    let context = transport.context();
 
     // Every generated `XServer` is wrapped in `AccountingDispatcher`
     // so per-peer counters (`total_requests`, `last_seen_ms`, RTT
@@ -332,7 +335,7 @@ where
     } else if let Some(setup) =
         setup.filter(|_| alpn == <WorkSetup as ServiceMarker>::ALPN.as_bytes())
     {
-        match setup.service() {
+        match setup.service(&context) {
             Some(mounted) => {
                 let server = AccountingDispatcher::new(WorkSetupServer(mounted), manager);
                 serve_loop(&transport, &server).await
@@ -346,7 +349,7 @@ where
         // The mounted channel answers for itself. Until the runner has
         // been handed one there is no channel to answer from, and this
         // is still the bounded retryable `NotReady` §3 left here.
-        match work.handler() {
+        match work.handler(&context) {
             Some(mounted) => {
                 let server = AccountingDispatcher::new(WorkServer(mounted), manager);
                 serve_loop(&transport, &server).await
@@ -459,6 +462,8 @@ pub(super) struct WorkRunnerConfig {
     pub(super) threshold_identity: Vec<u8>,
     /// The configured root the setup journals live under.
     pub(super) journal_root: PathBuf,
+    /// Bilateral routes from authenticated peers to owned journals.
+    pub(super) routes: WorkRoutes,
     /// The validator RPCs a read and a submission go to.
     pub(super) validators: Vec<String>,
     /// How often the clock ticks.
@@ -480,14 +485,14 @@ pub(super) struct WorkRunnerConfig {
 /// waits on a request.
 #[derive(Clone)]
 pub(super) struct MountedWork<S> {
-    mounted: Arc<Mutex<Option<MountedWorkService<S>>>>,
+    mounted: Arc<Mutex<BTreeMap<PeerId, Vec<MountedWorkService<S>>>>>,
     driver: Option<AcceptedWorkDriver>,
 }
 
 impl<S> Default for MountedWork<S> {
     fn default() -> Self {
         Self {
-            mounted: Arc::new(Mutex::new(None)),
+            mounted: Arc::new(Mutex::new(BTreeMap::new())),
             driver: None,
         }
     }
@@ -734,28 +739,29 @@ impl<S: Clone> MountedWork<S> {
         B: PaidEvaluateBackend + Send + Sync + 'static,
     {
         Self {
-            mounted: Arc::new(Mutex::new(None)),
+            mounted: Arc::new(Mutex::new(BTreeMap::new())),
             driver: Some(AcceptedWorkDriver::new(backend)),
         }
     }
 
-    /// Serves `Work` from `service` from now on, and says whether it
-    /// took the slot.
+    /// Adds one owned channel under its authenticated peer.
     ///
-    /// The first mount wins. One endpoint answers for one channel alone
-    /// — an authorization naming another is refused by the endpoint and
-    /// never routed — so a second mounted channel is still driven and is
-    /// not served, and the operator is told which.
+    /// A peer is served only while exactly one channel is mounted under
+    /// it. Retaining a second candidate rather than overwriting either one
+    /// makes an ambiguity fail closed instead of turning insertion order
+    /// into routing policy.
     fn mount(
         &self,
+        peer: PeerId,
         bond_edge: EdgeId,
         service: &WorkService,
         descriptor: Option<WorkChannelDescriptor>,
         source: &S,
     ) -> bool {
         match self.mounted.lock() {
-            Ok(mut held) if held.is_none() => {
-                *held = Some(MountedWorkService {
+            Ok(mut held) => {
+                let mounted = held.entry(peer).or_default();
+                mounted.push(MountedWorkService {
                     bond_edge,
                     service: service.clone(),
                     descriptor,
@@ -763,16 +769,23 @@ impl<S: Clone> MountedWork<S> {
                     accepting: Arc::new(AsyncMutex::new(())),
                     driver: self.driver.clone(),
                 });
-                true
+                mounted.len() == 1
             }
-            _ => false,
+            Err(_) => false,
         }
     }
 
-    /// The mounted channel's served handler, when the runner has mounted
-    /// one.
-    fn handler(&self) -> Option<MountedWorkService<S>> {
-        self.mounted.lock().ok().and_then(|held| held.clone())
+    /// The one handler mounted for the transport-vouched peer.
+    fn handler(&self, context: &TransportContext) -> Option<MountedWorkService<S>> {
+        let peer = context
+            .vouched_peer()
+            .map(|peer| PeerId::from_bytes(peer.0))?;
+        self.mounted.lock().ok().and_then(|held| {
+            let [mounted] = held.get(&peer)?.as_slice() else {
+                return None;
+            };
+            Some(mounted.clone())
+        })
     }
 
     /// The mounted channel's service, reached through the served
@@ -785,8 +798,8 @@ impl<S: Clone> MountedWork<S> {
     /// answering from, and scoping it to `cfg(test)` is what keeps the
     /// served slot to the one accessor that serves.
     #[cfg(test)]
-    fn service(&self) -> Option<WorkService> {
-        self.handler().map(|mounted| mounted.service)
+    fn service(&self, context: &TransportContext) -> Option<WorkService> {
+        self.handler(context).map(|mounted| mounted.service)
     }
 
     /// Replaces the finalized source for the matching driven channel.
@@ -796,8 +809,9 @@ impl<S: Clone> MountedWork<S> {
     /// held across a source request.
     fn refresh_source(&self, bond_edge: EdgeId, source: &S) {
         let source_slot = self.mounted.lock().ok().and_then(|held| {
-            held.as_ref()
-                .filter(|mounted| mounted.bond_edge == bond_edge)
+            held.values()
+                .flatten()
+                .find(|mounted| mounted.bond_edge == bond_edge)
                 .map(|mounted| Arc::clone(&mounted.source))
         });
         if let Some(source_slot) = source_slot
@@ -815,19 +829,19 @@ impl<S: Clone> MountedWork<S> {
     /// one thing keeping the files this process no longer owns.
     fn clear_all(&self) {
         if let Ok(mut held) = self.mounted.lock() {
-            *held = None;
+            held.clear();
         }
     }
 }
 
-/// The one provider setup this node answers `WorkSetup` from.
+/// Provider setups this node answers `WorkSetup` from by authenticated peer.
 ///
 /// Written by discovery and read by the accept loop, beside
 /// [`MountedWork`]. The clone in this slot is the exact [`SetupService`]
 /// stored in [`Driven::Setup`], so serving and driving share one exclusive
 /// journal rather than attempting to reopen it.
 #[derive(Clone, Debug, Default)]
-pub(super) struct MountedSetup(Arc<Mutex<Option<MountedSetupService>>>);
+pub(super) struct MountedSetup(Arc<Mutex<BTreeMap<PeerId, Vec<MountedSetupService>>>>);
 
 #[derive(Clone, Debug)]
 struct MountedSetupService {
@@ -836,44 +850,49 @@ struct MountedSetupService {
 }
 
 impl MountedSetup {
-    /// Serves one setup, only while the slot is empty.
-    fn mount(&self, bond_edge: EdgeId, service: &SetupService) -> bool {
+    /// Adds one owned setup under its authenticated peer.
+    fn mount(&self, peer: PeerId, bond_edge: EdgeId, service: &SetupService) -> bool {
         match self.0.lock() {
-            Ok(mut held) if held.is_none() => {
-                *held = Some(MountedSetupService {
+            Ok(mut held) => {
+                let mounted = held.entry(peer).or_default();
+                mounted.push(MountedSetupService {
                     bond_edge,
                     service: service.clone(),
                 });
-                true
+                mounted.len() == 1
             }
-            _ => false,
+            Err(_) => false,
         }
     }
 
-    /// The exact setup service discovery mounted, cloned without holding
-    /// the slot across dispatch.
-    fn service(&self) -> Option<SetupService> {
-        self.0
-            .lock()
-            .ok()
-            .and_then(|held| held.as_ref().map(|mounted| mounted.service.clone()))
+    /// The exact setup service mounted for the transport-vouched peer,
+    /// cloned without holding the map across dispatch.
+    fn service(&self, context: &TransportContext) -> Option<SetupService> {
+        let peer = context
+            .vouched_peer()
+            .map(|peer| PeerId::from_bytes(peer.0))?;
+        self.0.lock().ok().and_then(|held| {
+            let [mounted] = held.get(&peer)?.as_slice() else {
+                return None;
+            };
+            Some(mounted.service.clone())
+        })
     }
 
     /// Stops serving only the setup that made this transition.
     fn clear(&self, bond_edge: EdgeId) {
-        if let Ok(mut held) = self.0.lock()
-            && held
-                .as_ref()
-                .is_some_and(|mounted| mounted.bond_edge == bond_edge)
-        {
-            *held = None;
+        if let Ok(mut held) = self.0.lock() {
+            held.retain(|_, mounted| {
+                mounted.retain(|mounted| mounted.bond_edge != bond_edge);
+                !mounted.is_empty()
+            });
         }
     }
 
     /// Stops serving every setup during runner shutdown.
     fn clear_all(&self) {
         if let Ok(mut held) = self.0.lock() {
-            *held = None;
+            held.clear();
         }
     }
 }
@@ -968,6 +987,7 @@ impl SetupClock {
         signer: &Secp256k1Signer,
         work_mount: &MountedWork<S>,
         setup_mount: &MountedSetup,
+        route_peer: Option<PeerId>,
     ) -> bool
     where
         S: SetupView + FinalizedBlocks + FinalizedWorkView + TxSink + Sync,
@@ -989,7 +1009,7 @@ impl SetupClock {
                             policy.as_deref(),
                             source,
                             work_mount,
-                            &bond,
+                            route_peer,
                         );
                     } else if matches!(
                         progress,
@@ -1033,8 +1053,9 @@ impl SetupClock {
         policy: Option<&ProviderChannelPolicy>,
         source: &S,
         mount: &MountedWork<S>,
-        bond: &str,
+        route_peer: Option<PeerId>,
     ) {
+        let bond = hex::encode(self.bond_edge.to_bytes());
         // The setup's retained policy supplies the provider-controlled
         // fields, while the mounted channel supplies the payment edge and
         // complete terms the two parties actually signed. This is a full
@@ -1055,7 +1076,9 @@ impl SetupClock {
         match CloseEndpoint::new(store, signer.clone()) {
             Ok(close) => {
                 let service = WorkService::close_only(close);
-                if mount.mount(self.bond_edge, &service, descriptor, source) {
+                if route_peer.is_some_and(|peer| {
+                    mount.mount(peer, self.bond_edge, &service, descriptor, source)
+                }) {
                     info!(
                         bond,
                         "this node now answers Work from the channel it mounted"
@@ -1063,7 +1086,7 @@ impl SetupClock {
                 } else {
                     warn!(
                         bond,
-                        "a channel is already served; this one is driven and not served",
+                        "this channel has no unique peer route; it is driven and not served",
                     );
                 }
                 self.driven = Driven::Channel(service);
@@ -1083,6 +1106,7 @@ impl SetupClock {
 /// The clock, over every paid-work journal this node owns.
 pub(super) struct WorkRunner<S> {
     clocks: Vec<SetupClock>,
+    routes: WorkRoutes,
     signer: Secp256k1Signer,
     work_mount: MountedWork<S>,
     setup_mount: MountedSetup,
@@ -1107,10 +1131,10 @@ where
     /// # Errors
     ///
     /// When the root itself cannot be enumerated.
-    /// `WorkSetup` has no selector in its empty first request, so exactly
-    /// one discovered provider journal is the only unambiguous offer. If
-    /// there are several, all are still driven for recovery and close
-    /// duty, but none is served as an arbitrary answer to that request.
+    /// Every owned journal is driven. A configured route additionally
+    /// mounts its exact setup service under the authenticated peer that
+    /// names it; an unconfigured journal remains a close duty, not a
+    /// fallback answer.
     pub(super) fn discover(
         config: WorkRunnerConfig,
         work_mount: MountedWork<S>,
@@ -1134,18 +1158,6 @@ where
                 path = %unnamed.path.display(),
                 reason = %unnamed.reason,
                 "a setup journal under the work root could not be named",
-            );
-        }
-        let provider_setups = found
-            .setups
-            .iter()
-            .filter(|setup| setup.role == Role::Provider)
-            .count();
-        let setup_is_unambiguous = provider_setups == 1;
-        if provider_setups > 1 {
-            warn!(
-                provider_setups,
-                "more than one provider setup journal was discovered; WorkSetup is not served",
             );
         }
         let mut clocks = Vec::with_capacity(found.setups.len());
@@ -1186,15 +1198,21 @@ where
                         config.settlement_key.clone(),
                         admission,
                     ));
-                    if setup_is_unambiguous {
-                        if setup_mount.mount(setup.bond_edge, &service) {
+                    if let Some(route) = config
+                        .routes
+                        .iter()
+                        .find(|route| route.bond == setup.bond_edge)
+                    {
+                        if setup_mount.mount(route.peer, setup.bond_edge, &service) {
                             info!(
                                 bond,
                                 "this node now answers WorkSetup from its driven setup"
                             );
                         } else {
-                            warn!(bond, "the unambiguous provider setup could not be mounted");
+                            warn!(bond, "this provider setup has an ambiguous peer route");
                         }
+                    } else {
+                        warn!(bond, "this provider setup has no configured peer route");
                     }
                     Driven::Setup { service, policy }
                 }
@@ -1207,6 +1225,7 @@ where
         }
         Ok(Self {
             clocks,
+            routes: config.routes,
             signer: config.settlement_key,
             work_mount,
             setup_mount,
@@ -1221,8 +1240,19 @@ where
     async fn tick(&mut self, source: &S) -> bool {
         let mut answered = true;
         for clock in &mut self.clocks {
+            let route_peer = self
+                .routes
+                .iter()
+                .find(|route| route.bond == clock.bond_edge)
+                .map(|route| route.peer);
             answered &= clock
-                .tick(source, &self.signer, &self.work_mount, &self.setup_mount)
+                .tick(
+                    source,
+                    &self.signer,
+                    &self.work_mount,
+                    &self.setup_mount,
+                    route_peer,
+                )
                 .await;
         }
         answered
@@ -1326,10 +1356,10 @@ mod tests {
     use hellas_chain::{LatestBlock, QueryError, WorkChannelQuery, WorkChannelSnapshot};
     use hellas_kernel::{
         Auth, BlockHeight, BufferWriter, CoinId, Decode as _, Edge, EdgeValues, Encode as _, Fees,
-        Funding, LeaseSlots, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, MAX_START_VALIDITY_BLOCKS,
-        MIN_OMIT_RESPONSE_BLOCKS, Move, Parties, Party, Payout, PendingPaymentClose, Proof,
-        RegistryChunk, RegistryNamespace, RegistryRecordTag, StartId, Terms, Tx,
-        WorkPaymentSettlement, WorkPaymentTerms, WorkStakeBondTerms, Writer as _,
+        Funding, Key, LeaseSlots, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS,
+        MAX_START_VALIDITY_BLOCKS, MIN_OMIT_RESPONSE_BLOCKS, Move, Parties, Party, Payout,
+        PendingPaymentClose, Proof, RegistryChunk, RegistryNamespace, RegistryRecordTag, StartId,
+        Terms, Tx, WorkPaymentSettlement, WorkPaymentTerms, WorkStakeBondTerms, Writer as _,
     };
     use hellas_rpc::call::WithTrailer;
     use hellas_rpc::evaluate::{
@@ -1372,7 +1402,8 @@ mod tests {
 
     use super::*;
     use crate::commands::serve::work_config::{
-        ArtifactIdentity, ChainCrossCheck, WorkConfig, load_paid_work_duties,
+        ArtifactIdentity, ChainCrossCheck, WorkConfig, WorkRoutes, load_paid_work_duties,
+        load_work_config,
     };
 
     fn assert_retryable_not_ready(refusal: WorkRefused) {
@@ -1504,6 +1535,211 @@ mod tests {
         server.close().await;
     }
 
+    async fn exchange_routed_setup(
+        server: &Endpoint,
+        target: &EndpointAddr,
+        setup: &MountedSetup,
+        client_secret: u8,
+    ) -> ExchangeSetupResponse {
+        let local_peer = PeerId::from_bytes(*server.id().as_bytes());
+        let directory = Arc::new(PeerDirectory::with_config(
+            local_peer,
+            hellas_rpc::peer_directory_config(),
+        ));
+        let handler = NodeHandlerImpl::new(
+            server.id(),
+            "peer-routed-setup-test".to_string(),
+            Vec::new(),
+            directory.clone(),
+        );
+        let accepting = server.clone();
+        let setup = setup.clone();
+        let serving = tokio::spawn(async move {
+            let incoming = accepting
+                .accept()
+                .await
+                .expect("the routed setup server receives a connection");
+            let connection = incoming
+                .accept()
+                .expect("the routed setup connection starts")
+                .await
+                .expect("the routed setup handshake completes");
+            serve_connection::<TestChain>(
+                connection.alpn().to_vec(),
+                connection,
+                handler,
+                directory.manager(),
+                Some(setup),
+                None,
+            )
+            .await
+            .expect("the routed setup connection is served");
+        });
+
+        let client = Endpoint::builder(presets::Minimal)
+            .secret_key(SecretKey::from_bytes(&[client_secret; 32]))
+            .bind_addr(
+                "127.0.0.1:0"
+                    .parse::<std::net::SocketAddr>()
+                    .expect("a loopback socket"),
+            )
+            .expect("the routed setup client has a valid bind address")
+            .bind()
+            .await
+            .expect("the routed setup client binds");
+        let connection = client
+            .connect(
+                target.clone(),
+                <WorkSetup as ServiceMarker>::ALPN.as_bytes(),
+            )
+            .await
+            .expect("the routed setup client dials");
+        let response = WorkSetupClientImpl::new(IrohTransport::new(connection.clone()))
+            .exchange_setup(ExchangeSetupRequest::default())
+            .await
+            .expect("the routed setup request completes");
+        connection.close(0_u32.into(), b"routed setup complete");
+        serving.await.expect("the routed setup server task joins");
+        client.close().await;
+        response
+    }
+
+    fn advanced_setup_bundle(response: ExchangeSetupResponse) -> WorkChannelSetupBundleV1 {
+        let Some(exchange_setup_response::Outcome::Advanced(advanced)) = response.outcome else {
+            panic!("a configured peer receives its setup proposal")
+        };
+        match WorkChannelSetupBundleV1::decode(&advanced.bundle) {
+            Ok(bundle) => bundle,
+            Err(error) => panic!("the routed setup proposal decodes: {error}"),
+        }
+    }
+
+    /// Two empty first requests carry no selector at all. The authenticated
+    /// dialling peers are therefore the only route identities, and each must
+    /// reach the exact setup service that owns its configured journal.
+    #[tokio::test]
+    async fn two_vouched_peers_receive_their_distinct_configured_offers() {
+        let dir = temp();
+        let first = OfferFixture {
+            client_seed: 0x21,
+            bond_coin: 0xa1,
+        };
+        let second = OfferFixture {
+            client_seed: 0x23,
+            bond_coin: 0xa2,
+        };
+        first.seed_provider_offer(dir.path(), admits());
+        second.seed_provider_offer(dir.path(), admits());
+
+        let first_secret = 0x71;
+        let second_secret = 0x72;
+        let first_peer = PeerId::from_bytes(
+            *SecretKey::from_bytes(&[first_secret; 32])
+                .public()
+                .as_bytes(),
+        );
+        let second_peer = PeerId::from_bytes(
+            *SecretKey::from_bytes(&[second_secret; 32])
+                .public()
+                .as_bytes(),
+        );
+        let setup_mount = MountedSetup::default();
+        let runner = WorkRunner::discover(
+            WorkRunnerConfig {
+                network: network(),
+                threshold_identity: threshold_identity(),
+                journal_root: dir.path().to_path_buf(),
+                routes: configured_routes(&[
+                    (first_peer, first.bond_edge(), first.client().party_key()),
+                    (second_peer, second.bond_edge(), second.client().party_key()),
+                ]),
+                validators: Vec::new(),
+                poll: Duration::from_millis(1),
+                settlement_key: provider(),
+                admission: Some(admits()),
+            },
+            MountedWork::<TestChain>::default(),
+            setup_mount.clone(),
+        )
+        .expect("both owned provider journals are discovered");
+        assert_eq!(runner.clocks.len(), 2, "both journals keep a clock");
+
+        let alpn = <WorkSetup as ServiceMarker>::ALPN.as_bytes();
+        let server = Endpoint::builder(presets::Minimal)
+            .secret_key(SecretKey::from_bytes(&[0x70; 32]))
+            .alpns(vec![alpn.to_vec()])
+            .bind_addr(
+                "127.0.0.1:0"
+                    .parse::<std::net::SocketAddr>()
+                    .expect("a loopback socket"),
+            )
+            .expect("the routed setup server has a valid bind address")
+            .bind()
+            .await
+            .expect("the routed setup server binds");
+        let target = EndpointAddr::from_parts(
+            server.id(),
+            server.bound_sockets().into_iter().map(TransportAddr::Ip),
+        );
+
+        let first_bundle = advanced_setup_bundle(
+            exchange_routed_setup(&server, &target, &setup_mount, first_secret).await,
+        );
+        let second_bundle = advanced_setup_bundle(
+            exchange_routed_setup(&server, &target, &setup_mount, second_secret).await,
+        );
+        assert_eq!(first_bundle.revision(), 1);
+        assert_eq!(second_bundle.revision(), 1);
+        assert_ne!(
+            first_bundle, second_bundle,
+            "the two peers do not receive one global first mount",
+        );
+        assert_eq!(
+            first_bundle.bond_terms().parties.taker(),
+            first.client().party_key(),
+            "the first peer reaches the journal configured for its client",
+        );
+        assert_eq!(
+            second_bundle.bond_terms().parties.taker(),
+            second.client().party_key(),
+            "the second peer reaches the journal configured for its client",
+        );
+
+        assert!(
+            setup_mount.service(&TransportContext::default()).is_none(),
+            "an absent identity has no route",
+        );
+        assert!(
+            setup_mount
+                .service(&TransportContext {
+                    peer: Some(PeerIdentity(first_peer.into_bytes())),
+                    ..TransportContext::default()
+                })
+                .is_none(),
+            "an unvouched identity has no route",
+        );
+        assert!(
+            setup_mount
+                .service(&vouched_context(PeerId::from_bytes([0xff; 32])))
+                .is_none(),
+            "an unknown vouched peer has no route",
+        );
+        let exact_first = setup_mount
+            .service(&vouched_context(first_peer))
+            .expect("the first route owns one exact setup service");
+        assert!(
+            !setup_mount.mount(first_peer, first.bond_edge(), &exact_first),
+            "a second candidate makes the peer ambiguous",
+        );
+        assert!(
+            setup_mount.service(&vouched_context(first_peer)).is_none(),
+            "an ambiguous peer fails closed",
+        );
+
+        drop(runner);
+        server.close().await;
+    }
+
     #[tokio::test]
     async fn unmounted_work_refuses_every_method_as_bounded_retryable_not_ready() {
         let setup: WithTrailer<ExchangeSetupResponse> = UnmountedWork
@@ -1626,6 +1862,78 @@ mod tests {
         {
             Ok(dir) => dir,
             Err(error) => panic!("a temporary directory: {error}"),
+        }
+    }
+
+    fn default_route_peer() -> PeerId {
+        PeerId::from_bytes([0x31; 32])
+    }
+
+    fn vouched_context(peer: PeerId) -> TransportContext {
+        TransportContext {
+            peer: Some(PeerIdentity(peer.into_bytes())),
+            auth_level: AuthLevel::Vouched,
+            ..TransportContext::default()
+        }
+    }
+
+    /// Builds routes through the production loader, the only constructor
+    /// that can establish their duplicate-peer and duplicate-bond invariants.
+    fn configured_routes(routes: &[(PeerId, EdgeId, Key)]) -> WorkRoutes {
+        let route_values: Vec<_> = routes
+            .iter()
+            .map(|(peer, bond, client)| {
+                serde_json::json!({
+                    "peer": hex::encode(peer.as_bytes()),
+                    "bond": hex::encode(bond.to_bytes()),
+                    "client": hex::encode(client.to_bytes()),
+                })
+            })
+            .collect();
+        let value = serde_json::json!({
+            "chain": {
+                "network_id": network().as_str(),
+                "genesis_payload_digest": hex::encode([0x01; 32]),
+                "threshold_identity": hex::encode(threshold_identity()),
+            },
+            "validators": (1..=6)
+                .map(|index| format!("http://127.0.0.1:900{index}"))
+                .collect::<Vec<_>>(),
+            "journal": { "root": "/var/lib/hellas/work" },
+            "routes": route_values,
+            "policies": {
+                "policy_salt": hex::encode(SALT),
+                "channel": {
+                    "compute_credit_limit": 40,
+                    "delivery_credit_limit": 40,
+                },
+                "execution": {
+                    "allowed_environment": hex::encode([0x11; 32]),
+                    "generation_policy_digest": hex::encode([0x12; 32]),
+                    "identity_source_digest": hex::encode([0x13; 32]),
+                    "max_prompt_tokens": 512,
+                    "max_new_tokens": 128,
+                    "max_stop_token_ids": 4,
+                    "max_spool_bytes": 1_048_576_u64,
+                    "max_encoded_result_frame": 262_144,
+                    "max_encoded_quote_response": 1_048_576_u64,
+                    "dispatch_margin_blocks": 4,
+                    "delivery_margin_blocks": 2,
+                    "oracle_grace_blocks": 6,
+                    "fixed_price": 10,
+                },
+            },
+            "poll_ms": 1,
+            "response_alarm_margin_blocks": MAX_START_VALIDITY_BLOCKS,
+        });
+        let dir = temp();
+        let path = dir.path().join("routes.json");
+        if let Err(error) = std::fs::write(&path, value.to_string()) {
+            panic!("the route fixture is written: {error}");
+        }
+        match load_work_config(&path) {
+            Ok(config) => config.routes,
+            Err(error) => panic!("the route fixture passes the production loader: {error}"),
         }
     }
 
@@ -2833,6 +3141,11 @@ mod tests {
                 network: network(),
                 threshold_identity: threshold_identity(),
                 journal_root: root.to_path_buf(),
+                routes: configured_routes(&[(
+                    default_route_peer(),
+                    bond_edge(),
+                    client().party_key(),
+                )]),
                 validators: Vec::new(),
                 poll: Duration::from_millis(1),
                 settlement_key: provider(),
@@ -2900,6 +3213,66 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    struct OfferFixture {
+        client_seed: u8,
+        bond_coin: u8,
+    }
+
+    impl OfferFixture {
+        fn client(self) -> Secp256k1Signer {
+            signer(self.client_seed)
+        }
+
+        fn bond_funding(self) -> Funding {
+            Funding::new(coins(&[self.bond_coin]), coins(&[]))
+        }
+
+        fn bond_terms(self) -> WorkStakeBondTerms {
+            WorkStakeBondTerms {
+                parties: Parties::new(provider().party_key(), self.client().party_key()),
+                timeout: BlockHeight::new(500),
+                timeout_outputs: List::take(
+                    [Payout::new(provider().party_key(), 64); MAX_EDGE_OUTPUTS],
+                    1,
+                ),
+                max_job_price: 40,
+            }
+        }
+
+        fn bond_edge(self) -> EdgeId {
+            Tx::edge_id_of(
+                &self.bond_funding(),
+                &Terms::work_stake_bond(self.bond_terms()),
+            )
+        }
+
+        fn seed_provider_offer(self, root: &Path, admission: PaymentAdmission) {
+            let store = match SetupStore::open(
+                root,
+                network(),
+                self.bond_edge(),
+                Role::Provider,
+                &Secp256k1Verifier::new(),
+            ) {
+                Ok(store) => store,
+                Err(error) => panic!("the provider route opens its setup: {error}"),
+            };
+            let mut endpoint = SetupEndpoint::new(store, provider(), admission);
+            if let Err(error) = endpoint.arm_scan(SetupScan {
+                height: FLOOR,
+                payload: payload_at(FLOOR),
+            }) {
+                panic!("the provider route arms its finalized floor: {error}");
+            }
+            if let Err(error) =
+                endpoint.propose_bond(network(), self.bond_funding(), self.bond_terms())
+            {
+                panic!("the provider route journals its offer: {error}");
+            }
+        }
+    }
+
     fn client_setup(root: &Path, policy: ProviderChannelPolicy) -> SetupEndpoint {
         let store = match SetupStore::open(
             root,
@@ -2944,12 +3317,14 @@ mod tests {
         setup_mount: MountedSetup,
         work_mount: MountedWork<NodeChain>,
         execution_calls: Arc<AtomicUsize>,
+        peer: PeerId,
     }
 
     impl RunningPaidNode {
         async fn start(root: &Path, admission: PaymentAdmission, source: NodeChain) -> Self {
             let setup_mount = MountedSetup::default();
             let execution_calls = Arc::new(AtomicUsize::new(0));
+            let peer = PeerId::from_bytes(*SecretKey::from_bytes(&[0x62; 32]).public().as_bytes());
             let work_mount = MountedWork::with_backend(AnsweringPaidBackend {
                 calls: Arc::clone(&execution_calls),
             });
@@ -2958,6 +3333,7 @@ mod tests {
                     network: network(),
                     threshold_identity: threshold_identity(),
                     journal_root: root.to_path_buf(),
+                    routes: configured_routes(&[(peer, bond_edge(), client().party_key())]),
                     validators: Vec::new(),
                     poll: Duration::from_millis(1),
                     settlement_key: provider(),
@@ -3074,7 +3450,12 @@ mod tests {
                 setup_mount,
                 work_mount,
                 execution_calls,
+                peer,
             }
+        }
+
+        fn context(&self) -> TransportContext {
+            vouched_context(self.peer)
         }
 
         async fn connect(&self, alpn: &[u8]) -> (IrohTransport, Connection) {
@@ -3202,7 +3583,7 @@ mod tests {
         async fn wait_for_mount(&self) {
             let mounted = tokio::time::timeout(Duration::from_secs(5), async {
                 loop {
-                    if self.work_mount.service().is_some() {
+                    if self.work_mount.service(&self.context()).is_some() {
                         break;
                     }
                     tokio::task::yield_now().await;
@@ -3211,7 +3592,7 @@ mod tests {
             .await;
             assert!(mounted.is_ok(), "the production clock mounts the channel");
             assert!(
-                self.setup_mount.service().is_none(),
+                self.setup_mount.service(&self.context()).is_none(),
                 "the matching setup is cleared when its channel mounts",
             );
         }
@@ -3221,7 +3602,7 @@ mod tests {
                 loop {
                     let cursor = self
                         .work_mount
-                        .service()
+                        .service(&self.context())
                         .and_then(|service| service.with_state(|state| state.cursor().0).ok());
                     if cursor.is_some_and(|cursor| cursor >= height) {
                         break;
@@ -3264,7 +3645,7 @@ mod tests {
         let source = NodeChain::new();
         let node = RunningPaidNode::start(root, admission, source.clone()).await;
         assert!(
-            node.setup_mount.service().is_some(),
+            node.setup_mount.service(&node.context()).is_some(),
             "the runner mounts the exact setup it drives before the first dial",
         );
 
@@ -3310,7 +3691,7 @@ mod tests {
         // changes the coherent source before its first network request.
         let mounted = node
             .work_mount
-            .handler()
+            .handler(&node.context())
             .expect("the production clock mounted a request handler");
         if let Err(error) = mounted.refresh_admission().await {
             panic!("mount-time readiness primes the exact driven service: {error}");
@@ -3398,7 +3779,9 @@ mod tests {
         let chain = TestChain::new();
 
         assert!(
-            mount.service().is_none(),
+            mount
+                .service(&vouched_context(default_route_peer()))
+                .is_none(),
             "nothing is mounted before the first tick",
         );
         assert!(chain.submitted().is_empty(), "and nothing is submitted");
@@ -3406,7 +3789,7 @@ mod tests {
         assert!(runner.tick(&chain).await, "the fixture chain answers");
 
         assert_eq!(responded(&chain), start_id);
-        let Some(service) = mount.service() else {
+        let Some(service) = mount.service(&vouched_context(default_route_peer())) else {
             panic!("the tick that answered the contest mounted its channel")
         };
         let cursor = match service.with_state(|state| state.cursor().0) {
@@ -3444,7 +3827,7 @@ mod tests {
             0,
             "an unresponded contest below its deadline is not final",
         );
-        let Some(service) = mount.service() else {
+        let Some(service) = mount.service(&vouched_context(default_route_peer())) else {
             panic!("the first tick mounts the contested channel")
         };
         assert_eq!(
@@ -3533,7 +3916,7 @@ mod tests {
                 start_id,
                 "unmeasured evidence still answers a contest: {admission:?}",
             );
-            let Some(service) = mount.service() else {
+            let Some(service) = mount.service(&vouched_context(default_route_peer())) else {
                 panic!("unmeasured evidence still mounts its channel: {admission:?}")
             };
             let Some(accept_work_response::Outcome::Refused(refusal)) =
@@ -3580,7 +3963,7 @@ mod tests {
 
         assert!(runner.tick(&chain).await, "the fixture chain answers");
 
-        let Some(service) = mount.service() else {
+        let Some(service) = mount.service(&vouched_context(default_route_peer())) else {
             panic!("the driver handed back a channel and the runner published it")
         };
         let edge = match service.with_state(|state| state.channel().payment_edge()) {
@@ -3649,7 +4032,7 @@ mod tests {
         // The dispatch path's own two steps, both taken while the clock
         // is inside the chain read: resolve the handler for this ALPN,
         // and answer with it.
-        let Some(dispatch) = mount.handler() else {
+        let Some(dispatch) = mount.handler(&vouched_context(default_route_peer())) else {
             panic!("the channel is mounted before the chain is read")
         };
         let answered = tokio::time::timeout(Duration::from_secs(5), async move {
@@ -3728,7 +4111,9 @@ mod tests {
         // A channel nobody advances is a channel this node no longer
         // answers from, and the files go with it.
         assert!(
-            mount.service().is_none(),
+            mount
+                .service(&vouched_context(default_route_peer()))
+                .is_none(),
             "a stopped clock serves no channel",
         );
 
