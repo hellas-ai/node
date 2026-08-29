@@ -692,15 +692,15 @@ enum Commands {
         out: PathBuf,
     },
     #[cfg(feature = "node")]
-    /// Make this provider's one bond offer, so a client has something to
+    /// Make one of this provider's bond offers, so its client has something to
     /// answer
     ///
     /// A node serves `WorkSetup` from the setup journals under its work
     /// root and creates none, so a fresh provider offers nothing however
     /// well it is configured. This signs one bond and journals it, and
     /// returns only once the runner's own replay of that journal finds
-    /// it. One root holds one offer: a second here is a node that serves
-    /// neither.
+    /// it. A root may hold several offers only when their configured routes,
+    /// bonds, and every staked coin are pairwise disjoint.
     Provision {
         /// The paid-work configuration this offer is made under
         #[arg(long = "work-config")]

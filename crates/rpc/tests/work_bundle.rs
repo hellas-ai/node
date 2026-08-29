@@ -145,6 +145,10 @@ fn the_three_revisions_check_extend_and_round_trip() {
     assert!(one.payment_open_hash().is_none());
     assert!(one.bond_open().is_none());
     assert!(one.payment_open().is_none());
+    // The stake is named a revision before the Open that spends it is
+    // executable, and the provider's signature over it is already exported:
+    // which coins this offer promises is answerable here and nowhere else.
+    assert_eq!(one.bond_funding(), &bond_funding());
 
     let two = countersigned(one.clone());
     assert_eq!(two.revision(), 2);
@@ -180,6 +184,9 @@ fn the_three_revisions_check_extend_and_round_trip() {
     assert!(matches!(payment_open, Tx::Open { .. }));
 
     for bundle in [&one, &two, &three] {
+        // Fixed by revision one and carried unchanged, which is what makes
+        // it readable from whichever revision an endpoint has retained.
+        assert_eq!(bundle.bond_funding(), &bond_funding());
         let encoded = bundle.encode();
         assert_eq!(
             WorkChannelSetupBundleV1::decode(&encoded).as_ref(),

@@ -321,6 +321,20 @@ impl WorkChannelSetupBundleV1 {
         &self.bond_terms
     }
 
+    /// Returns the funding the provider stakes, fixed by its first revision.
+    ///
+    /// Beside [`Self::bond_open`] rather than instead of it, and the two are
+    /// reachable at different revisions. The Open is executable only once the
+    /// client has countersigned; these coins are encumbered from the moment
+    /// the provider signs, because the signature over that exact funding is
+    /// already exported. A provider asking which coins its own retained
+    /// proposals already promise therefore has to read them here — off the
+    /// Open, an offer nobody has answered would look like it staked nothing.
+    #[must_use]
+    pub const fn bond_funding(&self) -> &Funding {
+        &self.bond_funding
+    }
+
     /// Returns the payment edge this setup will create, once the client
     /// has named its terms.
     #[must_use]

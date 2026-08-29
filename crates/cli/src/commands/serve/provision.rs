@@ -1,10 +1,10 @@
-//! Making the one offer a fresh provider has nothing to serve without.
+//! Making the offers a fresh provider has nothing to serve without.
 //!
 //! `WorkRunner::discover` answers `WorkSetup` from the setup journals it
 //! finds under the configured work root, and finding is the whole of what
 //! it does. A correctly configured provider with no journal therefore
 //! refuses every client that dials it, and the paid path is unreachable
-//! from a clean install. This is the operator's step that writes one.
+//! from a clean install. This is the operator's step that writes them.
 //!
 //! # The order is the journal's, and none of its rules are here
 //!
@@ -32,15 +32,20 @@
 //! and about a file whose exclusive lock is already free for the runner
 //! to take.
 //!
-//! # One root holds one offer
+//! # One recourse backs one route
 //!
-//! `WorkSetup`'s first request carries no selector, so a node serves an
-//! offer only when exactly one provider journal is discovered, and
-//! deliberately serves none when there are several. Writing a second
-//! offer under a root that already holds one would turn a node that
-//! answers into a node that refuses. The refusal below is that same
-//! count, taken from the same `discover_setups`, asked before the second
-//! file exists rather than after.
+//! A provider offer reserves a route, a bond, and every coin funding that
+//! bond. A second offer is safe only when all three are disjoint from every
+//! provider offer already under the root. Existing peers come from the
+//! durable route table, while existing coins come from the bond funding in
+//! each retained setup bundle. Revision one is enough: it holds the funding
+//! before a client has answered, while [`SetupState::funding_coins`] is still
+//! empty because there is no executable Open yet.
+//!
+//! Discovery, route agreement, and funding comparison all happen while the
+//! candidate is only a value. The candidate journal is not opened until
+//! afterwards, so every collision is refused before a floor is written or a
+//! bond signature is made.
 //!
 //! # Evidence gates the countersignature, not the journal
 //!
@@ -81,7 +86,9 @@
 //! question consensus already answers.
 //!
 //! [`PaidWorkDuties`]: super::work_config::PaidWorkDuties
+//! [`SetupState::funding_coins`]: hellas_rpc::work_store::SetupState::funding_coins
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, bail};
@@ -96,10 +103,10 @@ use hellas_rpc::work_handshake::{PaymentAdmission, SetupEndpoint};
 use hellas_rpc::work_store::{Role, SetupScan, SetupStore, discover_setups};
 use tracing::{info, warn};
 
-use super::work_config::{PaidWorkDuties, WorkConfig, load_paid_work_duties};
+use super::work_config::{PaidWorkDuties, WorkConfig, WorkRoute, load_paid_work_duties};
 use crate::commands::CliResult;
 
-/// What an operator asks for when they make their one offer.
+/// What an operator asks for when they make one offer.
 pub struct ProvisionOptions {
     /// The loaded paid-work configuration, not the path it came from. It
     /// carries the network the bond is bound to, the root the journal is
@@ -126,11 +133,11 @@ pub struct ProvisionOptions {
 ///
 /// # Errors
 ///
-/// A configuration that builds no provider policy, a root that already
-/// holds a provider offer, a key or coin id that is not one, no
-/// configured validator with a finalized block to read a floor from, and
-/// whatever the setup journal says about the revision it refused or could
-/// not make durable.
+/// A configuration that builds no provider policy or no matching bilateral
+/// route, a route, bond, or funding coin already reserved by another offer,
+/// a key or coin id that is not one, no configured validator with a finalized
+/// block to read a floor from, and whatever the setup journal says about the
+/// revision it refused or could not make durable.
 pub async fn run_provision(options: ProvisionOptions) -> CliResult<()> {
     let duties = load_paid_work_duties(&options.work_config)?;
     let offer = Offer::plan(&options, &duties)?;
@@ -192,7 +199,6 @@ impl Offer {
         };
         let network = options.work_config.chain.network;
         let journal_root = options.work_config.journal_root.clone();
-        refuse_a_second_offer(&journal_root, network)?;
 
         // Maker is the provider and taker is the client, which is what
         // makes this signature the maker's: `propose_bond` refuses a bond
@@ -215,6 +221,8 @@ impl Offer {
             List::empty(CoinId::from_bytes([0; CoinId::LENGTH])),
         );
         let bond_edge = Tx::edge_id_of(&bond_funding, &Terms::work_stake_bond(bond_terms.clone()));
+        let route = route_for_candidate(&options.work_config, bond_edge, &bond_terms)?;
+        refuse_offer_collisions(&options.work_config, route, &bond_funding)?;
         Ok(Self {
             network,
             journal_root,
@@ -299,15 +307,50 @@ fn open_provider_journal(
     })
 }
 
-/// Refuses to write a second offer under one root.
+/// Returns the configured bilateral route the candidate would occupy.
 ///
-/// The count is the runner's own: it serves `WorkSetup` when exactly one
-/// provider journal is discovered and serves none when there are
-/// several, so a second offer here is a node that stops answering. A
-/// journal that cannot be named is reported and not counted, exactly as
-/// the runner reports it: it holds no revision, so there is no offer in
-/// it.
-fn refuse_a_second_offer(root: &Path, network: NetworkId) -> CliResult<()> {
+/// The bond is derived from the exact funding and terms first. Matching by
+/// that canonical value means a route cannot be selected by insertion order,
+/// and checking the client here refuses a journal the next startup would
+/// reject before the provider signs it.
+fn route_for_candidate<'config>(
+    config: &'config WorkConfig,
+    bond_edge: EdgeId,
+    bond_terms: &WorkStakeBondTerms,
+) -> CliResult<&'config WorkRoute> {
+    let Some(route) = config.routes.iter().find(|route| route.bond == bond_edge) else {
+        bail!(
+            "bond {} has no bilateral route in this work configuration; an offer is signed only \
+             after its peer, bond, and client are named together",
+            hex::encode(bond_edge.to_bytes()),
+        );
+    };
+    let client = bond_terms.parties.taker();
+    if route.client != client {
+        bail!(
+            "route for peer {:#} expects client {}, but candidate bond {} names {} as its taker",
+            route.peer,
+            hex::encode(route.client.to_bytes()),
+            hex::encode(bond_edge.to_bytes()),
+            hex::encode(client.to_bytes()),
+        );
+    }
+    Ok(route)
+}
+
+/// Refuses every collision before the candidate journal is opened.
+///
+/// An existing bond is named by discovery, its peer is named by the durable
+/// route table, and its funding is named by the retained bundle. Failure to
+/// recover any one of those facts is a refusal: absence of evidence is not
+/// evidence that the candidate is disjoint.
+fn refuse_offer_collisions(
+    config: &WorkConfig,
+    candidate: &WorkRoute,
+    candidate_funding: &Funding,
+) -> CliResult<()> {
+    let root = &config.journal_root;
+    let network = config.chain.network;
     let found = discover_setups(root, network).with_context(|| {
         format!(
             "failed to enumerate the work journals under {}",
@@ -321,19 +364,90 @@ fn refuse_a_second_offer(root: &Path, network: NetworkId) -> CliResult<()> {
             "a setup journal under the work root could not be named",
         );
     }
-    let Some(held) = found
+    if let Some(unnamed) = found.unidentified.first() {
+        bail!(
+            "setup journal {} cannot be identified, so a new offer cannot be proved disjoint: {}",
+            unnamed.path.display(),
+            unnamed.reason,
+        );
+    }
+
+    let candidate_coins = funding_coins(candidate_funding);
+    for held in found
         .setups
         .iter()
-        .find(|setup| setup.role == Role::Provider)
-    else {
-        return Ok(());
-    };
-    bail!(
-        "{} already holds a provider setup journal, over bond {}: a node serves WorkSetup only \
-         from exactly one, so a second offer under this root would leave it serving none",
-        root.display(),
-        hex::encode(held.bond_edge.to_bytes()),
-    );
+        .filter(|setup| setup.role == Role::Provider)
+    {
+        if held.bond_edge == candidate.bond {
+            bail!(
+                "candidate bond {} collides with a provider offer already under {}",
+                hex::encode(candidate.bond.to_bytes()),
+                root.display(),
+            );
+        }
+        let Some(route) = config
+            .routes
+            .iter()
+            .find(|route| route.bond == held.bond_edge)
+        else {
+            bail!(
+                "provider offer over bond {} under {} has no configured route, so the candidate \
+                 route cannot be proved disjoint",
+                hex::encode(held.bond_edge.to_bytes()),
+                root.display(),
+            );
+        };
+        let store = open_provider_journal(root, network, held.bond_edge)?;
+        let Some(bundle) = store.state().bundle() else {
+            bail!(
+                "provider offer over bond {} was discovered without a retained revision",
+                hex::encode(held.bond_edge.to_bytes()),
+            );
+        };
+        let held_client = bundle.bond_terms().parties.taker();
+        if route.client != held_client {
+            bail!(
+                "route for peer {:#} expects client {}, but provider offer over bond {} names {} \
+                 as its taker",
+                route.peer,
+                hex::encode(route.client.to_bytes()),
+                hex::encode(held.bond_edge.to_bytes()),
+                hex::encode(held_client.to_bytes()),
+            );
+        }
+        if route.peer == candidate.peer {
+            bail!(
+                "candidate route peer {:#} collides with the provider offer over bond {}",
+                candidate.peer,
+                hex::encode(held.bond_edge.to_bytes()),
+            );
+        }
+        // The retained revision's own staked funding, not the executable
+        // Opens: the provider signed these coins when it made the offer, so
+        // they are promised from that moment, while `funding_coins` answers
+        // from Opens that do not exist until the client countersigns. Read
+        // from there, every offer no client has answered would look like it
+        // reserved nothing.
+        let reserved = funding_coins(bundle.bond_funding());
+        if let Some(coin) = candidate_coins.intersection(&reserved).next() {
+            bail!(
+                "candidate stake coin {} is already reserved by provider offer over bond {}",
+                hex::encode(coin.to_bytes()),
+                hex::encode(held.bond_edge.to_bytes()),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Every input one bond funding consumes, irrespective of party position.
+fn funding_coins(funding: &Funding) -> BTreeSet<CoinId> {
+    funding
+        .maker()
+        .iter()
+        .chain(funding.taker().iter())
+        .copied()
+        .collect()
 }
 
 /// Reads one finalized block from the first configured validator that
@@ -420,7 +534,7 @@ fn fixed<const N: usize>(flag: &str, value: &str) -> CliResult<[u8; N]> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::fs;
 
     use hellas_kernel::{EdgeValues, Fees, MIN_OMIT_RESPONSE_BLOCKS};
     use hellas_rpc::protocol::Digest;
@@ -429,7 +543,7 @@ mod tests {
     use hellas_rpc::protocol::work_setup::{OmissionMeasurements, ProviderChannelPolicy};
     use hellas_rpc::work_close::{BlockSourceError, FinalizedWork};
 
-    use super::super::work_config::{ArtifactProvenance, ChainCrossCheck, MeasuredEvidence};
+    use super::super::work_config::{ArtifactProvenance, MeasuredEvidence, load_work_config};
     use super::*;
 
     fn network() -> NetworkId {
@@ -550,34 +664,91 @@ mod tests {
         PaidWorkDuties::Assumed(evidence())
     }
 
-    /// A configuration whose journal root is `root` and which names no
-    /// artifact, because the duties are handed in separately: this is
-    /// what the offer is written under, not what it is graded by.
-    fn work_config(root: &Path) -> WorkConfig {
-        WorkConfig {
-            chain: ChainCrossCheck {
-                network: network(),
-                genesis_payload_digest: Digest::from_bytes([0x01; 32]),
-                threshold_identity: Vec::new(),
+    /// A threshold identity the real work-config loader accepts.
+    const THRESHOLD_IDENTITY: [u8; 48] = [
+        0x97, 0xf1, 0xd3, 0xa7, 0x31, 0x97, 0xd7, 0x94, 0x26, 0x95, 0x63, 0x8c, 0x4f, 0xa9, 0xac,
+        0x0f, 0xc3, 0x68, 0x8c, 0x4f, 0x97, 0x74, 0xb9, 0x05, 0xa1, 0x4e, 0x3a, 0x3f, 0x17, 0x1b,
+        0xac, 0x58, 0x6c, 0x55, 0xe8, 0x3f, 0xf9, 0x7a, 0x1a, 0xef, 0xfb, 0x3a, 0xf0, 0x0a, 0xdb,
+        0x22, 0xc6, 0xbb,
+    ];
+
+    fn route(peer: u8, bond: EdgeId, client: Key) -> serde_json::Value {
+        serde_json::json!({
+            "peer": hex::encode([peer; 32]),
+            "bond": hex::encode(bond.to_bytes()),
+            "client": hex::encode(client.to_bytes()),
+        })
+    }
+
+    /// Loads routes through the production parser, so their duplicate-peer
+    /// and duplicate-bond invariants are facts these provisioning tests use,
+    /// not a test-only constructor that can make impossible route tables.
+    fn routed_work_config(root: &Path, routes: Vec<serde_json::Value>) -> CliResult<WorkConfig> {
+        let validators: Vec<String> = (1..=6)
+            .map(|index| format!("http://127.0.0.1:900{index}"))
+            .collect();
+        let file = serde_json::json!({
+            "chain": {
+                "network_id": network().as_str(),
+                "genesis_payload_digest": hex::encode([0x01; 32]),
+                "threshold_identity": hex::encode(THRESHOLD_IDENTITY),
             },
-            validators: Vec::new(),
-            journal_root: root.to_path_buf(),
-            routes: Default::default(),
-            policy_salt: [0x5a; 32],
-            channel_policy: policy().channel_policy,
-            execution_policy: policy().execution_policy,
-            poll: Duration::from_millis(250),
-            response_alarm_margin_blocks: 16,
-            artifact: None,
-        }
+            "validators": validators,
+            "journal": { "root": root.display().to_string() },
+            "routes": routes,
+            "policies": {
+                "policy_salt": hex::encode([0x5a; 32]),
+                "channel": {
+                    "compute_credit_limit": 40,
+                    "delivery_credit_limit": 40,
+                },
+                "execution": {
+                    "allowed_environment": hex::encode([0x11; 32]),
+                    "generation_policy_digest": hex::encode([0x12; 32]),
+                    "identity_source_digest": hex::encode([0x13; 32]),
+                    "max_prompt_tokens": 512,
+                    "max_new_tokens": 128,
+                    "max_stop_token_ids": 4,
+                    "max_spool_bytes": 1_048_576_u64,
+                    "max_encoded_result_frame": 262_144,
+                    "max_encoded_quote_response": 1_048_576_u64,
+                    "dispatch_margin_blocks": 4,
+                    "delivery_margin_blocks": 2,
+                    "oracle_grace_blocks": 6,
+                    "fixed_price": 10,
+                },
+            },
+            "poll_ms": 250,
+            "response_alarm_margin_blocks": 16,
+        });
+        let path = root.join("work-config.json");
+        fs::write(&path, file.to_string())
+            .with_context(|| format!("the route fixture writes {}", path.display()))?;
+        load_work_config(&path)
     }
 
     fn options(root: &Path, max_job_price: u64) -> ProvisionOptions {
+        let client = client().party_key();
+        let bond = expected_bond_for(client, &[0xa1], max_job_price);
+        let work_config = routed_work_config(root, vec![route(0x51, bond, client)])
+            .unwrap_or_else(|error| panic!("the route fixture loads: {error:#}"));
+        options_for(work_config, client, &[0xa1], max_job_price)
+    }
+
+    fn options_for(
+        work_config: WorkConfig,
+        client: Key,
+        stake_coins: &[u8],
+        max_job_price: u64,
+    ) -> ProvisionOptions {
         ProvisionOptions {
-            work_config: work_config(root),
+            work_config,
             settlement_key: provider(),
-            client: hex::encode(client().party_key().to_bytes()),
-            stake_coins: vec![hex::encode([0xa1; 32])],
+            client: hex::encode(client.to_bytes()),
+            stake_coins: stake_coins
+                .iter()
+                .map(|coin| hex::encode([*coin; 32]))
+                .collect(),
             bond_timeout: 500,
             timeout_payout: 64,
             max_job_price,
@@ -590,28 +761,52 @@ mod tests {
         duties: &PaidWorkDuties,
         max_job_price: u64,
     ) -> CliResult<Provisioned> {
-        Offer::plan(&options(root, max_job_price), duties)?.journal(floor())
+        provision_options(&options(root, max_job_price), duties)
+    }
+
+    fn provision_options(
+        options: &ProvisionOptions,
+        duties: &PaidWorkDuties,
+    ) -> CliResult<Provisioned> {
+        Offer::plan(options, duties)?.journal(floor())
     }
 
     /// The bond the fixture inputs name, spelled out here rather than
     /// taken from the command: the parties are positional, so a maker
     /// and taker the other way round is a different edge and this
     /// notices.
-    fn expected_bond(max_job_price: u64) -> EdgeId {
-        let funding = Funding::new(
-            List::take([CoinId::from_bytes([0xa1; 32]); MAX_PARTY_INPUTS], 1),
+    fn bond_funding_for(stake_coins: &[u8]) -> Funding {
+        let mut slots = [CoinId::from_bytes([0; CoinId::LENGTH]); MAX_PARTY_INPUTS];
+        for (slot, coin) in slots.iter_mut().zip(stake_coins) {
+            *slot = CoinId::from_bytes([*coin; CoinId::LENGTH]);
+        }
+        Funding::new(
+            List::take(slots, stake_coins.len()),
             List::empty(CoinId::from_bytes([0; CoinId::LENGTH])),
-        );
-        let terms = WorkStakeBondTerms {
-            parties: Parties::new(provider().party_key(), client().party_key()),
+        )
+    }
+
+    fn bond_terms_for(client: Key, max_job_price: u64) -> WorkStakeBondTerms {
+        WorkStakeBondTerms {
+            parties: Parties::new(provider().party_key(), client),
             timeout: BlockHeight::new(500),
             timeout_outputs: List::take(
                 [Payout::new(provider().party_key(), 64); MAX_EDGE_OUTPUTS],
                 1,
             ),
             max_job_price,
-        };
-        Tx::edge_id_of(&funding, &Terms::work_stake_bond(terms))
+        }
+    }
+
+    fn expected_bond_for(client: Key, stake_coins: &[u8], max_job_price: u64) -> EdgeId {
+        Tx::edge_id_of(
+            &bond_funding_for(stake_coins),
+            &Terms::work_stake_bond(bond_terms_for(client, max_job_price)),
+        )
+    }
+
+    fn expected_bond(max_job_price: u64) -> EdgeId {
+        expected_bond_for(client().party_key(), &[0xa1], max_job_price)
     }
 
     fn provider_setups(root: &Path) -> usize {
@@ -628,6 +823,70 @@ mod tests {
             .iter()
             .filter(|setup| setup.role == Role::Provider)
             .count()
+    }
+
+    fn proposal_signature(client: Key, stake_coins: &[u8], max_job_price: u64) -> [u8; 64] {
+        provider()
+            .sign(Tx::open_hash(
+                network(),
+                &bond_funding_for(stake_coins),
+                &Terms::work_stake_bond(bond_terms_for(client, max_job_price)),
+            ))
+            .to_bytes()
+    }
+
+    /// Whether any file under `root` holds `signature` verbatim.
+    ///
+    /// A settlement signature is deterministic (RFC 6979), so the exact bytes
+    /// a refused candidate would have exported are computable without letting
+    /// it export them. This is asked of an offer that *was* made as well as
+    /// of one that was refused: a scan that finds nothing everywhere would
+    /// answer "no signature was written" about a root full of them.
+    fn root_holds_signature(root: &Path, signature: &[u8]) -> bool {
+        fs::read_dir(root)
+            .unwrap_or_else(|error| panic!("the fixture root enumerates: {error}"))
+            .any(|entry| {
+                let entry = entry.unwrap_or_else(|error| panic!("a fixture entry reads: {error}"));
+                let bytes = fs::read(entry.path())
+                    .unwrap_or_else(|error| panic!("a fixture file reads: {error}"));
+                bytes
+                    .windows(signature.len())
+                    .any(|window| window == signature)
+            })
+    }
+
+    /// No file, no discoverable revision, and no retained signature are three
+    /// assertions because opening the absent store to inspect it would create
+    /// the revisionless journal this test is meant to rule out.
+    fn assert_no_offer_artifact(root: &Path, bond: EdgeId, signature: &[u8]) {
+        let key = hellas_rpc::work_store::setup::setup_key(network(), bond);
+        let stem = format!("setup-{}.", hex::encode(key.into_bytes()));
+        let entries: Vec<_> = fs::read_dir(root)
+            .unwrap_or_else(|error| panic!("the fixture root enumerates: {error}"))
+            .map(|entry| entry.unwrap_or_else(|error| panic!("a fixture entry reads: {error}")))
+            .collect();
+        assert!(
+            entries
+                .iter()
+                .all(|entry| !entry.file_name().to_string_lossy().starts_with(&stem)),
+            "the refused candidate left its setup journal behind",
+        );
+        assert!(
+            !root_holds_signature(root, signature),
+            "the refused candidate's bond signature was retained under the root",
+        );
+
+        let found = discover_setups(root, network())
+            .unwrap_or_else(|error| panic!("the fixture root enumerates: {error}"));
+        assert!(
+            found.unidentified.is_empty(),
+            "the refusal left an unidentified, revisionless journal: {:?}",
+            found.unidentified,
+        );
+        assert!(
+            found.setups.iter().all(|setup| setup.bond_edge != bond),
+            "the refused candidate left revision one discoverable",
+        );
     }
 
     /// A provisioned root is an offer the runner finds: the journal names
@@ -668,33 +927,181 @@ mod tests {
         assert_eq!(store.state().scan_armed(), Some(floor()));
     }
 
-    /// A root that already holds an offer takes no second one, and the
-    /// refusal says what a second would cost.
+    /// More than one offer is safe when its complete capital and routing
+    /// identity are separate. Discovery sees both without needing either
+    /// client to have answered revision one.
     #[test]
-    fn a_second_offer_under_one_root_is_refused() {
+    fn disjoint_routes_bonds_and_stakes_make_two_discoverable_offers() {
         let dir = tempfile::tempdir().unwrap();
-        let Ok(first) = provision(dir.path(), &admits(), 40) else {
-            panic!("the first offer is made");
-        };
+        let first_client = client().party_key();
+        let second_client = signer(0x23).party_key();
+        let first_bond = expected_bond_for(first_client, &[0xa1], 40);
+        let second_bond = expected_bond_for(second_client, &[0xb1], 41);
+        let config = routed_work_config(
+            dir.path(),
+            vec![
+                route(0x51, first_bond, first_client),
+                route(0x52, second_bond, second_client),
+            ],
+        )
+        .unwrap_or_else(|error| panic!("the two-route fixture loads: {error:#}"));
+        let first = options_for(config.clone(), first_client, &[0xa1], 40);
+        let second = options_for(config, second_client, &[0xb1], 41);
 
-        // A different bond, so this is the root being full rather than
-        // the journal recognising bytes it already holds.
-        let Err(error) = provision(dir.path(), &admits(), 41) else {
-            panic!("a root that holds an offer takes no second one");
+        provision_options(&first, &admits())
+            .unwrap_or_else(|error| panic!("the first offer is made: {error:#}"));
+        provision_options(&second, &admits())
+            .unwrap_or_else(|error| panic!("the disjoint second offer is made: {error:#}"));
+
+        let found = discover_setups(dir.path(), network())
+            .unwrap_or_else(|error| panic!("the two-offer root enumerates: {error}"));
+        assert!(found.unidentified.is_empty(), "{:?}", found.unidentified);
+        assert_eq!(provider_setups(dir.path()), 2);
+        assert!(
+            found
+                .setups
+                .iter()
+                .any(|setup| setup.bond_edge == first_bond)
+        );
+        assert!(
+            found
+                .setups
+                .iter()
+                .any(|setup| setup.bond_edge == second_bond)
+        );
+    }
+
+    /// The reservation comes back from A's revision-one bytes after every
+    /// in-memory value has been dropped. In particular, `funding_coins()` is
+    /// empty at that stage, so it cannot be the source this refusal uses.
+    #[test]
+    fn a_restart_refuses_a_coin_reserved_by_an_unanswered_offer_before_signing_or_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let first_client = client().party_key();
+        let second_client = signer(0x23).party_key();
+        let first_bond = expected_bond_for(first_client, &[0xa1, 0xa2], 40);
+        let second_bond = expected_bond_for(second_client, &[0xa2, 0xb2], 41);
+        let config = routed_work_config(
+            dir.path(),
+            vec![
+                route(0x51, first_bond, first_client),
+                route(0x52, second_bond, second_client),
+            ],
+        )
+        .unwrap_or_else(|error| panic!("the two-route fixture loads: {error:#}"));
+        let first = options_for(config.clone(), first_client, &[0xa1, 0xa2], 40);
+        provision_options(&first, &admits())
+            .unwrap_or_else(|error| panic!("the first offer is made: {error:#}"));
+
+        let store = open_provider_journal(dir.path(), network(), first_bond)
+            .unwrap_or_else(|error| panic!("the first offer reopens: {error:#}"));
+        assert_eq!(store.state().revision(), Some(1));
+        assert!(
+            store.state().funding_coins().is_empty(),
+            "revision one unexpectedly exposes an executable Open",
+        );
+        drop(store);
+        drop(first);
+        drop(config);
+
+        // The configuration and every setup fact are loaded again from disk;
+        // no reservation value from the first call crosses this line.
+        let config_path = dir.path().join("work-config.json");
+        let restarted = load_work_config(&config_path)
+            .unwrap_or_else(|error| panic!("the restarted configuration loads: {error:#}"));
+        let second = options_for(restarted, second_client, &[0xa2, 0xb2], 41);
+        let Err(error) = provision_options(&second, &admits()) else {
+            panic!("a restarted provider accepted stake reserved by revision one");
         };
 
         let said = format!("{error:#}");
         assert!(
-            said.contains(&hex::encode(first.bond_edge.to_bytes())),
-            "the refusal does not name the offer already held: {said}",
+            said.contains(&hex::encode([0xa2; CoinId::LENGTH])),
+            "the refusal does not name the colliding coin: {said}",
         );
         assert!(
-            said.contains("serving none"),
-            "the refusal does not say what a second offer costs: {said}",
+            said.contains(&hex::encode(first_bond.to_bytes())),
+            "the refusal does not name the offer holding the coin: {said}",
         );
-        // The count `WorkRunner::discover` takes is what the rule is
-        // about, so it is the count this asserts: a refusal that left a
-        // second journal behind would have done the thing it refused.
+        assert_eq!(provider_setups(dir.path()), 1);
+        // The same scan, over the offer that was made: what rules out B's
+        // signature has to be able to find A's, or it rules out nothing.
+        assert!(
+            root_holds_signature(
+                dir.path(),
+                &proposal_signature(first_client, &[0xa1, 0xa2], 40),
+            ),
+            "the signature scan cannot find the offer that was made",
+        );
+        assert_no_offer_artifact(
+            dir.path(),
+            second_bond,
+            &proposal_signature(second_client, &[0xa2, 0xb2], 41),
+        );
+    }
+
+    /// Route-table construction itself is the pre-signing peer collision
+    /// gate. A duplicate peer cannot become the configuration passed to the
+    /// second provisioning attempt.
+    #[test]
+    fn a_second_offer_cannot_reuse_the_first_offers_peer() {
+        let dir = tempfile::tempdir().unwrap();
+        let first_client = client().party_key();
+        let second_client = signer(0x23).party_key();
+        let first_bond = expected_bond_for(first_client, &[0xa1], 40);
+        let second_bond = expected_bond_for(second_client, &[0xb1], 41);
+        let first_config =
+            routed_work_config(dir.path(), vec![route(0x51, first_bond, first_client)])
+                .unwrap_or_else(|error| panic!("the first route loads: {error:#}"));
+        let first = options_for(first_config, first_client, &[0xa1], 40);
+        provision_options(&first, &admits())
+            .unwrap_or_else(|error| panic!("the first offer is made: {error:#}"));
+
+        let error = routed_work_config(
+            dir.path(),
+            vec![
+                route(0x51, first_bond, first_client),
+                route(0x51, second_bond, second_client),
+            ],
+        )
+        .expect_err("one authenticated peer cannot name the second offer too");
+        let said = format!("{error:#}");
+        assert!(
+            said.contains("names peer") && said.contains("twice"),
+            "unexpected duplicate-peer refusal: {said}",
+        );
+        assert_eq!(provider_setups(dir.path()), 1);
+        assert!(
+            root_holds_signature(dir.path(), &proposal_signature(first_client, &[0xa1], 40)),
+            "the signature scan cannot find the offer that was made",
+        );
+        assert_no_offer_artifact(
+            dir.path(),
+            second_bond,
+            &proposal_signature(second_client, &[0xb1], 41),
+        );
+    }
+
+    /// A repeated provision is still a second promise over the same bond.
+    /// It is refused during planning even though the journal could replay an
+    /// identical revision idempotently.
+    #[test]
+    fn a_second_offer_cannot_reuse_the_first_offers_bond() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = options(dir.path(), 40);
+        let first = provision_options(&options, &admits())
+            .unwrap_or_else(|error| panic!("the first offer is made: {error:#}"));
+
+        let Err(error) = provision_options(&options, &admits()) else {
+            panic!("a second offer reused the first offer's bond");
+        };
+        let said = format!("{error:#}");
+        assert!(
+            said.contains("candidate bond")
+                && said.contains("collides")
+                && said.contains(&hex::encode(first.bond_edge.to_bytes())),
+            "unexpected duplicate-bond refusal: {said}",
+        );
         assert_eq!(provider_setups(dir.path()), 1);
     }
 
