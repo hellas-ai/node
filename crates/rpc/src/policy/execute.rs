@@ -4,40 +4,40 @@ use std::str::FromStr;
 use super::glob;
 use super::parse_allow_patterns;
 
-/// A namespaced pattern for execute policy matching.
+/// A namespaced pattern for Catena execution-package policy matching.
 #[derive(Clone, Debug)]
 pub enum ExecutePattern {
-    /// `hf/<glob>` matches on the `HuggingFace` model ID.
-    HuggingFace(String),
-    /// `graph/<glob>` matches on the Xet graph hash.
-    Graph(String),
+    /// `package/<glob>` matches on the locally configured package alias/name.
+    Package(String),
+    /// `id/<glob>` matches on the exact Catena execution package hex string.
+    Id(String),
 }
 
-/// Controls which graphs the executor will run.
+/// Controls which Catena execution packages the executor will run.
 #[derive(Clone, Debug, Default)]
 pub enum ExecutePolicy {
-    /// Execute any graph (default).
+    /// Execute any package (default).
     #[default]
     Eager,
-    /// Execute only graphs matching one of the given patterns.
+    /// Execute only packages matching one of the given patterns.
     Allow(Vec<ExecutePattern>),
     /// Refuse all executions.
     Skip,
 }
 
 impl ExecutePolicy {
-    /// Returns `true` if this policy permits executing a graph with the given
-    /// identifiers. For LLM graphs `hf_model_id` is `Some(id)`; for raw graphs
-    /// it is `None`.
-    pub fn allows_execute(&self, graph_id: &str, hf_model_id: Option<&str>) -> bool {
+    /// Returns `true` if this policy permits executing a Catena package with
+    /// the given Catena execution package hex string and locally configured
+    /// package name.
+    pub fn allows_execute(&self, execution_package_id: &str, package_name: Option<&str>) -> bool {
         match self {
             Self::Eager => true,
             Self::Skip => false,
             Self::Allow(patterns) => patterns.iter().any(|pattern| match pattern {
-                ExecutePattern::HuggingFace(pattern) => {
-                    hf_model_id.is_some_and(|model_id| glob::matches(pattern, model_id))
+                ExecutePattern::Package(pattern) => {
+                    package_name.is_some_and(|name| glob::matches(pattern, name))
                 }
-                ExecutePattern::Graph(pattern) => glob::matches(pattern, graph_id),
+                ExecutePattern::Id(pattern) => glob::matches(pattern, execution_package_id),
             }),
         }
     }
@@ -59,7 +59,7 @@ impl FromStr for ExecutePolicy {
                 Ok(Self::Allow(patterns))
             }
             _ => Err(format!(
-                "invalid execute policy '{trimmed}': expected 'eager', 'skip', or 'allow(hf/pattern,...,graph/pattern,...)'"
+                "invalid execute policy '{trimmed}': expected 'eager', 'skip', or 'allow(package/pattern,...,id/pattern,...)'"
             )),
         }
     }
@@ -86,19 +86,19 @@ impl fmt::Display for ExecutePolicy {
 
 impl ExecutePattern {
     fn parse(pattern: &str) -> Result<Self, String> {
-        if let Some(rest) = pattern.strip_prefix("hf/") {
+        if let Some(rest) = pattern.strip_prefix("package/") {
             if rest.is_empty() {
-                return Err("hf/ pattern must not be empty".to_string());
+                return Err("package/ pattern must not be empty".to_string());
             }
-            Ok(Self::HuggingFace(rest.to_string()))
-        } else if let Some(rest) = pattern.strip_prefix("graph/") {
+            Ok(Self::Package(rest.to_string()))
+        } else if let Some(rest) = pattern.strip_prefix("id/") {
             if rest.is_empty() {
-                return Err("graph/ pattern must not be empty".to_string());
+                return Err("id/ pattern must not be empty".to_string());
             }
-            Ok(Self::Graph(rest.to_string()))
+            Ok(Self::Id(rest.to_string()))
         } else {
             Err(format!(
-                "execute pattern '{pattern}' must start with 'hf/' or 'graph/'"
+                "execute pattern '{pattern}' must start with 'package/' or 'id/'"
             ))
         }
     }
@@ -107,8 +107,8 @@ impl ExecutePattern {
 impl fmt::Display for ExecutePattern {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::HuggingFace(pattern) => write!(f, "hf/{pattern}"),
-            Self::Graph(pattern) => write!(f, "graph/{pattern}"),
+            Self::Package(pattern) => write!(f, "package/{pattern}"),
+            Self::Id(pattern) => write!(f, "id/{pattern}"),
         }
     }
 }
@@ -131,29 +131,27 @@ mod tests {
     }
 
     #[test]
-    fn parse_allow_hf() {
-        let policy: ExecutePolicy = "allow(hf/Qwen3/*)".parse().unwrap();
+    fn parse_allow_package() {
+        let policy: ExecutePolicy = "allow(package/Qwen3/*)".parse().unwrap();
         match &policy {
             ExecutePolicy::Allow(patterns) => {
                 assert_eq!(patterns.len(), 1);
                 assert!(
-                    matches!(&patterns[0], ExecutePattern::HuggingFace(pattern) if pattern == "Qwen3/*")
+                    matches!(&patterns[0], ExecutePattern::Package(pattern) if pattern == "Qwen3/*")
                 );
             }
             _ => panic!("expected Allow"),
         }
-        assert_eq!(policy.to_string(), "allow(hf/Qwen3/*)");
+        assert_eq!(policy.to_string(), "allow(package/Qwen3/*)");
     }
 
     #[test]
-    fn parse_allow_graph() {
-        let policy: ExecutePolicy = "allow(graph/abc123*)".parse().unwrap();
+    fn parse_allow_id() {
+        let policy: ExecutePolicy = "allow(id/0123*)".parse().unwrap();
         match &policy {
             ExecutePolicy::Allow(patterns) => {
                 assert_eq!(patterns.len(), 1);
-                assert!(
-                    matches!(&patterns[0], ExecutePattern::Graph(pattern) if pattern == "abc123*")
-                );
+                assert!(matches!(&patterns[0], ExecutePattern::Id(pattern) if pattern == "0123*"));
             }
             _ => panic!("expected Allow"),
         }
@@ -161,16 +159,14 @@ mod tests {
 
     #[test]
     fn parse_allow_mixed() {
-        let policy: ExecutePolicy = "allow(hf/Qwen3/*,graph/abc*)".parse().unwrap();
+        let policy: ExecutePolicy = "allow(package/Qwen3/*,id/0123*)".parse().unwrap();
         match &policy {
             ExecutePolicy::Allow(patterns) => {
                 assert_eq!(patterns.len(), 2);
                 assert!(
-                    matches!(&patterns[0], ExecutePattern::HuggingFace(pattern) if pattern == "Qwen3/*")
+                    matches!(&patterns[0], ExecutePattern::Package(pattern) if pattern == "Qwen3/*")
                 );
-                assert!(
-                    matches!(&patterns[1], ExecutePattern::Graph(pattern) if pattern == "abc*")
-                );
+                assert!(matches!(&patterns[1], ExecutePattern::Id(pattern) if pattern == "0123*"));
             }
             _ => panic!("expected Allow"),
         }
@@ -183,26 +179,34 @@ mod tests {
 
     #[test]
     fn allows_execute() {
-        assert!(ExecutePolicy::Eager.allows_execute("anyhash", Some("any/model")));
-        assert!(ExecutePolicy::Eager.allows_execute("anyhash", None));
-        assert!(!ExecutePolicy::Skip.allows_execute("anyhash", Some("any/model")));
+        let execution_package_id =
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert!(ExecutePolicy::Eager.allows_execute(execution_package_id, Some("any-package")));
+        assert!(ExecutePolicy::Eager.allows_execute(execution_package_id, None));
+        assert!(!ExecutePolicy::Skip.allows_execute(execution_package_id, Some("any-package")));
 
-        let hf_only = ExecutePolicy::Allow(vec![ExecutePattern::HuggingFace("Qwen3/*".into())]);
-        assert!(hf_only.allows_execute("", Some("Qwen3/Qwen3-0.6B")));
-        assert!(!hf_only.allows_execute("", Some("meta-llama/X")));
-        assert!(!hf_only.allows_execute("somehash", None));
+        let package_only = ExecutePolicy::Allow(vec![ExecutePattern::Package("Qwen3/*".into())]);
+        assert!(package_only.allows_execute("", Some("Qwen3/Qwen3-0.6B")));
+        assert!(!package_only.allows_execute("", Some("meta-llama/X")));
+        assert!(!package_only.allows_execute("some-id", None));
 
-        let graph_only = ExecutePolicy::Allow(vec![ExecutePattern::Graph("abc*".into())]);
-        assert!(graph_only.allows_execute("abc123", None));
-        assert!(!graph_only.allows_execute("def456", None));
-        assert!(graph_only.allows_execute("abc123", Some("anything")));
+        let id_only = ExecutePolicy::Allow(vec![ExecutePattern::Id("0123*".into())]);
+        assert!(id_only.allows_execute(execution_package_id, None));
+        assert!(!id_only.allows_execute(
+            "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+            None,
+        ));
+        assert!(id_only.allows_execute(execution_package_id, Some("anything")));
 
         let mixed = ExecutePolicy::Allow(vec![
-            ExecutePattern::HuggingFace("Qwen3/*".into()),
-            ExecutePattern::Graph("abc*".into()),
+            ExecutePattern::Package("Qwen3/*".into()),
+            ExecutePattern::Id("0123*".into()),
         ]);
         assert!(mixed.allows_execute("xyz", Some("Qwen3/Qwen3-0.6B")));
-        assert!(mixed.allows_execute("abc123", Some("unknown/model")));
-        assert!(!mixed.allows_execute("def456", Some("unknown/model")));
+        assert!(mixed.allows_execute(execution_package_id, Some("unknown-package")));
+        assert!(!mixed.allows_execute(
+            "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+            Some("unknown-package"),
+        ));
     }
 }
