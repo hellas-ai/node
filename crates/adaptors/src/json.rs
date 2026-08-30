@@ -13,10 +13,27 @@ pub(crate) fn provenance_json(provenance: &crate::Provenance) -> Option<JsonValu
     (!object.is_empty()).then_some(JsonValue::Object(object))
 }
 
+pub(crate) fn attach_hellas(
+    mut body: JsonValue,
+    provenance: Option<&crate::Provenance>,
+) -> JsonValue {
+    if let Some(hellas) = provenance.and_then(provenance_json) {
+        body["hellas"] = hellas;
+    }
+    body
+}
+
 pub(crate) fn json_to_wire_string(value: &JsonValue) -> String {
     match value {
         JsonValue::String(value) => value.clone(),
         _ => serde_json::to_string(value).expect("serializing JSON value cannot fail"),
+    }
+}
+
+pub(crate) fn structured_delta_string(delta: crate::StructuredDelta) -> String {
+    match delta {
+        crate::StructuredDelta::Text(text) => text,
+        crate::StructuredDelta::Json(value) => json_to_wire_string(&value),
     }
 }
 

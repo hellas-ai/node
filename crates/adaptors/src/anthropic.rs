@@ -4,7 +4,10 @@ use crate::{
     AdaptorError, AdaptorResult, CanonicalExecution, ExecutionRequest, ExecutionResult, Input,
     InputItem, ModelRef, OutputEvent, OutputItem, RawRequest, ReasoningOptions, RenderContext,
     StopReason, TextChannel, WireAdaptor, WireResponse, WireStreamEvent,
-    json::{json_to_wire_string, optional_bool, provenance_json, required_array, required_string},
+    json::{
+        attach_hellas, json_to_wire_string, optional_bool, required_array, required_string,
+        structured_delta_string,
+    },
 };
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -567,13 +570,6 @@ fn tool_call_block_index(
         .ok_or_else(|| AdaptorError::render(format!("unknown tool call index {parser_index}")))
 }
 
-fn attach_hellas(mut body: JsonValue, provenance: Option<&crate::Provenance>) -> JsonValue {
-    if let Some(hellas) = provenance.and_then(provenance_json) {
-        body["hellas"] = hellas;
-    }
-    body
-}
-
 fn usage_json(usage: crate::Usage) -> JsonValue {
     json!({
         "input_tokens": usage.input_tokens.unwrap_or(0),
@@ -588,13 +584,6 @@ fn stop_reason_json(stop_reason: StopReason) -> JsonValue {
         StopReason::ToolCall => "tool_use",
     };
     JsonValue::String(value.to_string())
-}
-
-fn structured_delta_string(delta: crate::StructuredDelta) -> String {
-    match delta {
-        crate::StructuredDelta::Text(text) => text,
-        crate::StructuredDelta::Json(value) => json_to_wire_string(&value),
-    }
 }
 
 fn required_u32(object: &JsonMap<String, JsonValue>, key: &str) -> AdaptorResult<u32> {
