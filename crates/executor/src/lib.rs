@@ -11,8 +11,6 @@ mod artifacts;
 
 mod chain;
 #[cfg(feature = "evaluate")]
-mod engine;
-#[cfg(feature = "evaluate")]
 mod evaluate;
 mod executor;
 mod fetch;

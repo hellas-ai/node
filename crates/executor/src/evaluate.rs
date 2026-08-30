@@ -20,7 +20,6 @@ use hellas_rpc::protocol::artifacts::{OutputAddressed, TextExecutionId, complete
 use hellas_rpc::provenance::ExecutionProvenance;
 use hellas_rpc::{Assurance, Digest, Evaluate, EvaluateRequest, OutputEventEnvelope, PublicKey};
 use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::artifacts::{EvaluateArtifactStore, PreparedTextArtifacts};
@@ -531,9 +530,7 @@ impl SchemeEngine for EvaluateEngine {
             locator,
             invocation,
             prepared_artifacts,
-            stream_batch_size: 1,
             accepted_at: Instant::now(),
-            cancel: CancellationToken::new(),
             sender,
             producer_key: self.provider.producer_key.clone(),
         };

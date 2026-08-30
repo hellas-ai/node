@@ -33,7 +33,7 @@ pub(crate) struct ProviderContext {
 
 /// Per-execution receiver returned to the streaming `Execute` consumer.
 /// Dropping it closes the matching sender held by the worker, which the
-/// worker observes on its next chunk send and converts into a cancel.
+/// worker observes on its next chunk send and reports as an execution failure.
 pub(crate) type ExecuteEventReceiver = mpsc::Receiver<Result<WorkEvent, WireStatus>>;
 
 /// Quote response paired with the provenance the executor committed to.

@@ -1,8 +1,8 @@
 use crate::artifacts::PreparedTextArtifacts;
-use crate::engine::{GenerationTermination, PackageEngine};
 use crate::executor::ExecutorMessage;
 use crate::package::PackageSource;
 use crate::state::{Invocation, LoadedPackage, PackageLocator, StopReason};
+use catena_runner::{GenerationControl, GenerationTermination, PackageRunner};
 use hellas_rpc::evaluate::{EvaluateOutputTranscriptBuilder, input_commitment};
 use hellas_rpc::pb::execute::{
     WorkChunk as PbChunk, WorkEvent as PbWorkEvent, work_event::Kind as PbEvent,
@@ -12,11 +12,9 @@ use hellas_rpc::{EvaluateRequest, OutputEventEnvelope, ProducerSigningKey};
 use hellas_wire::WireStatus;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::time::Instant;
 use tokio::sync::{mpsc as tokio_mpsc, oneshot};
-use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use zeroize::Zeroize;
 
@@ -47,9 +45,7 @@ pub(crate) struct ExecuteJob {
     pub locator: PackageLocator,
     pub invocation: Invocation,
     pub prepared_artifacts: Option<PreparedTextArtifacts>,
-    pub stream_batch_size: u32,
     pub accepted_at: Instant,
-    pub cancel: CancellationToken,
     pub sender: tokio_mpsc::Sender<Result<PbWorkEvent, WireStatus>>,
     pub producer_key: Arc<ProducerSigningKey>,
 }
@@ -157,12 +153,12 @@ fn worker_loop(
     rx: Receiver<WorkerCommand>,
     executor_tx: tokio_mpsc::UnboundedSender<ExecutorMessage>,
 ) {
-    let mut engines: HashMap<hellas_rpc::ExecutionPackageId, PackageEngine> = HashMap::new();
+    let mut runners: HashMap<hellas_rpc::ExecutionPackageId, PackageRunner> = HashMap::new();
     while let Ok(command) = rx.recv() {
         let job = match command {
             WorkerCommand::LoadPackage(load) => {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    load_package(load.source, &mut engines)
+                    load_package(load.source, &mut runners)
                 }))
                 .unwrap_or_else(|_| {
                     Err(crate::ExecutorError::PackageLoad(
@@ -178,13 +174,12 @@ fn worker_loop(
         let request_commitment = job.request_commitment;
         let package_name = job.package_name.clone();
         let sender = job.sender.clone();
-        let cancel = job.cancel.clone();
         let evaluate_request = job.evaluate_request.clone();
         let invocation = job.invocation.clone();
         let prepared_artifacts = job.prepared_artifacts.clone();
         let producer_key = job.producer_key.clone();
 
-        let position = Arc::new(AtomicU64::new(0));
+        let mut position = 0;
         let mut output_builder = EvaluateOutputTranscriptBuilder::new(
             input_commitment(&evaluate_request),
             evaluate_request.assurance,
@@ -192,16 +187,15 @@ fn worker_loop(
         );
         let mut output_events = Vec::new();
         let on_progress = make_on_progress(
-            Arc::clone(&position),
+            &mut position,
             sender.clone(),
-            cancel.clone(),
             execution_id.clone(),
             &mut output_builder,
             &mut output_events,
         );
 
         let termination = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_job(job, on_progress, &mut engines)
+            run_job(job, on_progress, &mut runners)
         })) {
             Ok(Ok(outcome)) => WorkerCompletionResult::Completed {
                 stop_reason: outcome.stop_reason,
@@ -212,7 +206,7 @@ fn worker_loop(
                 let msg = format!("{err:#}");
                 warn!(%execution_id, "execute worker job failed");
                 WorkerCompletionResult::Failed {
-                    position: position.load(Ordering::Relaxed),
+                    position,
                     error: msg,
                 }
             }
@@ -220,7 +214,7 @@ fn worker_loop(
                 let msg = "worker panicked; sensitive details suppressed".to_string();
                 warn!(%execution_id, "execute worker stopped without content logging");
                 WorkerCompletionResult::Failed {
-                    position: position.load(Ordering::Relaxed),
+                    position,
                     error: msg,
                 }
             }
@@ -243,16 +237,14 @@ fn worker_loop(
 
 fn run_job(
     job: ExecuteJob,
-    mut on_progress: impl FnMut(u64, Vec<u32>) -> Result<(), crate::ExecutorError>,
-    engines: &mut HashMap<hellas_rpc::ExecutionPackageId, PackageEngine>,
+    mut on_progress: impl FnMut(u64, u32) -> Result<(), crate::ExecutorError>,
+    runners: &mut HashMap<hellas_rpc::ExecutionPackageId, PackageRunner>,
 ) -> Result<GenerationOutcome, crate::ExecutorError> {
     let ExecuteJob {
         execution_id,
         locator,
         invocation,
-        stream_batch_size,
         accepted_at,
-        cancel,
         ..
     } = job;
 
@@ -264,102 +256,81 @@ fn run_job(
         "execute worker starting"
     );
 
-    let engine = engines.get(&locator.execution_package).ok_or_else(|| {
+    let runner = runners.get(&locator.execution_package).ok_or_else(|| {
         crate::ExecutorError::PackageNotLoaded(locator.execution_package.to_string())
     })?;
     let input_ids = SensitiveInputIds::new(invocation.input_ids);
-    let batch_size = usize::try_from(stream_batch_size.max(1))
-        .unwrap_or(usize::MAX)
-        .max(1);
-    let mut output_tokens = Vec::new();
-    let mut pending = Vec::with_capacity(batch_size);
     let mut generated = 0u64;
-    let mut progress_error = None;
 
-    let termination = engine
-        .generate(
+    let result = runner
+        .generate_tokens_streaming(
             &input_ids.0,
-            &invocation.stop_token_ids,
             invocation.max_new_tokens,
+            &invocation.stop_token_ids,
             |token| {
-                generated = generated.saturating_add(1);
-                output_tokens.push(token);
-                pending.push(token);
-                if pending.len() >= batch_size
-                    && let Err(err) = on_progress(generated, std::mem::take(&mut pending))
-                {
-                    progress_error = Some(err);
-                    cancel.cancel();
-                    return false;
-                }
-                !cancel.is_cancelled()
+                generated += 1;
+                on_progress(generated, token)?;
+                Ok(GenerationControl::Continue)
             },
         )
-        .map_err(|err| crate::ExecutorError::Execution(err.to_string()))?;
+        .map_err(|error| match error.downcast::<crate::ExecutorError>() {
+            Ok(error) => error,
+            Err(error) => crate::ExecutorError::Execution(format!("{error:#}")),
+        })?;
 
-    if let Some(err) = progress_error {
-        return Err(err);
-    }
-
-    if !pending.is_empty() {
-        on_progress(generated, pending)?;
-    }
-
-    let stop_reason = match termination {
-        GenerationTermination::StopToken => StopReason::StopToken,
-        GenerationTermination::MaxTokens => StopReason::MaxNewTokens,
+    let stop_reason = match result.termination {
+        GenerationTermination::StopToken(_) => StopReason::StopToken,
+        GenerationTermination::MaxNewTokens => StopReason::MaxNewTokens,
         GenerationTermination::Cancelled => StopReason::Cancelled,
     };
 
     Ok(GenerationOutcome {
         stop_reason,
-        output_tokens,
+        output_tokens: result.generated_tokens,
     })
 }
 
 fn load_package(
     source: PackageSource,
-    engines: &mut HashMap<hellas_rpc::ExecutionPackageId, PackageEngine>,
+    runners: &mut HashMap<hellas_rpc::ExecutionPackageId, PackageRunner>,
 ) -> Result<LoadedPackage, crate::ExecutorError> {
     let package = crate::package::fetch_verified_package(&source)?;
     let execution_package =
         hellas_rpc::ExecutionPackageId::from_bytes(*package.identity().as_bytes());
-    if let std::collections::hash_map::Entry::Vacant(entry) = engines.entry(execution_package) {
-        let engine = PackageEngine::load(package)
+    if let std::collections::hash_map::Entry::Vacant(entry) = runners.entry(execution_package) {
+        let runner = PackageRunner::from_verified(package)
             .map_err(|error| crate::ExecutorError::PackageLoad(format!("{error:#}")))?;
-        entry.insert(engine);
+        entry.insert(runner);
     }
-    let engine = engines
+    let runner = runners
         .get(&execution_package)
-        .expect("package engine was inserted before describing it");
+        .expect("package runner was inserted before describing it");
     Ok(LoadedPackage {
         locator: PackageLocator { execution_package },
-        vocabulary_size: engine.vocabulary_size(),
-        maximum_capacity: engine.maximum_capacity(),
+        vocabulary_size: runner.vocabulary_size(),
+        maximum_capacity: runner.maximum_capacity(),
     })
 }
 
 fn make_on_progress<'a, 'b>(
-    position: Arc<AtomicU64>,
+    position: &'a mut u64,
     sender: tokio_mpsc::Sender<Result<PbWorkEvent, WireStatus>>,
-    cancel: CancellationToken,
     execution_id: String,
     output_builder: &'a mut EvaluateOutputTranscriptBuilder<'b>,
     output_events: &'a mut Vec<OutputEventEnvelope>,
-) -> impl FnMut(u64, Vec<u32>) -> Result<(), crate::ExecutorError> + Send + 'a {
-    move |progress: u64, token_ids: Vec<u32>| {
+) -> impl FnMut(u64, u32) -> Result<(), crate::ExecutorError> + Send + 'a {
+    move |progress: u64, token_id: u32| {
         // Leave one permit for the actor's terminal frame. Without this
         // reservation a perfectly bounded chunk stream can fill the channel
         // and make its own required terminal outcome impossible to deliver.
         if sender.capacity() <= 1 {
-            warn!(%execution_id, "consumer stalled; cancelling worker before its channel can block the executor");
-            cancel.cancel();
+            warn!(%execution_id, "consumer stalled; failing execution before its channel can block the executor");
             return Err(crate::ExecutorError::Execution(
                 "execution consumer did not drain its bounded event channel".to_string(),
             ));
         }
         let output_event = output_builder
-            .push_token_delta(token_ids)
+            .push_token_delta(vec![token_id])
             .map_err(|err| crate::ExecutorError::Execution(err.to_string()))?;
         let event = PbWorkEvent {
             kind: Some(PbEvent::Chunk(PbChunk {
@@ -369,19 +340,17 @@ fn make_on_progress<'a, 'b>(
         match sender.try_send(Ok(event)) {
             Ok(()) => {}
             Err(tokio_mpsc::error::TrySendError::Full(_)) => {
-                warn!(%execution_id, "consumer stalled; cancelling worker before its channel can block the executor");
-                cancel.cancel();
+                warn!(%execution_id, "consumer stalled; failing execution before its channel can block the executor");
                 return Err(crate::ExecutorError::Execution(
                     "execution consumer did not drain its bounded event channel".to_string(),
                 ));
             }
             Err(tokio_mpsc::error::TrySendError::Closed(_)) => {
-                debug!(%execution_id, "consumer dropped; cancelling worker");
-                cancel.cancel();
+                debug!(%execution_id, "consumer dropped; failing execution");
                 return Err(crate::ExecutorError::ChannelClosed);
             }
         }
-        position.store(progress, Ordering::Relaxed);
+        *position = progress;
         output_events.push(output_event);
         Ok(())
     }
@@ -393,7 +362,7 @@ mod tests {
     use hellas_rpc::{Assurance, ContentId, Digest};
 
     #[test]
-    fn a_stalled_consumer_cancels_instead_of_blocking_the_worker() {
+    fn a_stalled_consumer_fails_instead_of_blocking_the_worker() {
         let producer_key = ProducerSigningKey::from_secret_bytes([7; 32]).unwrap();
         let request = EvaluateRequest {
             text_execution: Digest::from_bytes([1; 32]),
@@ -409,22 +378,20 @@ mod tests {
             &producer_key,
         );
         let mut output_events = Vec::new();
-        let position = Arc::new(AtomicU64::new(0));
+        let mut position = 0;
         let (sender, _receiver) = tokio_mpsc::channel(2);
-        let cancel = CancellationToken::new();
         let mut progress = make_on_progress(
-            Arc::clone(&position),
+            &mut position,
             sender,
-            cancel.clone(),
             "test-execution".to_string(),
             &mut builder,
             &mut output_events,
         );
 
-        progress(1, vec![11]).unwrap();
-        let error = progress(2, vec![12]).expect_err("the full channel must not block");
+        progress(1, 11).unwrap();
+        let error = progress(2, 12).expect_err("the full channel must not block");
         assert!(matches!(error, crate::ExecutorError::Execution(_)));
-        assert!(cancel.is_cancelled());
-        assert_eq!(position.load(Ordering::Relaxed), 1);
+        drop(progress);
+        assert_eq!(position, 1);
     }
 }
