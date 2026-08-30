@@ -2,16 +2,16 @@
 extern crate tracing;
 
 mod error;
-pub use error::{BackendInitError, ExecutorError, StateError};
+pub use error::{ExecutorError, StateError};
 
 #[cfg(feature = "evaluate")]
 mod artifact_store;
 #[cfg(feature = "evaluate")]
 mod artifacts;
 
-#[cfg(feature = "evaluate")]
-mod backend;
 mod chain;
+#[cfg(feature = "evaluate")]
+mod engine;
 #[cfg(feature = "evaluate")]
 mod evaluate;
 mod executor;
@@ -22,7 +22,7 @@ mod fetch_provider;
 mod fetch_registry;
 mod metrics;
 #[cfg(feature = "evaluate")]
-mod model;
+mod package;
 mod scheme;
 mod state;
 mod work;
@@ -53,6 +53,5 @@ pub use hellas_rpc::services::evaluate::EvaluateServer;
 pub use hellas_rpc::services::execute::ExecuteServer;
 pub use hellas_rpc::services::fetch::FetchServer;
 pub use metrics::ExecutorMetrics;
-
 #[cfg(feature = "evaluate")]
-pub(crate) const DEFAULT_MAX_SEQ: u32 = 16;
+pub use package::{PackageSource, verified_package_identity};

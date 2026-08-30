@@ -31,11 +31,10 @@ in
       inherit lib;
       package = hellas.pickCliPackage pkgs;
       packageDescription = ''
-        The hellas CLI package. Defaults to the best backend variant for
-        the host: cli-candle-metal on Darwin, cli-candle-cuda when
-        `nixpkgs.config.cudaSupport` is enabled on Linux, otherwise
-        cli-candle. These builds include OTEL. Override to `pkgs.hellas.cli`
-        for the minimal remote-only build without local execution or OTEL.
+        The hellas network CLI, including chain, gateway, node, and OTEL
+        support. On x86_64-linux, override with `pkgs.hellas.cli-catena` when
+        local Catena execution is required; the current HIP-only runner does
+        not support other platforms.
       '';
     }
     // {

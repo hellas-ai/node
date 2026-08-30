@@ -23,7 +23,7 @@
 //! Which is also to say what this is not: a paid gate on the executor's
 //! own front door. An owner of the [`ExecutorHandle`] can call it
 //! directly and get an execution for nothing — the same reach
-//! `materialize_model` has, and for the same reason, since the handle is
+//! `materialize_package` has, and for the same reason, since the handle is
 //! held in-process and no RPC routes to either.
 //!
 //! One thing this file must not do, and deliberately does not: consult
@@ -34,8 +34,8 @@
 //!
 //! # What is not covered by a test here
 //!
-//! That the Candle backend, given this request, produces that
-//! transcript. Running it needs model weights, so no check in this
+//! That the exact loaded Catena package, given this request, produces that
+//! transcript. Running it needs the executable package, so no check in this
 //! repository executes this path end to end; what the gate does with a
 //! transcript, and how many times it asks for one, is tested against a
 //! counting double at this trait in `hellas-rpc`.
@@ -84,7 +84,7 @@ async fn drain_transcript(
     let mut events = outcome.events;
     while let Some(event) = events.recv().await {
         let event = event.map_err(|status| {
-            ExecutorError::WeightsError(format!("paid evaluate stream failed: {status}"))
+            ExecutorError::Execution(format!("paid evaluate stream failed: {status}"))
         })?;
         match event.kind {
             Some(work_event::Kind::Finished(finished)) => {
@@ -92,16 +92,14 @@ async fn drain_transcript(
                 for event in finished.output_events {
                     transcript.push(hellas_rpc::stream::output_event_from_pb(event).map_err(
                         |err| {
-                            ExecutorError::WeightsError(format!(
-                                "paid evaluate terminal event: {err}"
-                            ))
+                            ExecutorError::Execution(format!("paid evaluate terminal event: {err}"))
                         },
                     )?);
                 }
                 return Ok(transcript);
             }
             Some(work_event::Kind::Failed(failed)) => {
-                return Err(ExecutorError::WeightsError(format!(
+                return Err(ExecutorError::Execution(format!(
                     "paid evaluate failed at position {}: {}",
                     failed.position, failed.error
                 )));
@@ -114,7 +112,7 @@ async fn drain_transcript(
             _ => {}
         }
     }
-    Err(ExecutorError::WeightsError(
+    Err(ExecutorError::Execution(
         "paid evaluate stream ended without a terminal".to_string(),
     ))
 }
@@ -182,7 +180,7 @@ mod tests {
         };
         let terminal = EvaluateTerminal {
             final_position: 2,
-            stop_reason: EvaluateStopReason::END_OF_SEQUENCE,
+            stop_reason: EvaluateStopReason::STOP_TOKEN,
             text_artifact: Digest::from_bytes([0x77; 32]),
             usage,
             billable_units: 5,
@@ -257,7 +255,7 @@ mod tests {
             WorkEvent {
                 kind: Some(work_event::Kind::Failed(WorkFailed {
                     position: 4,
-                    error: "the weights did not load".to_string(),
+                    error: "the Catena package did not run".to_string(),
                 })),
             },
         ];
@@ -265,7 +263,7 @@ mod tests {
             panic!("a failed execution has no transcript");
         };
         let text = error.to_string();
-        assert!(text.contains("the weights did not load"), "{text}");
+        assert!(text.contains("the Catena package did not run"), "{text}");
         assert!(text.contains('4'), "{text}");
     }
 
@@ -288,9 +286,8 @@ mod tests {
     /// the signed result and not a stored artifact. Nothing here reads
     /// the artifact store, so nothing here can suppress the answer.
     ///
-    /// It says nothing about what the artifact store does with an
-    /// ephemeral request; that is `EvaluateArtifactStores`' and has its
-    /// own tests.
+    /// It says nothing about artifact publication. The evaluate engine
+    /// computes an ephemeral result without publishing its token graph.
     #[tokio::test]
     async fn an_unretained_request_still_yields_its_transcript() {
         let mut unretained = request();
@@ -313,7 +310,7 @@ mod tests {
         }
         let events = match builder.finish(EvaluateTerminal {
             final_position: 2,
-            stop_reason: EvaluateStopReason::END_OF_SEQUENCE,
+            stop_reason: EvaluateStopReason::STOP_TOKEN,
             text_artifact: Digest::from_bytes([0x77; 32]),
             usage: EvaluateUsage {
                 input_units: 3,

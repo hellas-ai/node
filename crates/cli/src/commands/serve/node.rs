@@ -27,7 +27,6 @@ use hellas_executor::{
     FetchRouteRegistry, FetchTranscriptStoreBackend,
 };
 use hellas_kernel::{EdgeId, NetworkId, Secp256k1Signer, Secp256k1Verifier};
-use hellas_rpc::Dtype;
 use hellas_rpc::pb::work::{
     AcceptWorkRequest, AcceptWorkResponse, AdmitCertificateRequest, AdmitCertificateResponse,
     DeliverResultRequest, DeliverResultResponse, ExchangeSetupRequest, ExchangeSetupResponse,
@@ -128,10 +127,10 @@ pub(super) struct NodeConfig {
     pub(super) port: Option<u16>,
     pub(super) execute_policy: ExecutePolicy,
     pub(super) queue_size: usize,
-    pub(super) preload_models: Vec<String>,
+    #[cfg(feature = "evaluate")]
+    pub(super) packages: Vec<hellas_executor::PackageSource>,
     pub(super) build: String,
     pub(super) graffiti: Vec<u8>,
-    pub(super) supported_dtypes: Vec<Dtype>,
     pub(super) fetch_access_policy: FetchAccessPolicy,
     pub(super) artifact_store_path: PathBuf,
     pub(super) fetch_routes: FetchRouteRegistry,
@@ -161,7 +160,6 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
     let handle = Executor::spawn_configured(ExecutorSpawnConfig {
         execute_policy: config.execute_policy,
         queue_capacity: config.queue_size,
-        supported_dtypes: config.supported_dtypes,
         metrics: config.metrics.clone(),
         producer_key: Arc::new(config.producer_key),
         provider_genesis: Arc::new(config.provider_genesis),
@@ -176,11 +174,13 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
     })
     .await
     .context("failed to spawn executor")?;
-    for model in &config.preload_models {
+    #[cfg(feature = "evaluate")]
+    for package in config.packages {
+        let name = package.name().to_string();
         handle
-            .materialize_model(model.clone())
+            .materialize_package(package)
             .await
-            .with_context(|| format!("failed to make model {model} available"))?;
+            .with_context(|| format!("failed to load Catena package {name}"))?;
     }
 
     let alpns = served_alpns(config.work.is_some());
@@ -228,9 +228,9 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
     //    and given the same mount slot the accept loop reads: the runner
     //    publishes the channel it is handed, and `Work` is answered from
     //    it from that moment on.
-    // The paid driver owns the executor handle from here on. Its clones
-    // live in the mount and every mounted handler, so preloading is not
-    // the last operation the executor actor can receive.
+    // Owner-selected package loading is complete before bind. The paid driver
+    // owns the executor handle from here on; its clones live in the mount and
+    // every mounted handler that can submit later work to the actor.
     let work_mount: MountedWork<ProductionWorkSource> = MountedWork::with_backend(handle);
     let setup_mount = MountedSetup::default();
     let work = config.work.map(|work| {
@@ -1357,6 +1357,7 @@ mod tests {
         EvaluateOutputTranscriptBuilder, EvaluateStopReason, EvaluateTerminal, EvaluateUsage,
         input_commitment,
     };
+    use hellas_rpc::protocol::Digest;
     use hellas_rpc::protocol::artifacts::{
         BoundTermId, Canonical as _, InputAddressed as _, OutputAddressed as _,
         PreparedPaidInputV1, SourceRef, TextArtifact, TextExecution, TextPolicy, TokenIds,
@@ -1373,7 +1374,6 @@ mod tests {
     };
     use hellas_rpc::protocol::work_bundle::WorkChannelSetupBundleV1;
     use hellas_rpc::protocol::work_setup::{OmissionMeasurements, ProviderChannelPolicy};
-    use hellas_rpc::protocol::{ContentId, Digest};
     use hellas_rpc::services::work::WorkClientImpl;
     use hellas_rpc::services::work_setup::WorkSetupClientImpl;
     use hellas_rpc::work::{BackendFault, WorkRefusal};
@@ -2717,7 +2717,7 @@ mod tests {
         };
         match builder.finish(EvaluateTerminal {
             final_position: answer.len() as u64,
-            stop_reason: EvaluateStopReason::END_OF_SEQUENCE,
+            stop_reason: EvaluateStopReason::STOP_TOKEN,
             text_artifact: Digest::from_bytes([0x77; 32]),
             usage,
             billable_units,

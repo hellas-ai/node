@@ -29,6 +29,7 @@ use hellas_rpc::evaluate::{
     EvaluateOutputTranscriptBuilder, EvaluateStopReason, EvaluateTerminal, EvaluateUsage,
     input_commitment,
 };
+use hellas_rpc::protocol::Digest;
 use hellas_rpc::protocol::artifacts::{
     BoundTermId, Canonical as _, InputAddressed as _, OutputAddressed as _, PreparedPaidInputV1,
     SourceRef, TextArtifact, TextExecution, TextExecutionId, TextPolicy, TokenIds, completed_text,
@@ -42,7 +43,6 @@ use hellas_rpc::protocol::work_setup::{
     ObservedChannel, OmissionMeasurements, ReadyChannel, WorkChannelConfig, WorkChannelDescriptor,
     payment_terms_hash,
 };
-use hellas_rpc::protocol::{ContentId, Digest};
 use hellas_rpc::services::work::WorkServer;
 use hellas_rpc::work::{
     BackendFault, ClientEndpoint, PaidEvaluateBackend, ProviderEndpoint, RunOutcome, WorkService,
@@ -441,7 +441,7 @@ fn transcript_for(request: &EvaluateRequest, answer: &[u32]) -> Vec<OutputEventE
     .digest();
     match builder.finish(EvaluateTerminal {
         final_position: answer.len() as u64,
-        stop_reason: EvaluateStopReason::END_OF_SEQUENCE,
+        stop_reason: EvaluateStopReason::STOP_TOKEN,
         text_artifact,
         usage,
         billable_units,
@@ -573,7 +573,7 @@ impl FixedEngine {
         Self {
             answer: Ok(Reproduced {
                 output_token_ids: tokens.to_vec(),
-                stop_reason: EvaluateStopReason::END_OF_SEQUENCE,
+                stop_reason: EvaluateStopReason::STOP_TOKEN,
             }),
         }
     }
@@ -673,7 +673,7 @@ impl Reproducer for LatchedEngine {
             .store(self.advance_to, std::sync::atomic::Ordering::SeqCst);
         Ok(Reproduced {
             output_token_ids: ANSWER.to_vec(),
-            stop_reason: EvaluateStopReason::END_OF_SEQUENCE,
+            stop_reason: EvaluateStopReason::STOP_TOKEN,
         })
     }
 }

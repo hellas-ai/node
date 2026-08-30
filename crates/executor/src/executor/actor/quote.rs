@@ -79,12 +79,11 @@ impl Executor {
         let request_commitment_bytes = self.store.create_quote(QuoteRecord {
             terms,
             expires_at: Instant::now() + QUOTE_TTL,
-            model_id: format!("fetch:{service}/{method}"),
             runner_public_key: caller_key,
             kind: QuoteKind::Fetch {
                 request: provider_request,
             },
-        });
+        })?;
 
         info!(
             request_commitment = %format_request_commitment(&request_commitment_bytes),

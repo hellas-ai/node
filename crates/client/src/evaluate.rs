@@ -3,6 +3,7 @@ use hellas_rpc::evaluate::{
     output_canonicalization, verify_terminal_continuation,
 };
 use hellas_rpc::pb::execute::{WorkEvent, work_event};
+use hellas_rpc::protocol::artifacts::{OutputAddressed, TextExecutionId, completed_text};
 use hellas_rpc::stream::output_event_from_pb;
 use hellas_rpc::{
     Assurance, Digest, EventCommitment, InputCommitment, Operation, OutputEventEnvelope, PublicKey,
@@ -46,7 +47,15 @@ pub struct EvaluateChunkVerifier {
     max_output_tokens: u64,
     assurance: Assurance,
     events: Vec<OutputEventEnvelope>,
+    generated_token_ids: Vec<u32>,
+    text_artifact_expectation: Option<TextArtifactExpectation>,
     finalized: bool,
+}
+
+struct TextArtifactExpectation {
+    execution: TextExecutionId,
+    full_input_ids: Vec<u32>,
+    has_stop_tokens: bool,
 }
 
 impl EvaluateChunkVerifier {
@@ -67,8 +76,28 @@ impl EvaluateChunkVerifier {
             max_output_tokens: u64::from(max_output_tokens),
             assurance,
             events: Vec::new(),
+            generated_token_ids: Vec::new(),
+            text_artifact_expectation: None,
             finalized: false,
         }
+    }
+
+    /// Require the signed terminal artifact to be the canonical artifact
+    /// derived from this text execution, its full input, and the verified
+    /// streamed output tokens.
+    #[must_use]
+    pub fn with_text_artifact_expectation(
+        mut self,
+        execution: TextExecutionId,
+        full_input_ids: Vec<u32>,
+        has_stop_tokens: bool,
+    ) -> Self {
+        self.text_artifact_expectation = Some(TextArtifactExpectation {
+            execution,
+            full_input_ids,
+            has_stop_tokens,
+        });
+        self
     }
 
     pub const fn assurance(&self) -> Assurance {
@@ -152,6 +181,8 @@ impl EvaluateChunkVerifier {
         self.next_position = next_position;
         self.previous_event = event.event_commitment();
         self.next_sequence = next_sequence;
+        self.generated_token_ids
+            .extend(delta.token_ids.iter().copied());
         self.events.push(event);
         Ok((self.next_position, delta))
     }
@@ -174,6 +205,15 @@ impl EvaluateChunkVerifier {
                 "evaluate terminal transcript input commitment mismatch",
             ));
         }
+        let expected_event_count = self.events.len().checked_add(1).ok_or_else(|| {
+            ClientError::protocol("evaluate terminal transcript event count exceeds usize range")
+        })?;
+        if output_events.len() != expected_event_count {
+            return Err(ClientError::protocol(format!(
+                "evaluate terminal transcript must extend the streamed prefix by exactly one terminal event: expected {expected_event_count} events, got {}",
+                output_events.len()
+            )));
+        }
         let event_count = u64::try_from(output_events.len()).map_err(|_| {
             ClientError::protocol("evaluate terminal transcript event count exceeds u64 range")
         })?;
@@ -192,6 +232,47 @@ impl EvaluateChunkVerifier {
         )
         .map_err(|source| ClientError::EvaluateTranscript { source })?;
         self.ensure_output_position(output.terminal.final_position)?;
+        if output.terminal.stop_reason == hellas_rpc::evaluate::EvaluateStopReason::MAX_OUTPUT
+            && output.terminal.final_position != self.max_output_tokens
+        {
+            return Err(ClientError::protocol(format!(
+                "evaluate MAX_OUTPUT terminal position must equal the requested maximum {}: got {}",
+                self.max_output_tokens, output.terminal.final_position
+            )));
+        }
+        if let Some(expected) = &self.text_artifact_expectation {
+            if output.terminal.stop_reason == hellas_rpc::evaluate::EvaluateStopReason::STOP_TOKEN
+                && (!expected.has_stop_tokens
+                    || output.terminal.final_position >= self.max_output_tokens)
+            {
+                return Err(ClientError::protocol(
+                    "evaluate STOP_TOKEN terminal is inconsistent with the committed stop policy",
+                ));
+            }
+            let input_units = u64::try_from(expected.full_input_ids.len()).map_err(|_| {
+                ClientError::protocol("evaluate input token count exceeds u64 range")
+            })?;
+            if output.terminal.usage.input_units != input_units {
+                return Err(ClientError::protocol(format!(
+                    "evaluate terminal input usage mismatch: expected {input_units}, got {}",
+                    output.terminal.usage.input_units
+                )));
+            }
+            let derived = completed_text(
+                expected.execution,
+                &expected.full_input_ids,
+                &self.generated_token_ids,
+            )
+            .artifact
+            .output_id()
+            .digest();
+            if output.terminal.text_artifact != derived {
+                return Err(ClientError::protocol(format!(
+                    "evaluate terminal text artifact does not match the verified token stream: claimed {}, derived {derived}",
+                    output.terminal.text_artifact
+                )));
+            }
+        }
         self.finalized = true;
         Ok(output)
     }
@@ -379,22 +460,20 @@ mod tests {
     }
 
     #[test]
-    fn terminal_first_transcript_checks_input_producer_and_limit() {
+    fn terminal_first_transcript_checks_input_and_producer() {
         let producer = key(2);
         let other = key(3);
         let input = InputCommitment::from_digest(Digest::from_bytes([4; 32]));
-        let mut builder = EvaluateOutputTranscriptBuilder::new(input, TEST_ASSURANCE, &producer);
-        builder.push_token_delta(vec![10, 11]).unwrap();
-        let output_events = builder
+        let output_events = EvaluateOutputTranscriptBuilder::new(input, TEST_ASSURANCE, &producer)
             .finish(EvaluateTerminal {
-                final_position: 2,
-                stop_reason: EvaluateStopReason::MAX_OUTPUT,
+                final_position: 0,
+                stop_reason: EvaluateStopReason::STOP_TOKEN,
                 text_artifact: Digest::from_bytes([5; 32]),
                 usage: EvaluateUsage {
                     input_units: 3,
-                    output_units: 2,
+                    output_units: 0,
                 },
-                billable_units: 5,
+                billable_units: 3,
             })
             .unwrap();
 
@@ -419,16 +498,6 @@ mod tests {
                 .contains("input commitment mismatch")
         );
 
-        let mut too_small =
-            EvaluateChunkVerifier::new(input, TEST_ASSURANCE, producer.public_key(), 1);
-        assert!(
-            too_small
-                .verify_terminal(&output_events)
-                .unwrap_err()
-                .to_string()
-                .contains("exceeds requested maximum 1")
-        );
-
         let mut verifier =
             EvaluateChunkVerifier::new(input, TEST_ASSURANCE, producer.public_key(), 2);
         assert_eq!(
@@ -437,7 +506,7 @@ mod tests {
                 .unwrap()
                 .terminal
                 .final_position,
-            2
+            0
         );
     }
 
@@ -475,6 +544,103 @@ mod tests {
         assert_eq!(position, 2);
         assert_eq!(delta.token_ids, vec![10, 11]);
         verifier.verify_terminal(&output_events).unwrap();
+    }
+
+    #[test]
+    fn terminal_cannot_hide_an_unstreamed_token_delta() {
+        let producer = key(2);
+        let input = InputCommitment::from_digest(Digest::from_bytes([4; 32]));
+        let mut builder = EvaluateOutputTranscriptBuilder::new(input, TEST_ASSURANCE, &producer);
+        let streamed = builder.push_token_delta(vec![10]).unwrap();
+        builder.push_token_delta(vec![11]).unwrap();
+        let output_events = builder
+            .finish(EvaluateTerminal {
+                final_position: 2,
+                stop_reason: EvaluateStopReason::MAX_OUTPUT,
+                text_artifact: Digest::from_bytes([5; 32]),
+                usage: EvaluateUsage {
+                    input_units: 3,
+                    output_units: 2,
+                },
+                billable_units: 5,
+            })
+            .unwrap();
+        let mut verifier =
+            EvaluateChunkVerifier::new(input, TEST_ASSURANCE, producer.public_key(), 2);
+        verifier.verify_chunk(streamed).unwrap();
+
+        let error = verifier.verify_terminal(&output_events).unwrap_err();
+        assert!(error.to_string().contains("exactly one terminal event"));
+    }
+
+    #[test]
+    fn terminal_artifact_must_match_verified_streamed_tokens() {
+        let producer = key(2);
+        let input = InputCommitment::from_digest(Digest::from_bytes([4; 32]));
+        let execution = TextExecutionId::from_digest(Digest::from_bytes([6; 32]));
+        let input_ids = vec![1, 2, 3];
+        let forged_artifact = completed_text(execution, &input_ids, &[7])
+            .artifact
+            .output_id()
+            .digest();
+        let mut builder = EvaluateOutputTranscriptBuilder::new(input, TEST_ASSURANCE, &producer);
+        let streamed = builder.push_token_delta(vec![9]).unwrap();
+        let output_events = builder
+            .finish(EvaluateTerminal {
+                final_position: 1,
+                stop_reason: EvaluateStopReason::MAX_OUTPUT,
+                text_artifact: forged_artifact,
+                usage: EvaluateUsage {
+                    input_units: 3,
+                    output_units: 1,
+                },
+                billable_units: 4,
+            })
+            .unwrap();
+        let mut verifier =
+            EvaluateChunkVerifier::new(input, TEST_ASSURANCE, producer.public_key(), 1)
+                .with_text_artifact_expectation(execution, input_ids, false);
+        verifier.verify_chunk(streamed).unwrap();
+
+        let error = verifier.verify_terminal(&output_events).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not match the verified token stream")
+        );
+    }
+
+    #[test]
+    fn stop_terminal_must_match_the_committed_stop_policy() {
+        let producer = key(2);
+        let input = InputCommitment::from_digest(Digest::from_bytes([4; 32]));
+        let execution = TextExecutionId::from_digest(Digest::from_bytes([6; 32]));
+        let input_ids = vec![1];
+        let artifact = completed_text(execution, &input_ids, &[9])
+            .artifact
+            .output_id()
+            .digest();
+        let mut builder = EvaluateOutputTranscriptBuilder::new(input, TEST_ASSURANCE, &producer);
+        let streamed = builder.push_token_delta(vec![9]).unwrap();
+        let output_events = builder
+            .finish(EvaluateTerminal {
+                final_position: 1,
+                stop_reason: EvaluateStopReason::STOP_TOKEN,
+                text_artifact: artifact,
+                usage: EvaluateUsage {
+                    input_units: 1,
+                    output_units: 1,
+                },
+                billable_units: 2,
+            })
+            .unwrap();
+        let mut verifier =
+            EvaluateChunkVerifier::new(input, TEST_ASSURANCE, producer.public_key(), 2)
+                .with_text_artifact_expectation(execution, input_ids, false);
+        verifier.verify_chunk(streamed).unwrap();
+
+        let error = verifier.verify_terminal(&output_events).unwrap_err();
+        assert!(error.to_string().contains("committed stop policy"));
     }
 
     #[test]

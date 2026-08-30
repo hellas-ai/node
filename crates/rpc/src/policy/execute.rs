@@ -41,6 +41,15 @@ impl ExecutePolicy {
             }),
         }
     }
+
+    /// Authorize a request that identifies only an exact execution package.
+    ///
+    /// Artifact-addressed evaluate requests carry no local alias, so a
+    /// `package/...` rule cannot authorize them indirectly through whichever
+    /// aliases happen to be loaded on this node.
+    pub fn allows_execution_package(&self, execution_package_id: &str) -> bool {
+        self.allows_execute(execution_package_id, None)
+    }
 }
 
 impl FromStr for ExecutePolicy {
@@ -132,17 +141,17 @@ mod tests {
 
     #[test]
     fn parse_allow_package() {
-        let policy: ExecutePolicy = "allow(package/Qwen3/*)".parse().unwrap();
+        let policy: ExecutePolicy = "allow(package/qwen3-*)".parse().unwrap();
         match &policy {
             ExecutePolicy::Allow(patterns) => {
                 assert_eq!(patterns.len(), 1);
                 assert!(
-                    matches!(&patterns[0], ExecutePattern::Package(pattern) if pattern == "Qwen3/*")
+                    matches!(&patterns[0], ExecutePattern::Package(pattern) if pattern == "qwen3-*")
                 );
             }
             _ => panic!("expected Allow"),
         }
-        assert_eq!(policy.to_string(), "allow(package/Qwen3/*)");
+        assert_eq!(policy.to_string(), "allow(package/qwen3-*)");
     }
 
     #[test]
@@ -159,12 +168,12 @@ mod tests {
 
     #[test]
     fn parse_allow_mixed() {
-        let policy: ExecutePolicy = "allow(package/Qwen3/*,id/0123*)".parse().unwrap();
+        let policy: ExecutePolicy = "allow(package/qwen3-*,id/0123*)".parse().unwrap();
         match &policy {
             ExecutePolicy::Allow(patterns) => {
                 assert_eq!(patterns.len(), 2);
                 assert!(
-                    matches!(&patterns[0], ExecutePattern::Package(pattern) if pattern == "Qwen3/*")
+                    matches!(&patterns[0], ExecutePattern::Package(pattern) if pattern == "qwen3-*")
                 );
                 assert!(matches!(&patterns[1], ExecutePattern::Id(pattern) if pattern == "0123*"));
             }
@@ -185,13 +194,15 @@ mod tests {
         assert!(ExecutePolicy::Eager.allows_execute(execution_package_id, None));
         assert!(!ExecutePolicy::Skip.allows_execute(execution_package_id, Some("any-package")));
 
-        let package_only = ExecutePolicy::Allow(vec![ExecutePattern::Package("Qwen3/*".into())]);
-        assert!(package_only.allows_execute("", Some("Qwen3/Qwen3-0.6B")));
+        let package_only = ExecutePolicy::Allow(vec![ExecutePattern::Package("qwen3-*".into())]);
+        assert!(package_only.allows_execute("", Some("qwen3-30b-a3b")));
+        assert!(!package_only.allows_execution_package(execution_package_id));
         assert!(!package_only.allows_execute("", Some("meta-llama/X")));
         assert!(!package_only.allows_execute("some-id", None));
 
         let id_only = ExecutePolicy::Allow(vec![ExecutePattern::Id("0123*".into())]);
         assert!(id_only.allows_execute(execution_package_id, None));
+        assert!(id_only.allows_execution_package(execution_package_id));
         assert!(!id_only.allows_execute(
             "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
             None,
@@ -199,10 +210,10 @@ mod tests {
         assert!(id_only.allows_execute(execution_package_id, Some("anything")));
 
         let mixed = ExecutePolicy::Allow(vec![
-            ExecutePattern::Package("Qwen3/*".into()),
+            ExecutePattern::Package("qwen3-*".into()),
             ExecutePattern::Id("0123*".into()),
         ]);
-        assert!(mixed.allows_execute("xyz", Some("Qwen3/Qwen3-0.6B")));
+        assert!(mixed.allows_execute("xyz", Some("qwen3-30b-a3b")));
         assert!(mixed.allows_execute(execution_package_id, Some("unknown-package")));
         assert!(!mixed.allows_execute(
             "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",

@@ -50,10 +50,9 @@ use tokio::sync::mpsc;
 
 use super::Executor;
 
-/// Backpressure buffer for the per-execution event channel. Small enough
-/// that a slow consumer stalls the worker quickly (preventing unbounded
-/// memory growth); large enough to absorb minor jitter without blocking
-/// decode on every chunk.
+/// Backpressure buffer for the per-execution event channel. The worker keeps
+/// one slot reserved for the terminal frame and cancels a consumer that does
+/// not drain the rest; it never blocks the sole execution thread.
 const PER_EXECUTION_CHANNEL_CAPACITY: usize = 64;
 
 impl Executor {
@@ -200,11 +199,10 @@ impl Executor {
                             &entry.capabilities,
                         )
                         .map_err(fetch_access_error)?;
-                    let model_id = projection
-                        .request_view
-                        .model
-                        .clone()
-                        .unwrap_or_else(|| quote.model_id.clone());
+                    // Route-derived and operator-bounded. Never use the
+                    // projected request's arbitrary model string as a
+                    // Prometheus label or retain it in the metrics index.
+                    let metric_name = format!("{}/{}", request.service, request.method);
                     let (sender, receiver) = mpsc::channel(PER_EXECUTION_CHANNEL_CAPACITY);
                     let pending = PendingFetch {
                         request,
@@ -214,7 +212,7 @@ impl Executor {
                         request_commitment_id,
                         quota_reservation: admission.reservation,
                         execution_id: execution_id.clone(),
-                        model_id: model_id.clone(),
+                        metric_name: metric_name.clone(),
                         sender,
                         projector: projection.projector,
                     };
@@ -280,8 +278,10 @@ impl Executor {
                     };
 
                     self.metrics.record_execution_started(
-                        &model_id, /* prompt= */ 0, /* cached_prompt= */ 0,
-                        /* cached_output= */ 0, /* prefill= */ 0,
+                        "fetch",
+                        &metric_name,
+                        /* prompt= */ 0,
+                        /* prefill= */ 0,
                     );
                     let _ = self.store.remove_quote(&request_commitment);
 
@@ -357,7 +357,7 @@ impl Executor {
             request_commitment_id,
             quota_reservation,
             execution_id,
-            model_id,
+            metric_name,
             sender,
             result,
         } = completion;
@@ -377,7 +377,8 @@ impl Executor {
                     );
                 }
                 let _ = self.fetch_state.fail(input_commitment, error.clone());
-                self.metrics.record_execution_failed(&model_id, 0);
+                self.metrics
+                    .record_execution_failed("fetch", &metric_name, 0);
                 send_fetch_failed(sender, failure.position, error).await;
                 self.finish_fetch_slot();
                 return;
@@ -392,7 +393,8 @@ impl Executor {
                 let _ = self
                     .fetch_access_policy
                     .cancel_reservation(quota_reservation.as_ref());
-                self.metrics.record_execution_failed(&model_id, 0);
+                self.metrics
+                    .record_execution_failed("fetch", &metric_name, 0);
                 send_fetch_failed(sender, 0, error).await;
                 self.finish_fetch_slot();
                 return;
@@ -405,7 +407,8 @@ impl Executor {
         ) {
             let error = fetch_execute_error(err).to_string();
             let _ = self.fetch_state.fail(input_commitment, error.clone());
-            self.metrics.record_execution_failed(&model_id, 0);
+            self.metrics
+                .record_execution_failed("fetch", &metric_name, 0);
             send_fetch_failed(sender, 0, error).await;
             self.finish_fetch_slot();
             return;
@@ -422,7 +425,7 @@ impl Executor {
         }
 
         self.metrics
-            .record_execution_completed(&model_id, billable_units);
+            .record_execution_completed("fetch", &metric_name, 0);
         let _ = sender.send(Ok(event)).await;
 
         info!(
@@ -517,7 +520,7 @@ fn spawn_fetch_provider(
             assurance,
             request_commitment_id,
             execution_id,
-            model_id,
+            metric_name,
             sender,
         } = pending;
         let result = run_fetch_provider(
@@ -535,7 +538,7 @@ fn spawn_fetch_provider(
             request_commitment_id,
             quota_reservation,
             execution_id,
-            model_id,
+            metric_name,
             sender,
             result,
         }));
@@ -797,7 +800,6 @@ mod tests {
         FetchTranscriptStoreBackend, MockFetchProvider, ProjectedFetch,
     };
     use futures_util::stream;
-    use hellas_rpc::Dtype;
     use hellas_rpc::ProducerSigningKey;
     use hellas_rpc::fetch::build_input_events;
     use hellas_rpc::pb::fetch::FetchRequest;
@@ -1014,7 +1016,6 @@ mod tests {
         Executor::spawn_configured(ExecutorSpawnConfig {
             execute_policy: ExecutePolicy::Eager,
             queue_capacity: 1,
-            supported_dtypes: vec![Dtype::F32],
             metrics: Arc::new(ExecutorMetrics::default()),
             producer_key: Arc::new(producer_key),
             provider_genesis: Arc::new(test_genesis()),
@@ -1067,7 +1068,6 @@ mod tests {
         let handle = Executor::spawn_with_fetch_routes(
             ExecutePolicy::Eager,
             1,
-            vec![Dtype::F32],
             key(),
             test_genesis(),
             test_assurance(),
@@ -1111,7 +1111,6 @@ mod tests {
         let handle = Executor::spawn_with_fetch_routes(
             ExecutePolicy::Eager,
             1,
-            vec![Dtype::F32],
             key(),
             test_genesis(),
             test_assurance(),
@@ -1190,7 +1189,6 @@ mod tests {
         let handle = Executor::spawn_configured(ExecutorSpawnConfig {
             execute_policy: ExecutePolicy::Eager,
             queue_capacity: 1,
-            supported_dtypes: vec![Dtype::F32],
             metrics: Arc::new(ExecutorMetrics::default()),
             producer_key: Arc::new(key()),
             provider_genesis: Arc::new(test_genesis()),
@@ -1255,7 +1253,6 @@ mod tests {
         let handle = Executor::spawn_configured(ExecutorSpawnConfig {
             execute_policy: ExecutePolicy::Eager,
             queue_capacity: 1,
-            supported_dtypes: vec![Dtype::F32],
             metrics: Arc::new(ExecutorMetrics::default()),
             producer_key: Arc::new(key()),
             provider_genesis: Arc::new(test_genesis()),

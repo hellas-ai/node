@@ -18,10 +18,6 @@ pub(super) async fn handle(State(state): State<Arc<GatewayState>>, body: Bytes) 
         Err(response) => return *response,
     };
     let stream = parsed.stream.unwrap_or(false);
-    if let Some(model) = state.force_model.as_ref() {
-        apply_model_override(&mut parsed, &mut request, model);
-    }
-
     if let Some(proxy) = state.responses_proxy.as_ref() {
         return backend_wire_response(
             stream,
@@ -47,6 +43,8 @@ pub(super) async fn handle(State(state): State<Arc<GatewayState>>, body: Bytes) 
         )
         .await;
     }
+
+    apply_model_override(&mut parsed, &mut request, &state.package_name);
 
     let backend = GatewayBackend::new(state);
     backend_wire_response(

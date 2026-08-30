@@ -7,16 +7,22 @@ use hellas_attestation::{
     AnchorTime, AppleCredential, ApplePolicy, AssertionCounterStore, RegisteredAppleCredential,
     apple_app_attest_root_ca, apple_app_id_hash, register_apple, verify_apple_assertion,
 };
-use hellas_rpc::pb::courtesy::QuoteTokensRequest;
+use hellas_rpc::pb::courtesy::{QuoteResponse, QuoteTokensRequest, evaluate_start};
 use hellas_rpc::pb::execute::{OpenRequest, OpenResponse, Ticket, open_response};
 use hellas_rpc::pb::fetch::FetchRequest;
+use hellas_rpc::protocol::artifacts::{
+    BoundTermId, InputAddressed, OutputAddressed, SourceRef, TextArtifact, TextArtifactId,
+    TextExecution, TextExecutionId, TextPolicy, TokenIds,
+};
 use hellas_rpc::provenance::ExecutionProvenance;
 use hellas_rpc::services::courtesy::{Courtesy, Open as CourtesyOpen, QuoteTokens};
 use hellas_rpc::services::execute::{Execute, ExecuteClientImpl};
 use hellas_rpc::services::fetch::{Fetch, FetchClientImpl, Open as FetchOpen};
 use hellas_rpc::{
-    AppleAppAttestEnrollment, Assurance, ContentId, InputCommitment, PlatformCredential,
-    PlatformEnrollment, ProducerSigningKey, ProviderEnrollmentBundle, PublicKey, RootKind,
+    AppleAppAttestEnrollment, Assurance, ContentId, Digest, Evaluate, EvaluateProgramManifest,
+    EvaluateRequest, ExecutionPackageId, InputCommitment, MAX_STOP_TOKEN_IDS, PlatformCredential,
+    PlatformEnrollment, ProducerSigningKey, ProgramManifest, ProviderEnrollmentBundle, PublicKey,
+    RootKind,
 };
 use hellas_wire::iroh::IrohTransport;
 use hellas_wire::iroh::swarm::{DhtBackend, MdnsBackend, PeerExchangeBackend, ServiceRegistry};
@@ -446,12 +452,189 @@ fn validate_provider_trust_assurance(
     }
 }
 
+/// A token quote checked against the caller's request rather than trusted as
+/// an interpretation supplied by the provider.
+#[derive(Debug)]
+pub struct ValidatedEvaluateQuote {
+    pub ticket: Ticket,
+    pub producer_key: PublicKey,
+    pub text_execution: TextExecutionId,
+}
+
+/// Validate every deterministic field of a token quote and bind its ticket to
+/// the returned canonical Evaluate request.
+///
+/// The provider chooses only the nonce. Package aliases are deliberately not
+/// trusted: `request.execution_package` is the caller's exact Catena pin.
+pub fn validate_evaluate_quote_response(
+    request: &QuoteTokensRequest,
+    response: QuoteResponse,
+    expected_provider_genesis: Option<ContentId>,
+) -> ClientResult<ValidatedEvaluateQuote> {
+    if request.prompt_token_ids.is_empty() {
+        return Err(ClientError::protocol(
+            "token quote prompt_token_ids must not be empty",
+        ));
+    }
+    if request.stop_token_ids.len() > MAX_STOP_TOKEN_IDS {
+        return Err(ClientError::protocol(format!(
+            "token quote has {} stop IDs, over the limit of {MAX_STOP_TOKEN_IDS}",
+            request.stop_token_ids.len()
+        )));
+    }
+    let prompt_tokens = u32::try_from(request.prompt_token_ids.len())
+        .map_err(|_| ClientError::protocol("token quote prompt count exceeds u32"))?;
+    if response.prompt_tokens != prompt_tokens {
+        return Err(ClientError::protocol(format!(
+            "provider reported {} prompt tokens for a {prompt_tokens}-token quote",
+            response.prompt_tokens
+        )));
+    }
+
+    let execution_package = ExecutionPackageId::from_bytes(fixed_quote_field(
+        "execution_package",
+        &request.execution_package,
+    )?);
+    let manifest = ProgramManifest::Evaluate(EvaluateProgramManifest { execution_package });
+    let execution_environment = manifest.content_id();
+    let from = match request.start.as_ref().and_then(|start| start.kind.as_ref()) {
+        Some(evaluate_start::Kind::Genesis(_)) => {
+            let identity = TextArtifact::identity(
+                BoundTermId::from_digest(execution_environment.digest()),
+                execution_package,
+            );
+            SourceRef::output(identity.output_id())
+        }
+        Some(evaluate_start::Kind::Artifact(artifact)) => {
+            let digest = Digest::from_bytes(fixed_quote_field("artifact", &artifact.artifact)?);
+            SourceRef::output(TextArtifactId::from_digest(digest))
+        }
+        None => {
+            return Err(ClientError::protocol(
+                "token quote is missing its evaluate start",
+            ));
+        }
+    };
+    let prompt_tokens = TokenIds::from_u32s(request.prompt_token_ids.iter().copied());
+    let max_new_tokens = request
+        .max_new_tokens
+        .unwrap_or(hellas_rpc::DEFAULT_MAX_NEW_TOKENS);
+    if max_new_tokens == 0 {
+        return Err(ClientError::protocol(
+            "token quote max_new_tokens must be greater than zero",
+        ));
+    }
+    let policy =
+        TextPolicy::from_u32_stop_tokens(max_new_tokens, request.stop_token_ids.iter().copied());
+    let text_execution = TextExecution::new(from, prompt_tokens.output_id(), policy.output_id());
+
+    let evaluate_pb = response
+        .evaluate_request
+        .ok_or_else(|| ClientError::protocol("quote_tokens response missing evaluate_request"))?;
+    let evaluate_request = EvaluateRequest {
+        text_execution: Digest::from_bytes(fixed_quote_field(
+            "evaluate_request.text_execution",
+            &evaluate_pb.text_execution,
+        )?),
+        runner_public_key: hellas_rpc::run_ticket::public_key_from_pb(
+            evaluate_pb.runner_public_key.ok_or_else(|| {
+                ClientError::protocol("evaluate request missing runner_public_key")
+            })?,
+        )
+        .map_err(|source| ClientError::source("invalid evaluate runner_public_key", source))?,
+        execution_environment: ContentId::from_bytes(fixed_quote_field(
+            "evaluate_request.execution_environment",
+            &evaluate_pb.execution_environment,
+        )?),
+        nonce: fixed_quote_field("evaluate_request.nonce", &evaluate_pb.nonce)?,
+        assurance: hellas_rpc::run_ticket::assurance_from_pb(evaluate_pb.assurance)
+            .map_err(|source| ClientError::source("invalid evaluate request assurance", source))?,
+        retain: evaluate_pb.retain.unwrap_or(true),
+    };
+    let requested_runner = request
+        .runner_public_key
+        .clone()
+        .ok_or_else(|| ClientError::protocol("token quote is missing runner_public_key"))
+        .and_then(|key| {
+            hellas_rpc::run_ticket::public_key_from_pb(key).map_err(|source| {
+                ClientError::source("invalid requested runner_public_key", source)
+            })
+        })?;
+
+    let text_execution = text_execution.input_id();
+    if evaluate_request.text_execution != text_execution.digest()
+        || evaluate_request.execution_environment != execution_environment
+        || evaluate_request.runner_public_key != requested_runner
+        || evaluate_request.assurance.to_byte() as i32 != request.assurance
+        || evaluate_request.retain != request.retain.unwrap_or(true)
+    {
+        return Err(ClientError::protocol(
+            "provider's evaluate request does not match the token quote",
+        ));
+    }
+
+    let ticket = response
+        .ticket
+        .ok_or_else(|| ClientError::protocol("quote_tokens response missing ticket"))?;
+    let terms = hellas_rpc::run_ticket::job_terms_from_pb(&ticket)
+        .map_err(|source| ClientError::source("invalid evaluate ticket terms", source))?;
+    let expected_request = Evaluate::commit_request(&evaluate_request);
+    if terms.request != expected_request {
+        return Err(ClientError::protocol(
+            "evaluate ticket is not bound to the returned evaluate request",
+        ));
+    }
+    if terms.assurance != evaluate_request.assurance {
+        return Err(ClientError::protocol(
+            "evaluate ticket assurance does not match the committed request",
+        ));
+    }
+    if let Some(expected) = expected_provider_genesis
+        && terms.provider_genesis != expected
+    {
+        return Err(ClientError::protocol(format!(
+            "evaluate ticket provider genesis mismatch: expected {expected}, got {}",
+            terms.provider_genesis
+        )));
+    }
+    let enrollment = ProviderEnrollmentBundle::from_canonical_bytes(&ticket.provider_genesis)
+        .map_err(|source| ClientError::source("invalid evaluate provider enrollment", source))?;
+
+    Ok(ValidatedEvaluateQuote {
+        ticket,
+        producer_key: enrollment.genesis.statement.producer_public_key,
+        text_execution,
+    })
+}
+
+fn fixed_quote_field<const N: usize>(field: &str, bytes: &[u8]) -> ClientResult<[u8; N]> {
+    bytes.try_into().map_err(|_| {
+        ClientError::protocol(format!("{field} must be {N} bytes, got {}", bytes.len()))
+    })
+}
+
+/// Bind unauthenticated transport metadata to the request commitment carried
+/// by the already-validated ticket before exposing it as provenance.
+pub fn validate_evaluate_quote_provenance(
+    ticket: &Ticket,
+    provenance: ExecutionProvenance,
+) -> ClientResult<ExecutionProvenance> {
+    let expected =
+        fixed_quote_field::<32>("ticket.request_commitment", &ticket.request_commitment)?;
+    if provenance.commitment_id != expected {
+        return Err(ClientError::protocol(
+            "evaluate quote provenance does not match the ticket request commitment",
+        ));
+    }
+    Ok(provenance)
+}
+
 /// Quote prepared tokens on a specific peer and return its ticket and provenance.
 pub async fn quote_tokens<L>(
     runtime: &ExecutionRuntime<L>,
     target: &RemoteNodeTarget,
     quote_req: &QuoteTokensRequest,
-) -> ClientResult<(Ticket, ExecutionProvenance)> {
+) -> ClientResult<(Ticket, ExecutionProvenance, PublicKey, TextExecutionId)> {
     let requested_assurance = hellas_rpc::run_ticket::assurance_from_pb(quote_req.assurance)
         .map_err(|source| ClientError::source("invalid requested assurance", source))?;
     validate_provider_trust_assurance(&target.provider_trust, requested_assurance)?;
@@ -469,21 +652,11 @@ pub async fn quote_tokens<L>(
             status,
         )
     })?;
-    let response = with_trailer.response;
-    let evaluate_request = response.evaluate_request.ok_or_else(|| {
-        ClientError::protocol(format!(
-            "quote_tokens response from {} missing evaluate_request",
-            target.node_id()
-        ))
-    })?;
-    let ticket = response.ticket.ok_or_else(|| {
-        ClientError::protocol(format!(
-            "quote_tokens response from {} missing ticket",
-            target.node_id()
-        ))
-    })?;
-    validate_evaluate_assurance(&ticket, evaluate_request.assurance, quote_req.assurance)?;
-    validate_evaluate_retention(evaluate_request.retain, quote_req.retain)?;
+    let validated = validate_evaluate_quote_response(
+        quote_req,
+        with_trailer.response,
+        Some(target.provider_trust.expected_genesis),
+    )?;
     let provenance = hellas_rpc::provenance::read_provenance_metadata(&with_trailer.metadata)
         .map_err(|source| {
             ClientError::source(
@@ -494,7 +667,13 @@ pub async fn quote_tokens<L>(
                 source,
             )
         })?;
-    Ok((ticket, provenance))
+    let provenance = validate_evaluate_quote_provenance(&validated.ticket, provenance)?;
+    Ok((
+        validated.ticket,
+        provenance,
+        validated.producer_key,
+        validated.text_execution,
+    ))
 }
 
 /// Discover Courtesy peers until one returns a valid quote.
@@ -503,7 +682,13 @@ pub async fn discover_and_quote(
     quote_req: &QuoteTokensRequest,
     retries: usize,
     provider_trust: &ProviderTrustAnchor,
-) -> ClientResult<(RemoteNodeTarget, Ticket, ExecutionProvenance)> {
+) -> ClientResult<(
+    RemoteNodeTarget,
+    Ticket,
+    ExecutionProvenance,
+    PublicKey,
+    TextExecutionId,
+)> {
     let requested_assurance = hellas_rpc::run_ticket::assurance_from_pb(quote_req.assurance)
         .map_err(|source| ClientError::source("invalid requested assurance", source))?;
     validate_provider_trust_assurance(provider_trust, requested_assurance)?;
@@ -566,27 +751,20 @@ pub async fn discover_and_quote(
             }
         };
 
-        let response = with_trailer.response;
-        let Some(evaluate_request) = response.evaluate_request else {
-            last_error = Some(ClientError::protocol(format!(
-                "quote_tokens response from {peer_id} missing evaluate_request"
-            )));
-            if attempts >= max_attempts {
-                break;
+        let validated = match validate_evaluate_quote_response(
+            quote_req,
+            with_trailer.response,
+            Some(provider_trust.expected_genesis),
+        ) {
+            Ok(validated) => validated,
+            Err(error) => {
+                last_error = Some(error);
+                if attempts >= max_attempts {
+                    break;
+                }
+                continue;
             }
-            continue;
         };
-        let Some(ticket) = response.ticket else {
-            last_error = Some(ClientError::protocol(format!(
-                "quote_tokens response from {peer_id} missing ticket"
-            )));
-            if attempts >= max_attempts {
-                break;
-            }
-            continue;
-        };
-        validate_evaluate_assurance(&ticket, evaluate_request.assurance, quote_req.assurance)?;
-        validate_evaluate_retention(evaluate_request.retain, quote_req.retain)?;
 
         let provenance =
             match hellas_rpc::provenance::read_provenance_metadata(&with_trailer.metadata) {
@@ -602,11 +780,23 @@ pub async fn discover_and_quote(
                     continue;
                 }
             };
+        let provenance = match validate_evaluate_quote_provenance(&validated.ticket, provenance) {
+            Ok(provenance) => provenance,
+            Err(error) => {
+                last_error = Some(error);
+                if attempts >= max_attempts {
+                    break;
+                }
+                continue;
+            }
+        };
 
         return Ok((
             RemoteNodeTarget::direct(peer_id, provider_trust.clone()),
-            ticket,
+            validated.ticket,
             provenance,
+            validated.producer_key,
+            validated.text_execution,
         ));
     }
 
@@ -615,39 +805,6 @@ pub async fn discover_and_quote(
             "discovery stream exhausted without a successful quote (no peers found)",
         )
     }))
-}
-
-fn validate_evaluate_assurance(
-    ticket: &Ticket,
-    request_assurance: i32,
-    expected_assurance: i32,
-) -> ClientResult<()> {
-    let request_assurance = hellas_rpc::run_ticket::assurance_from_pb(request_assurance)
-        .map_err(|source| ClientError::source("invalid evaluate request assurance", source))?;
-    let expected_assurance = hellas_rpc::run_ticket::assurance_from_pb(expected_assurance)
-        .map_err(|source| ClientError::source("invalid requested assurance", source))?;
-    let terms = hellas_rpc::run_ticket::job_terms_from_pb(ticket)
-        .map_err(|source| ClientError::source("invalid evaluate ticket terms", source))?;
-    if request_assurance == expected_assurance && request_assurance == terms.assurance {
-        Ok(())
-    } else {
-        Err(ClientError::protocol(
-            "evaluate request assurance does not match ticket terms",
-        ))
-    }
-}
-
-fn validate_evaluate_retention(
-    response_retain: Option<bool>,
-    requested_retain: Option<bool>,
-) -> ClientResult<()> {
-    if response_retain.unwrap_or(true) == requested_retain.unwrap_or(true) {
-        Ok(())
-    } else {
-        Err(ClientError::protocol(
-            "evaluate response retention does not match request",
-        ))
-    }
 }
 
 /// Create and validate a fetch ticket on a specific peer.
@@ -832,9 +989,14 @@ pub fn execute_fetch_stream(
             .run_ticket(run_ticket)
             .await
             .map_err(|status| ClientError::wire("failed to start remote fetch execute stream", status))?;
-        let mut got_terminal = false;
+        let mut terminal = None;
         let mut verifier = FetchChunkVerifier::new(input_commitment, assurance, trust);
         while let Some(item) = wire.next().await {
+            if terminal.is_some() {
+                Err(ClientError::protocol(
+                    "remote fetch execute stream emitted an event after its terminal outcome"
+                ))?;
+            }
             let event = verify_fetch_work_event(
                 &mut verifier,
                 item.map_err(|status: WireStatus| {
@@ -842,20 +1004,29 @@ pub fn execute_fetch_stream(
                 })?,
                 input_commitment,
             )?;
-            let is_done = matches!(event, FetchExecutionEvent::Done(_));
-            yield event;
-            if is_done {
-                got_terminal = true;
-                break;
+            match event {
+                FetchExecutionEvent::Chunk {
+                    position,
+                    output_event,
+                    event,
+                } => {
+                    yield FetchExecutionEvent::Chunk {
+                        position,
+                        output_event,
+                        event,
+                    };
+                }
+                FetchExecutionEvent::Done(outcome) => {
+                    terminal = Some(outcome);
+                }
             }
         }
         wire.finish()
             .map_err(|status| ClientError::wire("remote fetch execute stream trailer", status))?;
-        if !got_terminal {
-            Err(ClientError::protocol(
-                "remote fetch execute stream ended Ok but emitted no Done event"
-            ))?;
-        }
+        let terminal = terminal.ok_or_else(|| {
+            ClientError::protocol("remote fetch execute stream ended Ok but emitted no Done event")
+        })?;
+        yield FetchExecutionEvent::Done(terminal);
         drop(client);
     }
 }
@@ -873,6 +1044,11 @@ mod tests {
     use super::*;
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD;
+    use hellas_rpc::pb::courtesy::{EvaluateGenesisStart, EvaluateStart};
+    use hellas_rpc::protocol::artifacts::{
+        BoundTermId, InputAddressed, OutputAddressed, SourceRef, TextArtifact, TextExecution,
+        TextPolicy, TokenIds,
+    };
     use hellas_rpc::{
         Digest, ProviderEnrollmentBundle, ProviderGenesisStatement, RootProof,
         SignedProviderGenesis, pb::execute::open_response, run_ticket::signature_to_pb,
@@ -937,6 +1113,129 @@ mod tests {
                 ))),
             },
         )
+    }
+
+    fn valid_token_quote() -> (
+        QuoteTokensRequest,
+        QuoteResponse,
+        ProviderTrustAnchor,
+        PublicKey,
+    ) {
+        let (trust, open) = signed_open_response(&[8; 32], &[9; 32]);
+        let enrollment =
+            ProviderEnrollmentBundle::from_canonical_bytes(&open.provider_genesis).unwrap();
+        let producer_key = enrollment.genesis.statement.producer_public_key;
+        let runner = ProducerSigningKey::from_secret_bytes([5; 32]).unwrap();
+        let execution_package = ExecutionPackageId::from_bytes([6; 32]);
+        let request = QuoteTokensRequest {
+            package: "smollm2-135m".to_string(),
+            execution_package: execution_package.as_bytes().to_vec(),
+            prompt_token_ids: vec![1, 2, 3],
+            max_new_tokens: Some(4),
+            stop_token_ids: vec![9, 7, 9],
+            start: Some(EvaluateStart {
+                kind: Some(evaluate_start::Kind::Genesis(EvaluateGenesisStart {})),
+            }),
+            runner_public_key: Some(hellas_rpc::run_ticket::public_key_to_pb(
+                &runner.public_key(),
+            )),
+            assurance: Assurance::ProducerSigned.to_byte().into(),
+            retain: Some(true),
+        };
+        let execution_environment =
+            ProgramManifest::Evaluate(EvaluateProgramManifest { execution_package }).content_id();
+        let identity = TextArtifact::identity(
+            BoundTermId::from_digest(execution_environment.digest()),
+            execution_package,
+        );
+        let prompt = TokenIds::from([1, 2, 3]);
+        let policy = TextPolicy::from_u32_stop_tokens(4, [9, 7, 9]);
+        let text_execution = TextExecution::new(
+            SourceRef::output(identity.output_id()),
+            prompt.output_id(),
+            policy.output_id(),
+        );
+        let evaluate_request = EvaluateRequest {
+            text_execution: text_execution.input_id().digest(),
+            runner_public_key: runner.public_key(),
+            execution_environment,
+            nonce: [4; 32],
+            assurance: Assurance::ProducerSigned,
+            retain: true,
+        };
+        let terms = hellas_rpc::JobTerms {
+            request: Evaluate::commit_request(&evaluate_request),
+            provider_genesis: trust.expected_genesis,
+            assurance: Assurance::ProducerSigned,
+            amount: 1000,
+            ttl_ms: 30_000,
+        };
+        let ticket = hellas_rpc::run_ticket::ticket_to_pb(terms, open.provider_genesis).unwrap();
+        let response = QuoteResponse {
+            ticket: Some(ticket),
+            prompt_tokens: 3,
+            evaluate_request: Some(hellas_rpc::pb::evaluate::EvaluateRequest {
+                text_execution: evaluate_request.text_execution.as_bytes().to_vec(),
+                runner_public_key: Some(hellas_rpc::run_ticket::public_key_to_pb(
+                    &evaluate_request.runner_public_key,
+                )),
+                execution_environment: evaluate_request.execution_environment.as_bytes().to_vec(),
+                nonce: evaluate_request.nonce.to_vec(),
+                assurance: evaluate_request.assurance.to_byte().into(),
+                retain: Some(evaluate_request.retain),
+            }),
+        };
+        (request, response, trust, producer_key)
+    }
+
+    #[test]
+    fn token_quote_binds_exact_package_request_ticket_and_producer() {
+        let (request, response, trust, producer_key) = valid_token_quote();
+        let validated =
+            validate_evaluate_quote_response(&request, response, Some(trust.expected_genesis))
+                .unwrap();
+        assert_eq!(validated.producer_key, producer_key);
+    }
+
+    #[test]
+    fn token_quote_rejects_a_provider_substituting_another_package() {
+        let (mut request, response, trust, _) = valid_token_quote();
+        request.execution_package = vec![42; 32];
+        let error =
+            validate_evaluate_quote_response(&request, response, Some(trust.expected_genesis))
+                .unwrap_err();
+        assert!(error.to_string().contains("does not match the token quote"));
+    }
+
+    #[test]
+    fn token_quote_provenance_must_name_the_ticket_commitment() {
+        let (_, response, _, _) = valid_token_quote();
+        let ticket = response.ticket.unwrap();
+        let commitment_id: [u8; 32] = ticket.request_commitment.as_slice().try_into().unwrap();
+        let valid = ExecutionProvenance { commitment_id };
+        assert_eq!(
+            validate_evaluate_quote_provenance(&ticket, valid.clone()).unwrap(),
+            valid
+        );
+
+        let error = validate_evaluate_quote_provenance(
+            &ticket,
+            ExecutionProvenance {
+                commitment_id: [42; 32],
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("does not match"), "{error}");
+    }
+
+    #[test]
+    fn token_quote_rejects_a_ticket_for_another_request() {
+        let (request, mut response, trust, _) = valid_token_quote();
+        response.ticket.as_mut().unwrap().request_commitment = vec![0; 32];
+        let error =
+            validate_evaluate_quote_response(&request, response, Some(trust.expected_genesis))
+                .unwrap_err();
+        assert!(error.to_string().contains("not bound"));
     }
 
     #[derive(Default)]

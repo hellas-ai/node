@@ -15,7 +15,7 @@ apple-app-attest = [
     "dep:ciborium",
     "dep:p256",
     "dep:rustls-pki-types",
-    "dep:rustls-webpki",
+    "dep:webpki",
     "dep:serde",
     "dep:serde_bytes",
     "dep:sha2",
@@ -28,7 +28,7 @@ ciborium = { workspace = true, optional = true }
 hellas-rpc = { workspace = true, features = ["execute"] }
 p256 = { workspace = true, optional = true }
 rustls-pki-types = { workspace = true, optional = true }
-rustls-webpki = { workspace = true, default-features = false, features = [
+webpki = { workspace = true, default-features = false, features = [
     "ring",
     "std",
 ], optional = true }

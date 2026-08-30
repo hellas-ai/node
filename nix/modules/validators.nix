@@ -48,13 +48,13 @@ let
     validator: index:
     let
       cli = getExe validator.package;
-      addressesFlag = optionalString (validator.addresses != [ ]) (
-        "--addresses ${escapeShellArg (concatStringsSep "," validator.addresses)}"
-      );
+      addressesFlag = optionalString (
+        validator.addresses != [ ]
+      ) "--addresses ${escapeShellArg (concatStringsSep "," validator.addresses)}";
       seedFlag = optionalString (validator.seed != null) "--seed ${toString validator.seed}";
-      genesisFlag = optionalString (validator.genesis != null) (
-        "--genesis ${escapeShellArg validator.genesis}"
-      );
+      genesisFlag = optionalString (
+        validator.genesis != null
+      ) "--genesis ${escapeShellArg validator.genesis}";
       relayFlags = concatStringsSep " " (
         map (url: "--relay-url ${escapeShellArg url}") validator.relayUrls
       );

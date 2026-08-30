@@ -3,7 +3,6 @@
 pub mod artifacts;
 pub mod commitment;
 pub mod digest;
-pub mod dtype;
 pub mod identity;
 pub mod job;
 pub mod manifest;
@@ -25,7 +24,6 @@ pub mod work_setup;
 
 pub use commitment::{Assurance, Operation, RequestCommitment, SchemeId, scheme_id};
 pub use digest::{ContentId, Digest, hash_tuple};
-pub use dtype::{Dtype, ParseDtypeError};
 pub use identity::{
     AppleAppAttestEnrollment, Decoder as DagCborDecoder, PlatformCredential, PlatformEnrollment,
     ProviderEnrollmentBundle, ProviderGenesisDecodeError, ProviderGenesisStatement,

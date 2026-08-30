@@ -1,13 +1,9 @@
 {
   description = "Hellas Node";
 
-  # CA derivations let the HF cache packages (and any other system-independent
-  # outputs) substitute across Linux/Darwin from a shared binary cache.
-  # extra-substituters / extra-trusted-public-keys are an opt-in for downstream
-  # users — nix will prompt to accept on first use (or auto-accept with
-  # `--accept-flake-config`).
+  # The binary cache is opt-in for downstream users: nix prompts on first use
+  # (or accepts it with `--accept-flake-config`).
   nixConfig = {
-    extra-experimental-features = [ "ca-derivations" ];
     extra-substituters = [ "https://cache.hellas.ai" ];
     extra-trusted-public-keys = [ "cache.hellas.ai-1:PYolh95U/Ms5fKE+NQTcNZUHyEv4QikaNocg9I9iy0g=" ];
   };
@@ -15,9 +11,18 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     rust-overlay.url = "github:oxalica/rust-overlay";
-    catgrad = {
-      url = "github:hellas-ai/catgrad";
-      inputs.nixpkgs.follows = "nixpkgs";
+    # Temporary sibling input while the runner API is developed in tandem.
+    # package.nix rewrites Cargo's relative path to this immutable store path.
+    catena-runner = {
+      url = "path:../catena-runner";
+      flake = false;
+    };
+    # The exact Catena revision embedded by the runner. This second local
+    # input keeps clean Nix builds independent of private GitHub credentials;
+    # both path inputs go away when the tandem branches are published.
+    exploratory-catena = {
+      url = "path:../exploratory-catena";
+      flake = false;
     };
   };
 
@@ -26,7 +31,8 @@
       self,
       nixpkgs,
       rust-overlay,
-      catgrad,
+      catena-runner,
+      exploratory-catena,
     }:
     let
       systems = [
@@ -48,7 +54,8 @@
             system
             nixpkgs
             rust-overlay
-            catgrad
+            catena-runner
+            exploratory-catena
             ;
         }
       );
@@ -68,9 +75,11 @@
         hellasLib = import ./nix/lib { pkgs = final; };
       };
 
-      nixosModules.hellas = import ./nix/modules/nixos.nix { inherit self; };
-      nixosModules.validators = import ./nix/modules/validators.nix { inherit self; };
-      nixosModules.default = self.nixosModules.hellas;
+      nixosModules = {
+        hellas = import ./nix/modules/nixos.nix { inherit self; };
+        validators = import ./nix/modules/validators.nix { inherit self; };
+        default = self.nixosModules.hellas;
+      };
 
       homeManagerModules.hellas = import ./nix/modules/home-manager.nix { inherit self; };
       homeManagerModules.default = self.homeManagerModules.hellas;

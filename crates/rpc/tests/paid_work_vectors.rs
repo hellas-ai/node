@@ -2343,7 +2343,7 @@ fn canonical_output_digest_normalizes_chunking() {
     let id = work_id(&channel(), &authorization());
     let terminal = EvaluateTerminal {
         final_position: 4,
-        stop_reason: EvaluateStopReason::END_OF_SEQUENCE,
+        stop_reason: EvaluateStopReason::STOP_TOKEN,
         text_artifact: Digest::from_bytes([0x60; 32]),
         usage: EvaluateUsage {
             input_units: 4,
@@ -2552,7 +2552,7 @@ fn spool_transcript() -> Vec<hellas_rpc::OutputEventEnvelope> {
     };
     match builder.finish(EvaluateTerminal {
         final_position: 3,
-        stop_reason: EvaluateStopReason::END_OF_SEQUENCE,
+        stop_reason: EvaluateStopReason::STOP_TOKEN,
         text_artifact: Digest::from_bytes([0x77; 32]),
         usage,
         billable_units: 7,

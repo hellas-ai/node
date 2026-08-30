@@ -28,19 +28,19 @@ node = [
     "hellas-chain/work-watcher",
     "hellas-client/work",
 ]
+# Token-native remote execution and its local text-presentation boundary.
+# This deliberately does not pull Catena into a client that only dials a node.
+llm = ["dep:hellas-gateway", "dep:hellas-presentation"]
 # HTTP gateway front-end (OpenAI/Anthropic/plain APIs).
-gateway = ["dep:hellas-gateway"]
+gateway = ["llm"]
 evaluate = [
     "node",
     "gateway",
     "dep:commonware-runtime",
     "hellas-gateway/evaluate",
     "hellas-executor/evaluate",
-    "dep:hellas-models",
+    "dep:hellas-presentation",
 ]
-candle = ["evaluate", "hellas-executor/candle"]
-candle-cuda = ["candle", "hellas-executor/candle-cuda"]
-candle-metal = ["candle", "hellas-executor/candle-metal"]
 chain = [
     "dep:hellas-chain",
     "dep:hellas-kernel",
@@ -82,7 +82,7 @@ hellas-client = { workspace = true, features = ["iroh"] }
 hellas-executor = { workspace = true, default-features = false, optional = true }
 hellas-gateway = { workspace = true, optional = true }
 hellas-kernel = { workspace = true, default-features = false, optional = true }
-hellas-models = { workspace = true, optional = true }
+hellas-presentation = { workspace = true, optional = true }
 hellas-store = { workspace = true }
 hellas-xet = { workspace = true }
 hellas-rpc = { workspace = true, default-features = false, features = [
@@ -112,7 +112,6 @@ serde_json.workspace = true
 tempfile = "3"
 thiserror.workspace = true
 tokio.workspace = true
-tokio-stream = { workspace = true }
 tracing.workspace = true
 tracing-opentelemetry = { workspace = true, optional = true }
 tracing-subscriber.workspace = true

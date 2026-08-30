@@ -512,8 +512,16 @@ impl TextOutput {
         self.execution
     }
 
+    pub const fn position(&self) -> u64 {
+        self.position
+    }
+
     pub const fn state(&self) -> TextStateId {
         self.state
+    }
+
+    pub const fn generated_tokens(&self) -> TokenIdsId {
+        self.generated_tokens
     }
 }
 
@@ -1280,5 +1288,15 @@ mod tests {
 
         let err = TokenIds::from_canonical_bytes(&bytes).unwrap_err();
         assert!(err.to_string().contains("schema tag"));
+    }
+
+    #[test]
+    fn decoder_rejects_impossible_array_length_before_allocation() {
+        let mut bytes = TokenIds::from([]).canonical_bytes();
+        assert_eq!(bytes.pop(), Some(0x80), "empty token array is final field");
+        bytes.extend([0x9b, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
+
+        let error = TokenIds::from_canonical_bytes(&bytes).unwrap_err();
+        assert!(error.to_string().contains("encoded bytes remain"));
     }
 }

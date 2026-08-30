@@ -36,9 +36,9 @@
 //! with matching sha256 confirming the bytes were the ones HF meant.
 //!
 //! So an advertised id is a hint that lets us skip work when it agrees,
-//! and never a key. Ids in this store are ones we computed, because they
-//! end up signed into an execution environment and a key we cannot
-//! defend is a claim we can lose.
+//! and never a key. Ids in this store are ones we computed: a
+//! content-addressed store cannot defend a key it did not derive from
+//! the bytes.
 
 pub mod fastresume;
 pub mod hf;
@@ -71,8 +71,9 @@ pub struct Indexed {
 /// Anything that can make content appear that is not here yet.
 ///
 /// Separate from [`Substituter`] on purpose. A substituter answers
-/// cheaply and locally; a fetcher spends bandwidth. Only one of those
-/// may be reached from a quote.
+/// cheaply and locally; a fetcher may spend bandwidth and disk. Keeping
+/// the interfaces separate lets callers choose explicitly whether an
+/// operation may perform remote work.
 pub trait Fetcher: Send + Sync {
     /// Name, for diagnostics.
     fn name(&self) -> &str;
@@ -95,7 +96,8 @@ pub trait Fetcher: Send + Sync {
 /// Deliberately narrow: a substituter answers "do you have this, and
 /// where", and nothing else. It does not fetch, because a source that
 /// can fetch and a source that can answer cheaply have very different
-/// costs and a quote may only ever consult the cheap question.
+/// costs. An availability check must not silently become network
+/// activity.
 pub trait Substituter: Send + Sync {
     /// Name, for diagnostics.
     fn name(&self) -> &str;
@@ -280,9 +282,8 @@ impl ContentStore {
     /// True when this content is available locally, right now, without
     /// touching the network.
     ///
-    /// The question a quote is allowed to ask. Answering a quote for
-    /// content we do not hold is what turns quoting into a remote fetch
-    /// primitive.
+    /// Deliberately narrower than [`Self::materialize`]: checking
+    /// availability never causes a remote fetch.
     #[must_use]
     pub fn have(&self, id: XetHash) -> bool {
         self.locate(id).is_some()
@@ -300,8 +301,8 @@ impl ContentStore {
             // Existence is not the question. The question is whether the
             // name still refers to the file whose bytes produced this id:
             // an ordinary rewrite leaves the path there and the entry
-            // false, and a quote answered on it commits to weights this
-            // node no longer holds.
+            // false, and `have` must not claim bytes the store no longer
+            // holds.
             if std::fs::metadata(&entry.path)
                 .is_ok_and(|metadata| fastresume::FileIdentity::of(&metadata) == entry.identity)
             {
@@ -329,12 +330,8 @@ impl ContentStore {
     /// Makes content `id` available locally, fetching it if it is not
     /// already here, and indexes the result.
     ///
-    /// The privileged operation. [`Self::have`] is the question a quote
-    /// may ask; this is the one that costs bandwidth and disk, and so
-    /// belongs behind whatever admission control the caller applies.
-    /// Separating them is the whole reason answering a quote can stop
-    /// being a way to make a stranger's node download an arbitrary
-    /// repository.
+    /// Unlike [`Self::have`], this operation may cost bandwidth and disk.
+    /// The caller decides when that remote work is permitted.
     ///
     /// `fetch` is handed the chunk list when we already hold one, so a
     /// partial response can be checked chunk by chunk rather than only

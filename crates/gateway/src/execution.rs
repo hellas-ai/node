@@ -8,7 +8,7 @@
 //! resource, which (for local executions) drops the per-execution
 //! `mpsc::Receiver` the worker pushes chunks into. The worker observes
 //! the closed channel on its next chunk send and converts it into a
-//! cancel that the runner sees between decode steps.
+//! cancel that the runner sees between generation steps.
 //!
 //! ```text
 //! ExecutionRequest::stream  →  PreparedExecution::stream
@@ -21,7 +21,7 @@
 //!
 //! Remote bootstrap, discovery, quote retries, ticket signing, and signed
 //! chunk verification live in `hellas-client`; this module retains local
-//! executor dispatch plus model and gateway response shaping.
+//! executor dispatch plus package-execution and gateway response shaping.
 
 use async_stream::try_stream;
 use futures::StreamExt;
@@ -37,11 +37,12 @@ use hellas_client::{
 };
 #[cfg(feature = "evaluate")]
 use hellas_executor::ExecutorHandle;
-use hellas_models::{ModelAssets, PreparedPrompt};
 use hellas_rpc::Digest;
+use hellas_rpc::ExecutionPackageId;
 use hellas_rpc::InputCommitment;
 use hellas_rpc::OutputEventEnvelope;
 use hellas_rpc::ProducerSigningKey;
+use hellas_rpc::PublicKey;
 use hellas_rpc::Retention;
 use hellas_rpc::evaluate::EvaluateStopReason;
 use hellas_rpc::pb::courtesy::{
@@ -49,6 +50,7 @@ use hellas_rpc::pb::courtesy::{
 };
 use hellas_rpc::pb::execute::Ticket;
 use hellas_rpc::pb::execute::WorkEvent;
+use hellas_rpc::protocol::artifacts::TextExecutionId;
 use hellas_rpc::provenance::ExecutionProvenance;
 use hellas_rpc::services::execute::ExecuteClientImpl;
 use hellas_wire::WireStatus;
@@ -122,20 +124,9 @@ pub enum Outcome {
     },
 }
 
-impl Outcome {
-    /// Cumulative token count at the moment the run terminated.
-    /// Authoritative for usage frames on both Completed and Failed.
-    pub fn position(&self) -> u64 {
-        match self {
-            Self::Completed { total_tokens, .. } => *total_tokens,
-            Self::Failed { position, .. } => *position,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopReason {
-    EndOfSequence,
+    StopToken,
     MaxNewTokens,
 }
 
@@ -177,32 +168,77 @@ pub struct ExecutionRequest {
 
 #[derive(Debug, Clone, Copy)]
 pub struct ExecutionRequestOptions {
-    pub max_seq: u32,
+    pub max_new_tokens: u32,
+    pub execution_package: ExecutionPackageId,
     pub assurance: hellas_rpc::Assurance,
     pub retention: Retention,
+}
+
+#[derive(Clone)]
+struct ExpectedTextArtifact {
+    execution: TextExecutionId,
+    input_ids: Vec<u32>,
+    has_stop_tokens: bool,
+}
+
+fn expected_text_artifact(
+    quote_req: &QuoteTokensRequest,
+    execution: TextExecutionId,
+) -> ExecutionResult<ExpectedTextArtifact> {
+    match quote_req
+        .start
+        .as_ref()
+        .and_then(|start| start.kind.as_ref())
+    {
+        Some(evaluate_start::Kind::Genesis(_)) => Ok(ExpectedTextArtifact {
+            execution,
+            input_ids: quote_req.prompt_token_ids.clone(),
+            has_stop_tokens: !quote_req.stop_token_ids.is_empty(),
+        }),
+        Some(evaluate_start::Kind::Artifact(_)) => Err(ExecutionError::protocol(
+            "artifact-start evaluate requires verified prior state tokens and is not exposed by this client",
+        )),
+        None => Err(ExecutionError::protocol(
+            "evaluate request is missing its start state",
+        )),
+    }
 }
 
 impl ExecutionRequest {
     pub fn new(
         runtime: CliRuntime,
-        assets: Arc<ModelAssets>,
-        prepared_prompt: PreparedPrompt,
+        package: String,
+        prompt_token_ids: Vec<u32>,
+        stop_token_ids: Vec<u32>,
         options: ExecutionRequestOptions,
         strategy: ExecutionStrategy,
         runner_key: ProducerSigningKey,
     ) -> ExecutionResult<Self> {
-        let quote = assets.prepare_quote(&prepared_prompt);
-        let revision = quote.huggingface_revision.trim();
-        let package = if revision.is_empty() {
-            quote.huggingface_model_id.clone()
-        } else {
-            format!("{}@{revision}", quote.huggingface_model_id)
-        };
+        if prompt_token_ids.is_empty() {
+            return Err(ExecutionError::protocol(
+                "prompt token IDs must not be empty",
+            ));
+        }
+        if stop_token_ids.len() > hellas_rpc::MAX_STOP_TOKEN_IDS {
+            return Err(ExecutionError::protocol(format!(
+                "stop token list has {} entries, over the limit of {}",
+                stop_token_ids.len(),
+                hellas_rpc::MAX_STOP_TOKEN_IDS
+            )));
+        }
+        if options.max_new_tokens == 0 {
+            return Err(ExecutionError::protocol(
+                "maximum new tokens must be greater than zero",
+            ));
+        }
+        let mut stop_token_ids = stop_token_ids;
+        hellas_rpc::normalize_stop_token_ids(&mut stop_token_ids);
         let quote_req = QuoteTokensRequest {
             package,
-            prompt_token_ids: quote.prompt_token_ids,
-            max_new_tokens: options.max_seq,
-            stop_token_ids: quote.stop_token_ids,
+            execution_package: options.execution_package.as_bytes().to_vec(),
+            prompt_token_ids,
+            max_new_tokens: Some(options.max_new_tokens),
+            stop_token_ids,
             start: Some(EvaluateStart {
                 kind: Some(evaluate_start::Kind::Genesis(EvaluateGenesisStart {})),
             }),
@@ -219,7 +255,6 @@ impl ExecutionRequest {
     }
 
     /// True if any leg of this strategy talks to a remote executor.
-    #[cfg(feature = "evaluate")]
     pub fn uses_remote_transport(&self) -> bool {
         #[cfg(feature = "evaluate")]
         let is_remote = |r: &ExecutionRoute| !matches!(r, ExecutionRoute::Local);
@@ -276,7 +311,6 @@ impl ExecutionRequest {
     /// Owning consumption: dropping the returned stream cancels everything
     /// downstream (broadcast subscribers, wire streams, the executor's
     /// per-running cancel token).
-    #[cfg(feature = "evaluate")]
     pub fn stream(self) -> impl Stream<Item = ExecutionResult<ExecutionEvent>> + Send {
         try_stream! {
             let prepared = self.prepare().await?;
@@ -306,21 +340,37 @@ impl PreparedExecution {
         self.primary.provenance()
     }
 
-    /// Stream primary's events live. If a shadow is configured, run it
-    /// after primary completes and only emit primary's `Done` once the two
-    /// terminal artifact commitments agree. Mismatch is reported as a `Done(Failed)` so the
-    /// terminal frame is honest about the disagreement.
-    pub fn stream(self) -> impl Stream<Item = ExecutionResult<ExecutionEvent>> + Send {
+    /// Stream a primary live only when no shadow is configured. With a shadow,
+    /// withhold every primary chunk until its terminal artifact matches; a
+    /// mismatch exposes only `Done(Failed)`, never unverified text.
+    pub fn stream(self) -> BoxStream<'static, ExecutionResult<ExecutionEvent>> {
         let Self { primary, shadow } = self;
-        try_stream! {
-            let mut primary_done: Option<Outcome> = None;
-            {
-                let primary = primary.stream();
-                tokio::pin!(primary);
+        reconcile_execution_streams(primary.stream(), shadow.map(PreparedRoute::stream))
+    }
+}
+
+fn reconcile_execution_streams(
+    primary: BoxStream<'static, ExecutionResult<ExecutionEvent>>,
+    shadow: Option<BoxStream<'static, ExecutionResult<ExecutionEvent>>>,
+) -> BoxStream<'static, ExecutionResult<ExecutionEvent>> {
+    Box::pin(try_stream! {
+        match shadow {
+            None => {
+                let mut primary = primary;
+                while let Some(event) = primary.next().await {
+                    yield event?;
+                }
+            }
+            Some(shadow) => {
+                let mut buffered = Vec::new();
+                let mut primary_token_bytes = Vec::new();
+                let mut primary = primary;
+                let mut primary_done: Option<Outcome> = None;
                 while let Some(event) = primary.next().await {
                     match event? {
                         ExecutionEvent::Chunk { position, tokens } => {
-                            yield ExecutionEvent::Chunk { position, tokens };
+                            primary_token_bytes.extend_from_slice(&tokens);
+                            buffered.push(ExecutionEvent::Chunk { position, tokens });
                         }
                         ExecutionEvent::Done(outcome) => {
                             primary_done = Some(outcome);
@@ -328,62 +378,104 @@ impl PreparedExecution {
                         }
                     }
                 }
-            }
-            let primary_outcome = primary_done
-                .ok_or_else(|| ExecutionError::protocol("primary stream ended without terminal outcome"))?;
+                let primary_outcome = primary_done
+                    .ok_or_else(|| ExecutionError::protocol("primary stream ended without terminal outcome"))?;
 
-            let final_outcome = match shadow {
-                None => primary_outcome,
-                Some(shadow_route) => verify_shadow(primary_outcome, shadow_route).await?,
-            };
-            yield ExecutionEvent::Done(final_outcome);
+                let final_outcome =
+                    verify_shadow(primary_outcome, primary_token_bytes, shadow).await?;
+                if matches!(final_outcome, Outcome::Completed { .. }) {
+                    for event in buffered {
+                        yield event;
+                    }
+                }
+                yield ExecutionEvent::Done(final_outcome);
+            }
         }
-    }
+    })
 }
 
-/// Run the shadow stream to completion (discarding its chunks), extract
-/// its terminal outcome, and return the reconciled outcome.
-async fn verify_shadow(primary: Outcome, shadow: PreparedRoute) -> ExecutionResult<Outcome> {
-    let primary_digest = match &primary {
-        Outcome::Completed { text_artifact, .. } => *text_artifact,
+/// Run the shadow stream to completion, compare its verified token sequence
+/// and terminal artifact with the primary, and return the reconciled outcome.
+async fn verify_shadow(
+    primary: Outcome,
+    primary_token_bytes: Vec<u8>,
+    shadow: BoxStream<'static, ExecutionResult<ExecutionEvent>>,
+) -> ExecutionResult<Outcome> {
+    let (primary_digest, primary_stop_reason, primary_total_tokens) = match &primary {
+        Outcome::Completed {
+            text_artifact,
+            stop_reason,
+            total_tokens,
+            ..
+        } => (*text_artifact, *stop_reason, *total_tokens),
         Outcome::Failed { .. } => return Ok(primary),
     };
+    let primary_output_tokens = token_count(&primary_token_bytes)?;
 
-    let shadow_outcome = drain_to_outcome(shadow.stream()).await?;
+    let (shadow_token_bytes, shadow_outcome) = drain_to_outcome(shadow).await?;
     match shadow_outcome {
         Outcome::Completed {
             text_artifact: shadow_digest,
+            stop_reason: shadow_stop_reason,
+            total_tokens: shadow_total_tokens,
             ..
         } => {
-            if primary_digest == shadow_digest {
-                Ok(primary)
-            } else {
+            if primary_token_bytes != shadow_token_bytes {
                 Ok(Outcome::Failed {
-                    position: primary.position(),
+                    position: primary_output_tokens,
+                    error: "verify mismatch: primary and shadow emitted different token sequences"
+                        .to_string(),
+                })
+            } else if primary_digest != shadow_digest {
+                Ok(Outcome::Failed {
+                    position: primary_output_tokens,
                     error: format!(
                         "verify mismatch: primary evaluate artifact {primary_digest} != shadow evaluate artifact {shadow_digest}"
                     ),
                 })
+            } else if primary_stop_reason != shadow_stop_reason
+                || primary_total_tokens != shadow_total_tokens
+            {
+                Ok(Outcome::Failed {
+                    position: primary_output_tokens,
+                    error: "verify mismatch: primary and shadow terminal semantics differ"
+                        .to_string(),
+                })
+            } else {
+                Ok(primary)
             }
         }
         Outcome::Failed {
             error: shadow_error,
             ..
         } => Ok(Outcome::Failed {
-            position: primary.position(),
+            position: primary_output_tokens,
             error: format!("shadow verification failed: {shadow_error}"),
         }),
     }
 }
 
-/// Consume a stream to its terminal `Done`, discarding chunks.
+fn token_count(bytes: &[u8]) -> ExecutionResult<u64> {
+    if !bytes.len().is_multiple_of(std::mem::size_of::<u32>()) {
+        return Err(ExecutionError::protocol(
+            "execution stream carried malformed token bytes",
+        ));
+    }
+    u64::try_from(bytes.len() / std::mem::size_of::<u32>())
+        .map_err(|_| ExecutionError::protocol("execution token count exceeds u64 range"))
+}
+
+/// Consume a stream to its terminal `Done`, retaining its canonical token
+/// sequence independently of chunk boundaries.
 async fn drain_to_outcome(
     stream: impl Stream<Item = ExecutionResult<ExecutionEvent>>,
-) -> ExecutionResult<Outcome> {
+) -> ExecutionResult<(Vec<u8>, Outcome)> {
     tokio::pin!(stream);
+    let mut token_bytes = Vec::new();
     while let Some(event) = stream.next().await {
-        if let ExecutionEvent::Done(outcome) = event? {
-            return Ok(outcome);
+        match event? {
+            ExecutionEvent::Chunk { tokens, .. } => token_bytes.extend_from_slice(&tokens),
+            ExecutionEvent::Done(outcome) => return Ok((token_bytes, outcome)),
         }
     }
     Err(ExecutionError::protocol(
@@ -403,12 +495,18 @@ enum PreparedRoute {
         ticket: Ticket,
         provenance: ExecutionProvenance,
         runner_key: Arc<ProducerSigningKey>,
+        producer_key: PublicKey,
+        max_new_tokens: u32,
+        expected_text_artifact: ExpectedTextArtifact,
     },
     RemoteDirect {
         transport: IrohTransport,
         ticket: Ticket,
         provenance: ExecutionProvenance,
         runner_key: Arc<ProducerSigningKey>,
+        producer_key: PublicKey,
+        max_new_tokens: u32,
+        expected_text_artifact: ExpectedTextArtifact,
     },
 }
 
@@ -437,45 +535,37 @@ impl PreparedRoute {
                 #[cfg(feature = "evaluate")]
                 {
                     let handle = require_local_executor(runtime)?;
-                    handle
-                        .materialize_model(quote_req.package.clone())
-                        .await
-                        .exec_context("failed to load local model metadata")?;
                     let outcome = handle
                         .quote_tokens(quote_req.clone())
                         .await
                         .exec_context("local quote_tokens failed")?;
-                    let ticket = outcome.response.ticket.clone().ok_or_else(|| {
-                        ExecutionError::protocol("local quote_tokens response missing ticket")
-                    })?;
-                    let evaluate_response =
-                        outcome.response.evaluate_request.as_ref().ok_or_else(|| {
-                            ExecutionError::protocol(
-                                "local quote_tokens response missing evaluate_request",
-                            )
-                        })?;
-                    if evaluate_response.assurance != quote_req.assurance {
-                        return Err(ExecutionError::protocol(
-                            "evaluate response assurance does not match request",
-                        ));
-                    }
-                    if evaluate_response.retain.unwrap_or(true) != quote_req.retain.unwrap_or(true)
-                    {
-                        return Err(ExecutionError::protocol(
-                            "evaluate response retention does not match request",
-                        ));
-                    }
-                    validate_evaluate_ticket(&ticket, quote_req.assurance)?;
+                    let provenance = outcome.provenance.clone();
+                    let validated = hellas_client::iroh::validate_evaluate_quote_response(
+                        quote_req,
+                        outcome.response,
+                        None,
+                    )?;
+                    let provenance = hellas_client::iroh::validate_evaluate_quote_provenance(
+                        &validated.ticket,
+                        provenance,
+                    )?;
+                    let expected_text_artifact =
+                        expected_text_artifact(quote_req, validated.text_execution)?;
                     Ok(Self::Local {
                         handle,
-                        ticket,
-                        provenance: outcome.provenance,
+                        ticket: validated.ticket,
+                        provenance,
                         runner_key,
+                        producer_key: validated.producer_key,
+                        max_new_tokens: quote_req
+                            .max_new_tokens
+                            .unwrap_or(hellas_rpc::DEFAULT_MAX_NEW_TOKENS),
+                        expected_text_artifact,
                     })
                 }
             }
             ExecutionRoute::RemoteDirect(target) => {
-                let (ticket, provenance) =
+                let (ticket, provenance, producer_key, text_execution) =
                     hellas_client::iroh::quote_tokens(runtime, target, quote_req).await?;
                 validate_evaluate_ticket(&ticket, quote_req.assurance)?;
                 let execute_transport =
@@ -485,19 +575,25 @@ impl PreparedRoute {
                     ticket,
                     provenance,
                     runner_key,
+                    producer_key,
+                    max_new_tokens: quote_req
+                        .max_new_tokens
+                        .unwrap_or(hellas_rpc::DEFAULT_MAX_NEW_TOKENS),
+                    expected_text_artifact: expected_text_artifact(quote_req, text_execution)?,
                 })
             }
             ExecutionRoute::RemoteDiscovery {
                 retries,
                 provider_trust,
             } => {
-                let (target, ticket, provenance) = hellas_client::iroh::discover_and_quote(
-                    runtime.remote_registry()?,
-                    quote_req,
-                    *retries,
-                    provider_trust,
-                )
-                .await?;
+                let (target, ticket, provenance, producer_key, text_execution) =
+                    hellas_client::iroh::discover_and_quote(
+                        runtime.remote_registry()?,
+                        quote_req,
+                        *retries,
+                        provider_trust,
+                    )
+                    .await?;
                 validate_evaluate_ticket(&ticket, quote_req.assurance)?;
                 let execute_transport =
                     hellas_client::iroh::execute_transport(runtime, &target).await?;
@@ -506,6 +602,11 @@ impl PreparedRoute {
                     ticket,
                     provenance,
                     runner_key,
+                    producer_key,
+                    max_new_tokens: quote_req
+                        .max_new_tokens
+                        .unwrap_or(hellas_rpc::DEFAULT_MAX_NEW_TOKENS),
+                    expected_text_artifact: expected_text_artifact(quote_req, text_execution)?,
                 })
             }
         }
@@ -519,13 +620,35 @@ impl PreparedRoute {
                 ticket,
                 provenance: _,
                 runner_key,
-            } => local_execute_stream(handle, ticket, runner_key).boxed(),
+                producer_key,
+                max_new_tokens,
+                expected_text_artifact,
+            } => local_execute_stream(
+                handle,
+                ticket,
+                runner_key,
+                producer_key,
+                max_new_tokens,
+                expected_text_artifact,
+            )
+            .boxed(),
             PreparedRoute::RemoteDirect {
                 transport,
                 ticket,
                 provenance: _,
                 runner_key,
-            } => remote_execute_stream(transport, ticket, runner_key).boxed(),
+                producer_key,
+                max_new_tokens,
+                expected_text_artifact,
+            } => remote_execute_stream(
+                transport,
+                ticket,
+                runner_key,
+                producer_key,
+                max_new_tokens,
+                expected_text_artifact,
+            )
+            .boxed(),
         }
     }
 }
@@ -539,6 +662,9 @@ fn local_execute_stream(
     handle: ExecutorHandle,
     ticket: Ticket,
     runner_key: Arc<ProducerSigningKey>,
+    producer_key: PublicKey,
+    max_new_tokens: u32,
+    expected_text_artifact: ExpectedTextArtifact,
 ) -> impl Stream<Item = ExecutionResult<ExecutionEvent>> + Send {
     try_stream! {
         let request_commitment = ticket.request_commitment.clone();
@@ -550,24 +676,38 @@ fn local_execute_stream(
             .exec_context("failed to start local execution stream")?;
         let _provenance = outcome.provenance; // already surfaced from PreparedRoute::Local
         let mut events = ReceiverStream::new(outcome.events);
-        let mut got_terminal = false;
+        let mut terminal = None;
         let input_commitment =
             hellas_client::evaluate_input_from_request_commitment(&request_commitment)?;
-        let mut verifier = EvaluateChunkVerifier::new(input_commitment, assurance);
+        let mut verifier = EvaluateChunkVerifier::new(
+            input_commitment,
+            assurance,
+            producer_key,
+            max_new_tokens,
+        )
+        .with_text_artifact_expectation(
+            expected_text_artifact.execution,
+            expected_text_artifact.input_ids,
+            expected_text_artifact.has_stop_tokens,
+        );
         while let Some(item) = events.next().await {
             let wire = item
                 .map_err(|status: WireStatus| ExecutionError::wire("local execution stream failed", status))?;
             let event = convert_wire_event(wire, input_commitment, &mut verifier)?;
-            let is_done = matches!(event, ExecutionEvent::Done(_));
-            yield event;
-            if is_done {
-                got_terminal = true;
-                break;
+            match event {
+                ExecutionEvent::Chunk { position, tokens } => {
+                    yield ExecutionEvent::Chunk { position, tokens };
+                }
+                ExecutionEvent::Done(outcome) => {
+                    terminal = Some(outcome);
+                    break;
+                }
             }
         }
-        if !got_terminal {
-            Err(ExecutionError::protocol("local execution stream ended without terminal outcome"))?;
-        }
+        let terminal = terminal.ok_or_else(|| {
+            ExecutionError::protocol("local execution stream ended without terminal outcome")
+        })?;
+        yield ExecutionEvent::Done(terminal);
         // Keep the handle alive for the lifetime of the stream so the
         // worker's per-execution sender doesn't trip the channel-closed
         // cancel path before the terminal event flushes.
@@ -583,6 +723,9 @@ fn remote_execute_stream(
     transport: IrohTransport,
     ticket: Ticket,
     runner_key: Arc<ProducerSigningKey>,
+    producer_key: PublicKey,
+    max_new_tokens: u32,
+    expected_text_artifact: ExpectedTextArtifact,
 ) -> impl Stream<Item = ExecutionResult<ExecutionEvent>> + Send {
     try_stream! {
         let client = ExecuteClientImpl::new(transport);
@@ -593,21 +736,38 @@ fn remote_execute_stream(
             .run_ticket(run_ticket)
             .await
             .map_err(|status| ExecutionError::wire("failed to start remote execute stream", status))?;
-        let mut got_terminal = false;
+        let mut terminal = None;
         let input_commitment =
             hellas_client::evaluate_input_from_request_commitment(&request_commitment)?;
-        let mut verifier = EvaluateChunkVerifier::new(input_commitment, assurance);
+        let mut verifier = EvaluateChunkVerifier::new(
+            input_commitment,
+            assurance,
+            producer_key,
+            max_new_tokens,
+        )
+        .with_text_artifact_expectation(
+            expected_text_artifact.execution,
+            expected_text_artifact.input_ids,
+            expected_text_artifact.has_stop_tokens,
+        );
         while let Some(item) = wire.next().await {
+            if terminal.is_some() {
+                Err(ExecutionError::protocol(
+                    "remote execute stream emitted an event after its terminal outcome"
+                ))?;
+            }
             let event = convert_wire_event(
                 item.map_err(|status: WireStatus| ExecutionError::wire("remote execute stream failed", status))?,
                 input_commitment,
                 &mut verifier,
             )?;
-            let is_done = matches!(event, ExecutionEvent::Done(_));
-            yield event;
-            if is_done {
-                got_terminal = true;
-                break;
+            match event {
+                ExecutionEvent::Chunk { position, tokens } => {
+                    yield ExecutionEvent::Chunk { position, tokens };
+                }
+                ExecutionEvent::Done(outcome) => {
+                    terminal = Some(outcome);
+                }
             }
         }
         // Stream EOF: surface the terminal trailer. A non-Ok trailer
@@ -615,9 +775,10 @@ fn remote_execute_stream(
         // becomes the call's error.
         wire.finish()
             .map_err(|status| ExecutionError::wire("remote execute stream trailer", status))?;
-        if !got_terminal {
-            Err(ExecutionError::protocol("remote execute stream ended Ok but emitted no Done event"))?;
-        }
+        let terminal = terminal.ok_or_else(|| {
+            ExecutionError::protocol("remote execute stream ended Ok but emitted no Done event")
+        })?;
+        yield ExecutionEvent::Done(terminal);
         drop(client);
     }
 }
@@ -652,11 +813,181 @@ fn convert_wire_event(
 
 fn stop_reason_from_evaluate(value: EvaluateStopReason) -> ExecutionResult<StopReason> {
     match value.as_u8() {
-        1 => Ok(StopReason::EndOfSequence),
+        1 => Ok(StopReason::StopToken),
         2 => Ok(StopReason::MaxNewTokens),
         other => Err(ExecutionError::EvaluateTranscript {
             source: hellas_rpc::evaluate::EvaluateProtocolError::UnknownStopReason(other),
         }),
+    }
+}
+
+#[cfg(test)]
+mod request_tests {
+    use super::*;
+    use futures::stream;
+
+    fn completed(artifact: u8) -> Outcome {
+        Outcome::Completed {
+            total_tokens: 2,
+            stop_reason: StopReason::MaxNewTokens,
+            text_artifact: Digest::from_bytes([artifact; 32]),
+            output_events: Vec::new(),
+        }
+    }
+
+    fn event_stream(
+        events: Vec<ExecutionEvent>,
+    ) -> BoxStream<'static, ExecutionResult<ExecutionEvent>> {
+        Box::pin(stream::iter(events.into_iter().map(Ok)))
+    }
+
+    #[test]
+    fn explicit_zero_output_limit_is_rejected() {
+        let result = ExecutionRequest::new(
+            CliRuntime::default(),
+            "package".to_string(),
+            vec![1],
+            Vec::new(),
+            ExecutionRequestOptions {
+                max_new_tokens: 0,
+                execution_package: ExecutionPackageId::from_bytes([1; 32]),
+                assurance: hellas_rpc::Assurance::ProducerSigned,
+                retention: Retention::Retain,
+            },
+            ExecutionStrategy::Run(ExecutionRoute::Local),
+            ProducerSigningKey::from_secret_bytes([2; 32]).expect("valid test key"),
+        );
+        let error = match result {
+            Ok(_) => panic!("an explicit zero output limit must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("greater than zero"));
+    }
+
+    #[tokio::test]
+    async fn verification_mismatch_exposes_no_primary_chunks() {
+        let tokens = hellas_rpc::encode_token_ids(&[42]);
+        let primary = event_stream(vec![
+            ExecutionEvent::Chunk {
+                position: 1,
+                tokens: tokens.clone(),
+            },
+            ExecutionEvent::Done(completed(1)),
+        ]);
+        let shadow = event_stream(vec![
+            ExecutionEvent::Chunk {
+                position: 1,
+                tokens,
+            },
+            ExecutionEvent::Done(completed(2)),
+        ]);
+
+        let output = reconcile_execution_streams(primary, Some(shadow))
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(output.len(), 1);
+        assert!(matches!(
+            &output[0],
+            Ok(ExecutionEvent::Done(Outcome::Failed { error, .. }))
+                if error.contains("verify mismatch")
+        ));
+    }
+
+    #[tokio::test]
+    async fn verified_primary_chunks_are_released_after_matching_shadow() {
+        let tokens = hellas_rpc::encode_token_ids(&[42]);
+        let primary = event_stream(vec![
+            ExecutionEvent::Chunk {
+                position: 1,
+                tokens: tokens.clone(),
+            },
+            ExecutionEvent::Done(completed(1)),
+        ]);
+        let shadow = event_stream(vec![
+            ExecutionEvent::Chunk {
+                position: 1,
+                tokens: tokens.clone(),
+            },
+            ExecutionEvent::Done(completed(1)),
+        ]);
+
+        let output = reconcile_execution_streams(primary, Some(shadow))
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(output.len(), 2);
+        assert!(matches!(
+            &output[0],
+            Ok(ExecutionEvent::Chunk { position: 1, tokens: actual }) if actual == &tokens
+        ));
+        assert!(matches!(
+            &output[1],
+            Ok(ExecutionEvent::Done(Outcome::Completed { text_artifact, .. }))
+                if *text_artifact == Digest::from_bytes([1; 32])
+        ));
+    }
+
+    #[tokio::test]
+    async fn matching_artifact_claim_cannot_hide_different_shadow_tokens() {
+        let primary = event_stream(vec![
+            ExecutionEvent::Chunk {
+                position: 1,
+                tokens: hellas_rpc::encode_token_ids(&[42]),
+            },
+            ExecutionEvent::Done(completed(1)),
+        ]);
+        let shadow = event_stream(vec![
+            ExecutionEvent::Chunk {
+                position: 1,
+                tokens: hellas_rpc::encode_token_ids(&[43]),
+            },
+            ExecutionEvent::Done(completed(1)),
+        ]);
+
+        let output = reconcile_execution_streams(primary, Some(shadow))
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(output.len(), 1);
+        assert!(matches!(
+            &output[0],
+            Ok(ExecutionEvent::Done(Outcome::Failed { error, .. }))
+                if error.contains("different token sequences")
+        ));
+    }
+
+    #[tokio::test]
+    async fn verification_ignores_honest_chunk_boundaries() {
+        let primary_tokens = hellas_rpc::encode_token_ids(&[1, 2]);
+        let primary = event_stream(vec![
+            ExecutionEvent::Chunk {
+                position: 2,
+                tokens: primary_tokens.clone(),
+            },
+            ExecutionEvent::Done(completed(1)),
+        ]);
+        let shadow = event_stream(vec![
+            ExecutionEvent::Chunk {
+                position: 1,
+                tokens: hellas_rpc::encode_token_ids(&[1]),
+            },
+            ExecutionEvent::Chunk {
+                position: 2,
+                tokens: hellas_rpc::encode_token_ids(&[2]),
+            },
+            ExecutionEvent::Done(completed(1)),
+        ]);
+
+        let output = reconcile_execution_streams(primary, Some(shadow))
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(output.len(), 2);
+        assert!(matches!(
+            &output[0],
+            Ok(ExecutionEvent::Chunk { position: 2, tokens }) if tokens == &primary_tokens
+        ));
+        assert!(matches!(
+            &output[1],
+            Ok(ExecutionEvent::Done(Outcome::Completed { .. }))
+        ));
     }
 }
 
@@ -695,7 +1026,8 @@ mod tests {
         let mut builder = EvaluateOutputTranscriptBuilder::new(input, request.assurance, &producer);
         let token_event = builder.push_token_delta(vec![10, 11]).unwrap();
 
-        let mut verifier = EvaluateChunkVerifier::new(input, request.assurance);
+        let mut verifier =
+            EvaluateChunkVerifier::new(input, request.assurance, producer.public_key(), 2);
         let event = WorkEvent {
             kind: Some(work_event::Kind::Chunk(WorkChunk {
                 output_event: Some(output_event_to_pb(&token_event)),
@@ -723,7 +1055,7 @@ mod tests {
         let output_events = builder
             .finish(EvaluateTerminal {
                 final_position: 2,
-                stop_reason: EvaluateStopReason::END_OF_SEQUENCE,
+                stop_reason: EvaluateStopReason::STOP_TOKEN,
                 text_artifact: Digest::from_bytes([4; 32]),
                 usage: EvaluateUsage {
                     input_units: 3,
@@ -732,7 +1064,8 @@ mod tests {
                 billable_units: 5,
             })
             .unwrap();
-        let mut verifier = EvaluateChunkVerifier::new(input, request.assurance);
+        let mut verifier =
+            EvaluateChunkVerifier::new(input, request.assurance, producer.public_key(), 2);
         let chunk = WorkEvent {
             kind: Some(work_event::Kind::Chunk(WorkChunk {
                 output_event: Some(output_event_to_pb(&token_event)),
@@ -752,7 +1085,7 @@ mod tests {
             decoded,
             ExecutionEvent::Done(Outcome::Completed {
                 total_tokens: 5,
-                stop_reason: StopReason::EndOfSequence,
+                stop_reason: StopReason::StopToken,
                 ..
             })
         ));

@@ -168,8 +168,19 @@ impl<'a> CanonicalDecoder<'a> {
     }
 
     pub fn array_len(&mut self) -> Result<usize, CanonicalDecodeError> {
-        usize::try_from(self.read_len(4)?)
-            .map_err(|_| CanonicalDecodeError::new("array length exceeds usize range"))
+        let len = usize::try_from(self.read_len(4)?)
+            .map_err(|_| CanonicalDecodeError::new("array length exceeds usize range"))?;
+        let remaining = self.bytes.len().saturating_sub(self.offset);
+        // Every definite-length CBOR array element occupies at least one
+        // byte. Reject impossible lengths before callers reserve a vector;
+        // otherwise a tiny hostile artifact can trigger a capacity panic or
+        // an enormous allocation before decoding reaches EOF.
+        if len > remaining {
+            return Err(CanonicalDecodeError::new(format!(
+                "array declares {len} elements but only {remaining} encoded bytes remain"
+            )));
+        }
+        Ok(len)
     }
 
     pub fn bytes_32(&mut self) -> Result<[u8; 32], CanonicalDecodeError> {

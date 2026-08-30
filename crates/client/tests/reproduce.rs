@@ -30,7 +30,7 @@ use hellas_rpc::protocol::work::{
     propose_authorization, terminal_result, work_id,
 };
 use hellas_rpc::{
-    Assurance, ContentId, Digest, EvaluateProgramManifest, EvaluateRequest, ExecutionPackageId,
+    Assurance, Digest, EvaluateProgramManifest, EvaluateRequest, ExecutionPackageId,
     OutputEventEnvelope, ProducerSigningKey, ProgramManifest, PublicKey,
 };
 
@@ -242,7 +242,7 @@ fn honest_result(answer: &[u32]) -> PaidJobResultV1 {
     .digest();
     let transcript: Vec<OutputEventEnvelope> = match builder.finish(EvaluateTerminal {
         final_position: answer.len() as u64,
-        stop_reason: EvaluateStopReason::END_OF_SEQUENCE,
+        stop_reason: EvaluateStopReason::STOP_TOKEN,
         text_artifact,
         usage,
         billable_units,
@@ -277,7 +277,7 @@ impl FixedEngine {
     }
 
     fn honest() -> Self {
-        Self::answering(&ANSWER, EvaluateStopReason::END_OF_SEQUENCE)
+        Self::answering(&ANSWER, EvaluateStopReason::STOP_TOKEN)
     }
 
     fn failing(reason: &str) -> Self {
@@ -426,7 +426,7 @@ async fn one_token_other_is_a_different_answer() {
     // The control: an engine that agrees with the altered answer matches
     // it. The re-execution compares two computations; it does not know
     // which is right.
-    let agreeing = FixedEngine::answering(&altered, EvaluateStopReason::END_OF_SEQUENCE);
+    let agreeing = FixedEngine::answering(&altered, EvaluateStopReason::STOP_TOKEN);
     assert_eq!(
         check(&agreeing, &dishonest).await,
         Ok(Reproduction::Matched)

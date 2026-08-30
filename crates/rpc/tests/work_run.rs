@@ -21,6 +21,7 @@ use hellas_rpc::evaluate::{
     EvaluateOutputTranscriptBuilder, EvaluateStopReason, EvaluateTerminal, EvaluateUsage,
     input_commitment,
 };
+use hellas_rpc::protocol::Digest;
 use hellas_rpc::protocol::artifacts::{
     BoundTermId, Canonical as _, InputAddressed as _, OutputAddressed as _, PreparedPaidInputV1,
     SourceRef, TextArtifact, TextExecution, TextPolicy, TokenIds,
@@ -35,7 +36,6 @@ use hellas_rpc::protocol::work_setup::{
     ObservedChannel, OmissionMeasurements, ReadyChannel, WorkChannelConfig, WorkChannelDescriptor,
     WorkSetupError, payment_terms_hash,
 };
-use hellas_rpc::protocol::Digest;
 use hellas_rpc::work::{
     BackendFault, PaidEvaluateBackend, ProviderEndpoint, RunAdmission, RunError, RunOutcome,
     WorkService, run_accepted_work,
@@ -471,7 +471,7 @@ fn transcript_for(
     };
     let terminal = EvaluateTerminal {
         final_position: generated.len() as u64,
-        stop_reason: EvaluateStopReason::END_OF_SEQUENCE,
+        stop_reason: EvaluateStopReason::STOP_TOKEN,
         text_artifact: Digest::from_bytes([0x77; 32]),
         usage,
         billable_units,
@@ -615,7 +615,7 @@ fn a_result_is_derived_from_the_transcript_that_produced_it() {
     // the tokens the fixture generated rather than from the result.
     let terminal = EvaluateTerminal {
         final_position: ANSWER.len() as u64,
-        stop_reason: EvaluateStopReason::END_OF_SEQUENCE,
+        stop_reason: EvaluateStopReason::STOP_TOKEN,
         text_artifact: Digest::from_bytes([0x77; 32]),
         usage: EvaluateUsage {
             input_units: PROMPT_TOKENS,

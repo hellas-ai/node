@@ -3,11 +3,12 @@ mod handle;
 
 use crate::ExecutorError;
 #[cfg(feature = "evaluate")]
-use hellas_rpc::Dtype;
+use crate::PackageSource;
+#[cfg(feature = "evaluate")]
+use hellas_rpc::ExecutionPackageId;
 use hellas_rpc::pb::courtesy::{
     GetArtifactRequest, GetArtifactResponse, GetPackageStatsRequest, GetPackageStatsResponse,
-    GetStatsResponse, ListPackagesResponse, PutArtifactRequest, PutArtifactResponse,
-    QuoteChatPromptRequest, QuotePromptRequest, QuoteResponse, QuoteTokensRequest,
+    GetStatsResponse, ListPackagesResponse, QuoteResponse, QuoteTokensRequest,
 };
 use hellas_rpc::pb::evaluate::EvaluateRequest as PbEvaluateRequest;
 use hellas_rpc::pb::execute::{RunTicketRequest, Ticket, WorkEvent};
@@ -64,29 +65,23 @@ pub(crate) enum ExecutorMessage {
         request: PbFetchRequest,
         reply: oneshot::Sender<Result<TicketOutcome<Ticket>, ExecutorError>>,
     },
-    QuotePrompt {
-        request: QuotePromptRequest,
-        reply: oneshot::Sender<Result<TicketOutcome<QuoteResponse>, ExecutorError>>,
-    },
     QuoteTokens {
         request: QuoteTokensRequest,
         reply: oneshot::Sender<Result<TicketOutcome<QuoteResponse>, ExecutorError>>,
     },
-    QuoteChatPrompt {
-        request: QuoteChatPromptRequest,
-        reply: oneshot::Sender<Result<TicketOutcome<QuoteResponse>, ExecutorError>>,
-    },
-    PutArtifact {
-        request: PutArtifactRequest,
-        reply: oneshot::Sender<Result<PutArtifactResponse, ExecutorError>>,
+    #[cfg(feature = "evaluate")]
+    PublishCanonicalArtifact {
+        canonical_artifact: Vec<u8>,
+        reply: oneshot::Sender<Result<hellas_rpc::Digest, ExecutorError>>,
     },
     GetArtifact {
         request: GetArtifactRequest,
         reply: oneshot::Sender<Result<GetArtifactResponse, ExecutorError>>,
     },
-    MaterializeModel {
-        model: String,
-        reply: oneshot::Sender<Result<(), ExecutorError>>,
+    #[cfg(feature = "evaluate")]
+    MaterializePackage {
+        source: PackageSource,
+        reply: oneshot::Sender<Result<ExecutionPackageId, ExecutorError>>,
     },
     /// Single streaming entry point: validate the quote, accept the job
     /// (queueing if the worker is busy), and return a Receiver wired to
@@ -100,8 +95,8 @@ pub(crate) enum ExecutorMessage {
     /// No ticket, no quote, and no admission of its own: the paid
     /// endpoint decided this invocation was owed and made that decision
     /// durable before this message was sent. What is left for the engine
-    /// is whether it *can* run the request — the artifacts, the dtype,
-    /// the policy, the weights on this disk.
+    /// is whether it *can* run the request — the artifacts, the policy,
+    /// and the exact package loaded on this node.
     RunPaidEvaluate {
         request: hellas_rpc::EvaluateRequest,
         reply: oneshot::Sender<Result<ExecuteOutcome, ExecutorError>>,
@@ -126,7 +121,7 @@ pub(crate) struct FetchCompletion {
     pub request_commitment_id: [u8; 32],
     pub quota_reservation: Option<FetchQuotaReservation>,
     pub execution_id: String,
-    pub model_id: String,
+    pub metric_name: String,
     pub sender: ExecuteEventReceiverSender,
     pub result: Result<FetchProviderRun, FetchProviderFailure>,
 }
@@ -151,13 +146,11 @@ pub(crate) struct PendingFetch {
     pub assurance: Assurance,
     pub request_commitment_id: [u8; 32],
     pub execution_id: String,
-    pub model_id: String,
+    pub metric_name: String,
     pub sender: ExecuteEventReceiverSender,
 }
 
 #[derive(Clone)]
 pub struct ExecutorHandle {
     pub(super) tx: mpsc::UnboundedSender<ExecutorMessage>,
-    #[cfg(feature = "evaluate")]
-    pub(super) preferred_dtype: Dtype,
 }

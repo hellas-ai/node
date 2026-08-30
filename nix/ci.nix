@@ -33,9 +33,8 @@ let
     );
     # Default features alone leave most of the CLI unlinted: `evaluate`,
     # `node` and `gateway` are all off by default, which is most of what
-    # the binary actually does. Not `--all-features` — that pulls
-    # candle-cuda and objc2, which cannot build here. So: the buildable
-    # feature sets, named.
+    # the binary actually does. So the buildable feature sets are named and
+    # checked independently.
     clippy-features = mk "check-clippy-features" (builtins.concatStringsSep " && " (
       map
         (f: "cargo clippy -p hellas-cli --no-default-features --features ${f} --all-targets -- -D warnings")
@@ -45,6 +44,7 @@ let
           "validator"
           "evaluate"
           "node"
+          "llm"
           "gateway"
           "otel"
         ]
@@ -196,13 +196,17 @@ let
   # `nix build .#packages.<system>.<attr>`.
   ciBuilds = {
     cli = "cli";
-    cli-candle = "cli-candle";
     cli-validator = "cli-validator";
     static-x86_64 = "cross-x86_64-linux-musl-cli";
     static-aarch64 = "cross-aarch64-linux-musl-cli";
     static-windows = "cross-x86_64-windows-cli";
-    docker-cuda = "docker-cuda";
     hellas-rpc-wasm = "hellas-rpc-wasm";
+  }
+  // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+    docker = "docker";
+  }
+  // lib.optionalAttrs (pkgs.stdenv.hostPlatform.system == "x86_64-linux") {
+    cli-catena = "cli-catena";
   };
 in
 {

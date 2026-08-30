@@ -1,80 +1,158 @@
-# hellas-cli
+# Hellas
 
-## Quickstart
+Hellas executes exact, token-native Catena packages locally
+or across the network. The node owns package materialization; remote peers can
+select only an operator-configured alias and can never make it fetch or load an
+arbitrary path.
 
-Execute:
+## Execution boundary
+
+There are three deliberately separate layers:
+
+| Layer | What it binds |
+| --- | --- |
+| Catena package identity | Exact program, executable artifacts, linking, executable token-ID/value adapter (not a tokenizer), vocabulary, and capacity |
+| Hellas request and signed transcript | Exact package identity, input token IDs, maximum output, caller-selected stop IDs, generated token IDs, and termination reason |
+| Local presentation | Prompt text, tokenizer, chat template, and decoded text |
+
+Catena does not specify a tokenizer, chat template, decoder, or default stop
+tokens. Hellas does not attest them either. The CLI's `--tokenizer` turns local
+text into the token IDs that Hellas does bind, and turns verified output IDs
+back into text. Stop IDs are explicit caller policy: repeat `--stop-token` or
+comma-separate values. With no such option, only `--max-new-tokens` ends a
+normal generation.
+
+Package aliases are local routing names, not identities. For a remote request,
+the caller supplies an exact package ID obtained through a trusted,
+out-of-band path. The node must prove that its alias resolves to that ID before
+the client accepts its quote. `ListPackages` is useful observation, but an
+adversarial node is not an authority for the ID the caller expects.
+Artifact-addressed requests carry no alias and therefore require an `id/...`
+execute-policy rule (or `eager`); an alias rule cannot authorize them by
+accident.
+
+## Quickstart: SmolLM2
+
+The examples assume the sibling Catena Runner checkout and an independently
+obtained tokenizer JSON:
 
 ```bash
-cargo run --features candle -- llm -p hey
+PACKAGE=smollm2-135m=../catena-runner/models/smollm2
+TOKENIZER=/path/to/smollm2-tokenizer.json
 ```
 
-Execute locally with the catgrad backend:
+Fetch and verify the package, then print the exact ID. The command writes only
+the digest to stdout, so it is safe to use in a script:
 
 ```bash
-cargo run --features candle -- llm --local -p hey
+PACKAGE_ID=$(cargo run -q -p hellas-cli --features evaluate -- \
+  package id --package "$PACKAGE")
+printf '%s\n' "$PACKAGE_ID"
 ```
 
-Verify a remote execution against the local catgrad backend:
+Distribute that ID with the package through a trusted release channel. Do not
+learn it from the node whose execution you are trying to verify.
+
+Run locally. This fetches package artifacts into
+`$HOME/.hellas/packages`, verifies them, compiles the package once, and then
+executes it:
 
 ```bash
-cargo run --features candle -- llm --verify-local -p hey
+cargo run -p hellas-cli --features evaluate -- \
+  llm --local --package "$PACKAGE" --tokenizer "$TOKENIZER" \
+  --prompt 'The capital of France is'
 ```
 
-## End-to-end
-
-Run server:
+Serve that package to remote callers:
 
 ```bash
-cargo run --features candle -- serve --execute-policy=eager
+cargo run -p hellas-cli --features evaluate -- serve \
+  --execute-policy 'allow(package/smollm2-135m)' \
+  --package "$PACKAGE"
 ```
 
-`serve` without policy flags starts in deny-by-default mode
-(`--execute-policy=skip`). Only pass eager or allow-list policies when you
-intentionally want a node to serve remote work.
+`serve` loads every repeated `--package NAME=PATH` before binding. Its default
+execution policy is `skip`; use `eager` only when intentionally serving every
+package the operator loaded.
 
-Make a model available on startup:
+Run against a known node. `--provider` is the out-of-band 32-byte content ID
+that anchors the remote node's identity; omit `NODE_ID` to use discovery:
 
 ```bash
-cargo run --features candle -- serve \
-  --execute-policy=eager \
-  --preload HuggingFaceTB/SmolLM2-135M-Instruct
+cargo run -p hellas-cli --features evaluate -- \
+  --provider "$PROVIDER_CONTENT_ID" \
+  llm "$NODE_ID" --package smollm2-135m --package-id "$PACKAGE_ID" \
+  --tokenizer "$TOKENIZER" \
+  --prompt 'The capital of France is'
 ```
 
-Repeat `--preload` for multiple models.
-
-**A node quotes only models it already holds.** `--preload` downloads;
-serving does not. A quote for anything else is refused with
-`FailedPrecondition` and no bytes fetched — otherwise anyone who could
-dial the node could name a 700 GB repository and have the node download
-it. A HuggingFace cache the node can already read counts as holding the
-model, so mounting one (as the Docker example below does) works without
-any preload at all.
-
-Run client:
+For a remote result checked against local Catena execution, use
+`--verify-local` and pass `NAME=PATH`:
 
 ```bash
-cargo run --features candle -- llm bb18ebc065d836ecc7e1f33972d2c17eac9894cd33ce4916f66cb1165ccc7550 -p hey
+cargo run -p hellas-cli --features evaluate -- \
+  --provider "$PROVIDER_CONTENT_ID" \
+  llm "$NODE_ID" --verify-local --package "$PACKAGE" \
+  --tokenizer "$TOKENIZER" --prompt 'The capital of France is'
+```
+
+Defaults are 16 new tokens, two discovery retries, retained artifacts, and no
+stop IDs. Use `--retain=false` when the executor must not retain prompt- or
+token-bearing artifacts.
+
+## Qwen3-30B-A3B
+
+Qwen is deliberately opt-in: its current Catena package names about 56.9 GiB
+of weights. Use its own independent tokenizer and explicit stop policy. The
+runner example currently uses stop IDs `151643` and `151645`:
+
+```bash
+cargo run -p hellas-cli --features evaluate -- \
+  llm --local \
+  --package qwen3-30b-a3b=../catena-runner/models/qwen \
+  --tokenizer /path/to/qwen-tokenizer.json \
+  --stop-token 151643 --stop-token 151645 \
+  --prompt 'The capital of France is'
+```
+
+## HTTP gateway
+
+Run a local gateway:
+
+```bash
+cargo run -p hellas-cli --features evaluate -- gateway --local \
+  --package "$PACKAGE" --tokenizer "$TOKENIZER"
+```
+
+Or route it to a remote node:
+
+```bash
+cargo run -p hellas-cli --features gateway -- \
+  --provider "$PROVIDER_CONTENT_ID" gateway \
+  --node-id "$NODE_ID" --package smollm2-135m \
+  --package-id "$PACKAGE_ID" --tokenizer "$TOKENIZER"
+```
+
+The gateway binds loopback and prints a fresh bearer token at startup. The
+Hellas execution backend accepts plain text at `/v1/completions` and simple
+text input at `/v1/responses`. Chat, message, reasoning, and tool inputs are
+rejected because no chat template is implicit. Select the proxy or Fetch
+Responses backend when those semantics come from another explicitly chosen
+service.
+
+The exposed routes are:
+
+```text
+POST /v1/completions
+POST /v1/responses
+POST /v1/chat/completions
+POST /v1/messages
 ```
 
 Monitor discovery and peer health:
 
 ```bash
-cargo run -- monitor --timeout-secs 30
-```
-
-Run HTTP gateway (OpenAI / Anthropic / plain completions over Hellas network):
-
-```bash
-cargo run --features gateway -- gateway --port 8080
-```
-
-Routes:
-
-```bash
-POST /v1/chat/completions
-POST /v1/responses
-POST /v1/messages
-POST /v1/completions
+cargo run -p hellas-cli -- monitor --timeout-secs 30
 ```
 
 ## Chain
@@ -149,10 +227,31 @@ cargo run --no-default-features --features chain -- \
 
 ## Nix
 
-Enter the default Rust development shell:
+The Catena interface is being developed in tandem in the sibling
+`catena-runner` and `exploratory-catena` checkouts. Until those branches are
+published, override both temporary path inputs explicitly (replace the paths
+if your checkout layout differs):
 
 ```bash
-nix develop
+nix develop \
+  --override-input catena-runner path:/mnt/Home/src/catena-runner \
+  --override-input exploratory-catena path:/mnt/Home/src/exploratory-catena \
+  --no-write-lock-file
+```
+
+The main outputs are `.#cli` (network client/node/gateway), `.#cli-catena`
+(x86_64 Linux plus local Catena execution), and `.#cli-validator`. The current
+runner is HIP-only, so the local evaluator is deliberately not advertised on
+other systems.
+
+On an x86_64 Linux ROCm host, enter the evaluator shell with the same input
+overrides:
+
+```bash
+nix develop .#rocm \
+  --override-input catena-runner path:/mnt/Home/src/catena-runner \
+  --override-input exploratory-catena path:/mnt/Home/src/exploratory-catena \
+  --no-write-lock-file
 ```
 
 Work on the kernel Quint models:
@@ -165,30 +264,18 @@ nix run .#check-kernel-model-verify
 
 ## Docker
 
-Docker images: `.#docker-cpu`, `.#docker-cuda12-sm89`, etc. They stream to stdout.
+The Docker output is a network-only node image. It contains no local Catena or
+GPU runtime and is tagged `ghcr.io/hellas-ai/hellas:network`. The derivation
+streams a Docker archive to stdout:
 
 ```bash
-$(nix build .#docker-cuda12-sm89 --print-out-paths) | docker load
-nix run .#docker-push-all                # push all images to ghcr.io/hellas-ai/hellas
-```
-
-Run a CUDA server with persistent HF cache and metrics:
-
-```bash
-docker run --rm -it \
-  --device=nvidia.com/gpu=all \
-  -p 31145:31145/udp \
-  -p 9090:9090 \
-  -v ~/.cache/huggingface:/home/hellas/.cache/huggingface \
-  ghcr.io/hellas-ai/hellas:cuda12-sm89 \
-  --execute-policy=eager \
-  --metrics-port=9090 \
-  --preload HuggingFaceTB/SmolLM2-135M-Instruct
+$(nix build .#docker --print-out-paths) | docker load
+nix run .#docker-push-all
 ```
 
 ## Dependency maintenance
 
-Available in the dev shell (`nix develop`):
+Available in the development shell:
 
 ```bash
 cargo audit                # security advisories

@@ -1,29 +1,14 @@
 { self }:
 rec {
-  # The ordinary production CLI: local CPU execution and OTEL, without an
-  # accelerator-specific backend. Accelerator builds remain explicit module
-  # overrides.
-  normalCliPackage = pkgs: self.packages.${pkgs.stdenv.hostPlatform.system}.cli-candle;
+  # The ordinary production CLI carries the network, chain, gateway, and OTEL
+  # surfaces. Local Catena execution is the explicit `cli-catena` package.
+  normalCliPackage = pkgs: self.packages.${pkgs.stdenv.hostPlatform.system}.cli;
+  catenaPlatform = pkgs: pkgs.stdenv.hostPlatform.system == "x86_64-linux";
+  catenaCliPackage = pkgs: self.packages.${pkgs.stdenv.hostPlatform.system}.cli-catena;
+  nixosCliPackage =
+    pkgs: if catenaPlatform pkgs then catenaCliPackage pkgs else normalCliPackage pkgs;
 
-  # Pick the best available hellas CLI variant for the target system:
-  #   Darwin         → cli-candle-metal
-  #   Linux + cuda   → cli-candle-cuda  (requires `nixpkgs.config.cudaSupport = true`)
-  #   otherwise      → cli-candle
-  # Each step checks the package set for membership so a missing variant
-  # falls through instead of erroring.
-  pickCliPackage =
-    pkgs:
-    let
-      pkgSet = self.packages.${pkgs.stdenv.hostPlatform.system};
-      inherit (pkgs.stdenv.hostPlatform) isDarwin;
-      cudaEnabled = pkgs.config.cudaSupport or false;
-    in
-    if isDarwin && pkgSet ? cli-candle-metal then
-      pkgSet.cli-candle-metal
-    else if cudaEnabled && pkgSet ? cli-candle-cuda then
-      pkgSet.cli-candle-cuda
-    else
-      pkgSet.cli-candle;
+  pickCliPackage = normalCliPackage;
 
   renderEnvironment = builtins.mapAttrs (_: toString);
 
@@ -54,7 +39,7 @@ rec {
         );
         default = { };
         example = {
-          HF_HOME = "/var/lib/hellas/huggingface";
+          RUST_LOG = "hellas=info";
           OTEL_SERVICE_NAME = "hellas";
         };
         description = "Environment variables exported to Hellas processes.";
@@ -117,14 +102,14 @@ rec {
         type = types.nullOr (types.either types.str (types.listOf types.str));
         default = null;
         example = [
-          "hf/Qwen/*"
-          "graph/llm/*"
+          "package/smollm2-135m"
+          "id/0123456789abcdef*"
         ];
         description = ''
-          Graph execution policy.
-          "skip" (CLI default) refuses all executions,
-          "eager" executes any graph,
-          and "allow(hf/pattern,...,graph/pattern,...)" executes only matching requests.
+          Catena execution policy. "skip" (CLI default) refuses all
+          executions, "eager" executes any owner-loaded package, and
+          "allow(package/pattern,...,id/pattern,...)" matches package aliases
+          or exact verified package identities.
           A list of patterns is shorthand for "allow(p1,p2,...)".
         '';
       };
@@ -133,10 +118,27 @@ rec {
         default = null;
         description = "Maximum number of queued executions waiting behind the active worker.";
       };
-      preloadWeights = mkOption {
-        type = types.listOf types.str;
-        default = [ ];
-        description = "Model identifiers to preload on startup.";
+      executionPackages = mkOption {
+        type = types.attrsOf (
+          types.oneOf [
+            types.str
+            types.path
+          ]
+        );
+        default = { };
+        example.smollm2-135m = "/srv/catena/smollm2";
+        description = ''
+          Catena execution packages materialized by the operator at startup.
+          Each attribute name is the RPC-visible alias and its value is the
+          local package manifest directory. Peers can select an alias, never a
+          filesystem path.
+        '';
+      };
+      packageCache = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        example = "/var/lib/hellas/packages";
+        description = "Directory for verified Catena package objects. Null uses the CLI's HOME-relative default.";
       };
       fetchConfig = mkOption {
         type = types.nullOr types.attrs;
@@ -234,12 +236,12 @@ rec {
       local = mkOption {
         type = types.bool;
         default = false;
-        description = "Run the gateway against an in-process catgrad executor.";
+        description = "Run the gateway against an in-process Catena executor.";
       };
       verifyLocal = mkOption {
         type = types.bool;
         default = false;
-        description = "Verify remote responses against an in-process catgrad executor.";
+        description = "Verify remote responses against an in-process Catena executor.";
       };
       verifyNodeId = mkOption {
         type = types.nullOr types.str;
@@ -266,27 +268,57 @@ rec {
         default = null;
         description = "Fallback max output tokens when a request omits a limit.";
       };
-      forceModel = mkOption {
+      executionPackageName = mkOption {
+        type = types.str;
+        example = "smollm2-135m";
+        description = "Fixed Catena package alias used by Hellas-backed gateway routes.";
+      };
+      executionPackagePath = mkOption {
+        type = types.nullOr (types.either types.str types.path);
+        default = null;
+        example = "/srv/catena/smollm2";
+        description = "Local Catena package manifest directory, required only for local execution or local verification.";
+      };
+      packageId = mkOption {
+        type = types.nullOr (types.strMatching "[0-9a-f]{64}");
+        default = null;
+        example = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        description = ''
+          Out-of-band exact Catena package identity for remote execution.
+          Required when neither local nor verifyLocal is selected. Local
+          execution and local verification derive this identity from the
+          independently verified local package instead.
+        '';
+      };
+      packageCache = mkOption {
         type = types.nullOr types.str;
         default = null;
-        description = "Model id that replaces the model named by incoming requests.";
+        example = "/var/lib/hellas-gateway/packages";
+        description = "Directory for verified Catena package objects. Null uses the gateway HOME-relative default.";
+      };
+      tokenizer = mkOption {
+        type = types.oneOf [
+          types.str
+          types.path
+          types.package
+        ];
+        example = "/srv/hellas-presentation/smollm2-tokenizer.json";
+        description = ''
+          Application-selected tokenizer JSON. This presentation input is
+          independent of the Catena execution package and is not covered by
+          the Hellas execution guarantee.
+        '';
+      };
+      stopTokenIds = mkOption {
+        type = types.listOf types.ints.unsigned;
+        default = [ ];
+        example = [ 2 ];
+        description = "Caller-selected stop token IDs; none are inferred from the tokenizer or Catena package.";
       };
       metricsPort = mkOption {
         type = types.nullOr types.port;
         default = null;
         description = "Optional Prometheus metrics port.";
-      };
-      dtype = mkOption {
-        type = types.nullOr (
-          types.enum [
-            "f32"
-            "f16"
-            "bf16"
-            "f8"
-          ]
-        );
-        default = null;
-        description = "Dtype used by local gateway execution and verification.";
       };
       responsesBackend = mkOption {
         type = types.enum [
@@ -408,16 +440,19 @@ rec {
     ++ optArg "--port" serve.port
     ++ optArg "--execute-policy" (renderPolicy serve.executePolicy)
     ++ optArg "--queue-size" serve.queueSize
+    ++ optArg "--package-cache" serve.packageCache
     ++ optArg "--metrics-port" serve.metricsPort
     ++ [
       "--assurance"
       serve.assurance
     ]
     ++ optArg "--graffiti" serve.graffiti
-    ++ lib.concatMap (model: [
-      "--preload"
-      model
-    ]) serve.preloadWeights
+    ++ lib.concatLists (
+      lib.mapAttrsToList (name: path: [
+        "--package"
+        "${name}=${toString path}"
+      ]) serve.executionPackages
+    )
     ++ lib.optionals (serve.fetchConfig != null) [
       "--fetch-config"
       (builtins.toFile "hellas-fetch-config.json" (builtins.toJSON serve.fetchConfig))
@@ -438,6 +473,9 @@ rec {
           flag
           (toString value)
         ];
+      packageSpec =
+        gateway.executionPackageName
+        + lib.optionalString (gateway.executionPackagePath != null) "=${gateway.executionPackagePath}";
     in
     [
       "--identity"
@@ -445,7 +483,12 @@ rec {
       "gateway"
       "--assurance"
       gateway.assurance
+      "--package"
+      packageSpec
+      "--tokenizer"
+      (toString gateway.tokenizer)
     ]
+    ++ optArg "--package-id" gateway.packageId
     ++ [
       "--host"
       gateway.host
@@ -463,9 +506,12 @@ rec {
     ++ optArg "--queue-size" gateway.queueSize
     ++ optArg "--retries" gateway.retries
     ++ optArg "--default-max-tokens" gateway.defaultMaxTokens
-    ++ optArg "--force-model" gateway.forceModel
+    ++ optArg "--package-cache" gateway.packageCache
+    ++ lib.concatMap (token: [
+      "--stop-token"
+      (toString token)
+    ]) gateway.stopTokenIds
     ++ optArg "--metrics-port" gateway.metricsPort
-    ++ optArg "--dtype" gateway.dtype
     ++ [
       "--responses-backend"
       gateway.responsesBackend

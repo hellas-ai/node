@@ -1,17 +1,11 @@
 use std::collections::HashMap;
-#[cfg(feature = "evaluate")]
-use std::str::FromStr;
 use std::time::{Duration, Instant};
 
-#[cfg(feature = "evaluate")]
-use crate::DEFAULT_MAX_SEQ;
 use crate::ExecutorError;
 use crate::fetch_provider::FetchProviderRequest;
 #[cfg(feature = "evaluate")]
-use hellas_rpc::Dtype;
-#[cfg(feature = "evaluate")]
 use hellas_rpc::pb::courtesy::{
-    EvaluateStart as PbEvaluateStart, QuotePreparedTextRequest, evaluate_start,
+    EvaluateStart as PbEvaluateStart, QuoteTokensRequest, evaluate_start,
 };
 #[cfg(feature = "evaluate")]
 use hellas_rpc::pb::evaluate::EvaluateRequest as PbEvaluateRequest;
@@ -24,31 +18,39 @@ use hellas_rpc::run_ticket::ticket_to_pb;
 #[cfg(feature = "evaluate")]
 use hellas_rpc::run_ticket::{public_key_from_pb, public_key_to_pb};
 #[cfg(feature = "evaluate")]
-use hellas_rpc::spec::DEFAULT_MODEL_REVISION;
-#[cfg(feature = "evaluate")]
 use hellas_rpc::stream::output_event_to_pb;
 use hellas_rpc::{Assurance, ContentId, Digest, JobTerms, PublicKey, RequestCommitment};
 #[cfg(feature = "evaluate")]
-use hellas_rpc::{EvaluateRequest, OutputEventEnvelope, Retention};
+use hellas_rpc::{
+    DEFAULT_MAX_NEW_TOKENS, EvaluateProgramManifest, EvaluateRequest, ExecutionPackageId,
+    MAX_STOP_TOKEN_IDS, OutputEventEnvelope, ProgramManifest, Retention, normalize_stop_token_ids,
+};
 use uuid::Uuid;
 
 pub use crate::StateError;
 
 pub(crate) const QUOTE_AMOUNT: u64 = 1000;
 pub(crate) const QUOTE_TTL: Duration = Duration::from_secs(30);
+pub(crate) const MAX_OUTSTANDING_QUOTES: usize = 1024;
 
 #[cfg(feature = "evaluate")]
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct ModelLocator {
-    pub model_id: String,
-    pub revision: String,
-    pub dtype: Dtype,
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct PackageLocator {
+    pub execution_package: ExecutionPackageId,
 }
 
 #[cfg(feature = "evaluate")]
-impl ModelLocator {
-    pub(crate) fn spec(&self) -> String {
-        model_spec(&self.model_id, &self.revision)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LoadedPackage {
+    pub locator: PackageLocator,
+    pub vocabulary_size: u64,
+    pub maximum_capacity: u64,
+}
+
+#[cfg(feature = "evaluate")]
+impl LoadedPackage {
+    pub(crate) fn validate_invocation(self, invocation: &Invocation) -> Result<(), ExecutorError> {
+        validate_invocation(invocation, self.vocabulary_size, self.maximum_capacity)
     }
 }
 
@@ -62,7 +64,9 @@ pub struct Invocation {
 
 #[cfg(feature = "evaluate")]
 pub(crate) struct QuotePlan {
-    pub locator: ModelLocator,
+    pub locator: PackageLocator,
+    pub vocabulary_size: u64,
+    pub maximum_capacity: u64,
     pub execution_environment: ContentId,
     pub invocation: Invocation,
     pub initial_artifact_id: Option<Digest>,
@@ -73,83 +77,47 @@ pub(crate) struct QuotePlan {
 
 #[cfg(feature = "evaluate")]
 impl QuotePlan {
-    /// The content id of this model's program manifest, built only from
-    /// files this node already holds.
-    ///
-    /// [`hellas_models::Reach::Local`] is the whole security property of
-    /// the quote path. Resolving a HuggingFace file path is downloading
-    /// it, so with download reach this function — reachable by any peer
-    /// that can dial us, with a model id it chooses — is a remote fetch
-    /// primitive: name a 700 GB repo and the node fetches it. Local
-    /// reach cannot: it holds no HTTP client at all, and a model that is
-    /// not here is [`ExecutorError::ModelNotMaterialized`].
-    ///
-    /// Still split out because it remains the expensive step even when
-    /// it downloads nothing: it reads every weight shard to hash it.
-    /// Callers on an async task must run it through
-    /// [`tokio::task::spawn_blocking`]; run inline it holds the
-    /// executor's single actor task for the whole read, so one quote
-    /// stalls every run ticket, receipt and settle behind it.
-    pub(crate) fn execution_environment(
-        locator: &ModelLocator,
-        backend: &str,
-    ) -> Result<ContentId, ExecutorError> {
-        let manifest = hellas_models::program_manifest(
-            &locator.spec(),
-            locator.dtype,
-            backend,
-            hellas_models::Reach::Local,
-        )
-        .map_err(|err| refusal_for(&locator.spec(), err))?;
-        Ok(hellas_rpc::ProgramManifest::Evaluate(manifest).content_id())
+    pub(crate) fn validate_invocation(&self, invocation: &Invocation) -> Result<(), ExecutorError> {
+        validate_invocation(invocation, self.vocabulary_size, self.maximum_capacity)
     }
 
-    /// Builds the plan, refusing before the expensive part if
-    /// `execute_policy` will not run this model.
-    ///
-    /// The policy is checked *here*, not by the caller afterwards.
-    /// Building the manifest reads every shard of the model to hash it,
-    /// so a check that runs after this function has returned has already
-    /// paid for a model it is about to refuse.
-    ///
-    /// The policy is not what makes this safe, though — its default is
-    /// `Eager`, which permits everything. What makes it safe is that
-    /// [`Self::execution_environment`] resolves locally: the plan can
-    /// only be built for a model this node already holds.
-    pub(crate) fn from_prepared_text_request(
-        request: QuotePreparedTextRequest,
-        supported_dtypes: &[Dtype],
-        execute_policy: &hellas_rpc::policy::ExecutePolicy,
+    /// The Hellas content ID binding the exact verified Catena execution
+    /// package. This is pure and cheap: package bytes were verified once by
+    /// the owner-only loading path, never while handling an RPC.
+    pub(crate) fn execution_environment(locator: PackageLocator) -> ContentId {
+        ProgramManifest::Evaluate(EvaluateProgramManifest {
+            execution_package: locator.execution_package,
+        })
+        .content_id()
+    }
+
+    /// Builds a token-native quote after the peer-supplied package alias has
+    /// already been resolved through the executor's loaded-package registry.
+    pub(crate) fn from_tokens_request(
+        request: QuoteTokensRequest,
+        package: LoadedPackage,
     ) -> Result<Self, ExecutorError> {
-        let model_id = request.huggingface_model_id.trim();
-        if model_id.is_empty() {
-            return Err(ExecutorError::InvalidQuoteRequest(
-                "missing huggingface_model_id".to_string(),
-            ));
+        let requested_package = ExecutionPackageId::from_bytes(bytes32(
+            &request.execution_package,
+            "execution_package",
+        )?);
+        if requested_package != package.locator.execution_package {
+            return Err(ExecutorError::InvalidQuoteRequest(format!(
+                "package alias resolved to {}, but caller pinned {requested_package}",
+                package.locator.execution_package
+            )));
         }
+        let max_new_tokens = request.max_new_tokens.unwrap_or(DEFAULT_MAX_NEW_TOKENS);
 
-        let revision = request.huggingface_revision.trim();
-        let revision = if revision.is_empty() {
-            DEFAULT_MODEL_REVISION
-        } else {
-            revision
+        if request.stop_token_ids.len() > MAX_STOP_TOKEN_IDS {
+            return Err(ExecutorError::InvalidTokenPayload(format!(
+                "stop_token_ids contains {} entries, over the limit of {MAX_STOP_TOKEN_IDS}",
+                request.stop_token_ids.len()
+            )));
         }
-        .to_string();
-
-        let dtype = resolve_accept_dtypes(&request.accept_dtypes, supported_dtypes)?;
-        let max_new_tokens = if request.max_new_tokens == 0 {
-            DEFAULT_MAX_SEQ
-        } else {
-            request.max_new_tokens
-        };
-
-        let input_ids = request.prompt_token_ids.clone();
-        if input_ids.is_empty() {
-            return Err(ExecutorError::InvalidTokenPayload(
-                "prompt is empty after decoding".to_string(),
-            ));
-        }
-        let stop_token_ids = request.stop_token_ids;
+        let input_ids = request.prompt_token_ids;
+        let mut stop_token_ids = request.stop_token_ids;
+        normalize_stop_token_ids(&mut stop_token_ids);
         let initial_artifact_id = parse_evaluate_start(request.start)?;
         let runner_public_key = request
             .runner_public_key
@@ -164,27 +132,11 @@ impl QuotePlan {
         let assurance = hellas_rpc::run_ticket::assurance_from_pb(request.assurance)
             .map_err(|err| ExecutorError::InvalidQuoteRequest(err.to_string()))?;
         let retention = Retention::from_retain(request.retain.unwrap_or(true));
-
-        let locator = ModelLocator {
-            model_id: model_id.to_string(),
-            revision,
-            dtype,
-        };
-        let backend = if cfg!(any(feature = "candle-cuda", feature = "candle-metal")) {
-            "accelerated"
-        } else {
-            "cpu"
-        };
-        if !execute_policy.allows_execute(&locator.spec(), Some(locator.model_id.as_str())) {
-            return Err(ExecutorError::PolicyDenied(format!(
-                "execute policy denied model {}",
-                locator.spec()
-            )));
-        }
-
-        let execution_environment = Self::execution_environment(&locator, backend)?;
-        Ok(Self {
-            locator,
+        let execution_environment = Self::execution_environment(package.locator);
+        let plan = Self {
+            locator: package.locator,
+            vocabulary_size: package.vocabulary_size,
+            maximum_capacity: package.maximum_capacity,
             execution_environment,
             invocation: Invocation {
                 input_ids,
@@ -195,64 +147,59 @@ impl QuotePlan {
             runner_public_key,
             assurance,
             retention,
-        })
-    }
-}
-
-/// Turns a model-layer failure into what a serving path says back.
-///
-/// One case is lifted out of the transparent `ModelAssets` passthrough:
-/// "this node does not hold that model" is a distinct, actionable answer
-/// and deserves a variant a client can match on, rather than being one
-/// more opaque asset error.
-#[cfg(feature = "evaluate")]
-pub(crate) fn refusal_for(
-    model: &str,
-    err: hellas_models::ModelAssetsError,
-) -> crate::ExecutorError {
-    match err {
-        hellas_models::ModelAssetsError::NotMaterialized { .. } => {
-            tracing::info!(model = %model, "refused a quote for a model this node does not hold");
-            ExecutorError::ModelNotMaterialized(err.to_string())
-        }
-        other => other.into(),
+        };
+        plan.validate_invocation(&plan.invocation)?;
+        Ok(plan)
     }
 }
 
 #[cfg(feature = "evaluate")]
-pub(crate) fn resolve_accept_dtypes(
-    prefs: &[String],
-    supported_dtypes: &[Dtype],
-) -> Result<Dtype, ExecutorError> {
-    if supported_dtypes.is_empty() {
-        return Err(ExecutorError::InvalidQuoteRequest(
-            "executor must support at least one dtype".to_string(),
+fn validate_invocation(
+    invocation: &Invocation,
+    vocabulary_size: u64,
+    maximum_capacity: u64,
+) -> Result<(), ExecutorError> {
+    if invocation.input_ids.is_empty() {
+        return Err(ExecutorError::InvalidTokenPayload(
+            "input token IDs must not be empty".to_string(),
         ));
     }
-    if prefs.is_empty() {
-        return Ok(supported_dtypes[0]);
+    if invocation.max_new_tokens == 0 {
+        return Err(ExecutorError::InvalidTokenPayload(
+            "max_new_tokens must be greater than zero".to_string(),
+        ));
     }
-    let mut parsed = Vec::with_capacity(prefs.len());
-    for raw in prefs {
-        let dtype = Dtype::from_str(raw).map_err(|e| {
-            ExecutorError::InvalidQuoteRequest(format!("invalid dtype `{raw}`: {e}"))
-        })?;
-        if !dtype.is_model_dtype() {
-            return Err(ExecutorError::InvalidQuoteRequest(
-                "model dtype must be f32, f16, bf16, or f8".to_string(),
-            ));
+    if invocation.stop_token_ids.len() > MAX_STOP_TOKEN_IDS {
+        return Err(ExecutorError::InvalidTokenPayload(format!(
+            "stop token IDs contains {} entries, over the limit of {MAX_STOP_TOKEN_IDS}",
+            invocation.stop_token_ids.len()
+        )));
+    }
+    for (field, tokens) in [
+        ("input token IDs", invocation.input_ids.as_slice()),
+        ("stop token IDs", invocation.stop_token_ids.as_slice()),
+    ] {
+        if let Some(token) = tokens
+            .iter()
+            .copied()
+            .find(|&token| u64::from(token) >= vocabulary_size)
+        {
+            return Err(ExecutorError::InvalidTokenPayload(format!(
+                "{field} contain token {token}, but package vocabulary size is {}",
+                vocabulary_size
+            )));
         }
-        parsed.push(dtype);
     }
-    for dtype in &parsed {
-        if supported_dtypes.contains(dtype) {
-            return Ok(*dtype);
-        }
+    let total_tokens = u64::try_from(invocation.input_ids.len())
+        .unwrap_or(u64::MAX)
+        .saturating_add(u64::from(invocation.max_new_tokens));
+    if total_tokens > maximum_capacity {
+        return Err(ExecutorError::InvalidTokenPayload(format!(
+            "prompt plus max_new_tokens is {total_tokens} tokens, but package capacity is {}",
+            maximum_capacity
+        )));
     }
-    Err(ExecutorError::DtypeNotSupported {
-        request: parsed[0],
-        supported: supported_dtypes.to_vec(),
-    })
+    Ok(())
 }
 
 #[cfg(feature = "evaluate")]
@@ -333,18 +280,9 @@ fn hex32(bytes: &[u8; 32]) -> String {
 }
 
 #[cfg(feature = "evaluate")]
-pub(crate) fn model_spec(model_id: &str, revision: &str) -> String {
-    if revision.is_empty() {
-        model_id.to_string()
-    } else {
-        format!("{model_id}@{revision}")
-    }
-}
-
-#[cfg(feature = "evaluate")]
 #[derive(Clone, Debug)]
-pub(crate) enum LocalModelStatus {
-    Ready,
+pub(crate) enum LocalPackageStatus {
+    Ready(LoadedPackage),
     Failed(String),
 }
 
@@ -352,7 +290,6 @@ pub(crate) enum LocalModelStatus {
 pub struct QuoteRecord {
     pub terms: JobTerms,
     pub expires_at: Instant,
-    pub model_id: String,
     pub runner_public_key: PublicKey,
     pub kind: QuoteKind,
 }
@@ -410,10 +347,15 @@ impl ExecutorState {
         Self::default()
     }
 
-    pub fn create_quote(&mut self, quote: QuoteRecord) -> [u8; 32] {
+    pub fn create_quote(&mut self, quote: QuoteRecord) -> Result<[u8; 32], ExecutorError> {
         let key = *quote.terms.request.as_bytes();
+        if !self.quotes.contains_key(&key) && self.quotes.len() >= MAX_OUTSTANDING_QUOTES {
+            return Err(ExecutorError::QueueFull {
+                capacity: MAX_OUTSTANDING_QUOTES,
+            });
+        }
         self.quotes.insert(key, quote);
-        key
+        Ok(key)
     }
 
     pub fn get_quote(
@@ -460,7 +402,7 @@ fn make_id(prefix: &str) -> String {
 #[cfg(feature = "evaluate")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopReason {
-    EndOfSequence,
+    StopToken,
     MaxNewTokens,
     Cancelled,
 }
@@ -490,5 +432,59 @@ impl Termination {
             }
         };
         PbWorkEvent { kind: Some(kind) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn quote(index: u32) -> QuoteRecord {
+        let mut bytes = [0_u8; 32];
+        bytes[..4].copy_from_slice(&index.to_be_bytes());
+        let digest = Digest::from_bytes(bytes);
+        let input = hellas_rpc::InputCommitment::from_digest(digest);
+        QuoteRecord {
+            terms: JobTerms {
+                request: RequestCommitment::from_digest(digest),
+                provider_genesis: ContentId::from_bytes([1; 32]),
+                assurance: Assurance::ProducerSigned,
+                amount: QUOTE_AMOUNT,
+                ttl_ms: QUOTE_TTL.as_millis() as u64,
+            },
+            expires_at: Instant::now() + QUOTE_TTL,
+            runner_public_key: hellas_rpc::ProducerSigningKey::from_secret_bytes([2; 32])
+                .unwrap()
+                .public_key(),
+            kind: QuoteKind::Fetch {
+                request: FetchProviderRequest::new(
+                    "test",
+                    "run",
+                    hellas_rpc::JsonBytes::new(Vec::new()),
+                    input,
+                ),
+            },
+        }
+    }
+
+    #[test]
+    fn outstanding_quotes_are_bounded_without_evicting_live_tickets() {
+        let mut state = ExecutorState::new();
+        for index in 0..MAX_OUTSTANDING_QUOTES as u32 {
+            state.create_quote(quote(index)).unwrap();
+        }
+        let Err(error) = state.create_quote(quote(MAX_OUTSTANDING_QUOTES as u32)) else {
+            panic!("a quote over the bound must be refused");
+        };
+        assert!(matches!(
+            error,
+            ExecutorError::QueueFull {
+                capacity: MAX_OUTSTANDING_QUOTES
+            }
+        ));
+
+        // Repeating an existing deterministic commitment is replacement, not
+        // attacker-controlled cardinality growth.
+        state.create_quote(quote(0)).unwrap();
     }
 }

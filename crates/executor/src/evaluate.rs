@@ -5,51 +5,49 @@ use std::time::Instant;
 
 use crate::ExecutorError;
 use async_trait::async_trait;
-use hellas_models::{ChatMessage, ModelAssets, PreparedQuote, Reach};
 use hellas_rpc::evaluate::{
     EvaluateOutputTranscriptBuilder, EvaluateStopReason, EvaluateTerminal, EvaluateUsage,
     input_commitment,
 };
 use hellas_rpc::pb::courtesy::{
-    EvaluateGenesisStart, EvaluateStart, GetArtifactRequest, GetArtifactResponse,
-    ListPackagesResponse, PackageInfo, PackageStatus, PutArtifactRequest, PutArtifactResponse,
-    QuoteChatPromptRequest, QuotePromptRequest, QuoteResponse, QuoteTokensRequest, evaluate_start,
+    GetArtifactRequest, GetArtifactResponse, ListPackagesResponse, PackageInfo, PackageStatus,
+    QuoteResponse, QuoteTokensRequest,
 };
 use hellas_rpc::pb::evaluate::EvaluateRequest as PbEvaluateRequest;
-use hellas_rpc::pb::execute::{PublicKey as PbPublicKey, Ticket};
+use hellas_rpc::pb::execute::Ticket;
 use hellas_rpc::policy::ExecutePolicy;
+use hellas_rpc::protocol::artifacts::{OutputAddressed, TextExecutionId, completed_text};
 use hellas_rpc::provenance::ExecutionProvenance;
-use hellas_rpc::run_ticket::{public_key_from_pb, public_key_to_pb};
-use hellas_rpc::spec::ModelSpec;
-use hellas_rpc::{
-    Assurance, Digest, Dtype, Evaluate, EvaluateRequest, OutputEventEnvelope, PublicKey,
-};
+use hellas_rpc::{Assurance, Digest, Evaluate, EvaluateRequest, OutputEventEnvelope, PublicKey};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::artifacts::{EvaluateArtifactStore, EvaluateArtifactStores};
+use crate::artifacts::{EvaluateArtifactStore, PreparedTextArtifacts};
 use crate::executor::{ExecuteOutcome, ExecutorMessage, ProviderContext, TicketOutcome};
 use crate::metrics::ExecutorMetrics;
+use crate::package::PackageSource;
 use crate::scheme::{SchemeEngine, SchemeJob, SchemeRunContext};
 use crate::state::{
-    ExecutorState, Invocation, LocalModelStatus, ModelLocator, QUOTE_AMOUNT, QUOTE_TTL, QuoteKind,
-    QuotePlan, QuoteRecord, StopReason, Termination, evaluate_request_to_pb, new_execution_id,
-    quote_ticket, refusal_for,
+    ExecutorState, Invocation, LocalPackageStatus, PackageLocator, QUOTE_AMOUNT, QUOTE_TTL,
+    QuoteKind, QuotePlan, QuoteRecord, StopReason, Termination, evaluate_request_to_pb,
+    new_execution_id, quote_ticket,
 };
 use crate::worker::{
     EnqueueError, ExecuteJob, ExecuteWorker, WorkerCompletion, WorkerCompletionResult,
 };
 
 const PER_EXECUTION_CHANNEL_CAPACITY: usize = 64;
+const COMPLETED_EXECUTION_CACHE_CAPACITY: usize = 1024;
 
 /// The opaque quote payload the executor core stores for an evaluate ticket.
 #[derive(Clone)]
 pub struct EvaluateJob {
     pub evaluate_request: EvaluateRequest,
-    pub locator: ModelLocator,
+    pub locator: PackageLocator,
     pub invocation: Invocation,
-    pub model_id: String,
+    pub package_name: String,
+    pub prepared_artifacts: Option<PreparedTextArtifacts>,
 }
 
 impl SchemeJob for EvaluateJob {
@@ -74,10 +72,10 @@ enum StartExecutionError {
 }
 
 pub struct EvaluateEngine {
-    artifacts: EvaluateArtifactStores,
-    supported_dtypes: Vec<Dtype>,
-    models: HashMap<ModelLocator, LocalModelStatus>,
+    artifacts: EvaluateArtifactStore,
+    packages: HashMap<String, LocalPackageStatus>,
     completed: HashMap<[u8; 32], CompletedEvaluate>,
+    completed_order: VecDeque<[u8; 32]>,
     worker: ExecuteWorker,
     pending_executions: VecDeque<ExecuteJob>,
     queue_capacity: usize,
@@ -96,7 +94,6 @@ struct CompletedEvaluate {
 impl EvaluateEngine {
     pub fn new(
         artifacts: EvaluateArtifactStore,
-        supported_dtypes: Vec<Dtype>,
         queue_capacity: usize,
         execute_policy: ExecutePolicy,
         metrics: Arc<ExecutorMetrics>,
@@ -104,10 +101,10 @@ impl EvaluateEngine {
         tx: mpsc::UnboundedSender<ExecutorMessage>,
     ) -> Self {
         Self {
-            artifacts: EvaluateArtifactStores::new(artifacts),
-            supported_dtypes,
-            models: HashMap::new(),
+            artifacts,
+            packages: HashMap::new(),
             completed: HashMap::new(),
+            completed_order: VecDeque::new(),
             worker: ExecuteWorker::spawn(tx),
             pending_executions: VecDeque::new(),
             queue_capacity,
@@ -115,10 +112,6 @@ impl EvaluateEngine {
             metrics,
             provider,
         }
-    }
-
-    fn preferred_dtype(&self) -> Dtype {
-        self.supported_dtypes[0]
     }
 
     fn try_start_execution(&self, job: ExecuteJob) -> Result<(), StartExecutionError> {
@@ -190,21 +183,36 @@ impl EvaluateEngine {
         stop_reason: StopReason,
         output_tokens: Vec<u32>,
         output_events: Vec<OutputEventEnvelope>,
+        prepared_artifacts: Option<&PreparedTextArtifacts>,
     ) -> Result<(Termination, u64), ExecutorError> {
-        let text_artifact = self
-            .artifacts
-            .for_retention(evaluate_request.retention())
-            .record_completed_text(evaluate_request, invocation, &output_tokens)
-            .await?;
+        let text_artifact = if evaluate_request.retention().should_retain() {
+            self.artifacts
+                .record_completed_text_with_prepared(
+                    evaluate_request,
+                    invocation,
+                    &output_tokens,
+                    prepared_artifacts,
+                )
+                .await?
+        } else {
+            completed_text(
+                TextExecutionId::from_digest(evaluate_request.text_execution),
+                &invocation.input_ids,
+                &output_tokens,
+            )
+            .artifact
+            .output_id()
+            .digest()
+        };
         let input_units = invocation.input_ids.len() as u64;
         let output_units = output_tokens.len() as u64;
         let usage = EvaluateUsage {
             input_units,
             output_units,
         };
-        let billable_units = usage.billable_units().map_err(|err| {
-            ExecutorError::WeightsError(format!("evaluate billing failed: {err}"))
-        })?;
+        let billable_units = usage
+            .billable_units()
+            .map_err(|err| ExecutorError::Execution(format!("evaluate billing failed: {err}")))?;
         let terminal = EvaluateTerminal {
             final_position: output_units,
             stop_reason: evaluate_stop_reason(stop_reason),
@@ -218,9 +226,9 @@ impl EvaluateEngine {
             &self.provider.producer_key,
             output_events,
         )
-        .map_err(|err| ExecutorError::WeightsError(format!("evaluate transcript failed: {err}")))?
+        .map_err(|err| ExecutorError::Execution(format!("evaluate transcript failed: {err}")))?
         .finish(terminal)
-        .map_err(|err| ExecutorError::WeightsError(format!("evaluate transcript failed: {err}")))?;
+        .map_err(|err| ExecutorError::Execution(format!("evaluate transcript failed: {err}")))?;
         Ok((Termination::Completed { output_events }, billable_units))
     }
 
@@ -228,8 +236,8 @@ impl EvaluateEngine {
     /// refuses it if this node may not.
     ///
     /// Every admission this engine has that is about the *request* — the
-    /// assurance it was made under, the artifacts it names, the dtype,
-    /// the execute policy, and whether the weights are on this disk —
+    /// assurance it was made under, the artifacts it names, the execute
+    /// policy, and whether the exact package is loaded —
     /// runs here, once, so the quoted path and the paid path cannot
     /// disagree about what this node will run.
     ///
@@ -243,44 +251,61 @@ impl EvaluateEngine {
         ensure_supported_assurance(evaluate_request.assurance, self.provider.assurance)?;
         let resolved = self
             .artifacts
-            .for_retention(evaluate_request.retention())
             .resolve_evaluate_request(evaluate_request.clone())
             .await?;
-        if !self.supported_dtypes.contains(&resolved.locator.dtype) {
-            return Err(ExecutorError::DtypeNotSupported {
-                request: resolved.locator.dtype,
-                supported: self.supported_dtypes.clone(),
-            });
-        }
-        if !self.execute_policy.allows_execute(
-            &resolved.locator.spec(),
-            Some(resolved.locator.model_id.as_str()),
-        ) {
+        let loaded = self.loaded_package_for(resolved.locator).ok_or_else(|| {
+            ExecutorError::PackageNotLoaded(resolved.locator.execution_package.to_string())
+        })?;
+        loaded.validate_invocation(&resolved.invocation)?;
+        let execution_package = resolved.locator.execution_package.to_string();
+        if !self
+            .execute_policy
+            .allows_execution_package(&execution_package)
+        {
             return Err(ExecutorError::PolicyDenied(format!(
-                "execute policy denied model {}",
-                resolved.locator.spec()
+                "execute policy denied exact package {execution_package}; artifact-addressed requests require an id/... rule",
             )));
         }
-        // The other way in. Nothing above has established that the model
-        // is on this disk — the model comes from a stored artifact, and
-        // an artifact can be put here over the wire — so without this a
-        // job admitted here would be run later by a worker whose loader
-        // downloads whatever it does not find: the same hole, one step
-        // further away.
-        let spec = resolved.locator.spec();
-        hellas_models::require_program_files(&spec).map_err(|err| refusal_for(&spec, err))?;
+        let package_name = self
+            .package_names_for(resolved.locator)
+            .into_iter()
+            .next()
+            .expect("a resolved loaded package has at least one local alias");
         Ok(EvaluateJob {
             evaluate_request,
             locator: resolved.locator,
             invocation: resolved.invocation,
-            model_id: spec,
+            package_name,
+            prepared_artifacts: resolved.prepared_artifacts,
+        })
+    }
+
+    fn package_names_for(&self, locator: PackageLocator) -> Vec<String> {
+        let mut names = self
+            .packages
+            .iter()
+            .filter_map(|(name, status)| match status {
+                LocalPackageStatus::Ready(loaded) if loaded.locator == locator => {
+                    Some(name.clone())
+                }
+                LocalPackageStatus::Ready(_) | LocalPackageStatus::Failed(_) => None,
+            })
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    fn loaded_package_for(&self, locator: PackageLocator) -> Option<crate::state::LoadedPackage> {
+        self.packages.values().find_map(|status| match status {
+            LocalPackageStatus::Ready(loaded) if loaded.locator == locator => Some(*loaded),
+            LocalPackageStatus::Ready(_) | LocalPackageStatus::Failed(_) => None,
         })
     }
 }
 
 fn evaluate_stop_reason(stop_reason: StopReason) -> EvaluateStopReason {
     match stop_reason {
-        StopReason::EndOfSequence => EvaluateStopReason::END_OF_SEQUENCE,
+        StopReason::StopToken => EvaluateStopReason::STOP_TOKEN,
         StopReason::MaxNewTokens => EvaluateStopReason::MAX_OUTPUT,
         StopReason::Cancelled => unreachable!("cancellation is not a success terminal"),
     }
@@ -305,10 +330,9 @@ impl SchemeEngine for EvaluateEngine {
         let request_commitment_bytes = store.create_quote(QuoteRecord {
             terms,
             expires_at: Instant::now() + QUOTE_TTL,
-            model_id: job.model_id.clone(),
             runner_public_key: job.evaluate_request.runner_public_key,
             kind: QuoteKind::Scheme(Box::new(job)),
-        });
+        })?;
 
         Ok(TicketOutcome {
             response: ticket,
@@ -325,28 +349,36 @@ impl SchemeEngine for EvaluateEngine {
     ) -> Result<TicketOutcome<QuoteResponse>, ExecutorError> {
         let total_start = Instant::now();
         store.prune_expired_quotes(Instant::now());
-        // Off the actor task: building a plan resolves and may download
-        // every model file, then reads each one to hash it. Run inline
-        // it pins a runtime worker thread for the whole of that, so a
-        // single quote degrades every other connection the process is
-        // serving. (It does not remove the executor's own serialization
-        // — the actor still awaits this before its next message.)
-        let supported_dtypes = self.supported_dtypes.clone();
-        let execute_policy = self.execute_policy.clone();
-        let plan = tokio::task::spawn_blocking(move || {
-            QuotePlan::from_tokens_request(request, &supported_dtypes, &execute_policy)
-        })
-        .await
-        .map_err(|err| {
-            ExecutorError::WeightsError(format!("quote planning task failed: {err}"))
-        })??;
+        let package_name = request.package.trim().to_string();
+        if package_name.is_empty() {
+            return Err(ExecutorError::InvalidQuoteRequest(
+                "missing package".to_string(),
+            ));
+        }
+        let package = match self.packages.get(&package_name) {
+            Some(LocalPackageStatus::Ready(package)) => *package,
+            Some(LocalPackageStatus::Failed(error)) => {
+                return Err(ExecutorError::PackageNotLoaded(format!(
+                    "{package_name}: {error}"
+                )));
+            }
+            None => {
+                return Err(ExecutorError::PackageNotLoaded(package_name.to_string()));
+            }
+        };
+        if !self.execute_policy.allows_execute(
+            &package.locator.execution_package.to_string(),
+            Some(&package_name),
+        ) {
+            return Err(ExecutorError::PolicyDenied(format!(
+                "execute policy denied package {package_name} ({})",
+                package.locator.execution_package,
+            )));
+        }
+        let plan = QuotePlan::from_tokens_request(request, package)?;
         ensure_supported_assurance(plan.assurance, self.provider.assurance)?;
 
-        let resolved = self
-            .artifacts
-            .for_retention(plan.retention)
-            .record_prepared_text(&plan)
-            .await?;
+        let resolved = self.artifacts.prepare_text(&plan).await?;
         let evaluate_request = resolved.evaluate_request.clone();
         let evaluate_request_pb = evaluate_request_to_pb(&evaluate_request);
         let request_commitment = Evaluate::commit_request(&evaluate_request);
@@ -356,20 +388,23 @@ impl SchemeEngine for EvaluateEngine {
             evaluate_request.assurance,
         )?;
         let commitment_id = request_commitment.digest();
-        let model_id = plan.locator.spec();
-        let prompt_tokens = plan.invocation.input_ids.len() as u32;
+        let prompt_tokens = u32::try_from(plan.invocation.input_ids.len()).map_err(|_| {
+            ExecutorError::InvalidTokenPayload(
+                "prompt token count exceeds the RPC representation".to_string(),
+            )
+        })?;
         let request_commitment_bytes = store.create_quote(QuoteRecord {
             terms,
             expires_at: Instant::now() + QUOTE_TTL,
-            model_id: model_id.clone(),
             runner_public_key: evaluate_request.runner_public_key,
             kind: QuoteKind::Scheme(Box::new(EvaluateJob {
                 evaluate_request,
                 locator: resolved.locator,
                 invocation: resolved.invocation,
-                model_id,
+                package_name,
+                prepared_artifacts: resolved.prepared_artifacts,
             })),
-        });
+        })?;
 
         info!(
             request_commitment = %hex32(&request_commitment_bytes),
@@ -392,103 +427,42 @@ impl SchemeEngine for EvaluateEngine {
         })
     }
 
-    async fn quote_prompt(
+    async fn materialize_package(
         &mut self,
-        store: &mut ExecutorState,
-        request: QuotePromptRequest,
-    ) -> Result<TicketOutcome<QuoteResponse>, ExecutorError> {
-        let dtype = self.preferred_dtype();
-        let assets = load_assets(&request.package, dtype)?;
-        let prepared = assets.prepare_plain(&request.prompt)?;
-        let runner_public_key = parse_runner_public_key(request.runner_public_key)?;
-        let retention = hellas_rpc::Retention::from_retain(request.retain.unwrap_or(true));
-        let quote = assets.prepare_quote(&prepared);
-        let tokens_request = quote_tokens_request(
-            request.package,
-            quote,
-            request.max_new_tokens,
-            &runner_public_key,
-            request.assurance,
-            retention,
-        );
-        self.quote_tokens(store, tokens_request).await
-    }
-
-    async fn quote_chat_prompt(
-        &mut self,
-        store: &mut ExecutorState,
-        request: QuoteChatPromptRequest,
-    ) -> Result<TicketOutcome<QuoteResponse>, ExecutorError> {
-        let dtype = self.preferred_dtype();
-        let assets = load_assets(&request.package, dtype)?;
-
-        let mut messages = Vec::new();
-        if !request.system_prompt.is_empty() {
-            messages.push(ChatMessage::system(&request.system_prompt));
+        source: PackageSource,
+    ) -> Result<hellas_rpc::ExecutionPackageId, ExecutorError> {
+        let name = source.name().to_string();
+        if matches!(self.packages.get(&name), Some(LocalPackageStatus::Ready(_))) {
+            return Err(ExecutorError::InvalidPackageSource(format!(
+                "package alias {name:?} is already loaded"
+            )));
         }
-        for m in &request.messages {
-            let msg = match m.role.as_str() {
-                "assistant" => ChatMessage::assistant(&m.content),
-                _ => ChatMessage::user(&m.content),
-            };
-            messages.push(msg);
-        }
-        let prepared = assets.prepare_chat(&messages)?;
-        let runner_public_key = parse_runner_public_key(request.runner_public_key)?;
-        let retention = hellas_rpc::Retention::from_retain(request.retain.unwrap_or(true));
-        let quote = assets.prepare_quote(&prepared);
-        let tokens_request = quote_tokens_request(
-            request.package,
-            quote,
-            request.max_new_tokens,
-            &runner_public_key,
-            request.assurance,
-            retention,
-        );
-        self.quote_tokens(store, tokens_request).await
-    }
-
-    async fn materialize_model(&mut self, model: String) -> Result<(), ExecutorError> {
-        let spec = ModelSpec::parse(&model).map_err(hellas_models::ModelAssetsError::from)?;
-        let locator = ModelLocator {
-            model_id: spec.id().to_string(),
-            revision: spec.revision().to_string(),
-            dtype: self.preferred_dtype(),
-        };
-        let key = locator.clone();
-        match ModelAssets::load(&locator.spec(), locator.dtype, Reach::Download).and_then(
-            |assets| hellas_models::materialize_program_files(&key.spec()).map(|()| assets),
-        ) {
-            Ok(_) => {
-                self.models.insert(key.clone(), LocalModelStatus::Ready);
+        match self.worker.load_package(source).await {
+            Ok(loaded) => {
+                self.packages
+                    .insert(name.clone(), LocalPackageStatus::Ready(loaded));
                 info!(
-                    model = %key.model_id,
-                    requested_revision = %key.revision,
-                    dtype = %key.dtype,
-                    "materialized model"
+                    package = %name,
+                    execution_package = %loaded.locator.execution_package,
+                    "loaded Catena package"
                 );
-                Ok(())
+                Ok(loaded.locator.execution_package)
             }
-            Err(err) => {
-                self.models
-                    .insert(key.clone(), LocalModelStatus::Failed(err.to_string()));
-                Err(err.into())
+            Err(error) => {
+                self.packages
+                    .insert(name, LocalPackageStatus::Failed(error.to_string()));
+                Err(error)
             }
         }
     }
 
-    async fn put_artifact(
+    async fn publish_canonical_artifact(
         &mut self,
-        request: PutArtifactRequest,
-    ) -> Result<PutArtifactResponse, ExecutorError> {
-        let digest = self
-            .artifacts
-            .retained()
-            .publish_canonical_bytes(request.canonical_artifact)
-            .await?;
-        Ok(PutArtifactResponse {
-            digest: digest.as_bytes().to_vec(),
-        })
+        canonical_artifact: Vec<u8>,
+    ) -> Result<Digest, ExecutorError> {
+        self.artifacts
+            .publish_canonical_bytes(canonical_artifact)
+            .await
     }
 
     async fn get_artifact(
@@ -500,7 +474,6 @@ impl SchemeEngine for EvaluateEngine {
         // reachable through this API.
         let canonical_artifact = self
             .artifacts
-            .retained()
             .get_canonical_bytes(digest_from_slice(&request.digest, "digest")?)
             .await?;
         Ok(GetArtifactResponse { canonical_artifact })
@@ -508,15 +481,22 @@ impl SchemeEngine for EvaluateEngine {
 
     async fn list_packages(&self) -> ListPackagesResponse {
         let packages = self
-            .models
+            .packages
             .iter()
-            .map(|(locator, status)| {
-                let (proto_status, error) = match status {
-                    LocalModelStatus::Ready => (PackageStatus::Ready, String::new()),
-                    LocalModelStatus::Failed(err) => (PackageStatus::Failed, err.clone()),
+            .map(|(name, status)| {
+                let (proto_status, execution_package, error) = match status {
+                    LocalPackageStatus::Ready(loaded) => (
+                        PackageStatus::Ready,
+                        loaded.locator.execution_package.as_bytes().to_vec(),
+                        String::new(),
+                    ),
+                    LocalPackageStatus::Failed(err) => {
+                        (PackageStatus::Failed, Vec::new(), err.clone())
+                    }
                 };
                 PackageInfo {
-                    name: locator.spec(),
+                    name: name.clone(),
+                    execution_package,
                     status: proto_status.into(),
                     error,
                 }
@@ -538,17 +518,19 @@ impl SchemeEngine for EvaluateEngine {
             evaluate_request,
             locator,
             invocation,
-            model_id,
+            package_name,
+            prepared_artifacts,
         } = *job;
         let stat_prompt = invocation.input_ids.len() as u64;
         let (sender, receiver) = mpsc::channel(PER_EXECUTION_CHANNEL_CAPACITY);
         let execute_job = ExecuteJob {
             execution_id: ctx.execution_id.clone(),
             request_commitment: ctx.request_commitment,
-            model_id: model_id.clone(),
+            package_name: package_name.clone(),
             evaluate_request,
             locator,
             invocation,
+            prepared_artifacts,
             stream_batch_size: 1,
             accepted_at: Instant::now(),
             cancel: CancellationToken::new(),
@@ -571,10 +553,9 @@ impl SchemeEngine for EvaluateEngine {
         };
 
         self.metrics.record_execution_started(
-            &model_id,
+            "evaluate",
+            &package_name,
             stat_prompt,
-            /* cached_prompt= */ 0,
-            /* cached_output= */ 0,
             /* prefill= */ stat_prompt,
         );
 
@@ -635,9 +616,10 @@ impl SchemeEngine for EvaluateEngine {
         let WorkerCompletion {
             execution_id,
             request_commitment,
-            model_id,
+            package_name,
             evaluate_request,
             invocation,
+            prepared_artifacts,
             sender,
             result,
         } = completion;
@@ -665,6 +647,7 @@ impl SchemeEngine for EvaluateEngine {
                             stop_reason,
                             output_tokens,
                             output_events,
+                            prepared_artifacts.as_ref(),
                         )
                         .await
                     {
@@ -691,48 +674,38 @@ impl SchemeEngine for EvaluateEngine {
             }
         };
 
-        if let Some(billable_units) = billable_units {
+        if billable_units.is_some() {
             self.metrics
-                .record_execution_completed(&model_id, billable_units);
-            self.completed.insert(
-                request_commitment,
-                CompletedEvaluate {
-                    runner_public_key: evaluate_request.runner_public_key,
-                    assurance: evaluate_request.assurance,
-                    termination: termination.clone(),
-                },
-            );
+                .record_execution_completed("evaluate", &package_name, generated);
+            if evaluate_request.retention().should_retain() {
+                if !self.completed.contains_key(&request_commitment) {
+                    while self.completed.len() >= COMPLETED_EXECUTION_CACHE_CAPACITY {
+                        let Some(oldest) = self.completed_order.pop_front() else {
+                            break;
+                        };
+                        self.completed.remove(&oldest);
+                    }
+                    self.completed_order.push_back(request_commitment);
+                }
+                self.completed.insert(
+                    request_commitment,
+                    CompletedEvaluate {
+                        runner_public_key: evaluate_request.runner_public_key,
+                        assurance: evaluate_request.assurance,
+                        termination: termination.clone(),
+                    },
+                );
+            }
         } else {
-            self.metrics.record_execution_failed(&model_id, generated);
+            self.metrics
+                .record_execution_failed("evaluate", &package_name, generated);
         }
 
-        let _ = sender.send(Ok(termination.into_pb())).await;
+        // Completion runs on the actor itself. A stalled consumer must never
+        // wedge package loads, quotes, or every later execution behind an
+        // awaited send into its already-full per-run channel.
+        let _ = sender.try_send(Ok(termination.into_pb()));
         self.dispatch_next_execution();
-    }
-}
-
-/// Assemble the wire `QuoteTokensRequest` from the model-domain
-/// [`PreparedQuote`] plus the protocol framing (genesis start marker,
-/// runner key) the model layer deliberately leaves to callers.
-fn quote_tokens_request(
-    package: String,
-    quote: PreparedQuote,
-    max_new_tokens: u32,
-    runner_public_key: &hellas_rpc::PublicKey,
-    assurance: i32,
-    retention: hellas_rpc::Retention,
-) -> QuoteTokensRequest {
-    QuoteTokensRequest {
-        package,
-        prompt_token_ids: quote.prompt_token_ids,
-        max_new_tokens,
-        stop_token_ids: quote.stop_token_ids,
-        start: Some(EvaluateStart {
-            kind: Some(evaluate_start::Kind::Genesis(EvaluateGenesisStart {})),
-        }),
-        runner_public_key: Some(public_key_to_pb(runner_public_key)),
-        assurance,
-        retain: Some(retention.should_retain()),
     }
 }
 
@@ -749,29 +722,10 @@ fn ensure_supported_assurance(
     }
 }
 
-fn parse_runner_public_key(key: Option<PbPublicKey>) -> Result<PublicKey, ExecutorError> {
-    key.ok_or_else(|| ExecutorError::InvalidQuoteRequest("missing runner_public_key".to_string()))
-        .and_then(|key| {
-            public_key_from_pb(key).map_err(|err| {
-                ExecutorError::InvalidQuoteRequest(format!("invalid runner_public_key: {err}"))
-            })
-        })
-}
-
 fn digest_from_slice(bytes: &[u8], field: &str) -> Result<Digest, ExecutorError> {
     crate::state::fixed::<32>(field, bytes)
         .map(Digest::from_bytes)
         .map_err(ExecutorError::InvalidQuoteRequest)
-}
-
-/// Tokenizer and config for a quote, from what this node already holds.
-///
-/// `quote_prompt` and `quote_chat_prompt` are reachable by any peer that
-/// can dial us and take a package from the request, so they get the
-/// same local reach the manifest does. A repo's `tokenizer.json` is
-/// small only because its author chose to make it small.
-fn load_assets(package: &str, dtype: Dtype) -> Result<ModelAssets, ExecutorError> {
-    ModelAssets::load(package, dtype, Reach::Local).map_err(|err| refusal_for(package, err))
 }
 
 fn hex32(bytes: &[u8; 32]) -> String {
@@ -782,6 +736,8 @@ fn hex32(bytes: &[u8; 32]) -> String {
 mod tests {
     use super::*;
     use hellas_rpc::ProducerSigningKey;
+    use hellas_rpc::pb::courtesy::{EvaluateGenesisStart, EvaluateStart, evaluate_start};
+    use hellas_rpc::run_ticket::public_key_to_pb;
 
     fn key(byte: u8) -> ProducerSigningKey {
         ProducerSigningKey::from_secret_bytes([byte; 32]).expect("valid test key")
@@ -791,7 +747,6 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         EvaluateEngine::new(
             EvaluateArtifactStore::memory(),
-            vec![Dtype::F32],
             1,
             ExecutePolicy::Eager,
             Arc::new(ExecutorMetrics::default()),
@@ -804,21 +759,112 @@ mod tests {
         )
     }
 
+    fn artifact_plan(locator: PackageLocator) -> QuotePlan {
+        QuotePlan {
+            locator,
+            vocabulary_size: u64::from(u32::MAX) + 1,
+            maximum_capacity: u64::MAX,
+            execution_environment: QuotePlan::execution_environment(locator),
+            invocation: Invocation {
+                input_ids: vec![1, 2, 3],
+                max_new_tokens: 8,
+                stop_token_ids: Vec::new(),
+            },
+            initial_artifact_id: None,
+            runner_public_key: key(3).public_key(),
+            assurance: Assurance::ProducerSigned,
+            retention: hellas_rpc::Retention::Retain,
+        }
+    }
+
+    fn token_request(execution_package: hellas_rpc::ExecutionPackageId) -> QuoteTokensRequest {
+        QuoteTokensRequest {
+            package: "smollm2-135m".to_string(),
+            execution_package: execution_package.as_bytes().to_vec(),
+            prompt_token_ids: vec![1, 2, 3],
+            max_new_tokens: Some(4),
+            stop_token_ids: vec![9, 2, 9],
+            start: Some(EvaluateStart {
+                kind: Some(evaluate_start::Kind::Genesis(EvaluateGenesisStart {})),
+            }),
+            runner_public_key: Some(public_key_to_pb(&key(3).public_key())),
+            assurance: Assurance::ProducerSigned.to_byte().into(),
+            retain: Some(false),
+        }
+    }
+
+    #[test]
+    fn token_quote_pins_the_exact_package_and_normalizes_stop_ids() {
+        let actual = hellas_rpc::ExecutionPackageId::from_bytes([6; 32]);
+        let loaded = crate::state::LoadedPackage {
+            locator: PackageLocator {
+                execution_package: actual,
+            },
+            vocabulary_size: 100,
+            maximum_capacity: 100,
+        };
+        let plan = QuotePlan::from_tokens_request(token_request(actual), loaded).unwrap();
+        assert_eq!(plan.invocation.stop_token_ids, [2, 9]);
+
+        let pinned_other = hellas_rpc::ExecutionPackageId::from_bytes([7; 32]);
+        let Err(error) = QuotePlan::from_tokens_request(token_request(pinned_other), loaded) else {
+            panic!("a different exact package pin must be rejected");
+        };
+        assert!(error.to_string().contains("caller pinned"), "{error}");
+    }
+
+    #[test]
+    fn token_quote_defaults_only_an_absent_output_limit() {
+        let execution_package = hellas_rpc::ExecutionPackageId::from_bytes([6; 32]);
+        let loaded = crate::state::LoadedPackage {
+            locator: PackageLocator { execution_package },
+            vocabulary_size: 100,
+            maximum_capacity: 100,
+        };
+        let mut absent = token_request(execution_package);
+        absent.max_new_tokens = None;
+        let plan = QuotePlan::from_tokens_request(absent, loaded).unwrap();
+        assert_eq!(
+            plan.invocation.max_new_tokens,
+            hellas_rpc::DEFAULT_MAX_NEW_TOKENS
+        );
+
+        let mut zero = token_request(execution_package);
+        zero.max_new_tokens = Some(0);
+        let Err(error) = QuotePlan::from_tokens_request(zero, loaded) else {
+            panic!("an explicit zero limit must not select the default");
+        };
+        assert!(error.to_string().contains("greater than zero"), "{error}");
+    }
+
+    #[test]
+    fn token_quote_bounds_stop_policy_work_before_normalizing() {
+        let actual = hellas_rpc::ExecutionPackageId::from_bytes([6; 32]);
+        let loaded = crate::state::LoadedPackage {
+            locator: PackageLocator {
+                execution_package: actual,
+            },
+            vocabulary_size: 100,
+            maximum_capacity: 100,
+        };
+        let mut request = token_request(actual);
+        request.stop_token_ids = vec![2; hellas_rpc::MAX_STOP_TOKEN_IDS + 1];
+        let Err(error) = QuotePlan::from_tokens_request(request, loaded) else {
+            panic!("an oversized stop policy must be rejected");
+        };
+        assert!(error.to_string().contains("over the limit"), "{error}");
+    }
+
     /// The vulnerability, at the door it came in by: an unauthenticated
-    /// peer names a model and the node must refuse without fetching it.
+    /// peer names a package and the node must refuse without resolving a path
+    /// or fetching anything.
     ///
     /// `ExecutePolicy::Eager` is the default and permits everything, so
     /// the policy is deliberately left permissive here — what refuses
-    /// this quote is that the node does not hold the model, and a quote
-    /// may not make it hold one.
-    ///
-    /// The error variant is the assertion that carries the weight. A
-    /// quote path that downloaded would report a fetch failure (or, with
-    /// a real repository and a real network, would succeed after paying
-    /// for it); only a path that never asks the hub can answer
-    /// `ModelNotMaterialized`.
+    /// this quote is that the alias is absent from the owner-populated local
+    /// registry. A quote may not add it.
     #[tokio::test]
-    async fn quoting_an_unmaterialized_model_is_refused_without_fetching_it() {
+    async fn quoting_an_unloaded_package_is_refused_without_fetching_it() {
         let mut engine = test_engine(Arc::new(key(2)));
         let mut store = ExecutorState::new();
         let runner = key(3).public_key();
@@ -827,13 +873,10 @@ mod tests {
             .quote_tokens(
                 &mut store,
                 QuoteTokensRequest {
-                    // Pinned, and to a commit no cache holds: nothing but
-                    // a download could resolve this.
-                    package:
-                        "hellas-test/not-on-this-node@c1899de289a04d12100db370d81485cdf75e47ca"
-                            .to_string(),
+                    package: "not-on-this-node".to_string(),
+                    execution_package: vec![8; 32],
                     prompt_token_ids: vec![1, 2, 3],
-                    max_new_tokens: 4,
+                    max_new_tokens: Some(4),
                     stop_token_ids: Vec::new(),
                     start: Some(EvaluateStart {
                         kind: Some(evaluate_start::Kind::Genesis(EvaluateGenesisStart {})),
@@ -844,19 +887,16 @@ mod tests {
                 },
             )
             .await
-            .expect_err("a model this node does not hold must not be quotable");
+            .expect_err("a package this node has not loaded must not be quotable");
 
         match &err {
-            ExecutorError::ModelNotMaterialized(message) => {
-                assert!(
-                    message.contains("hellas-test/not-on-this-node"),
-                    "{message}"
-                );
+            ExecutorError::PackageNotLoaded(message) => {
+                assert!(message.contains("not-on-this-node"), "{message}");
             }
-            other => panic!("expected a not-materialized refusal, got {other:?}"),
+            other => panic!("expected a not-loaded refusal, got {other:?}"),
         }
         // Answerable later, not forbidden: a client can ask the operator
-        // for the model and come back.
+        // for the package and come back.
         assert_eq!(
             hellas_wire::WireStatus::from(err).code,
             hellas_wire::WireCode::FailedPrecondition,
@@ -869,21 +909,11 @@ mod tests {
         );
     }
 
-    /// The same door, with a name instead of a model.
-    ///
-    /// A revision reaches `hf-hub`'s `refs/` lookup, which reads the file
-    /// it names; an absolute one replaces the cache path outright. So the
-    /// quote request below is not a request for a model at all — it is a
-    /// request that this node read `/etc/passwd` and tell the caller
-    /// something about it.
-    ///
-    /// `InvalidArgument` rather than `FailedPrecondition` is the
-    /// assertion that separates this from the test above: a node that
-    /// merely did not hold the model would say "not here yet", which is
-    /// an invitation to try again with a different path.
+    /// Package aliases are opaque registry keys. Path-shaped attacker input
+    /// is never interpreted as a filesystem location.
     #[tokio::test]
-    async fn quoting_a_revision_that_is_a_path_is_refused_as_a_bad_name() {
-        for revision in ["/etc/passwd", "../../..", "refs/heads/../../../etc"] {
+    async fn quoting_a_path_shaped_alias_is_only_a_registry_miss() {
+        for package in ["/etc/passwd", "../../..", "refs/heads/../../../etc"] {
             let mut engine = test_engine(Arc::new(key(2)));
             let mut store = ExecutorState::new();
             let runner = key(3).public_key();
@@ -892,9 +922,10 @@ mod tests {
                 .quote_tokens(
                     &mut store,
                     QuoteTokensRequest {
-                        package: format!("hellas-test/not-on-this-node@{revision}"),
+                        package: package.to_string(),
+                        execution_package: vec![8; 32],
                         prompt_token_ids: vec![1, 2, 3],
-                        max_new_tokens: 4,
+                        max_new_tokens: Some(4),
                         stop_token_ids: Vec::new(),
                         start: Some(EvaluateStart {
                             kind: Some(evaluate_start::Kind::Genesis(EvaluateGenesisStart {})),
@@ -905,18 +936,15 @@ mod tests {
                     },
                 )
                 .await
-                .expect_err("a revision that is a path must not be resolved");
+                .expect_err("a path-shaped alias must not be resolved");
 
             assert!(
-                matches!(
-                    err,
-                    ExecutorError::ModelAssets(hellas_models::ModelAssetsError::Spec(_)),
-                ),
-                "{revision:?} was refused, but not as a bad name: {err:?}",
+                matches!(err, ExecutorError::PackageNotLoaded(_)),
+                "{package:?} was not treated as an opaque registry miss: {err:?}",
             );
             assert_eq!(
                 hellas_wire::WireStatus::from(err).code,
-                hellas_wire::WireCode::InvalidArgument,
+                hellas_wire::WireCode::FailedPrecondition,
             );
             // A refused quote leaves nothing behind to be run against.
             assert!(
@@ -928,34 +956,18 @@ mod tests {
     }
 
     /// The same door, one round trip further away: the evaluate quote
-    /// takes its model from a stored artifact rather than from the
-    /// request, and artifacts can be put here over the wire. A ticket
-    /// issued for a model this node does not hold would be redeemed by a
-    /// worker that downloads it, so the refusal has to happen here too.
+    /// takes its exact package identity from a stored artifact rather than
+    /// from an alias. Wire-uploaded artifacts cannot make the worker load it.
     #[tokio::test]
-    async fn quoting_an_artifact_bound_to_an_unmaterialized_model_is_refused() {
+    async fn quoting_an_artifact_bound_to_an_unloaded_package_is_refused() {
         let mut engine = test_engine(Arc::new(key(2)));
         let mut store = ExecutorState::new();
-        let plan = QuotePlan {
-            locator: ModelLocator {
-                model_id: "hellas-test/not-on-this-node".to_string(),
-                revision: "c1899de289a04d12100db370d81485cdf75e47ca".to_string(),
-                dtype: Dtype::F32,
-            },
-            execution_environment: hellas_rpc::ContentId::from_bytes([9; 32]),
-            invocation: Invocation {
-                input_ids: vec![1, 2, 3],
-                max_new_tokens: 8,
-                stop_token_ids: Vec::new(),
-            },
-            initial_artifact_id: None,
-            runner_public_key: key(3).public_key(),
-            assurance: Assurance::ProducerSigned,
-            retention: hellas_rpc::Retention::Retain,
+        let locator = PackageLocator {
+            execution_package: hellas_rpc::ExecutionPackageId::from_bytes([6; 32]),
         };
+        let plan = artifact_plan(locator);
         let recorded = engine
             .artifacts
-            .for_retention(plan.retention)
             .record_prepared_text(&plan)
             .await
             .expect("record the prepared text an artifact quote resolves through");
@@ -966,17 +978,57 @@ mod tests {
                 evaluate_request_to_pb(&recorded.evaluate_request),
             )
             .await
-            .expect_err("a ticket must not be issued for a model this node does not hold");
+            .expect_err("a ticket must not be issued for a package this node has not loaded");
 
         match &err {
-            ExecutorError::ModelNotMaterialized(message) => {
+            ExecutorError::PackageNotLoaded(message) => {
                 assert!(
-                    message.contains("hellas-test/not-on-this-node"),
+                    message.contains(&locator.execution_package.to_string()),
                     "{message}"
                 );
             }
-            other => panic!("expected a not-materialized refusal, got {other:?}"),
+            other => panic!("expected a not-loaded refusal, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn artifact_quote_requires_an_exact_id_policy_rule() {
+        let mut engine = test_engine(Arc::new(key(2)));
+        let mut store = ExecutorState::new();
+        let locator = PackageLocator {
+            execution_package: hellas_rpc::ExecutionPackageId::from_bytes([6; 32]),
+        };
+        let plan = artifact_plan(locator);
+        let recorded = engine.artifacts.record_prepared_text(&plan).await.unwrap();
+        engine.packages.insert(
+            "smollm2-135m".to_string(),
+            LocalPackageStatus::Ready(crate::state::LoadedPackage {
+                locator,
+                vocabulary_size: plan.vocabulary_size,
+                maximum_capacity: plan.maximum_capacity,
+            }),
+        );
+
+        engine.execute_policy = "allow(package/smollm2-135m)".parse().unwrap();
+        let error = engine
+            .quote_evaluate(
+                &mut store,
+                evaluate_request_to_pb(&recorded.evaluate_request),
+            )
+            .await
+            .expect_err("an alias rule cannot authorize an alias-free artifact request");
+        assert!(matches!(error, ExecutorError::PolicyDenied(_)));
+
+        engine.execute_policy = format!("allow(id/{})", locator.execution_package)
+            .parse()
+            .unwrap();
+        engine
+            .quote_evaluate(
+                &mut store,
+                evaluate_request_to_pb(&recorded.evaluate_request),
+            )
+            .await
+            .expect("the exact package identity authorizes the artifact request");
     }
 
     #[tokio::test]
@@ -993,7 +1045,7 @@ mod tests {
         let output_events = builder
             .finish(EvaluateTerminal {
                 final_position: 1,
-                stop_reason: EvaluateStopReason::END_OF_SEQUENCE,
+                stop_reason: EvaluateStopReason::STOP_TOKEN,
                 text_artifact: Digest::from_bytes([8; 32]),
                 usage: EvaluateUsage {
                     input_units: 4,

@@ -3,6 +3,8 @@
   system,
   nixpkgs,
   rust-overlay,
+  catena-runner,
+  exploratory-catena,
   # When set, builds everything for this target triple via `pkgsCross`.
   # Leave null for native builds.
   crossSystem ? null,
@@ -69,10 +71,18 @@ let
     cargoLock = {
       lockFile = ../Cargo.lock;
       outputHashes = {
-        "catgrad-0.2.1" = "sha256-0ylGTfMbQ2rbOrvrpWshzZeMuVbWAC3uEHwbcGQ+WJE=";
         "commonware-actor-2026.7.0" = "sha256-LEVuwzWlttz1znLpe0bmEV/Gk+7v9BI9/Un25tR7naM=";
       };
     };
+    postPatch = ''
+      substituteInPlace Cargo.toml \
+        --replace-fail \
+          'catena-runner = { path = "../catena-runner", default-features = false }' \
+          'catena-runner = { path = "${catena-runner}", default-features = false }' \
+        --replace-fail \
+          'catena-lang = { path = "../exploratory-catena/catena-lang" }' \
+          'catena-lang = { path = "${exploratory-catena}/catena-lang" }'
+    '';
     inherit stdenv;
     auditable = false;
     RUST_MIN_STACK = "16777216";

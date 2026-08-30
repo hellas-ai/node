@@ -1424,7 +1424,7 @@ pub fn check_prepared_input(
     // input this bundle does not carry.
     //
     // Its bound term is the environment the execution actually resolves
-    // in — a provider materializing this source reads the model from
+    // in — a party materializing this source reads the execution package from
     // here, not from the request — so an identity naming another
     // environment is a job that would fault at dispatch after both
     // parties had signed for it.

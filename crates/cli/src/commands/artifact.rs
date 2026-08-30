@@ -1,5 +1,4 @@
-//! `hellas artifact` subcommand — put/get canonical artifact bytes
-//! over the Courtesy service.
+//! `hellas artifact` subcommand — fetch retained canonical artifact bytes.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -7,7 +6,7 @@ use std::path::PathBuf;
 use anyhow::{Context, bail};
 use clap::Subcommand;
 use hellas_rpc::Digest;
-use hellas_rpc::pb::courtesy::{GetArtifactRequest, PutArtifactRequest};
+use hellas_rpc::pb::courtesy::GetArtifactRequest;
 use hellas_rpc::services::courtesy::{Courtesy, CourtesyClientImpl};
 use hellas_wire::ServiceMarker;
 use hellas_wire::iroh::IrohTransport;
@@ -18,13 +17,6 @@ use crate::commands::CliResult;
 
 #[derive(Debug, Subcommand)]
 pub enum ArtifactCommand {
-    /// Store exact canonical artifact bytes on a provider and print the digest
-    Put {
-        node_id: EndpointId,
-        #[arg(long = "node-addr", value_delimiter = ',')]
-        node_addrs: Vec<SocketAddr>,
-        path: PathBuf,
-    },
     /// Fetch canonical artifact bytes by digest from a provider
     Get {
         node_id: EndpointId,
@@ -39,11 +31,6 @@ pub enum ArtifactCommand {
 
 pub async fn run(command: ArtifactCommand, secret_key: SecretKey) -> CliResult<()> {
     match command {
-        ArtifactCommand::Put {
-            node_id,
-            node_addrs,
-            path,
-        } => put(node_id, node_addrs, path, secret_key).await,
         ArtifactCommand::Get {
             node_id,
             node_addrs,
@@ -51,26 +38,6 @@ pub async fn run(command: ArtifactCommand, secret_key: SecretKey) -> CliResult<(
             output,
         } => get(node_id, node_addrs, digest, output, secret_key).await,
     }
-}
-
-async fn put(
-    node_id: EndpointId,
-    node_addrs: Vec<SocketAddr>,
-    path: PathBuf,
-    secret_key: SecretKey,
-) -> CliResult<()> {
-    let canonical_artifact = tokio::fs::read(&path)
-        .await
-        .with_context(|| format!("failed to read artifact bytes from {}", path.display()))?;
-    let client = connect_courtesy(node_id, node_addrs, secret_key).await?;
-    let response = client
-        .put_artifact(PutArtifactRequest { canonical_artifact })
-        .await
-        .map_err(|e| anyhow::anyhow!("put_artifact: {e}"))?;
-    let digest = Digest::from_slice(&response.digest)
-        .map_err(|e| anyhow::anyhow!("provider returned invalid artifact digest: {e}"))?;
-    println!("{digest}");
-    Ok(())
 }
 
 async fn get(

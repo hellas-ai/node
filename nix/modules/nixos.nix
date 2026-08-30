@@ -17,13 +17,21 @@ in
   options.services.hellas =
     hellas.commonOptions {
       inherit lib;
-      package = hellas.normalCliPackage pkgs;
-      packageDescription = ''
-        The hellas CLI used to run the serve daemon. Defaults to the normal
-        CPU-only, OTEL-capable cli-candle package. Override to an accelerator
-        build such as `pkgs.hellas.cli-candle-cuda-cuda12-sm80` explicitly.
-        The slim `pkgs.hellas.cli` package omits local execution and OTEL.
-      '';
+      package = hellas.nixosCliPackage pkgs;
+      packageDescription =
+        if hellas.catenaPlatform pkgs then
+          ''
+            The hellas CLI used to run the serve daemon. On x86_64-linux it
+            defaults to `pkgs.hellas.cli-catena`, which can materialize and
+            execute Catena packages. Override with `pkgs.hellas.cli` for a
+            network-only node.
+          ''
+        else
+          ''
+            The hellas network CLI used to run the serve daemon. Local Catena
+            execution is currently available only on x86_64-linux because the
+            runner uses a HIP-only backend.
+          '';
     }
     // hellas.serveOptions { inherit lib pkgs; }
     // {
@@ -32,11 +40,13 @@ in
           type = types.package;
           default = cfg.package;
           defaultText = lib.literalMD ''
-            `services.hellas.package`: the normal CPU-only, OTEL-capable CLI.
-            Override with `pkgs.hellas.cli` for the slim remote-only build,
-            which intentionally omits OTEL.
+            `services.hellas.package`: the platform's default node CLI.
           '';
-          description = "The hellas CLI used to run the HTTP gateway.";
+          description = ''
+            The hellas CLI used to run the HTTP gateway. The default supports
+            local Catena execution only on x86_64-linux; other platforms use
+            the network-only CLI.
+          '';
         };
       };
       openFirewall = mkOption {
@@ -51,6 +61,12 @@ in
       {
         assertion = pkgs.stdenv.hostPlatform.isLinux;
         message = "services.hellas is only supported on Linux.";
+      }
+      {
+        assertion =
+          hellas.catenaPlatform pkgs
+          || (cfg.executionPackages == { } && !gateway.local && !gateway.verifyLocal);
+        message = "Local Catena execution is supported only on x86_64-linux; use the network CLI without executionPackages, gateway.local, or gateway.verifyLocal on this platform.";
       }
       {
         assertion = gateway.nodeAddrs == [ ] || gateway.nodeId != null;
@@ -69,6 +85,22 @@ in
       {
         assertion = !(gateway.verifyLocal && gateway.verifyNodeId != null);
         message = "services.hellas.gateway.verifyLocal and services.hellas.gateway.verifyNodeId are mutually exclusive.";
+      }
+      {
+        assertion = !(gateway.local || gateway.verifyLocal) || gateway.executionPackagePath != null;
+        message = "services.hellas.gateway.executionPackagePath is required for local execution or local verification.";
+      }
+      {
+        assertion = gateway.executionPackagePath == null || gateway.local || gateway.verifyLocal;
+        message = "services.hellas.gateway.executionPackagePath is only valid for local execution or local verification.";
+      }
+      {
+        assertion = !gateway.enable || gateway.local || gateway.verifyLocal || gateway.packageId != null;
+        message = "services.hellas.gateway.packageId is required for remote execution.";
+      }
+      {
+        assertion = !(gateway.local || gateway.verifyLocal) || gateway.packageId == null;
+        message = "services.hellas.gateway.packageId must be omitted for local execution or local verification; it is derived from the verified local package.";
       }
       {
         assertion = gateway.verifyNodeId == null || gateway.nodeId != null;

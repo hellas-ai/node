@@ -132,10 +132,10 @@ struct RpcService {
 }
 
 struct RpcMethod {
-    /// `QuotePrompt` (as it appears in the .proto).
+    /// `QuoteTokens` (as it appears in the .proto).
     proto_name: String,
     /// Fully-qualified proto request type with a leading dot, e.g.
-    /// `.hellas.courtesy.v1.QuotePromptRequest` — matching `SchemaIndex` keys.
+    /// `.hellas.courtesy.v1.QuoteTokensRequest` — matching `SchemaIndex` keys.
     request_proto_type: String,
     /// Fully-qualified proto response type with a leading dot.
     response_proto_type: String,
@@ -199,7 +199,7 @@ struct SchemaIndex {
 
 #[derive(Clone, Debug)]
 struct IndexedMessage {
-    /// Short proto name (`QuotePromptRequest`).
+    /// Short proto name (`QuoteTokensRequest`).
     short_name: String,
     fields: Vec<IndexedField>,
 }
@@ -432,7 +432,7 @@ fn classify_field(f: &FieldDescriptorProto) -> IndexedFieldType {
 
 /// Per-method render inputs.
 struct MethodPlan {
-    /// Marker type ident (`QuotePrompt`).
+    /// Marker type ident (`QuoteTokens`).
     marker: Ident,
     /// Client / handler method ident (`quote_prompt`).
     fn_name: Ident,

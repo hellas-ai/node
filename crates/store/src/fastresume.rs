@@ -1,8 +1,8 @@
 //! Remembering that a file has already been hashed.
 //!
-//! Identifying a weight file costs a full read of it. A 14 GB shard read
-//! on every quote is the difference between a manifest being cheap and
-//! being a denial-of-service surface, so the result has to be
+//! Identifying a large file costs a full read of it. Repeating that work
+//! on every scan makes routine indexing expensive and turns large cache
+//! trees into a denial-of-service surface, so the result has to be
 //! remembered.
 //!
 //! Named after libtorrent's fastresume data, which is the same idea and
@@ -15,9 +15,8 @@
 //! # Why this one has to be stricter than a torrent client's
 //!
 //! A stale entry in a torrent client means a corrupt download. A stale
-//! entry here means the provider signs an `execution_environment`
-//! committing to weights it does not have — a claim it can lose under
-//! the fraud game. So the key carries more than libtorrent's
+//! entry here makes the index claim that content still occupies a path
+//! whose bytes have changed. So the key carries more than libtorrent's
 //! `(size, mtime)`:
 //!
 //! - `dev` + `ino` — in the HuggingFace layout a content change *is* an
@@ -30,8 +29,6 @@
 //!   closes the two holes above.
 //!
 //! Any disagreement discards the entry. There is no partial trust.
-//!
-//! # Scope
 //!
 //! # Persistence
 //!
@@ -61,9 +58,8 @@ use hellas_xet::{Chunk, XetHash};
 /// are checked together; there is no most-significant one.
 ///
 /// Public because it is the one definition of "the same file" this
-/// workspace has. Anything else that remembers work done on a file —
-/// the model layer's manifest memo, for one — must ask the same
-/// question this asks, and a second implementation of it would be a
+/// workspace has. Anything else that remembers work done on a file must
+/// ask the same question this asks; a second implementation would be a
 /// second answer.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct FileIdentity {
@@ -271,11 +267,11 @@ fn parse(bytes: &[u8]) -> Option<Vec<(FileIdentity, Indexed)>> {
 
 /// True when `path` cannot be content: HuggingFace caches carry lock
 /// files, partial downloads and negative-cache markers alongside real
-/// blobs, and none of them are weights.
+/// blobs, and none of them are complete content.
 ///
-/// Not used on the manifest path, where filenames come from the model
-/// index — it is here for whatever indexes a cache directory wholesale,
-/// so the rule lives with the rest of the cache-shaped knowledge.
+/// An explicitly named file is still checked. This helper also keeps the
+/// filtering rule in one place for callers that index a cache directory
+/// wholesale.
 #[must_use]
 pub fn is_cache_debris(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {

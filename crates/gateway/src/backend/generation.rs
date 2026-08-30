@@ -5,7 +5,7 @@ use thiserror::Error;
 
 use crate::execution::Outcome;
 use hellas_client::ClientError;
-use hellas_models::{ModelAssetsError, TextOutputDecoder};
+use hellas_presentation::TextOutputDecoder;
 
 use super::super::state::PreparedGeneration;
 
@@ -20,7 +20,7 @@ pub(super) enum GenerationError {
     #[error("Inference error: {0}")]
     Execution(#[from] ClientError),
     #[error("Inference error: {0}")]
-    Decode(#[from] ModelAssetsError),
+    Decode(#[from] anyhow::Error),
     #[error("execution stream ended without terminal outcome")]
     MissingTerminalOutcome,
 }
@@ -36,12 +36,11 @@ pub(super) fn generation_stream(
 ) -> impl futures::Stream<Item = Result<GenerationEvent, GenerationError>> + Send {
     let PreparedGeneration {
         prepared,
-        assets,
-        stop_token_ids,
+        presentation,
         ..
     } = generation;
     try_stream! {
-        let mut decoder = TextOutputDecoder::new(assets, &stop_token_ids);
+        let mut decoder = TextOutputDecoder::new(presentation);
         let inner = prepared.stream();
         tokio::pin!(inner);
         while let Some(event) = inner.next().await {

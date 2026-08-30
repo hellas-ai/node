@@ -5,7 +5,7 @@ use crate::ExecutorError;
 use hellas_rpc::{ContentId, Digest, EvaluateRequest};
 
 use crate::artifact_store::{ArtifactStorage, ArtifactStoreConfig};
-use crate::state::{Invocation, ModelLocator, QuotePlan};
+use crate::state::{Invocation, PackageLocator, QuotePlan};
 
 use hellas_rpc::protocol::artifacts::{
     BoundTermId, Canonical, CanonicalDecode, InputAddressed, OutputAddressed, SourceRef,
@@ -15,12 +15,22 @@ use hellas_rpc::protocol::artifacts::{
 
 const CANONICAL_PARTITION: &str = "evaluate_canonical";
 const EXECUTION_OUTPUT_PARTITION: &str = "evaluate_execution_outputs";
+const MAX_TEXT_ARTIFACT_CHAIN_DEPTH: usize = 1024;
 
 #[derive(Clone, Debug)]
 pub(crate) struct ResolvedEvaluateExecution {
     pub evaluate_request: EvaluateRequest,
-    pub locator: ModelLocator,
+    pub locator: PackageLocator,
     pub invocation: Invocation,
+    pub prepared_artifacts: Option<PreparedTextArtifacts>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedTextArtifacts {
+    identity: Option<TextArtifact>,
+    prompt_tokens: TokenIds,
+    policy: TextPolicy,
+    execution: TextExecution,
 }
 
 pub(crate) struct EvaluateArtifactStore {
@@ -36,39 +46,8 @@ pub(crate) struct EvaluateArtifactStore {
     outputs_by_execution: HashMap<TextExecutionId, TextArtifactId>,
 }
 
-/// Retained and ephemeral evaluate artifacts share one routing point.
-/// Courtesy APIs intentionally receive only [`Self::retained`].
-pub(crate) struct EvaluateArtifactStores {
-    retained: EvaluateArtifactStore,
-    ephemeral: EvaluateArtifactStore,
-}
-
-impl EvaluateArtifactStores {
-    pub(crate) fn new(retained: EvaluateArtifactStore) -> Self {
-        Self {
-            retained,
-            ephemeral: EvaluateArtifactStore::memory(),
-        }
-    }
-
-    pub(crate) fn for_retention(
-        &mut self,
-        retention: hellas_rpc::Retention,
-    ) -> &mut EvaluateArtifactStore {
-        if retention.should_retain() {
-            &mut self.retained
-        } else {
-            &mut self.ephemeral
-        }
-    }
-
-    pub(crate) fn retained(&mut self) -> &mut EvaluateArtifactStore {
-        &mut self.retained
-    }
-}
-
 struct MaterializedTextSource {
-    locator: ModelLocator,
+    locator: PackageLocator,
     execution_environment: hellas_rpc::ContentId,
     tokens: Vec<u32>,
 }
@@ -180,38 +159,51 @@ impl EvaluateArtifactStore {
         Ok(Some(bytes))
     }
 
-    pub async fn record_prepared_text(
+    /// Build the canonical input graph for a token quote without publishing
+    /// any of it. A quote is unauthenticated and may expire unused; retained
+    /// storage begins only after the corresponding execution succeeds.
+    pub async fn prepare_text(
         &mut self,
         plan: &QuotePlan,
     ) -> Result<ResolvedEvaluateExecution, ExecutorError> {
         let execution_environment = plan.execution_environment;
         let bound_term_id = BoundTermId::from_digest(execution_environment.digest());
 
-        let from = match plan.initial_artifact_id {
+        let (from, prior_tokens, identity_to_insert) = match plan.initial_artifact_id {
             Some(artifact_id) => {
                 let artifact_id = TextArtifactId::from_digest(artifact_id);
-                let _ = self.materialize_artifact(artifact_id).await?;
-                SourceRef::output(artifact_id)
+                let source = self.materialize_artifact(artifact_id).await?;
+                if source.locator != plan.locator
+                    || source.execution_environment != execution_environment
+                {
+                    return Err(ExecutorError::InvalidQuoteRequest(
+                        "initial artifact belongs to a different Catena package".to_string(),
+                    ));
+                }
+                (SourceRef::output(artifact_id), source.tokens, None)
             }
             None => {
-                let identity = TextArtifact::identity(
-                    bound_term_id,
-                    &plan.locator.model_id,
-                    &plan.locator.revision,
-                    plan.locator.dtype.as_wire(),
-                );
+                let identity =
+                    TextArtifact::identity(bound_term_id, plan.locator.execution_package);
                 let identity_id = identity.output_id();
-                self.insert_text_artifact(identity).await?;
-                SourceRef::output(identity_id)
+                (SourceRef::output(identity_id), Vec::new(), Some(identity))
             }
         };
 
+        let mut invocation = plan.invocation.clone();
+        if !prior_tokens.is_empty() {
+            let mut full_input = prior_tokens;
+            full_input.extend(invocation.input_ids);
+            invocation.input_ids = full_input;
+        }
+        plan.validate_invocation(&invocation)?;
+
         let prompt_tokens = TokenIds::from(plan.invocation.input_ids.clone());
-        let prompt_tokens_id = self.insert_token_ids(prompt_tokens).await?;
+        let prompt_tokens_id = prompt_tokens.output_id();
         let policy = text_policy(&plan.invocation);
-        let policy_id = self.insert_policy(policy).await?;
+        let policy_id = policy.output_id();
         let execution = TextExecution::new(from, prompt_tokens_id, policy_id);
-        let execution_id = self.insert_text_execution(execution).await?;
+        let execution_id = execution.input_id();
         let evaluate_request = EvaluateRequest {
             text_execution: execution_id.digest(),
             runner_public_key: plan.runner_public_key,
@@ -223,9 +215,46 @@ impl EvaluateArtifactStore {
 
         Ok(ResolvedEvaluateExecution {
             evaluate_request,
-            locator: plan.locator.clone(),
-            invocation: plan.invocation.clone(),
+            locator: plan.locator,
+            invocation,
+            prepared_artifacts: Some(PreparedTextArtifacts {
+                identity: identity_to_insert,
+                prompt_tokens,
+                policy,
+                execution,
+            }),
         })
+    }
+
+    async fn publish_prepared_text(
+        &mut self,
+        prepared: &PreparedTextArtifacts,
+    ) -> Result<(), ExecutorError> {
+        if let Some(identity) = prepared.identity.clone() {
+            self.insert_text_artifact(identity).await?;
+        }
+        self.insert_token_ids(prepared.prompt_tokens.clone())
+            .await?;
+        self.insert_policy(prepared.policy.clone()).await?;
+        self.insert_text_execution(prepared.execution.clone())
+            .await?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn record_prepared_text(
+        &mut self,
+        plan: &QuotePlan,
+    ) -> Result<ResolvedEvaluateExecution, ExecutorError> {
+        let resolved = self.prepare_text(plan).await?;
+        self.publish_prepared_text(
+            resolved
+                .prepared_artifacts
+                .as_ref()
+                .expect("a token plan always builds prepared artifacts"),
+        )
+        .await?;
+        Ok(resolved)
     }
 
     pub async fn resolve_evaluate_request(
@@ -258,6 +287,7 @@ impl EvaluateArtifactStore {
                 max_new_tokens: policy.max_new_tokens(),
                 stop_token_ids,
             },
+            prepared_artifacts: None,
         })
     }
 
@@ -293,13 +323,23 @@ impl EvaluateArtifactStore {
     /// shared with the client-side re-execution that has to arrive at the
     /// same artifact id without this store; what is done here is storing
     /// the bodies it derived.
-    pub async fn record_completed_text(
+    pub async fn record_completed_text_with_prepared(
         &mut self,
         evaluate_request: &EvaluateRequest,
         invocation: &Invocation,
         output_tokens: &[u32],
+        prepared: Option<&PreparedTextArtifacts>,
     ) -> Result<Digest, ExecutorError> {
         let execution_id = TextExecutionId::from_digest(evaluate_request.text_execution);
+        if let Some(prepared) = prepared {
+            self.publish_prepared_text(prepared).await?;
+            let prepared_id = prepared.execution.input_id();
+            if prepared_id != execution_id {
+                return Err(ExecutorError::ArtifactStore(
+                    "prepared execution does not match evaluate request".to_string(),
+                ));
+            }
+        }
         let _ = self.text_execution(execution_id).await?;
 
         let completed = completed_text(execution_id, &invocation.input_ids, output_tokens);
@@ -314,6 +354,17 @@ impl EvaluateArtifactStore {
             self.outputs_by_execution.insert(execution_id, stored);
         }
         Ok(artifact_id.digest())
+    }
+
+    #[cfg(test)]
+    async fn record_completed_text(
+        &mut self,
+        evaluate_request: &EvaluateRequest,
+        invocation: &Invocation,
+        output_tokens: &[u32],
+    ) -> Result<Digest, ExecutorError> {
+        self.record_completed_text_with_prepared(evaluate_request, invocation, output_tokens, None)
+            .await
     }
 
     async fn materialize_source(
@@ -334,8 +385,103 @@ impl EvaluateArtifactStore {
         &mut self,
         artifact_id: TextArtifactId,
     ) -> Result<MaterializedTextSource, ExecutorError> {
-        let artifact = self.text_artifact(artifact_id).await?;
-        self.materialize_decoded_artifact(artifact).await
+        struct OutputStep {
+            artifact: TextArtifact,
+            execution: TextExecutionId,
+            prompt_tokens: TokenIds,
+            generated_tokens: TokenIds,
+            state_tokens: TokenIds,
+        }
+
+        let mut current = artifact_id;
+        let mut visited_artifacts = HashSet::new();
+        let mut visited_executions = HashSet::new();
+        let mut steps = Vec::new();
+        let (locator, execution_environment) = loop {
+            if !visited_artifacts.insert(current) {
+                return Err(ExecutorError::InvalidQuoteRequest(format!(
+                    "evaluate artifact graph contains a cycle at {current}"
+                )));
+            }
+            let artifact = self.text_artifact(current).await?;
+            match artifact {
+                TextArtifact::Identity {
+                    bound_term,
+                    execution_package,
+                } => {
+                    let locator = PackageLocator { execution_package };
+                    let execution_environment = ContentId::from_bytes(*bound_term.as_bytes());
+                    if execution_environment != QuotePlan::execution_environment(locator) {
+                        return Err(ExecutorError::InvalidQuoteRequest(
+                            "identity artifact bound term does not match its Catena package"
+                                .to_string(),
+                        ));
+                    }
+                    break (locator, execution_environment);
+                }
+                TextArtifact::Output(output) => {
+                    if steps.len() >= MAX_TEXT_ARTIFACT_CHAIN_DEPTH {
+                        return Err(ExecutorError::InvalidQuoteRequest(format!(
+                            "evaluate artifact graph exceeds {MAX_TEXT_ARTIFACT_CHAIN_DEPTH} outputs"
+                        )));
+                    }
+                    let execution_id = output.execution();
+                    if !visited_executions.insert(execution_id) {
+                        return Err(ExecutorError::InvalidQuoteRequest(format!(
+                            "evaluate artifact graph repeats execution {execution_id}"
+                        )));
+                    }
+                    let execution = self.text_execution(execution_id).await?;
+                    let prompt_tokens = self.token_ids(execution.prompt_tokens()).await?;
+                    let generated_tokens = self.token_ids(output.generated_tokens()).await?;
+                    let state = self.text_state(output.state()).await?;
+                    let state_tokens = self.token_ids(state.tokens()).await?;
+                    current = match execution.from() {
+                        SourceRef::Output(parent) => *parent,
+                        SourceRef::Input(parent_execution) => {
+                            let parent = self
+                                .output_artifact_for_execution(*parent_execution)
+                                .await?;
+                            let parent_artifact = self.text_artifact(parent).await?;
+                            validate_execution_output_mapping(
+                                *parent_execution,
+                                parent,
+                                &parent_artifact,
+                            )?;
+                            parent
+                        }
+                    };
+                    steps.push(OutputStep {
+                        artifact: TextArtifact::Output(output),
+                        execution: execution_id,
+                        prompt_tokens,
+                        generated_tokens,
+                        state_tokens,
+                    });
+                }
+            }
+        };
+
+        let mut tokens = Vec::new();
+        for step in steps.into_iter().rev() {
+            let mut input = tokens;
+            input.extend(token_ids_to_u32(&step.prompt_tokens));
+            let generated = token_ids_to_u32(&step.generated_tokens);
+            let expected = completed_text(step.execution, &input, &generated);
+            if expected.artifact != step.artifact || expected.state_tokens != step.state_tokens {
+                return Err(ExecutorError::InvalidQuoteRequest(format!(
+                    "evaluate output artifact for {} is inconsistent with its execution and token bodies",
+                    step.execution
+                )));
+            }
+            tokens = token_ids_to_u32(&step.state_tokens);
+        }
+
+        Ok(MaterializedTextSource {
+            locator,
+            execution_environment,
+            tokens,
+        })
     }
 
     async fn materialize_execution_output(
@@ -345,87 +491,7 @@ impl EvaluateArtifactStore {
     ) -> Result<MaterializedTextSource, ExecutorError> {
         let artifact = self.text_artifact(artifact_id).await?;
         validate_execution_output_mapping(execution_id, artifact_id, &artifact)?;
-        self.materialize_decoded_artifact(artifact).await
-    }
-
-    async fn materialize_decoded_artifact(
-        &mut self,
-        artifact: TextArtifact,
-    ) -> Result<MaterializedTextSource, ExecutorError> {
-        match artifact {
-            TextArtifact::Identity {
-                bound_term,
-                model_id,
-                revision,
-                dtype,
-            } => {
-                let dtype = parse_identity_dtype(&dtype)?;
-                Ok(MaterializedTextSource {
-                    locator: ModelLocator {
-                        model_id,
-                        revision,
-                        dtype,
-                    },
-                    execution_environment: hellas_rpc::ContentId::from_bytes(
-                        *bound_term.as_bytes(),
-                    ),
-                    tokens: Vec::new(),
-                })
-            }
-            TextArtifact::Output(output) => {
-                let execution = self.text_execution(output.execution()).await?;
-                let (locator, execution_environment) =
-                    self.source_locator(execution.from().clone()).await?;
-                let state = self.text_state(output.state()).await?;
-                let tokens = self.token_ids(state.tokens()).await?;
-                Ok(MaterializedTextSource {
-                    locator,
-                    execution_environment,
-                    tokens: token_ids_to_u32(&tokens),
-                })
-            }
-        }
-    }
-
-    async fn source_locator(
-        &mut self,
-        source: TextSource,
-    ) -> Result<(ModelLocator, ContentId), ExecutorError> {
-        let mut source = source;
-        loop {
-            let (artifact_id, expected_execution) = match source {
-                SourceRef::Input(id) => (self.output_artifact_for_execution(id).await?, Some(id)),
-                SourceRef::Output(id) => (id, None),
-            };
-            let artifact = self.text_artifact(artifact_id).await?;
-            if let Some(expected_execution) = expected_execution {
-                validate_execution_output_mapping(expected_execution, artifact_id, &artifact)?;
-            }
-            match artifact {
-                TextArtifact::Identity {
-                    bound_term,
-                    model_id,
-                    revision,
-                    dtype,
-                } => {
-                    return Ok((
-                        ModelLocator {
-                            model_id,
-                            revision,
-                            dtype: parse_identity_dtype(&dtype)?,
-                        },
-                        ContentId::from_bytes(*bound_term.as_bytes()),
-                    ));
-                }
-                TextArtifact::Output(output) => {
-                    source = self
-                        .text_execution(output.execution())
-                        .await?
-                        .from()
-                        .clone();
-                }
-            }
-        }
+        self.materialize_artifact(artifact_id).await
     }
 
     async fn output_artifact_for_execution(
@@ -667,14 +733,6 @@ fn validate_execution_output_mapping(
     }
 }
 
-fn parse_identity_dtype(dtype: &str) -> Result<hellas_rpc::Dtype, ExecutorError> {
-    dtype.parse().map_err(|err| {
-        ExecutorError::ArtifactStore(format!(
-            "invalid dtype {dtype:?} in identity artifact: {err}"
-        ))
-    })
-}
-
 async fn scan_digests(
     storage: &Arc<dyn ArtifactStorage>,
     partition: &'static str,
@@ -748,7 +806,7 @@ mod tests {
     use commonware_runtime::{
         Blob as _, Runner as _, Storage as _, Supervisor as _, deterministic,
     };
-    use hellas_rpc::Dtype;
+    use hellas_rpc::ExecutionPackageId;
 
     fn runner_public_key() -> hellas_rpc::PublicKey {
         hellas_rpc::ProducerSigningKey::from_secret_bytes([8; 32])
@@ -760,7 +818,7 @@ mod tests {
         EvaluateRequest {
             text_execution,
             runner_public_key: runner_public_key(),
-            execution_environment: hellas_rpc::ContentId::from_bytes([9; 32]),
+            execution_environment: plan().execution_environment,
             nonce: [7; 32],
             assurance: hellas_rpc::Assurance::ProducerSigned,
             retain: true,
@@ -768,13 +826,14 @@ mod tests {
     }
 
     fn plan() -> QuotePlan {
+        let locator = PackageLocator {
+            execution_package: ExecutionPackageId::from_bytes([8; 32]),
+        };
         QuotePlan {
-            locator: ModelLocator {
-                model_id: "model".to_string(),
-                revision: "main".to_string(),
-                dtype: Dtype::F32,
-            },
-            execution_environment: hellas_rpc::ContentId::from_bytes([9; 32]),
+            locator,
+            vocabulary_size: u64::from(u32::MAX) + 1,
+            maximum_capacity: u64::MAX,
+            execution_environment: QuotePlan::execution_environment(locator),
             invocation: Invocation {
                 input_ids: vec![1, 2, 3],
                 max_new_tokens: 8,
@@ -821,12 +880,73 @@ mod tests {
         next_plan.invocation.input_ids = vec![20];
         next_plan.initial_artifact_id = Some(first_artifact);
         let next = store.record_prepared_text(&next_plan).await.unwrap();
+        assert_eq!(next.invocation.input_ids, vec![1, 2, 3, 10, 11, 20]);
         let resolved = store
             .resolve_evaluate_request(next.evaluate_request)
             .await
             .unwrap();
 
         assert_eq!(resolved.invocation.input_ids, vec![1, 2, 3, 10, 11, 20]);
+    }
+
+    #[tokio::test]
+    async fn followup_rejects_an_output_artifact_with_inconsistent_state() {
+        let mut store = EvaluateArtifactStore::default();
+        let first = store.record_prepared_text(&plan()).await.unwrap();
+        let execution = TextExecutionId::from_digest(first.evaluate_request.text_execution);
+        let generated = store
+            .insert_token_ids(TokenIds::from([10, 11]))
+            .await
+            .unwrap();
+        let wrong_state_tokens = store.insert_token_ids(TokenIds::from([99])).await.unwrap();
+        let wrong_state = store
+            .insert_text_state(TextState::new(wrong_state_tokens))
+            .await
+            .unwrap();
+        let inconsistent = store
+            .insert_text_artifact(TextArtifact::output(execution, 2, wrong_state, generated))
+            .await
+            .unwrap();
+        let mut next_plan = plan();
+        next_plan.initial_artifact_id = Some(inconsistent.digest());
+
+        let error = store.prepare_text(&next_plan).await.unwrap_err();
+        assert!(error.to_string().contains("is inconsistent"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn followup_revalidates_full_context_capacity() {
+        let mut store = EvaluateArtifactStore::default();
+        let first = store.record_prepared_text(&plan()).await.unwrap();
+        let first_artifact = store
+            .record_completed_text(&first.evaluate_request, &first.invocation, &[10, 11])
+            .await
+            .unwrap();
+        let mut next_plan = plan();
+        next_plan.invocation.input_ids = vec![20];
+        next_plan.maximum_capacity = 13;
+        next_plan.initial_artifact_id = Some(first_artifact);
+
+        let error = store.record_prepared_text(&next_plan).await.unwrap_err();
+        assert!(error.to_string().contains("package capacity is 13"));
+    }
+
+    #[tokio::test]
+    async fn followup_rejects_an_artifact_from_another_package() {
+        let mut store = EvaluateArtifactStore::default();
+        let mut other = plan();
+        other.locator.execution_package = ExecutionPackageId::from_bytes([9; 32]);
+        other.execution_environment = QuotePlan::execution_environment(other.locator);
+        let first = store.record_prepared_text(&other).await.unwrap();
+        let first_artifact = store
+            .record_completed_text(&first.evaluate_request, &first.invocation, &[10, 11])
+            .await
+            .unwrap();
+        let mut next_plan = plan();
+        next_plan.initial_artifact_id = Some(first_artifact);
+
+        let error = store.record_prepared_text(&next_plan).await.unwrap_err();
+        assert!(error.to_string().contains("different Catena package"));
     }
 
     #[tokio::test]
@@ -904,36 +1024,21 @@ mod tests {
     }
 
     #[test]
-    fn retention_routes_prompt_artifacts_away_from_persistent_and_courtesy_storage() {
+    fn quotes_publish_nothing_and_successful_retained_execution_publishes_its_graph() {
         deterministic::Runner::default().start(|context| async move {
             let config = ArtifactStoreConfig::new(context.child("retained"));
-            let retained = EvaluateArtifactStore::open(config.clone()).await.unwrap();
-            let mut stores = EvaluateArtifactStores::new(retained);
+            let mut store = EvaluateArtifactStore::open(config.clone()).await.unwrap();
 
             let mut ephemeral_plan = plan();
             ephemeral_plan.retention = hellas_rpc::Retention::Ephemeral;
-            let ephemeral = stores
-                .for_retention(ephemeral_plan.retention)
-                .record_prepared_text(&ephemeral_plan)
-                .await
-                .unwrap();
-            stores
-                .for_retention(ephemeral_plan.retention)
-                .record_completed_text(
-                    &ephemeral.evaluate_request,
-                    &ephemeral.invocation,
-                    &[10, 11],
-                )
-                .await
-                .unwrap();
+            let ephemeral = store.prepare_text(&ephemeral_plan).await.unwrap();
 
             assert!(
-                stores
-                    .retained()
+                store
                     .get_canonical_bytes(ephemeral.evaluate_request.text_execution)
                     .await
                     .is_err(),
-                "ephemeral token graph must not be exposed by Courtesy GetArtifact"
+                "an unused quote must publish no token graph"
             );
             let mut reopened = EvaluateArtifactStore::open(config.clone()).await.unwrap();
             assert!(
@@ -944,15 +1049,14 @@ mod tests {
                 "ephemeral token graph must not enter persistent storage"
             );
 
-            let retained_plan = plan();
-            let retained = stores
-                .for_retention(retained_plan.retention)
-                .record_prepared_text(&retained_plan)
-                .await
-                .unwrap();
-            stores
-                .for_retention(retained_plan.retention)
-                .record_completed_text(&retained.evaluate_request, &retained.invocation, &[10, 11])
+            let retained = store.prepare_text(&plan()).await.unwrap();
+            store
+                .record_completed_text_with_prepared(
+                    &retained.evaluate_request,
+                    &retained.invocation,
+                    &[10, 11],
+                    retained.prepared_artifacts.as_ref(),
+                )
                 .await
                 .unwrap();
 

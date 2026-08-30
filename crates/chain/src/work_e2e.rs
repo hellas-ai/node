@@ -108,7 +108,6 @@ use hellas_rpc::evaluate::{
     input_commitment,
 };
 use hellas_rpc::pb::work::{ExchangeSetupRequest, exchange_setup_response::Outcome};
-use hellas_rpc::protocol::ContentId;
 use hellas_rpc::protocol::artifacts::{
     BoundTermId, Canonical as _, InputAddressed as _, OutputAddressed as _, PreparedPaidInputV1,
     SourceRef, TextArtifact, TextExecution, TextExecutionId, TextPolicy, TokenIds, completed_text,
@@ -968,7 +967,7 @@ impl Reproducer for ClientReexecution {
         );
         Ok(Reproduced {
             output_token_ids: FixtureExecutor::run(&plan.prompt_token_ids, plan.max_new_tokens),
-            stop_reason: EvaluateStopReason::END_OF_SEQUENCE,
+            stop_reason: EvaluateStopReason::STOP_TOKEN,
         })
     }
 }
@@ -1002,7 +1001,7 @@ fn transcript_for(
     .digest();
     match builder.finish(EvaluateTerminal {
         final_position: answer.len() as u64,
-        stop_reason: EvaluateStopReason::END_OF_SEQUENCE,
+        stop_reason: EvaluateStopReason::STOP_TOKEN,
         text_artifact,
         usage,
         billable_units,

@@ -10,9 +10,11 @@ pub(crate) mod codex_auth;
 pub(crate) mod discovery;
 pub mod fetch;
 pub mod identity;
-#[cfg(feature = "evaluate")]
+#[cfg(feature = "llm")]
 pub mod llm;
 pub mod monitor;
+#[cfg(feature = "llm")]
+pub mod package;
 pub mod rpc;
 #[cfg(feature = "node")]
 pub mod serve;

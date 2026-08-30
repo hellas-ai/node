@@ -16,8 +16,9 @@ use std::sync::atomic::AtomicU64;
 type U64Counter = Counter<u64, AtomicU64>;
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
-pub struct ModelLabel {
-    pub model_id: String,
+pub struct ExecutionLabel {
+    pub scheme: String,
+    pub name: String,
 }
 
 /// Single source of truth for executor counters. Each field is a prometheus
@@ -25,233 +26,243 @@ pub struct ModelLabel {
 /// [`Counter::get`] (used by the GetStats RPC path).
 #[derive(Default)]
 pub struct ExecutorMetrics {
-    pub(crate) executions_started: U64Counter,
-    pub(crate) executions_completed: U64Counter,
-    pub(crate) executions_failed: U64Counter,
-    pub(crate) prompt_tokens: U64Counter,
-    pub(crate) cached_prompt_tokens: U64Counter,
-    pub(crate) cached_output_tokens: U64Counter,
-    pub(crate) prefill_tokens: U64Counter,
-    pub(crate) generated_tokens: U64Counter,
+    pub(crate) evaluate_executions_started: U64Counter,
+    pub(crate) evaluate_executions_completed: U64Counter,
+    pub(crate) evaluate_executions_failed: U64Counter,
+    pub(crate) evaluate_prompt_tokens: U64Counter,
+    pub(crate) evaluate_prefill_tokens: U64Counter,
+    pub(crate) evaluate_generated_tokens: U64Counter,
 
-    pub(crate) by_model_executions_started: Family<ModelLabel, U64Counter>,
-    pub(crate) by_model_executions_completed: Family<ModelLabel, U64Counter>,
-    pub(crate) by_model_executions_failed: Family<ModelLabel, U64Counter>,
-    pub(crate) by_model_prompt_tokens: Family<ModelLabel, U64Counter>,
-    pub(crate) by_model_cached_prompt_tokens: Family<ModelLabel, U64Counter>,
-    pub(crate) by_model_cached_output_tokens: Family<ModelLabel, U64Counter>,
-    pub(crate) by_model_prefill_tokens: Family<ModelLabel, U64Counter>,
-    pub(crate) by_model_generated_tokens: Family<ModelLabel, U64Counter>,
+    pub(crate) by_execution_started: Family<ExecutionLabel, U64Counter>,
+    pub(crate) by_execution_completed: Family<ExecutionLabel, U64Counter>,
+    pub(crate) by_execution_failed: Family<ExecutionLabel, U64Counter>,
+    pub(crate) by_execution_prompt_tokens: Family<ExecutionLabel, U64Counter>,
+    pub(crate) by_execution_prefill_tokens: Family<ExecutionLabel, U64Counter>,
+    pub(crate) by_execution_generated_tokens: Family<ExecutionLabel, U64Counter>,
 
     // `Family::read()` is private in prometheus-client, so we mirror the set
-    // of model ids we've ever incremented to power the GetStats RPC.
-    seen_models: Mutex<BTreeSet<String>>,
+    // of execution labels we've ever incremented to power the GetStats RPC.
+    seen_executions: Mutex<BTreeSet<(String, String)>>,
 }
 
 impl ExecutorMetrics {
-    /// Register all counters with the supplied registry under the `hellas`
-    /// (global) and `hellas_model_*` (per-model labelled) prefixes. The
+    /// Register all counters with the supplied registry under the
+    /// `hellas_evaluate_*` and `hellas_execution_*` prefixes. The
     /// counter handles are shared (`Arc` internally), so clones registered
     /// here observe the same updates as the executor's `Arc<Self>`.
     pub fn register_with(&self, registry: &mut Registry) {
         let sub = registry.sub_registry_with_prefix("hellas");
         for (name, desc, ctr) in [
             (
-                "executions_started",
-                "Executions started",
-                &self.executions_started,
+                "evaluate_executions_started",
+                "Catena evaluate executions started",
+                &self.evaluate_executions_started,
             ),
             (
-                "executions_completed",
-                "Executions completed",
-                &self.executions_completed,
+                "evaluate_executions_completed",
+                "Catena evaluate executions completed",
+                &self.evaluate_executions_completed,
             ),
             (
-                "executions_failed",
-                "Executions failed",
-                &self.executions_failed,
-            ),
-            ("prompt_tokens", "Total prompt tokens", &self.prompt_tokens),
-            (
-                "cached_prompt_tokens",
-                "Prompt tokens from cache",
-                &self.cached_prompt_tokens,
+                "evaluate_executions_failed",
+                "Catena evaluate executions failed",
+                &self.evaluate_executions_failed,
             ),
             (
-                "cached_output_tokens",
-                "Output tokens from cache",
-                &self.cached_output_tokens,
+                "evaluate_prompt_tokens",
+                "Catena evaluate prompt tokens",
+                &self.evaluate_prompt_tokens,
             ),
             (
-                "prefill_tokens",
-                "Prefill tokens computed",
-                &self.prefill_tokens,
+                "evaluate_prefill_tokens",
+                "Catena evaluate prefill tokens computed",
+                &self.evaluate_prefill_tokens,
             ),
             (
-                "generated_tokens",
-                "Output tokens generated",
-                &self.generated_tokens,
+                "evaluate_generated_tokens",
+                "Catena evaluate output tokens generated",
+                &self.evaluate_generated_tokens,
             ),
         ] {
             sub.register(name, desc, ctr.clone());
         }
-        let model_sub = sub.sub_registry_with_prefix("model");
+        let execution_sub = sub.sub_registry_with_prefix("execution");
         for (name, desc, fam) in [
             (
                 "executions_started",
                 "Executions started",
-                &self.by_model_executions_started,
+                &self.by_execution_started,
             ),
             (
                 "executions_completed",
                 "Executions completed",
-                &self.by_model_executions_completed,
+                &self.by_execution_completed,
             ),
             (
                 "executions_failed",
                 "Executions failed",
-                &self.by_model_executions_failed,
+                &self.by_execution_failed,
             ),
             (
                 "prompt_tokens",
                 "Total prompt tokens",
-                &self.by_model_prompt_tokens,
-            ),
-            (
-                "cached_prompt_tokens",
-                "Prompt tokens from cache",
-                &self.by_model_cached_prompt_tokens,
-            ),
-            (
-                "cached_output_tokens",
-                "Output tokens from cache",
-                &self.by_model_cached_output_tokens,
+                &self.by_execution_prompt_tokens,
             ),
             (
                 "prefill_tokens",
                 "Prefill tokens computed",
-                &self.by_model_prefill_tokens,
+                &self.by_execution_prefill_tokens,
             ),
             (
                 "generated_tokens",
                 "Output tokens generated",
-                &self.by_model_generated_tokens,
+                &self.by_execution_generated_tokens,
             ),
         ] {
-            model_sub.register(name, desc, fam.clone());
+            execution_sub.register(name, desc, fam.clone());
         }
     }
 
-    fn note_model(&self, model_id: &str) -> ModelLabel {
-        if let Ok(mut seen) = self.seen_models.lock()
-            && !seen.contains(model_id)
+    fn note_execution(&self, scheme: &str, name: &str) -> ExecutionLabel {
+        let key = (scheme.to_string(), name.to_string());
+        if let Ok(mut seen) = self.seen_executions.lock()
+            && !seen.contains(&key)
         {
-            seen.insert(model_id.to_string());
+            seen.insert(key.clone());
         }
-        ModelLabel {
-            model_id: model_id.to_string(),
+        ExecutionLabel {
+            scheme: key.0,
+            name: key.1,
         }
     }
 
     pub(crate) fn record_execution_started(
         &self,
-        model_id: &str,
+        scheme: &str,
+        name: &str,
         prompt: u64,
-        cached_prompt: u64,
-        cached_output: u64,
         prefill: u64,
     ) {
-        self.executions_started.inc();
-        self.prompt_tokens.inc_by(prompt);
-        self.cached_prompt_tokens.inc_by(cached_prompt);
-        self.cached_output_tokens.inc_by(cached_output);
-        self.prefill_tokens.inc_by(prefill);
-
-        let label = self.note_model(model_id);
-        self.by_model_executions_started.get_or_create(&label).inc();
-        self.by_model_prompt_tokens
-            .get_or_create(&label)
-            .inc_by(prompt);
-        self.by_model_cached_prompt_tokens
-            .get_or_create(&label)
-            .inc_by(cached_prompt);
-        self.by_model_cached_output_tokens
-            .get_or_create(&label)
-            .inc_by(cached_output);
-        self.by_model_prefill_tokens
-            .get_or_create(&label)
-            .inc_by(prefill);
+        let label = self.note_execution(scheme, name);
+        self.by_execution_started.get_or_create(&label).inc();
+        if scheme == "evaluate" {
+            self.evaluate_executions_started.inc();
+            self.evaluate_prompt_tokens.inc_by(prompt);
+            self.evaluate_prefill_tokens.inc_by(prefill);
+            self.by_execution_prompt_tokens
+                .get_or_create(&label)
+                .inc_by(prompt);
+            self.by_execution_prefill_tokens
+                .get_or_create(&label)
+                .inc_by(prefill);
+        }
     }
 
-    pub(crate) fn record_execution_completed(&self, model_id: &str, generated: u64) {
-        self.generated_tokens.inc_by(generated);
-        self.executions_completed.inc();
-        let label = self.note_model(model_id);
-        self.by_model_generated_tokens
-            .get_or_create(&label)
-            .inc_by(generated);
-        self.by_model_executions_completed
-            .get_or_create(&label)
-            .inc();
+    pub(crate) fn record_execution_completed(&self, scheme: &str, name: &str, generated: u64) {
+        let label = self.note_execution(scheme, name);
+        self.by_execution_completed.get_or_create(&label).inc();
+        if scheme == "evaluate" {
+            self.evaluate_generated_tokens.inc_by(generated);
+            self.evaluate_executions_completed.inc();
+            self.by_execution_generated_tokens
+                .get_or_create(&label)
+                .inc_by(generated);
+        }
     }
 
-    pub(crate) fn record_execution_failed(&self, model_id: &str, generated: u64) {
-        self.generated_tokens.inc_by(generated);
-        self.executions_failed.inc();
-        let label = self.note_model(model_id);
-        self.by_model_generated_tokens
-            .get_or_create(&label)
-            .inc_by(generated);
-        self.by_model_executions_failed.get_or_create(&label).inc();
+    pub(crate) fn record_execution_failed(&self, scheme: &str, name: &str, generated: u64) {
+        let label = self.note_execution(scheme, name);
+        self.by_execution_failed.get_or_create(&label).inc();
+        if scheme == "evaluate" {
+            self.evaluate_generated_tokens.inc_by(generated);
+            self.evaluate_executions_failed.inc();
+            self.by_execution_generated_tokens
+                .get_or_create(&label)
+                .inc_by(generated);
+        }
     }
 
-    /// Snapshot the global counters for the GetStats RPC.
+    /// Snapshot Catena evaluate counters for the Courtesy GetStats RPC.
     pub(crate) fn global_snapshot(&self) -> hellas_rpc::pb::courtesy::TokenStats {
         hellas_rpc::pb::courtesy::TokenStats {
-            executions_started: self.executions_started.get(),
-            executions_completed: self.executions_completed.get(),
-            executions_failed: self.executions_failed.get(),
-            prompt_tokens: self.prompt_tokens.get(),
-            cached_prompt_tokens: self.cached_prompt_tokens.get(),
-            cached_output_tokens: self.cached_output_tokens.get(),
-            prefill_tokens: self.prefill_tokens.get(),
-            generated_tokens: self.generated_tokens.get(),
+            executions_started: self.evaluate_executions_started.get(),
+            executions_completed: self.evaluate_executions_completed.get(),
+            executions_failed: self.evaluate_executions_failed.get(),
+            prompt_tokens: self.evaluate_prompt_tokens.get(),
+            prefill_tokens: self.evaluate_prefill_tokens.get(),
+            generated_tokens: self.evaluate_generated_tokens.get(),
         }
     }
 
-    /// Snapshot a per-model row for the GetStats RPC. Only counters that have
-    /// observed events for this model are nonzero.
-    pub(crate) fn model_snapshot(&self, model_id: &str) -> hellas_rpc::pb::courtesy::TokenStats {
-        let label = ModelLabel {
-            model_id: model_id.to_string(),
+    /// Snapshot one scheme/name row. Only counters that have observed events
+    /// for this exact label are nonzero.
+    pub(crate) fn execution_snapshot(
+        &self,
+        scheme: &str,
+        name: &str,
+    ) -> hellas_rpc::pb::courtesy::TokenStats {
+        let label = ExecutionLabel {
+            scheme: scheme.to_string(),
+            name: name.to_string(),
+        };
+        let value = |family: &Family<ExecutionLabel, U64Counter>| {
+            family.get(&label).map(|counter| counter.get()).unwrap_or(0)
         };
         hellas_rpc::pb::courtesy::TokenStats {
-            executions_started: self.by_model_executions_started.get_or_create(&label).get(),
-            executions_completed: self
-                .by_model_executions_completed
-                .get_or_create(&label)
-                .get(),
-            executions_failed: self.by_model_executions_failed.get_or_create(&label).get(),
-            prompt_tokens: self.by_model_prompt_tokens.get_or_create(&label).get(),
-            cached_prompt_tokens: self
-                .by_model_cached_prompt_tokens
-                .get_or_create(&label)
-                .get(),
-            cached_output_tokens: self
-                .by_model_cached_output_tokens
-                .get_or_create(&label)
-                .get(),
-            prefill_tokens: self.by_model_prefill_tokens.get_or_create(&label).get(),
-            generated_tokens: self.by_model_generated_tokens.get_or_create(&label).get(),
+            executions_started: value(&self.by_execution_started),
+            executions_completed: value(&self.by_execution_completed),
+            executions_failed: value(&self.by_execution_failed),
+            prompt_tokens: value(&self.by_execution_prompt_tokens),
+            prefill_tokens: value(&self.by_execution_prefill_tokens),
+            generated_tokens: value(&self.by_execution_generated_tokens),
         }
     }
 
-    /// Iterate over all model ids that have ever been observed, for
-    /// enumerating per-model rows in the GetStats RPC.
-    pub(crate) fn known_model_ids(&self) -> Vec<String> {
-        self.seen_models
+    /// Iterate over names observed for one scheme. Fetch labels therefore
+    /// cannot appear in Courtesy's Catena-package rows.
+    pub(crate) fn known_execution_names(&self, scheme: &str) -> Vec<String> {
+        self.seen_executions
             .lock()
-            .map(|seen| seen.iter().cloned().collect())
+            .map(|seen| {
+                seen.iter()
+                    .filter(|(seen_scheme, _)| seen_scheme == scheme)
+                    .map(|(_, name)| name.clone())
+                    .collect()
+            })
             .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ExecutorMetrics;
+
+    #[test]
+    fn courtesy_totals_are_evaluate_tokens_not_fetch_units() {
+        let metrics = ExecutorMetrics::default();
+        metrics.record_execution_started("fetch", "codex/responses", 0, 0);
+        metrics.record_execution_completed("fetch", "codex/responses", 99);
+
+        let empty = metrics.global_snapshot();
+        assert_eq!(empty.executions_started, 0);
+        assert_eq!(empty.executions_completed, 0);
+        assert_eq!(empty.generated_tokens, 0);
+
+        metrics.record_execution_started("evaluate", "smollm2-135m", 3, 3);
+        metrics.record_execution_completed("evaluate", "smollm2-135m", 2);
+        let evaluate = metrics.global_snapshot();
+        assert_eq!(evaluate.executions_started, 1);
+        assert_eq!(evaluate.executions_completed, 1);
+        assert_eq!(evaluate.prompt_tokens, 3);
+        assert_eq!(evaluate.prefill_tokens, 3);
+        assert_eq!(evaluate.generated_tokens, 2);
+    }
+
+    #[test]
+    fn reading_an_unknown_label_does_not_allocate_it() {
+        let metrics = ExecutorMetrics::default();
+        let snapshot = metrics.execution_snapshot("evaluate", "attacker-input");
+        assert_eq!(snapshot.executions_started, 0);
+        assert!(metrics.known_execution_names("evaluate").is_empty());
     }
 }

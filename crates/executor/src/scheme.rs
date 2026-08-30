@@ -5,15 +5,18 @@ use std::any::Any;
 use crate::ExecutorError;
 use async_trait::async_trait;
 use hellas_rpc::pb::courtesy::{
-    GetArtifactRequest, GetArtifactResponse, ListPackagesResponse, PutArtifactRequest,
-    PutArtifactResponse, QuoteChatPromptRequest, QuotePromptRequest, QuoteResponse,
+    GetArtifactRequest, GetArtifactResponse, ListPackagesResponse, QuoteResponse,
     QuoteTokensRequest,
 };
 use hellas_rpc::pb::evaluate::EvaluateRequest as PbEvaluateRequest;
 use hellas_rpc::pb::execute::Ticket;
 use hellas_rpc::{Assurance, PublicKey};
+#[cfg(feature = "evaluate")]
+use hellas_rpc::{Digest, ExecutionPackageId};
 
 use crate::executor::{ExecuteOutcome, TicketOutcome};
+#[cfg(feature = "evaluate")]
+use crate::package::PackageSource;
 use crate::state::ExecutorState;
 
 pub trait SchemeJob: Any + Send + Sync {
@@ -50,32 +53,25 @@ pub trait SchemeEngine: Send + Sync {
         request: QuoteTokensRequest,
     ) -> Result<TicketOutcome<QuoteResponse>, ExecutorError>;
 
-    async fn quote_prompt(
-        &mut self,
-        store: &mut ExecutorState,
-        request: QuotePromptRequest,
-    ) -> Result<TicketOutcome<QuoteResponse>, ExecutorError>;
-
-    async fn quote_chat_prompt(
-        &mut self,
-        store: &mut ExecutorState,
-        request: QuoteChatPromptRequest,
-    ) -> Result<TicketOutcome<QuoteResponse>, ExecutorError>;
-
-    /// Makes a model available on this node, **downloading** it if it is
-    /// not here.
+    /// Fetches, verifies, and loads one Catena package on this node.
     ///
     /// The one path in a serving process that may spend bandwidth on a
-    /// model, and deliberately not an RPC: it is reached only from an
-    /// operator's preload flag or a caller running its own in-process
-    /// executor. Every peer-reachable path resolves locally and refuses
-    /// what this has not made available.
-    async fn materialize_model(&mut self, model: String) -> Result<(), ExecutorError>;
-
-    async fn put_artifact(
+    /// package, and deliberately not an RPC: it is reached only from an
+    /// operator's package flags or a caller running its own in-process
+    /// executor. Every peer-reachable path consults only the resulting
+    /// exact-identity registry and refuses what this has not loaded.
+    #[cfg(feature = "evaluate")]
+    async fn materialize_package(
         &mut self,
-        request: PutArtifactRequest,
-    ) -> Result<PutArtifactResponse, ExecutorError>;
+        source: PackageSource,
+    ) -> Result<ExecutionPackageId, ExecutorError>;
+
+    /// Publish one canonical artifact through the owner-only handle path.
+    #[cfg(feature = "evaluate")]
+    async fn publish_canonical_artifact(
+        &mut self,
+        canonical_artifact: Vec<u8>,
+    ) -> Result<Digest, ExecutorError>;
 
     async fn get_artifact(
         &mut self,
@@ -101,7 +97,7 @@ pub trait SchemeEngine: Send + Sync {
     /// It admits nothing financial, and does not pretend to. Its one
     /// caller is `ExecutorHandle::run_paid_evaluate`, which is reachable
     /// by an owner of the handle and by no RPC — the same reach
-    /// `materialize_model` has. What makes an invocation through it a
+    /// `materialize_package` has. What makes an invocation through it a
     /// paid one is the running marker the paid endpoint journaled
     /// before calling, and that marker is not visible from here.
     async fn start_request(

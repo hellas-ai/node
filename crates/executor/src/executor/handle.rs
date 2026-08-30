@@ -5,23 +5,16 @@
 //! inbound RPCs here.
 
 use std::pin::Pin;
-#[cfg(feature = "evaluate")]
-use std::sync::Arc;
 
 use crate::ExecutorError;
 use futures_core::Stream;
 #[cfg(feature = "evaluate")]
-use futures_util::StreamExt;
-#[cfg(feature = "evaluate")]
-use hellas_models::{ModelAssets, TextOutputDecoder};
-#[cfg(feature = "evaluate")]
-use hellas_rpc::Dtype;
+use hellas_rpc::ExecutionPackageId;
 use hellas_rpc::call::WithTrailer;
 use hellas_rpc::pb::courtesy::{
-    DecodeTokensRequest, DecodeTokensResponse, GetArtifactRequest, GetArtifactResponse,
-    GetPackageStatsRequest, GetPackageStatsResponse, GetStatsRequest, GetStatsResponse,
-    ListPackagesRequest, ListPackagesResponse, PutArtifactRequest, PutArtifactResponse,
-    QuoteChatPromptRequest, QuotePromptRequest, QuoteResponse, QuoteTokensRequest,
+    GetArtifactRequest, GetArtifactResponse, GetPackageStatsRequest, GetPackageStatsResponse,
+    GetStatsRequest, GetStatsResponse, ListPackagesRequest, ListPackagesResponse, QuoteResponse,
+    QuoteTokensRequest,
 };
 use hellas_rpc::pb::evaluate::EvaluateRequest as PbEvaluateRequest;
 use hellas_rpc::pb::execute::{OpenRequest, OpenResponse, RunTicketRequest, Ticket, WorkEvent};
@@ -36,13 +29,10 @@ use tokio::sync::oneshot;
 use tokio_stream::wrappers::ReceiverStream;
 
 use super::{ExecuteOutcome, ExecutorHandle, ExecutorMessage, TicketOutcome};
+#[cfg(feature = "evaluate")]
+use crate::PackageSource;
 
 type ExecuteStream = Pin<Box<dyn Stream<Item = Result<WorkEvent, WireStatus>> + Send>>;
-type DecodeTokensRequestStream =
-    Pin<Box<dyn Stream<Item = Result<DecodeTokensRequest, WireStatus>> + Send>>;
-type DecodeTokensStream =
-    Pin<Box<dyn Stream<Item = Result<DecodeTokensResponse, WireStatus>> + Send>>;
-
 impl ExecutorHandle {
     pub(crate) async fn send<T>(
         &self,
@@ -71,14 +61,6 @@ impl ExecutorHandle {
             .await
     }
 
-    pub async fn quote_prompt(
-        &self,
-        request: QuotePromptRequest,
-    ) -> Result<TicketOutcome<QuoteResponse>, ExecutorError> {
-        self.send(|reply| ExecutorMessage::QuotePrompt { request, reply })
-            .await
-    }
-
     pub async fn quote_tokens(
         &self,
         request: QuoteTokensRequest,
@@ -87,20 +69,18 @@ impl ExecutorHandle {
             .await
     }
 
-    pub async fn quote_chat_prompt(
+    /// Publish one canonical evaluate artifact from an owner-controlled local
+    /// workflow. There is intentionally no peer-reachable counterpart.
+    #[cfg(feature = "evaluate")]
+    pub async fn publish_canonical_artifact(
         &self,
-        request: QuoteChatPromptRequest,
-    ) -> Result<TicketOutcome<QuoteResponse>, ExecutorError> {
-        self.send(|reply| ExecutorMessage::QuoteChatPrompt { request, reply })
-            .await
-    }
-
-    pub async fn put_artifact_handle(
-        &self,
-        request: PutArtifactRequest,
-    ) -> Result<PutArtifactResponse, ExecutorError> {
-        self.send(|reply| ExecutorMessage::PutArtifact { request, reply })
-            .await
+        canonical_artifact: Vec<u8>,
+    ) -> Result<hellas_rpc::Digest, ExecutorError> {
+        self.send(|reply| ExecutorMessage::PublishCanonicalArtifact {
+            canonical_artifact,
+            reply,
+        })
+        .await
     }
 
     /// Read from the retained Courtesy artifact namespace. Ephemeral job
@@ -119,13 +99,17 @@ impl ExecutorHandle {
             .await
     }
 
-    /// Makes a model available on this node, downloading it if needed.
+    /// Fetches, verifies, and loads one Catena package on this node.
     ///
     /// Only an owner of the handle can call this — there is no RPC for
-    /// it — and calling it is what lets quotes for that model be
+    /// it — and calling it is what lets quotes for that package alias be
     /// answered at all.
-    pub async fn materialize_model(&self, model: String) -> Result<(), ExecutorError> {
-        self.send(|reply| ExecutorMessage::MaterializeModel { model, reply })
+    #[cfg(feature = "evaluate")]
+    pub async fn materialize_package(
+        &self,
+        source: PackageSource,
+    ) -> Result<ExecutionPackageId, ExecutorError> {
+        self.send(|reply| ExecutorMessage::MaterializePackage { source, reply })
             .await
     }
 
@@ -220,15 +204,6 @@ impl CourtesyHandler for ExecutorHandle {
         ))
     }
 
-    async fn quote_prompt(
-        &self,
-        request: QuotePromptRequest,
-    ) -> Result<WithTrailer<QuoteResponse>, WireStatus> {
-        let outcome = self.quote_prompt(request).await?;
-        let result = with_provenance(outcome);
-        Ok(result)
-    }
-
     async fn quote_tokens(
         &self,
         request: QuoteTokensRequest,
@@ -236,22 +211,6 @@ impl CourtesyHandler for ExecutorHandle {
         let outcome = self.quote_tokens(request).await?;
         let result = with_provenance(outcome);
         Ok(result)
-    }
-
-    async fn quote_chat_prompt(
-        &self,
-        request: QuoteChatPromptRequest,
-    ) -> Result<WithTrailer<QuoteResponse>, WireStatus> {
-        let outcome = self.quote_chat_prompt(request).await?;
-        let result = with_provenance(outcome);
-        Ok(result)
-    }
-
-    async fn put_artifact(
-        &self,
-        request: PutArtifactRequest,
-    ) -> Result<PutArtifactResponse, WireStatus> {
-        Ok(self.put_artifact_handle(request).await?)
     }
 
     async fn get_artifact(
@@ -277,104 +236,5 @@ impl CourtesyHandler for ExecutorHandle {
         request: GetPackageStatsRequest,
     ) -> Result<GetPackageStatsResponse, WireStatus> {
         Ok(self.get_package_stats_handle(request).await?)
-    }
-
-    async fn decode_tokens(
-        &self,
-        request: DecodeTokensRequestStream,
-    ) -> Result<DecodeTokensStream, WireStatus> {
-        #[cfg(feature = "evaluate")]
-        {
-            Ok(decode_tokens_stream(request, self.preferred_dtype))
-        }
-        #[cfg(not(feature = "evaluate"))]
-        {
-            let _ = request;
-            Err(WireStatus::new(
-                WireCode::FailedPrecondition,
-                "evaluate scheme is not enabled on this node",
-            ))
-        }
-    }
-}
-
-#[cfg(feature = "evaluate")]
-fn decode_tokens_stream(
-    mut requests: DecodeTokensRequestStream,
-    dtype: Dtype,
-) -> DecodeTokensStream {
-    Box::pin(async_stream::try_stream! {
-        let mut decoder: Option<DecodeSession> = None;
-        while let Some(item) = requests.next().await {
-            let request = item?;
-            if decoder.is_none() {
-                let assets = load_decode_assets(request.package.clone(), dtype).await?;
-                decoder = Some(DecodeSession::new(request.package.clone(), assets));
-            }
-
-            let session = decoder
-                .as_mut()
-                .expect("decode session is initialized before use");
-            session.validate_request_model(&request)?;
-            if request.token_bytes.is_empty() {
-                continue;
-            }
-            let text = session.push_bytes(&request.token_bytes)?;
-            if !text.is_empty() {
-                yield DecodeTokensResponse { text };
-            }
-        }
-    })
-}
-
-#[cfg(feature = "evaluate")]
-async fn load_decode_assets(package: String, dtype: Dtype) -> Result<Arc<ModelAssets>, WireStatus> {
-    if package.is_empty() {
-        return Err(WireStatus::new(
-            WireCode::InvalidArgument,
-            "package is required on the first decode_tokens request",
-        ));
-    }
-    // `decode_tokens` is a courtesy convenience any peer can call with a
-    // package it chooses. Local reach, like every other peer-reachable
-    // path: it detokenizes with what this node holds or it refuses.
-    let assets = tokio::task::spawn_blocking(move || {
-        ModelAssets::load(&package, dtype, hellas_models::Reach::Local)
-    })
-    .await
-    .map_err(|err| WireStatus::internal(format!("tokenizer load task failed: {err}")))??;
-    Ok(Arc::new(assets))
-}
-
-#[cfg(feature = "evaluate")]
-struct DecodeSession {
-    package: String,
-    decoder: TextOutputDecoder,
-}
-
-#[cfg(feature = "evaluate")]
-impl DecodeSession {
-    fn new(package: String, assets: Arc<ModelAssets>) -> Self {
-        let decoder = TextOutputDecoder::for_model(assets);
-        Self { package, decoder }
-    }
-
-    fn validate_request_model(&self, request: &DecodeTokensRequest) -> Result<(), WireStatus> {
-        if request.package.is_empty() {
-            return Ok(());
-        }
-        if request.package == self.package {
-            return Ok(());
-        }
-        Err(WireStatus::new(
-            WireCode::InvalidArgument,
-            "decode_tokens stream cannot switch tokenizer after the first request",
-        ))
-    }
-
-    fn push_bytes(&mut self, bytes: &[u8]) -> Result<String, WireStatus> {
-        self.decoder
-            .push_bytes(bytes)
-            .map_err(hellas_wire::WireStatus::from)
     }
 }

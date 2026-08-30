@@ -251,6 +251,11 @@ pub(crate) fn default_artifact_store_path() -> anyhow::Result<PathBuf> {
     default_hellas_path(ARTIFACT_STORE_DIR, "--artifact-store-path")
 }
 
+#[cfg(feature = "evaluate")]
+pub(crate) fn default_package_cache_path() -> anyhow::Result<PathBuf> {
+    default_hellas_path("packages", "--package-cache")
+}
+
 pub(crate) fn provider_trust(
     expected_genesis: Option<hellas_rpc::ContentId>,
     required_assurance: hellas_rpc::Assurance,

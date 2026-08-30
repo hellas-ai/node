@@ -11,13 +11,10 @@ use hellas_executor::{
 };
 use hellas_kernel::Secp256k1Signer;
 use hellas_rpc::policy::ExecutePolicy;
-use hellas_rpc::{
-    Assurance, ContentId, Dtype, FetchProgramManifest, ProducerSigningKey, ProgramManifest,
-};
+use hellas_rpc::{Assurance, ContentId, FetchProgramManifest, ProducerSigningKey, ProgramManifest};
 use iroh::SecretKey;
 use serde::Deserialize;
 use std::collections::BTreeSet;
-use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -45,7 +42,10 @@ pub struct ServeOptions {
     pub port: Option<u16>,
     pub execute_policy: ExecutePolicy,
     pub queue_size: usize,
-    pub preload_models: Vec<String>,
+    #[cfg(feature = "evaluate")]
+    pub packages: Vec<crate::commands::package::PackageArg>,
+    #[cfg(feature = "evaluate")]
+    pub package_cache: Option<PathBuf>,
     pub artifact_store_path: Option<PathBuf>,
     /// The loaded paid-work configuration, not the path it came from.
     /// Its presence is still what serves the two work ALPNs; what is new
@@ -53,13 +53,8 @@ pub struct ServeOptions {
     /// fan-out, the journal root, and the policies it would mount a
     /// channel with.
     pub work_config: Option<WorkConfig>,
-    /// Read only by the fastresume load/save below, which go through
-    /// `hellas-models` and so exist only on an `evaluate` build.
-    #[cfg(feature = "evaluate")]
-    pub store_records: Option<PathBuf>,
     pub metrics_port: Option<u16>,
     pub graffiti: String,
-    pub dtype: Vec<Dtype>,
     pub fetch_config_file: Option<PathBuf>,
     pub fetch_max_in_flight: usize,
     pub fetch_queue_size: usize,
@@ -119,31 +114,14 @@ async fn run_with_store(
     artifact_store_path: PathBuf,
     #[cfg(feature = "evaluate")] artifact_store: ArtifactStoreConfig,
 ) -> CliResult<()> {
-    // What an earlier `hellas store adopt` already hashed.
-    //
-    // Without this a node re-hashes every weight shard the first time it
-    // is asked to quote — 647 ms against 549 µs on a 29-blob cache — so
-    // the whole benefit of `adopt` would accrue to a CLI process that
-    // exited immediately afterwards.
-    //
-    // Two nodes sharing one record file is decided rather than avoided:
-    // `save` is a write-and-rename, so the later writer wins whole and
-    // the earlier one's work is lost. Losing it costs a re-hash, which
-    // is the cost of not having adopted at all.
     #[cfg(feature = "evaluate")]
-    let store_records = options
-        .store_records
+    let package_cache = options
+        .package_cache
         .clone()
-        .or_else(hellas_store::state::records_path);
+        .map(Ok)
+        .unwrap_or_else(crate::identity::default_package_cache_path)?;
     #[cfg(feature = "evaluate")]
-    if let Some(path) = store_records.as_deref() {
-        let loaded = hellas_models::load_store_records(path);
-        info!(
-            records = loaded,
-            path = %path.display(),
-            "loaded what an earlier run already hashed",
-        );
-    }
+    let packages = crate::commands::package::package_sources(options.packages, package_cache)?;
 
     // What the operator configured, said back once, and then which of
     // §4's four evidence cases this node started in, in words. The
@@ -194,7 +172,6 @@ async fn run_with_store(
         });
     }
 
-    let preload_models = dedupe_preload_models(options.preload_models);
     let build = option_env!("GIT_REV").unwrap_or("unknown").to_string();
     let graffiti = {
         let mut buf = [0u8; 16];
@@ -218,10 +195,10 @@ async fn run_with_store(
         port: options.port,
         execute_policy: options.execute_policy.clone(),
         queue_size: options.queue_size,
-        preload_models: preload_models.clone(),
+        #[cfg(feature = "evaluate")]
+        packages,
         build,
         graffiti,
-        supported_dtypes: options.dtype,
         fetch_access_policy,
         artifact_store_path,
         fetch_routes,
@@ -255,35 +232,12 @@ async fn run_with_store(
     print_qr(&add_url);
     eprintln!("Explorer:     {add_url}");
 
-    if !preload_models.is_empty() {
-        info!(
-            "Models available for quoting: {}",
-            preload_models.join(", ")
-        );
-    }
-
     println!("RPC server running. Press Ctrl+C to stop.");
     tokio::signal::ctrl_c()
         .await
         .context("failed to listen for shutdown signal")?;
 
     println!("Shutting down...");
-    // Before the shutdown timeout, which can end in `process::exit`.
-    #[cfg(feature = "evaluate")]
-    if let Some(path) = store_records.as_deref() {
-        match hellas_models::save_store_records(path) {
-            Ok(saved) => info!(
-                records = saved,
-                path = %path.display(),
-                "saved what this run hashed",
-            ),
-            Err(error) => warn!(
-                %error,
-                path = %path.display(),
-                "could not save what this run hashed; the next start will re-hash it",
-            ),
-        }
-    }
     match timeout(Duration::from_secs(5), node.shutdown()).await {
         Ok(result) => result.context("failed to shut down RPC server")?,
         Err(_) => {
@@ -589,18 +543,6 @@ fn print_qr(data: &str) {
     }
 }
 
-fn dedupe_preload_models(mut models: Vec<String>) -> Vec<String> {
-    let mut seen = HashSet::new();
-    models.retain(|model| {
-        let trimmed = model.trim();
-        !trimmed.is_empty() && seen.insert(trimmed.to_string())
-    });
-    models
-        .into_iter()
-        .map(|model| model.trim().to_string())
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -615,28 +557,6 @@ mod tests {
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect()
-    }
-
-    #[test]
-    fn dedupe_preload_models_preserves_first_occurrence() {
-        let models = dedupe_preload_models(vec![
-            "foo/bar".to_string(),
-            "baz/qux".to_string(),
-            "foo/bar".to_string(),
-            "baz/qux@rev".to_string(),
-        ]);
-        assert_eq!(models, vec!["foo/bar", "baz/qux", "baz/qux@rev"]);
-    }
-
-    #[test]
-    fn dedupe_preload_models_trims_and_drops_empty_entries() {
-        let models = dedupe_preload_models(vec![
-            " foo/bar ".to_string(),
-            "".to_string(),
-            "   ".to_string(),
-            "baz/qux@rev".to_string(),
-        ]);
-        assert_eq!(models, vec!["foo/bar", "baz/qux@rev"]);
     }
 
     fn write_config(dir: &tempfile::TempDir, config: serde_json::Value) -> PathBuf {

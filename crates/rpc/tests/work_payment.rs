@@ -34,6 +34,7 @@ use hellas_rpc::pb::work::{
     AdmitCertificateRequest, AdmitCertificateResponse, WorkPaid, WorkRefusalCode,
     admit_certificate_response::Outcome as AdmitOutcome,
 };
+use hellas_rpc::protocol::Digest;
 use hellas_rpc::protocol::artifacts::{
     BoundTermId, Canonical as _, InputAddressed as _, OutputAddressed as _, PreparedPaidInputV1,
     SourceRef, TextArtifact, TextExecution, TextPolicy, TokenIds,
@@ -48,7 +49,6 @@ use hellas_rpc::protocol::work_setup::{
     ObservedChannel, OmissionMeasurements, ReadyChannel, WorkChannelConfig, WorkChannelDescriptor,
     payment_terms_hash,
 };
-use hellas_rpc::protocol::Digest;
 use hellas_rpc::services::work::{WorkClientImpl, WorkServer};
 use hellas_rpc::work::{
     BackendFault, ClientEndpoint, PaidEvaluateBackend, PaymentError, ProviderEndpoint, RunError,
@@ -429,7 +429,7 @@ fn transcript_for(request: &EvaluateRequest, answer: &[u32]) -> Vec<OutputEventE
     };
     match builder.finish(EvaluateTerminal {
         final_position: answer.len() as u64,
-        stop_reason: EvaluateStopReason::END_OF_SEQUENCE,
+        stop_reason: EvaluateStopReason::STOP_TOKEN,
         text_artifact: Digest::from_bytes([0x77; 32]),
         usage,
         billable_units,

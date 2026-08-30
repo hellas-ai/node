@@ -23,6 +23,7 @@ use hellas_rpc::pb::work::{
     AcceptWorkRequest, AcceptWorkResponse, WorkAccepted, WorkRefusalCode, WorkRefused,
     accept_work_response::Outcome,
 };
+use hellas_rpc::protocol::Digest;
 use hellas_rpc::protocol::artifacts::{
     BoundTermId, Canonical as _, InputAddressed as _, OutputAddressed as _, PreparedPaidInputV1,
     SourceRef, TextArtifact, TextExecution, TextPolicy, TokenIds,
@@ -36,7 +37,6 @@ use hellas_rpc::protocol::work_setup::{
     ObservedChannel, OmissionMeasurements, ReadyChannel, WorkChannelConfig, WorkChannelDescriptor,
     payment_terms_hash,
 };
-use hellas_rpc::protocol::Digest;
 use hellas_rpc::services::work::{Work, WorkServer};
 use hellas_rpc::work::{
     ClientEndpoint, EndpointError, JobProposal, ProposeError, ProviderEndpoint, WorkRefusal,

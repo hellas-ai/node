@@ -4,8 +4,6 @@ extern crate tracing;
 #[cfg(feature = "gateway")]
 use clap::ValueEnum;
 use clap::{Parser, Subcommand};
-#[cfg(any(feature = "node", feature = "gateway"))]
-use hellas_rpc::Dtype;
 use iroh::EndpointId;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -16,23 +14,7 @@ mod identity;
 mod metrics;
 #[cfg(feature = "node")]
 mod platform_hardening;
-#[cfg(feature = "node")]
-mod reproduce;
 mod tracing_config;
-
-#[cfg(any(feature = "node", feature = "gateway"))]
-/// `clap` value parser for `--dtype`. Accepts model floating-point dtypes.
-/// Rejects `u32`, which is the tensor token-index dtype, never a model dtype.
-fn parse_model_dtype(s: &str) -> Result<Dtype, String> {
-    let dtype: Dtype = s
-        .parse()
-        .map_err(|err: hellas_rpc::ParseDtypeError| err.to_string())?;
-    if dtype.is_model_dtype() {
-        Ok(dtype)
-    } else {
-        Err("model dtype must be f32, f16, bf16, or f8".to_string())
-    }
-}
 
 fn parse_public_key_hex(s: &str) -> Result<hellas_rpc::PublicKey, String> {
     let bytes = parse_hex_array::<33>(s)?;
@@ -139,23 +121,6 @@ fn parse_json_object(s: &str) -> Result<serde_json::Map<String, serde_json::Valu
     }
 }
 
-/// Default dtype per build configuration. CUDA / Metal builds assume modern
-/// hardware (Ampere+, M2+) where `bf16` matches the dtype most current models
-/// are trained at and gives a real perf/VRAM win. CPU / unspecified-backend
-/// builds default to `f32` because CPUs typically emulate bf16 via f32 anyway,
-/// and `f32` is the safest broadly-correct choice. Used for `serve --dtype`
-/// and `gateway --dtype`.
-#[cfg(all(
-    any(feature = "node", feature = "gateway"),
-    any(feature = "candle-cuda", feature = "candle-metal")
-))]
-const DEFAULT_DTYPE_STR: &str = "bf16";
-#[cfg(all(
-    any(feature = "node", feature = "gateway"),
-    not(any(feature = "candle-cuda", feature = "candle-metal"))
-))]
-const DEFAULT_DTYPE_STR: &str = "f32";
-
 #[cfg(feature = "gateway")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum GatewayResponsesBackend {
@@ -178,26 +143,19 @@ impl From<GatewayResponsesBackend> for hellas_gateway::ResponsesBackend {
 /// The trust anchor this gateway's remote routes are built from, or
 /// `None` for a gateway that has none to build.
 ///
-/// A `--node-id` or a `--verify` shadow names a provider to dial, and a
-/// Fetch responses backend dials one for every request it serves. Each
-/// makes `--provider` required, and its absence is refused here, before
-/// anything binds. A gateway that names none of them is not owed one:
-/// it builds no remote route, and asking it to configure a provider it
-/// cannot reach is asking for configuration to satisfy a code path that
-/// does not run. Supplying `--provider` anyway still builds the anchor,
-/// so a discovery gateway keeps the routes it always had.
+/// Every non-local Hellas route dials either a direct node or discovery, and
+/// Fetch always dials remotely. Their trust anchor is required before the
+/// gateway binds; local Hellas execution and a proxy-only gateway need none.
 #[cfg(feature = "gateway")]
 fn gateway_provider_trust(
-    node_id: Option<EndpointId>,
-    verify: Option<EndpointId>,
+    local: bool,
     responses_backend: GatewayResponsesBackend,
     expected_genesis: Option<hellas_rpc::ContentId>,
     assurance: hellas_rpc::Assurance,
     apple_app_attest_app_id: Option<String>,
     apple_app_attest_cdhashes: Vec<[u8; 32]>,
 ) -> anyhow::Result<Option<hellas_client::ProviderTrustAnchor>> {
-    let dials_provider = node_id.is_some()
-        || verify.is_some()
+    let dials_provider = (responses_backend == GatewayResponsesBackend::Hellas && !local)
         || responses_backend == GatewayResponsesBackend::Fetch;
     if !dials_provider && expected_genesis.is_none() {
         return Ok(None);
@@ -211,44 +169,12 @@ fn gateway_provider_trust(
     .map(Some)
 }
 
-/// Default `--dtype` preference list for `llm`, resolved at dispatch.
-///
-/// This is what the client *asks a provider for*. It is not a
-/// capability this node advertises: a serving node's dtypes come from
-/// `serve --dtype`, and the executor narrows those to what the backend
-/// it selected can actually run.
-///
-/// - **Network mode** (no `--local` / `--verify-local`): `[bf16, f32, f16]`
-///   regardless of build, **including a CPU build** — the weights are
-///   loaded on the provider, so this machine's hardware says nothing
-///   about what to ask for. Asking for f32 first here would make a CPU
-///   laptop unable to use a bf16-only GPU provider at all, since the
-///   refusal is per-dtype and the provider's list is what it is.
-/// - **Local-ish mode on a cuda/metal build**: same `[bf16, f32, f16]`.
-///   The operator opted into a GPU-backend feature, so the build assumes
-///   Ampere+/M2+ where bf16 is natively supported. If the machine turns
-///   out to have no such device the embedded executor drops bf16 from
-///   what it will accept, and the client's second preference is taken.
-/// - **Local-ish mode on a cpu / unspecified build**: `[f32, f16]`. Skips
-///   bf16 because CPU bf16 throughput is rarely a win and we want a default
-///   that loads on every backend, including GPUs without native bf16
-///   support in non-standard builds.
-#[cfg(feature = "evaluate")]
-fn default_llm_dtypes(is_local_mode: bool) -> Vec<Dtype> {
-    let cuda_or_metal = cfg!(any(feature = "candle-cuda", feature = "candle-metal"));
-    if is_local_mode && !cuda_or_metal {
-        vec![Dtype::F32, Dtype::F16]
-    } else {
-        vec![Dtype::BF16, Dtype::F32, Dtype::F16]
-    }
-}
-
 #[derive(Parser)]
 #[command(name = "hellas")]
 #[command(version)]
 #[command(about = "Hellas node CLI")]
 struct Cli {
-    /// Path to the versioned provider identity (default: $HOME/.hellas/identity)
+    /// Path to the versioned local identity (default: $HOME/.hellas/identity)
     #[arg(long = "identity", global = true)]
     identity: Option<PathBuf>,
 
@@ -256,7 +182,7 @@ struct Cli {
     #[arg(long = "software-root", global = true)]
     software_root: bool,
 
-    /// Assurance requested from and served by execution providers.
+    /// Assurance required for remote execution and offered when serving.
     #[arg(
         long,
         global = true,
@@ -265,14 +191,9 @@ struct Cli {
     )]
     assurance: hellas_rpc::Assurance,
 
-    /// The provider to accept remote execution from: an out-of-band
-    /// ContentId pin on its canonical enrollment bundle.
-    ///
-    /// Not a genesis *document* — it is a hash you assert, not a file
-    /// you load — and unrelated to `--network`, which names the chain
-    /// a signature settles on. A paying client sets both: one says
-    /// which chain the payment channel opens on, the other says whose
-    /// work it will pay for.
+    /// Out-of-band ContentId pin for the remote node's canonical enrollment
+    /// bundle. This is a hash asserted by the caller, not a document learned
+    /// from the node being checked.
     #[arg(
         long = "provider",
         global = true,
@@ -353,9 +274,8 @@ enum Commands {
         /// Port to listen on (auto-selects if not specified or if in use)
         #[arg(long)]
         port: Option<u16>,
-        /// Execute policy: 'skip' (default, refuse all executions),
-        /// 'eager' (execute any graph),
-        /// or 'allow(hf/pattern,...,graph/pattern,...)' (execute only matching)
+        /// Execute policy: 'skip' (default), 'eager', or
+        /// 'allow(package/pattern,...,id/pattern,...)'.
         #[arg(long = "execute-policy", default_value = "skip")]
         execute_policy: hellas_rpc::policy::ExecutePolicy,
         /// Maximum number of queued executions waiting behind the active worker
@@ -364,11 +284,17 @@ enum Commands {
             default_value_t = hellas_rpc::DEFAULT_EXECUTION_QUEUE_CAPACITY
         )]
         queue_size: usize,
-        /// Download a model on startup so it can be quoted. This is the only way this node
-        /// fetches a model: quotes are answered only for models already here. Repeat or use
-        /// commas: --preload foo/bar --preload baz/qux@rev
-        #[arg(long = "preload", value_delimiter = ',')]
-        preload_models: Vec<String>,
+        /// Catena execution package to fetch, verify, compile, and serve,
+        /// written NAME=PATH. Repeat for multiple local aliases. Peer requests
+        /// can only select aliases loaded here; they never resolve paths.
+        #[cfg(feature = "evaluate")]
+        #[arg(long = "package", value_name = "NAME=PATH")]
+        packages: Vec<commands::package::PackageArg>,
+        /// Directory for materialized Catena package objects
+        /// (default: $HOME/.hellas/packages).
+        #[cfg(feature = "evaluate")]
+        #[arg(long = "package-cache")]
+        package_cache: Option<PathBuf>,
         /// Persistent canonical artifact blob store path (default: $HOME/.hellas/artifacts)
         #[arg(long = "artifact-store-path")]
         artifact_store_path: Option<PathBuf>,
@@ -376,35 +302,12 @@ enum Commands {
         /// Work remains retryably not ready until the configured state mounts.
         #[arg(long = "work-config")]
         work_config_file: Option<PathBuf>,
-        /// What `hellas store adopt` already hashed, so this node does not hash it again
-        /// (default: $HELLAS_STORE_DIR/fastresume.bin, else $HOME/.hellas/store/fastresume.bin)
-        ///
-        /// The records are a hash cache for model weights, loaded and saved
-        /// through `hellas-models`, which only exists on an `evaluate` build.
-        /// A node that cannot evaluate has nothing to fastresume, so the flag
-        /// is not offered rather than accepted and ignored.
-        #[cfg(feature = "evaluate")]
-        #[arg(long = "store-records")]
-        store_records: Option<PathBuf>,
         /// Prometheus metrics port (e.g. 9090)
         #[arg(long = "metrics-port")]
         metrics_port: Option<u16>,
         /// Operator graffiti tag (up to 16 bytes, padded/truncated)
         #[arg(long = "graffiti", default_value = "")]
         graffiti: String,
-        /// Dtypes this executor will accept, comma-separated. The first entry
-        /// is the executor's preferred dtype (used when the server constructs
-        /// a program itself, e.g. for `QuotePromptRequest`). Other entries are
-        /// also accepted on a per-request basis. Each accepted dtype loads its
-        /// own bundle of weights, so listing more dtypes costs more VRAM.
-        /// Defaults to `f32`.
-        #[arg(
-            long = "dtype",
-            default_value = DEFAULT_DTYPE_STR,
-            value_delimiter = ',',
-            value_parser = parse_model_dtype
-        )]
-        dtype: Vec<Dtype>,
         /// Unified Fetch configuration file: routes (provider upstreams,
         /// protocols, capabilities) and caller access policy. No file means
         /// this node serves no Fetch routes.
@@ -429,9 +332,10 @@ enum Commands {
     /// The gateway's routes reach an executor, so it binds loopback only
     /// and every route requires a credential drawn fresh at startup and
     /// printed once to your terminal. Send it as
-    /// `Authorization: Bearer <token>`; a restart draws a new one. It
-    /// still downloads any model a credentialled request names so it can
-    /// tokenize for it — `--force-model` is what takes that choice away.
+    /// `Authorization: Bearer <token>`; a restart draws a new one. Hellas
+    /// routes use the one operator-selected Catena package below. Text
+    /// tokenization and decoding are a separate, unattested presentation
+    /// concern configured explicitly by `--tokenizer`.
     Gateway {
         /// Host interface to bind. Must resolve to a loopback address;
         /// anything else is refused, because these routes reach an
@@ -447,11 +351,11 @@ enum Commands {
         /// Direct UDP address hint for the target node. Repeat or use commas.
         #[arg(long = "node-addr", value_delimiter = ',', requires = "node_id")]
         node_addrs: Vec<SocketAddr>,
-        /// Run locally with the catgrad backend instead of the Hellas network
+        /// Run locally with Catena instead of the Hellas network
         #[cfg(feature = "evaluate")]
         #[arg(long = "local", default_value_t = false, conflicts_with_all = ["node_id", "node_addrs"])]
         local: bool,
-        /// Run remotely and verify that the response matches a local catgrad execution
+        /// Run remotely and verify that the response matches local Catena execution
         #[cfg(feature = "evaluate")]
         #[arg(
             long = "verify-local",
@@ -481,18 +385,71 @@ enum Commands {
         #[arg(long = "retries", default_value_t = 2)]
         retries: usize,
         /// Fallback max new tokens when request omits max_tokens
-        #[arg(long = "default-max-tokens", default_value_t = 128)]
+        #[arg(
+            long = "default-max-tokens",
+            default_value_t = 128,
+            value_parser = clap::value_parser!(u32).range(1..)
+        )]
         default_max_tokens: u32,
-        /// Override request model and force this HuggingFace model id, optionally with @revision
-        #[arg(long = "force-model")]
-        force_model: Option<String>,
+        /// Fixed Catena package alias used by Hellas-backed routes. Use NAME
+        /// with --package-id for remote execution, or NAME=PATH when a local
+        /// or verification leg must materialize and identify the package.
+        /// Request-body model strings cannot select files.
+        #[cfg_attr(
+            feature = "evaluate",
+            arg(
+                long = "package",
+                value_name = "NAME[=PATH]",
+                help = "Fixed Catena package route: NAME for remote-only, or NAME=PATH when a local verification leg must materialize it"
+            )
+        )]
+        #[cfg_attr(
+            not(feature = "evaluate"),
+            arg(
+                long = "package",
+                value_name = "NAME",
+                help = "Peer-local Catena package alias used only for routing; --package-id supplies the trusted identity"
+            )
+        )]
+        package: commands::package::PackageArg,
+        /// Exact Catena execution-package ID expected from a remote executor.
+        /// Local and verify-local gateways derive it from the verified package.
+        #[cfg_attr(
+            feature = "evaluate",
+            arg(
+                long = "package-id",
+                value_name = "64_HEX",
+                required_unless_present_any = ["local", "verify_local"],
+                conflicts_with_all = ["local", "verify_local"],
+                help = "Exact Catena execution-package ID expected from a remote executor; local modes derive it from the verified package"
+            )
+        )]
+        #[cfg_attr(
+            not(feature = "evaluate"),
+            arg(
+                long = "package-id",
+                value_name = "64_HEX",
+                required = true,
+                help = "Exact Catena execution-package ID expected from the remote executor"
+            )
+        )]
+        package_id: Option<hellas_rpc::ExecutionPackageId>,
+        /// Directory for locally materialized Catena package objects
+        /// (default: $HOME/.hellas/packages; unused for remote-only routes).
+        #[cfg(feature = "evaluate")]
+        #[arg(long = "package-cache")]
+        package_cache: Option<PathBuf>,
+        /// Tokenizer JSON used only for local text presentation. It is not
+        /// part of the Hellas execution guarantee.
+        #[arg(long = "tokenizer", value_name = "PATH")]
+        tokenizer: PathBuf,
+        /// Caller-selected stop token ID. Repeat or comma-separate. No stop
+        /// tokens are inferred from the tokenizer or Catena package.
+        #[arg(long = "stop-token", value_delimiter = ',')]
+        stop_token_ids: Vec<u32>,
         /// Prometheus metrics port (e.g. 9090)
         #[arg(long = "metrics-port")]
         metrics_port: Option<u16>,
-        /// Dtype the local executor (when `--local` or `--verify-local`) runs at,
-        /// and the dtype the client builds the quote program at: f32, f16, or bf16
-        #[arg(long = "dtype", default_value = DEFAULT_DTYPE_STR, value_parser = parse_model_dtype)]
-        dtype: Dtype,
         /// Backend for /v1/responses.
         #[arg(long = "responses-backend", value_enum, default_value_t = GatewayResponsesBackend::Hellas)]
         responses_backend: GatewayResponsesBackend,
@@ -542,7 +499,7 @@ enum Commands {
         #[arg(long = "node-addr", value_delimiter = ',')]
         node_addrs: Vec<SocketAddr>,
     },
-    /// Store or fetch canonical artifact bytes on a provider
+    /// Fetch canonical artifact bytes from a node
     Artifact {
         #[command(subcommand)]
         command: commands::artifact::ArtifactCommand,
@@ -558,33 +515,82 @@ enum Commands {
         #[command(subcommand)]
         command: commands::chain::ChainCommand,
     },
-    #[cfg(feature = "evaluate")]
-    /// Run LLM inference remotely or locally
+    #[cfg(feature = "llm")]
+    /// Run token-native Catena inference remotely, or locally when built with `evaluate`
     Llm {
         /// Node ID to run on remotely (omit to auto-discover)
         node_id: Option<EndpointId>,
         /// Direct UDP address hint for the target node. Repeat or use commas.
         #[arg(long = "node-addr", value_delimiter = ',', requires = "node_id")]
         node_addrs: Vec<SocketAddr>,
-        /// HuggingFace model id used to fetch weights, optionally with @revision
-        #[arg(short = 'm', long = "model", default_value = "Qwen/Qwen3-0.6B")]
-        model: String,
+        /// Catena package alias sent to the executor. Use NAME with an exact
+        /// --package-id for remote execution, or NAME=PATH when `--local` or
+        /// `--verify-local` materializes and identifies it on this machine.
+        #[cfg_attr(
+            feature = "evaluate",
+            arg(long = "package", value_name = "NAME[=PATH]")
+        )]
+        #[cfg_attr(
+            not(feature = "evaluate"),
+            arg(
+                long = "package",
+                value_name = "NAME",
+                help = "Peer-local package alias used only for routing; --package-id supplies the trusted identity"
+            )
+        )]
+        package: commands::package::PackageArg,
+        /// Exact Catena execution-package ID expected from a remote executor.
+        /// Omit for local and verify-local runs, which derive it from the
+        /// locally verified package.
+        #[cfg_attr(
+            feature = "evaluate",
+            arg(
+                long = "package-id",
+                value_name = "64_HEX",
+                required_unless_present_any = ["local", "verify_local"],
+                conflicts_with_all = ["local", "verify_local"]
+            )
+        )]
+        #[cfg_attr(
+            not(feature = "evaluate"),
+            arg(
+                long = "package-id",
+                value_name = "64_HEX",
+                required = true,
+                help = "Exact Catena execution-package ID expected from the remote node"
+            )
+        )]
+        package_id: Option<hellas_rpc::ExecutionPackageId>,
+        /// Directory for locally materialized Catena package objects
+        /// (default: $HOME/.hellas/packages).
+        #[cfg(feature = "evaluate")]
+        #[arg(long = "package-cache")]
+        package_cache: Option<PathBuf>,
+        /// Tokenizer JSON used only for local text presentation. It is not
+        /// part of the Hellas execution guarantee.
+        #[arg(long = "tokenizer", value_name = "PATH")]
+        tokenizer: PathBuf,
+        /// Caller-selected stop token ID. Repeat or comma-separate. No stop
+        /// tokens are inferred from the tokenizer or Catena package.
+        #[arg(long = "stop-token", value_delimiter = ',')]
+        stop_token_ids: Vec<u32>,
         /// Prompt to send (required)
         #[arg(short = 'p', long = "prompt")]
         prompt: String,
-        /// Pass the prompt through unchanged instead of applying the model chat template
-        #[arg(long = "raw", default_value_t = false)]
-        raw: bool,
         /// Allow the provider to retain prompt- and token-bearing artifacts.
         #[arg(long = "retain", default_value_t = true, action = clap::ArgAction::Set)]
         retain: bool,
         /// Maximum number of new tokens to generate
-        #[arg(long = "max-seq", default_value_t = 16)]
-        max_seq: u32,
+        #[arg(
+            long = "max-new-tokens",
+            default_value_t = 16,
+            value_parser = clap::value_parser!(u32).range(1..)
+        )]
+        max_new_tokens: u32,
         /// Max execution retries on failure (discovery path only)
         #[arg(long = "retries", default_value_t = 2)]
         retries: usize,
-        /// Run locally with the catgrad backend instead of the Hellas network
+        /// Run locally with Catena instead of the Hellas network
         #[cfg(feature = "evaluate")]
         #[arg(long = "local", default_value_t = false, conflicts_with_all = ["verify_local", "node_id", "node_addrs"])]
         local: bool,
@@ -596,16 +602,12 @@ enum Commands {
             conflicts_with = "local"
         )]
         verify_local: bool,
-        /// Comma-separated preference list (each one of `f32`, `f16`,
-        /// `bf16`). The client builds the quote program at the first entry,
-        /// then on a remote `DtypeNotSupported` rejection retries at the
-        /// next. For `--local` / `--verify-local` the embedded executor's
-        /// `supported_dtypes` is the full list. If omitted the default
-        /// depends on the build and mode (cuda/metal builds and any network
-        /// mode prefer `bf16,f32,f16`; cpu builds in local-ish mode prefer
-        /// `f32,f16` to stay safe on hardware without bf16/f16 support).
-        #[arg(long = "dtype", value_delimiter = ',', value_parser = parse_model_dtype)]
-        dtype: Vec<Dtype>,
+    },
+    #[cfg(feature = "evaluate")]
+    /// Inspect owner-selected Catena execution packages
+    Package {
+        #[command(subcommand)]
+        command: commands::package::PackageCommand,
     },
     /// Run trust-based fetch JSON work
     Fetch {
@@ -823,6 +825,20 @@ async fn main() {
         command => command,
     };
 
+    #[cfg(feature = "evaluate")]
+    let command = match command {
+        Commands::Package { command } => {
+            let result = commands::package::run(command).await;
+            tracer_provider.shutdown();
+            if let Err(err) = result {
+                eprintln!("error: {err:#}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        command => command,
+    };
+
     #[cfg(feature = "chain")]
     let command = match command {
         Commands::Chain { command } => {
@@ -898,14 +914,14 @@ async fn main() {
             port,
             execute_policy,
             queue_size,
-            preload_models,
+            #[cfg(feature = "evaluate")]
+            packages,
+            #[cfg(feature = "evaluate")]
+            package_cache,
             artifact_store_path,
             work_config_file,
-            #[cfg(feature = "evaluate")]
-            store_records,
             metrics_port,
             graffiti,
-            dtype,
             fetch_config_file,
             fetch_max_in_flight,
             fetch_queue_size,
@@ -928,14 +944,14 @@ async fn main() {
                         port,
                         execute_policy,
                         queue_size,
-                        preload_models,
+                        #[cfg(feature = "evaluate")]
+                        packages,
+                        #[cfg(feature = "evaluate")]
+                        package_cache,
                         artifact_store_path,
                         work_config,
-                        #[cfg(feature = "evaluate")]
-                        store_records,
                         metrics_port,
                         graffiti,
-                        dtype,
                         fetch_config_file,
                         fetch_max_in_flight,
                         fetch_queue_size,
@@ -990,9 +1006,13 @@ async fn main() {
             queue_size,
             retries,
             default_max_tokens,
-            force_model,
+            package,
+            package_id,
+            #[cfg(feature = "evaluate")]
+            package_cache,
+            tokenizer,
+            stop_token_ids,
             metrics_port,
-            dtype,
             responses_backend,
             responses_proxy_url,
             responses_proxy_api_key_env,
@@ -1005,9 +1025,53 @@ async fn main() {
             wrap_args,
         } => {
             async {
+                #[cfg(feature = "evaluate")]
+                let materializes_package = local || verify_local;
+                #[cfg(not(feature = "evaluate"))]
+                let materializes_package = false;
+                if materializes_package && package_id.is_some() {
+                    anyhow::bail!(
+                        "--package-id is only for remote-only gateways; local package verification derives the exact ID"
+                    );
+                }
+                if !materializes_package && package_id.is_none() {
+                    anyhow::bail!(
+                        "remote gateway execution requires --package-id <64-hex Catena package ID>"
+                    );
+                }
+                if !materializes_package {
+                    package
+                        .require_remote_alias()
+                        .map_err(anyhow::Error::msg)?;
+                }
+                #[cfg(feature = "evaluate")]
+                if !materializes_package && package_cache.is_some() {
+                    anyhow::bail!("--package-cache is only used with --local or --verify-local");
+                }
+                #[cfg(feature = "evaluate")]
+                let (package_dir, package_artifact_dir) = if materializes_package {
+                    let package_cache = package_cache
+                        .map(Ok)
+                        .unwrap_or_else(identity::default_package_cache_path)?;
+                    let package_dir = package.package_dir().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "local Catena execution needs a manifest path; pass --package {}=PATH",
+                            package.name(),
+                        )
+                    })?;
+                    (
+                        Some(package_dir.to_path_buf()),
+                        Some(package.artifact_dir(&package_cache)),
+                    )
+                } else {
+                    (None, None)
+                };
+                #[cfg(not(feature = "evaluate"))]
+                let (package_dir, package_artifact_dir) = (None, None);
+                #[cfg(not(feature = "evaluate"))]
+                let local = false;
                 let provider_trust = gateway_provider_trust(
-                    node_id,
-                    verify,
+                    local,
                     responses_backend,
                     expected_provider_genesis,
                     assurance,
@@ -1028,9 +1092,13 @@ async fn main() {
                     queue_size,
                     retries,
                     default_max_tokens,
-                    force_model,
+                    package_name: package.name().to_string(),
+                    execution_package: package_id,
+                    package_dir,
+                    package_artifact_dir,
+                    tokenizer,
+                    stop_token_ids,
                     metrics_port,
-                    dtype,
                     responses_backend: responses_backend.into(),
                     responses_proxy_url,
                     responses_proxy_api_key_env,
@@ -1062,47 +1130,81 @@ async fn main() {
         Commands::Chain { .. } => unreachable!("chain commands handled before identity load"),
         Commands::Store { .. } => unreachable!("store commands handled before identity load"),
         #[cfg(feature = "evaluate")]
+        Commands::Package { .. } => {
+            unreachable!("package commands handled before identity load")
+        }
+        #[cfg(feature = "llm")]
         Commands::Llm {
             node_id,
             node_addrs,
-            model,
+            package,
+            package_id,
+            #[cfg(feature = "evaluate")]
+            package_cache,
+            tokenizer,
+            stop_token_ids,
             prompt,
-            raw,
             retain,
-            max_seq,
+            max_new_tokens,
             retries,
+            #[cfg(feature = "evaluate")]
             local,
+            #[cfg(feature = "evaluate")]
             verify_local,
-            dtype,
         } => {
-            let is_local_mode = local || verify_local;
-            let dtype = if dtype.is_empty() {
-                default_llm_dtypes(is_local_mode)
-            } else {
-                dtype
-            };
-            commands::llm::run(
-                commands::llm::ExecuteOptions {
-                    node_id,
-                    node_addrs,
-                    model,
-                    prompt,
-                    raw,
-                    retain,
-                    max_seq,
-                    retries,
-                    local,
-                    verify_local,
-                    dtype,
-                    producer_key: local_identity.producer_key,
-                    provider_genesis: local_identity.enrollment.canonical_bytes(),
-                    expected_provider_genesis,
-                    apple_app_attest_app_id: apple_app_attest_app_id.clone(),
-                    apple_app_attest_cdhashes: apple_app_attest_cdhashes.clone(),
-                    assurance,
-                },
-                secret_key,
-            )
+            async {
+                let package_name = package.name().to_string();
+                #[cfg(feature = "evaluate")]
+                let local_package = if local || verify_local {
+                    let package_cache = package_cache
+                        .map(Ok)
+                        .unwrap_or_else(identity::default_package_cache_path)?;
+                    Some(package.into_source(&package_cache)?)
+                } else {
+                    package
+                        .require_remote_alias()
+                        .map_err(anyhow::Error::msg)?;
+                    if package_cache.is_some() {
+                        anyhow::bail!(
+                            "--package-cache is only used with --local or --verify-local"
+                        );
+                    }
+                    None
+                };
+                #[cfg(not(feature = "evaluate"))]
+                package
+                    .require_remote_alias()
+                    .map_err(anyhow::Error::msg)?;
+                commands::llm::run(
+                    commands::llm::ExecuteOptions {
+                        node_id,
+                        node_addrs,
+                        package_name,
+                        execution_package: package_id,
+                        #[cfg(feature = "evaluate")]
+                        local_package,
+                        tokenizer,
+                        stop_token_ids,
+                        prompt,
+                        retain,
+                        max_new_tokens,
+                        retries,
+                        #[cfg(feature = "evaluate")]
+                        local,
+                        #[cfg(feature = "evaluate")]
+                        verify_local,
+                        producer_key: local_identity.producer_key,
+                        #[cfg(feature = "evaluate")]
+                        provider_genesis: local_identity.enrollment.canonical_bytes(),
+                        expected_provider_genesis,
+                        apple_app_attest_app_id: apple_app_attest_app_id.clone(),
+                        apple_app_attest_cdhashes: apple_app_attest_cdhashes.clone(),
+                        assurance,
+                    },
+                    secret_key,
+                )
+                .await
+            }
             .await
         }
         Commands::Fetch {
@@ -1185,6 +1287,78 @@ fn command_owns_tracing(command: &Commands) -> bool {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "llm")]
+    const TEST_PACKAGE: &str = "smollm2-135m";
+    #[cfg(feature = "llm")]
+    const TEST_PACKAGE_ID: &str =
+        "0808080808080808080808080808080808080808080808080808080808080808";
+    #[cfg(feature = "evaluate")]
+    const TEST_LOCAL_PACKAGE: &str = "smollm2-135m=/path/to/catena-package";
+    #[cfg(feature = "llm")]
+    const TEST_TOKENIZER: &str = "/path/to/tokenizer.json";
+
+    #[cfg(feature = "llm")]
+    fn parse_llm(args: &[&str]) -> Result<Cli, clap::Error> {
+        parse_llm_with_package(TEST_PACKAGE, args)
+    }
+
+    #[cfg(feature = "llm")]
+    fn parse_llm_with_package(package: &str, args: &[&str]) -> Result<Cli, clap::Error> {
+        #[cfg(feature = "evaluate")]
+        let local = args.contains(&"--local") || args.contains(&"--verify-local");
+        #[cfg(not(feature = "evaluate"))]
+        let local = false;
+        let package_id: &[&str] = if local {
+            &[]
+        } else {
+            &["--package-id", TEST_PACKAGE_ID]
+        };
+        Cli::try_parse_from(
+            [
+                "hellas",
+                "llm",
+                "--package",
+                package,
+                "--tokenizer",
+                TEST_TOKENIZER,
+            ]
+            .into_iter()
+            .chain(package_id.iter().copied())
+            .chain(args.iter().copied()),
+        )
+    }
+
+    #[cfg(feature = "gateway")]
+    fn parse_gateway(args: &[&str]) -> Result<Cli, clap::Error> {
+        parse_gateway_with_package(TEST_PACKAGE, args)
+    }
+
+    #[cfg(feature = "gateway")]
+    fn parse_gateway_with_package(package: &str, args: &[&str]) -> Result<Cli, clap::Error> {
+        #[cfg(feature = "evaluate")]
+        let local = args.contains(&"--local") || args.contains(&"--verify-local");
+        #[cfg(not(feature = "evaluate"))]
+        let local = false;
+        let package_id: &[&str] = if local {
+            &[]
+        } else {
+            &["--package-id", TEST_PACKAGE_ID]
+        };
+        Cli::try_parse_from(
+            [
+                "hellas",
+                "gateway",
+                "--package",
+                package,
+                "--tokenizer",
+                TEST_TOKENIZER,
+            ]
+            .into_iter()
+            .chain(package_id.iter().copied())
+            .chain(args.iter().copied()),
+        )
+    }
+
     #[test]
     fn identity_init_has_an_explicit_dispatch_command() {
         let cli = Cli::try_parse_from(["hellas", "identity", "init"]).unwrap();
@@ -1199,21 +1373,29 @@ mod tests {
     #[cfg(feature = "evaluate")]
     #[test]
     fn llm_accepts_local_mode() {
-        let cli = Cli::try_parse_from(["hellas", "llm", "--local", "-p", "hello"]).unwrap();
+        let cli = parse_llm_with_package(TEST_LOCAL_PACKAGE, &["--local", "-p", "hello"]).unwrap();
         match cli.command {
             Commands::Llm {
                 node_id,
                 node_addrs,
                 local,
                 verify_local,
-                raw,
+                package,
+                tokenizer,
+                stop_token_ids,
                 ..
             } => {
                 assert!(node_id.is_none());
                 assert!(node_addrs.is_empty());
                 assert!(local);
                 assert!(!verify_local);
-                assert!(!raw);
+                assert_eq!(package.name(), "smollm2-135m");
+                assert_eq!(
+                    package.package_dir(),
+                    Some(Path::new("/path/to/catena-package"))
+                );
+                assert_eq!(tokenizer, PathBuf::from(TEST_TOKENIZER));
+                assert!(stop_token_ids.is_empty());
             }
             _ => panic!("expected llm command"),
         }
@@ -1221,25 +1403,70 @@ mod tests {
 
     #[cfg(feature = "evaluate")]
     #[test]
-    fn llm_accepts_raw_mode() {
-        let cli = Cli::try_parse_from(["hellas", "llm", "--raw", "-p", "hello"]).unwrap();
-        match cli.command {
-            Commands::Llm { raw, .. } => assert!(raw),
-            _ => panic!("expected llm command"),
-        }
+    fn package_id_accepts_an_owner_selected_manifest() {
+        let cli = Cli::try_parse_from(["hellas", "package", "id", "--package", TEST_LOCAL_PACKAGE])
+            .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Package {
+                command: commands::package::PackageCommand::Id { .. },
+            }
+        ));
     }
 
-    #[cfg(feature = "evaluate")]
+    #[cfg(feature = "llm")]
+    #[test]
+    fn llm_requires_explicit_package_and_tokenizer() {
+        assert!(Cli::try_parse_from(["hellas", "llm", "-p", "hello"]).is_err());
+        assert!(
+            Cli::try_parse_from(["hellas", "llm", "--package", TEST_PACKAGE, "-p", "hello",])
+                .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "hellas",
+                "llm",
+                "--package",
+                TEST_PACKAGE,
+                "--tokenizer",
+                TEST_TOKENIZER,
+                "-p",
+                "hello",
+            ])
+            .is_err(),
+            "a remote alias without an exact package pin must be rejected"
+        );
+    }
+
+    #[cfg(feature = "gateway")]
+    #[test]
+    fn gateway_requires_explicit_package_and_tokenizer() {
+        assert!(Cli::try_parse_from(["hellas", "gateway"]).is_err());
+        assert!(Cli::try_parse_from(["hellas", "gateway", "--package", TEST_PACKAGE]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "hellas",
+                "gateway",
+                "--package",
+                TEST_PACKAGE,
+                "--tokenizer",
+                TEST_TOKENIZER,
+            ])
+            .is_err(),
+            "a remote gateway alias without an exact package pin must be rejected"
+        );
+    }
+
+    #[cfg(feature = "llm")]
     #[test]
     fn llm_retention_defaults_on_and_can_be_disabled() {
-        let default = Cli::try_parse_from(["hellas", "llm", "-p", "hello"]).unwrap();
+        let default = parse_llm(&["-p", "hello"]).unwrap();
         assert!(matches!(
             default.command,
             Commands::Llm { retain: true, .. }
         ));
 
-        let disabled =
-            Cli::try_parse_from(["hellas", "llm", "--retain=false", "-p", "hello"]).unwrap();
+        let disabled = parse_llm(&["--retain=false", "-p", "hello"]).unwrap();
         assert!(matches!(
             disabled.command,
             Commands::Llm { retain: false, .. }
@@ -1249,14 +1476,15 @@ mod tests {
     #[cfg(feature = "evaluate")]
     #[test]
     fn llm_rejects_local_with_node_id() {
-        let result = Cli::try_parse_from([
-            "hellas",
-            "llm",
-            "bb18ebc065d836ecc7e1f33972d2c17eac9894cd33ce4916f66cb1165ccc7550",
-            "--local",
-            "-p",
-            "hello",
-        ]);
+        let result = parse_llm_with_package(
+            TEST_LOCAL_PACKAGE,
+            &[
+                "bb18ebc065d836ecc7e1f33972d2c17eac9894cd33ce4916f66cb1165ccc7550",
+                "--local",
+                "-p",
+                "hello",
+            ],
+        );
 
         assert!(result.is_err());
     }
@@ -1264,8 +1492,10 @@ mod tests {
     #[cfg(feature = "evaluate")]
     #[test]
     fn llm_rejects_conflicting_local_modes() {
-        let result =
-            Cli::try_parse_from(["hellas", "llm", "--local", "--verify-local", "-p", "hello"]);
+        let result = parse_llm_with_package(
+            TEST_LOCAL_PACKAGE,
+            &["--local", "--verify-local", "-p", "hello"],
+        );
 
         assert!(result.is_err());
     }
@@ -1273,7 +1503,7 @@ mod tests {
     #[cfg(feature = "evaluate")]
     #[test]
     fn gateway_accepts_local_mode() {
-        let cli = Cli::try_parse_from(["hellas", "gateway", "--local"]).unwrap();
+        let cli = parse_gateway_with_package(TEST_LOCAL_PACKAGE, &["--local"]).unwrap();
         match cli.command {
             Commands::Gateway {
                 node_id,
@@ -1292,13 +1522,14 @@ mod tests {
     #[cfg(feature = "evaluate")]
     #[test]
     fn gateway_rejects_local_with_node_id() {
-        let result = Cli::try_parse_from([
-            "hellas",
-            "gateway",
-            "--local",
-            "--node-id",
-            "bb18ebc065d836ecc7e1f33972d2c17eac9894cd33ce4916f66cb1165ccc7550",
-        ]);
+        let result = parse_gateway_with_package(
+            TEST_LOCAL_PACKAGE,
+            &[
+                "--local",
+                "--node-id",
+                "bb18ebc065d836ecc7e1f33972d2c17eac9894cd33ce4916f66cb1165ccc7550",
+            ],
+        );
 
         assert!(result.is_err());
     }
@@ -1306,20 +1537,20 @@ mod tests {
     /// The anchor `hellas gateway <args>` would run with.
     #[cfg(feature = "gateway")]
     fn gateway_trust(args: &[&str]) -> anyhow::Result<Option<hellas_client::ProviderTrustAnchor>> {
-        let cli = Cli::try_parse_from(["hellas", "gateway"].iter().chain(args).copied())
-            .expect("valid gateway arguments");
+        let cli = parse_gateway(args).expect("valid gateway arguments");
         let Commands::Gateway {
-            node_id,
-            verify,
             responses_backend,
+            #[cfg(feature = "evaluate")]
+            local,
             ..
         } = cli.command
         else {
             panic!("expected gateway command");
         };
+        #[cfg(not(feature = "evaluate"))]
+        let local = false;
         gateway_provider_trust(
-            node_id,
-            verify,
+            local,
             responses_backend,
             cli.provider_genesis,
             cli.assurance,
@@ -1337,8 +1568,9 @@ mod tests {
         const ENVIRONMENT: &str =
             "0909090909090909090909090909090909090909090909090909090909090909";
 
-        // Names no provider: no anchor is built, and none is demanded.
-        assert!(gateway_trust(&[]).unwrap().is_none());
+        // Local and proxy-only modes do not dial a Hellas provider.
+        #[cfg(feature = "evaluate")]
+        assert!(gateway_trust(&["--local"]).unwrap().is_none());
         assert!(
             gateway_trust(&["--responses-backend", "proxy"])
                 .unwrap()
@@ -1348,6 +1580,7 @@ mod tests {
         // Names one: `--provider` is required, and its absence is refused
         // by the flag that would supply it.
         for dialling in [
+            vec![],
             vec!["--node-id", NODE],
             vec!["--node-id", NODE, "--verify", SHADOW],
             vec![
@@ -1358,6 +1591,12 @@ mod tests {
             ],
         ] {
             let refusal = gateway_trust(&dialling).unwrap_err().to_string();
+            assert!(refusal.contains("--provider <content-id>"), "{refusal}");
+        }
+
+        #[cfg(feature = "evaluate")]
+        {
+            let refusal = gateway_trust(&["--verify-local"]).unwrap_err().to_string();
             assert!(refusal.contains("--provider <content-id>"), "{refusal}");
         }
 
@@ -1373,25 +1612,18 @@ mod tests {
         assert!(gateway_trust(&["--provider", PROVIDER]).unwrap().is_some());
     }
 
-    #[cfg(feature = "evaluate")]
+    #[cfg(feature = "llm")]
     #[test]
     fn llm_rejects_node_addr_without_node_id() {
-        let result = Cli::try_parse_from([
-            "hellas",
-            "llm",
-            "--node-addr",
-            "127.0.0.1:31145",
-            "-p",
-            "hello",
-        ]);
+        let result = parse_llm(&["--node-addr", "127.0.0.1:31145", "-p", "hello"]);
 
         assert!(result.is_err());
     }
 
-    #[cfg(feature = "evaluate")]
+    #[cfg(feature = "gateway")]
     #[test]
     fn gateway_rejects_node_addr_without_node_id() {
-        let result = Cli::try_parse_from(["hellas", "gateway", "--node-addr", "127.0.0.1:31145"]);
+        let result = parse_gateway(&["--node-addr", "127.0.0.1:31145"]);
 
         assert!(result.is_err());
     }
@@ -1533,34 +1765,6 @@ mod tests {
     }
 
     #[test]
-    fn artifact_put_accepts_provider_and_path() {
-        let cli = Cli::try_parse_from([
-            "hellas",
-            "artifact",
-            "put",
-            "bb18ebc065d836ecc7e1f33972d2c17eac9894cd33ce4916f66cb1165ccc7550",
-            "--node-addr",
-            "127.0.0.1:31145",
-            "/tmp/artifact.cbor",
-        ])
-        .unwrap();
-        match cli.command {
-            Commands::Artifact {
-                command:
-                    commands::artifact::ArtifactCommand::Put {
-                        node_id: _,
-                        node_addrs,
-                        path,
-                    },
-            } => {
-                assert_eq!(node_addrs.len(), 1);
-                assert_eq!(path, std::path::Path::new("/tmp/artifact.cbor"));
-            }
-            _ => panic!("expected artifact put command"),
-        }
-    }
-
-    #[test]
     fn artifact_get_accepts_digest_and_output() {
         let digest = "00".repeat(32);
         let cli = Cli::try_parse_from([
@@ -1591,92 +1795,62 @@ mod tests {
         }
     }
 
-    /// On CPU-only builds the default is `f32`; on CUDA/Metal builds it is
-    /// `bf16`. See [`DEFAULT_DTYPE_STR`]. Used for `serve` / `gateway`,
-    /// which still take a single dtype.
-    #[cfg(feature = "node")]
-    fn expected_default_dtype() -> Dtype {
-        parse_model_dtype(DEFAULT_DTYPE_STR).unwrap()
-    }
-
-    #[cfg(feature = "evaluate")]
+    #[cfg(feature = "llm")]
     #[test]
-    fn llm_dtype_omitted_yields_empty_vec_for_runtime_resolution() {
-        // Clap parses no `--dtype` as an empty `Vec<Dtype>`; main resolves
-        // the per-mode default via [`default_llm_dtypes`].
-        let cli = Cli::try_parse_from(["hellas", "llm", "-p", "hi"]).unwrap();
+    fn llm_accepts_explicit_stop_tokens_without_inference() {
+        let cli = parse_llm(&[
+            "--stop-token",
+            "1,2",
+            "--stop-token",
+            "3",
+            "--max-new-tokens",
+            "32",
+            "-p",
+            "hi",
+        ])
+        .unwrap();
         match cli.command {
-            Commands::Llm { dtype, .. } => assert!(dtype.is_empty()),
-            _ => panic!("expected llm command"),
-        }
-    }
-
-    #[cfg(feature = "evaluate")]
-    #[test]
-    fn llm_accepts_single_dtype() {
-        let cli = Cli::try_parse_from(["hellas", "llm", "--dtype", "f16", "-p", "hi"]).unwrap();
-        match cli.command {
-            Commands::Llm { dtype, .. } => assert_eq!(dtype, vec![Dtype::F16]),
-            _ => panic!("expected llm command"),
-        }
-    }
-
-    #[cfg(feature = "evaluate")]
-    #[test]
-    fn llm_accepts_dtype_preference_list() {
-        let cli =
-            Cli::try_parse_from(["hellas", "llm", "--dtype", "bf16,f32,f16", "-p", "hi"]).unwrap();
-        match cli.command {
-            Commands::Llm { dtype, .. } => {
-                assert_eq!(dtype, vec![Dtype::BF16, Dtype::F32, Dtype::F16]);
+            Commands::Llm {
+                stop_token_ids,
+                max_new_tokens,
+                ..
+            } => {
+                assert_eq!(stop_token_ids, vec![1, 2, 3]);
+                assert_eq!(max_new_tokens, 32);
             }
             _ => panic!("expected llm command"),
         }
     }
 
-    #[cfg(feature = "evaluate")]
+    #[cfg(feature = "llm")]
     #[test]
-    fn default_llm_dtypes_local_cpu_skips_bf16() {
-        let cuda_or_metal = cfg!(any(feature = "candle-cuda", feature = "candle-metal"));
-        let prefs = default_llm_dtypes(/* is_local_mode = */ true);
-        if cuda_or_metal {
-            assert_eq!(prefs, vec![Dtype::BF16, Dtype::F32, Dtype::F16]);
-        } else {
-            assert_eq!(prefs, vec![Dtype::F32, Dtype::F16]);
-        }
+    fn llm_rejects_an_explicit_zero_output_limit() {
+        assert!(parse_llm(&["--max-new-tokens", "0", "-p", "hi"]).is_err());
     }
 
-    #[cfg(feature = "evaluate")]
+    #[cfg(feature = "gateway")]
     #[test]
-    fn default_llm_dtypes_network_uses_bf16_first() {
-        let prefs = default_llm_dtypes(/* is_local_mode = */ false);
-        assert_eq!(prefs, vec![Dtype::BF16, Dtype::F32, Dtype::F16]);
-    }
-
-    #[cfg(feature = "evaluate")]
-    #[test]
-    fn gateway_accepts_dtype_bf16() {
-        let cli = Cli::try_parse_from(["hellas", "gateway", "--dtype", "bf16"]).unwrap();
+    fn gateway_accepts_explicit_stop_tokens() {
+        let cli = parse_gateway(&["--stop-token", "1,2", "--stop-token", "3"]).unwrap();
         match cli.command {
-            Commands::Gateway { dtype, .. } => assert_eq!(dtype, Dtype::BF16),
+            Commands::Gateway { stop_token_ids, .. } => {
+                assert_eq!(stop_token_ids, vec![1, 2, 3]);
+            }
             _ => panic!("expected gateway command"),
         }
     }
 
-    #[cfg(feature = "evaluate")]
+    #[cfg(feature = "gateway")]
+    #[test]
+    fn gateway_rejects_a_zero_default_output_limit() {
+        assert!(parse_gateway(&["--default-max-tokens", "0"]).is_err());
+    }
+
+    #[cfg(feature = "gateway")]
     #[test]
     fn gateway_wrap_forwards_trailing_args() {
-        let cli = Cli::try_parse_from([
-            "hellas",
-            "gateway",
-            "--wrap",
-            "pi",
-            "--",
-            "-p",
-            "--no-session",
-            "say hello",
-        ])
-        .unwrap();
+        let cli =
+            parse_gateway(&["--wrap", "pi", "--", "-p", "--no-session", "say hello"]).unwrap();
         match cli.command {
             Commands::Gateway {
                 wrap, wrap_args, ..
@@ -1688,19 +1862,17 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "evaluate")]
+    #[cfg(feature = "gateway")]
     #[test]
     fn gateway_wrap_args_require_wrap() {
-        let result = Cli::try_parse_from(["hellas", "gateway", "--", "-p", "hi"]);
+        let result = parse_gateway(&["--", "-p", "hi"]);
         assert!(result.is_err(), "trailing args without --wrap should error");
     }
 
-    #[cfg(feature = "evaluate")]
+    #[cfg(feature = "gateway")]
     #[test]
     fn gateway_accepts_responses_fetch_backend() {
-        let cli = Cli::try_parse_from([
-            "hellas",
-            "gateway",
+        let cli = parse_gateway(&[
             "--responses-backend",
             "fetch",
             "--responses-fetch-route-service",
@@ -1963,16 +2135,6 @@ mod tests {
 
     #[cfg(feature = "node")]
     #[test]
-    fn serve_accepts_dtype_f16() {
-        let cli = Cli::try_parse_from(["hellas", "serve", "--dtype", "f16"]).unwrap();
-        match cli.command {
-            Commands::Serve { dtype, .. } => assert_eq!(dtype, vec![Dtype::F16]),
-            _ => panic!("expected serve command"),
-        }
-    }
-
-    #[cfg(feature = "node")]
-    #[test]
     fn serve_accepts_fetch_config() {
         let cli = Cli::try_parse_from([
             "hellas",
@@ -2055,43 +2217,5 @@ mod tests {
             }
             _ => panic!("expected codex-auth import command"),
         }
-    }
-
-    #[cfg(feature = "node")]
-    #[test]
-    fn serve_accepts_multi_dtype() {
-        let cli = Cli::try_parse_from(["hellas", "serve", "--dtype", "f32,f16,bf16"]).unwrap();
-        match cli.command {
-            Commands::Serve { dtype, .. } => {
-                assert_eq!(dtype, vec![Dtype::F32, Dtype::F16, Dtype::BF16]);
-            }
-            _ => panic!("expected serve command"),
-        }
-    }
-
-    #[cfg(feature = "node")]
-    #[test]
-    fn serve_dtype_defaults_to_build_default() {
-        let cli = Cli::try_parse_from(["hellas", "serve"]).unwrap();
-        match cli.command {
-            Commands::Serve { dtype, .. } => {
-                assert_eq!(dtype, vec![expected_default_dtype()]);
-            }
-            _ => panic!("expected serve command"),
-        }
-    }
-
-    #[cfg(feature = "node")]
-    #[test]
-    fn serve_rejects_dtype_u32_in_list() {
-        let result = Cli::try_parse_from(["hellas", "serve", "--dtype", "f32,u32"]);
-        assert!(result.is_err());
-    }
-
-    #[cfg(feature = "evaluate")]
-    #[test]
-    fn llm_rejects_dtype_u32() {
-        let result = Cli::try_parse_from(["hellas", "llm", "--dtype", "u32", "-p", "hi"]);
-        assert!(result.is_err());
     }
 }

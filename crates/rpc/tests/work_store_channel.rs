@@ -18,6 +18,7 @@ use hellas_rpc::evaluate::{
     EvaluateOutputTranscriptBuilder, EvaluateStopReason, EvaluateTerminal, EvaluateUsage,
     input_commitment,
 };
+use hellas_rpc::protocol::Digest;
 use hellas_rpc::protocol::artifacts::{
     BoundTermId, InputAddressed as _, OutputAddressed as _, PreparedPaidInputV1, SourceRef,
     TextArtifact, TextExecution, TextPolicy, TokenIds,
@@ -28,7 +29,6 @@ use hellas_rpc::protocol::work::{
     payment_binding_digest, prepared_input_digest, private_policy_commitment, result_digest,
     terminal_result, work_id,
 };
-use hellas_rpc::protocol::Digest;
 use hellas_rpc::work_store::journal::{Journal, JournalError, JournalId, JournalKind};
 use hellas_rpc::work_store::{
     ChannelRecord, ChannelStateError, ChannelStore, JobPhase, JobState, Role, SetupOrigin,
@@ -266,7 +266,7 @@ fn transcript_of(request: &EvaluateRequest, answer: &[u32]) -> Vec<OutputEventEn
     };
     match builder.finish(EvaluateTerminal {
         final_position: answer.len() as u64,
-        stop_reason: EvaluateStopReason::END_OF_SEQUENCE,
+        stop_reason: EvaluateStopReason::STOP_TOKEN,
         text_artifact: Digest::from_bytes([0x77; 32]),
         usage,
         billable_units,

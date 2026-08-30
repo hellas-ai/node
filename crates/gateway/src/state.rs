@@ -6,24 +6,18 @@ use crate::execution::{
 use anyhow::Context;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use hellas_adaptors::{
-    ContentPart as WireContentPart, ExecutionRequest as WireExecutionRequest, Input, InputItem,
-    Message as WireMessage,
-};
+use hellas_adaptors::{ExecutionRequest as WireExecutionRequest, Input};
 use hellas_client::{ExecutionRoute, ProducerTrust, RemoteNodeTarget};
 #[cfg(feature = "evaluate")]
-use hellas_executor::Executor;
-use hellas_models::{ChatMessage, ModelAssets, PreparedPrompt, Reach};
-use hellas_rpc::Dtype;
+use hellas_executor::{Executor, PackageSource};
+use hellas_presentation::{PreparedPrompt, TextPresentation};
 use hellas_rpc::Retention;
 #[cfg(feature = "evaluate")]
 use hellas_rpc::policy::ExecutePolicy;
 use hellas_rpc::provenance::ExecutionProvenance;
 use iroh::EndpointId;
-use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
 use tokio::time::Duration;
 
 /// End-to-end deadline applied while consuming a prepared generation.
@@ -38,10 +32,11 @@ pub(super) struct GatewayState {
     pub(super) verify_local: bool,
     pub(super) verify_node_id: Option<EndpointId>,
     default_max_tokens: u32,
-    pub(super) force_model: Option<String>,
+    pub(super) package_name: String,
+    pub(super) execution_package: hellas_rpc::ExecutionPackageId,
     pub(super) inference_timeout: Duration,
-    pub(super) dtype: Dtype,
     runtime: CliRuntime,
+    presentation: Arc<TextPresentation>,
     pub(super) responses_proxy: Option<Arc<ResponsesProxy>>,
     pub(super) responses_fetch: Option<Arc<super::fetch_backend::ResponsesFetchBackend>>,
     runner_key: Arc<hellas_rpc::ProducerSigningKey>,
@@ -51,8 +46,6 @@ pub(super) struct GatewayState {
     /// deliberately not kept: there is no second place a route could be
     /// assembled, and so no place one could be assembled without an anchor.
     strategy: Option<ExecutionStrategy>,
-    model_cache: Arc<RwLock<HashMap<String, Arc<ModelAssets>>>>,
-    model_load_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
 /// The execution strategy these options describe, or `None` when they
@@ -115,8 +108,7 @@ pub(super) struct PreparedGeneration {
     /// in-band SSE `hellas-provenance` event.
     pub(super) provenance: Option<ExecutionProvenance>,
     pub(super) prompt_tokens: u32,
-    pub(super) stop_token_ids: Vec<u32>,
-    pub(super) assets: Arc<ModelAssets>,
+    pub(super) presentation: Arc<TextPresentation>,
     pub(super) inference_timeout: Duration,
 }
 
@@ -128,7 +120,18 @@ pub(super) struct HttpError {
 
 impl GatewayState {
     pub(super) async fn from_options(options: &GatewayOptions) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            options.default_max_tokens > 0,
+            "default maximum tokens must be greater than zero"
+        );
         let runner_key = Arc::new(options.producer_key.clone());
+        let tokenizer = options.tokenizer.clone();
+        let stop_token_ids = options.stop_token_ids.clone();
+        let presentation = Arc::new(
+            tokio::task::spawn_blocking(move || TextPresentation::load(&tokenizer, stop_token_ids))
+                .await
+                .context("tokenizer loader panicked")??,
+        );
         let responses_proxy = match options.responses_backend {
             ResponsesBackend::Hellas => None,
             ResponsesBackend::Proxy => Some(Arc::new(ResponsesProxy::new(
@@ -139,25 +142,53 @@ impl GatewayState {
         };
 
         #[cfg(feature = "evaluate")]
-        let runtime = if options.local || options.verify_local {
-            CliRuntime::local(
-                Executor::spawn_with_producer_key(
-                    ExecutePolicy::Eager,
-                    options.queue_size,
-                    vec![options.dtype],
-                    runner_key.as_ref().clone(),
-                    options.provider_genesis.clone(),
-                    options.assurance,
-                )
-                .context("failed to initialize local execution backend")?,
+        let (runtime, execution_package) = if options.local || options.verify_local {
+            let package_dir = options
+                .package_dir
+                .clone()
+                .context("local gateway execution requires --package NAME=PATH")?;
+            let package_artifact_dir = options
+                .package_artifact_dir
+                .clone()
+                .context("local gateway execution requires a package artifact cache")?;
+            let handle = Executor::spawn_with_producer_key(
+                ExecutePolicy::Eager,
+                options.queue_size,
+                runner_key.as_ref().clone(),
+                options.provider_genesis.clone(),
+                options.assurance,
             )
-            .with_remote(options.secret_key.clone())
-            .await?
+            .context("failed to initialize local Catena executor")?;
+            let execution_package = handle
+                .materialize_package(PackageSource::new(
+                    options.package_name.clone(),
+                    package_dir,
+                    package_artifact_dir,
+                )?)
+                .await
+                .context("failed to load local Catena package")?;
+            (
+                CliRuntime::local(handle)
+                    .with_remote(options.secret_key.clone())
+                    .await?,
+                execution_package,
+            )
         } else {
-            CliRuntime::remote(options.secret_key.clone()).await?
+            let execution_package = options.execution_package.context(
+                "remote gateway execution requires --package-id <64-hex Catena package ID>",
+            )?;
+            (
+                CliRuntime::remote(options.secret_key.clone()).await?,
+                execution_package,
+            )
         };
         #[cfg(not(feature = "evaluate"))]
-        let runtime = CliRuntime::remote(options.secret_key.clone()).await?;
+        let (runtime, execution_package) = (
+            CliRuntime::remote(options.secret_key.clone()).await?,
+            options.execution_package.context(
+                "remote gateway execution requires --package-id <64-hex Catena package ID>",
+            )?,
+        );
 
         let responses_fetch = match options.responses_backend {
             ResponsesBackend::Fetch => {
@@ -210,24 +241,17 @@ impl GatewayState {
             verify_local: options.verify_local,
             verify_node_id: options.verify,
             default_max_tokens: options.default_max_tokens,
-            force_model: options.force_model.clone(),
+            package_name: options.package_name.clone(),
+            execution_package,
             inference_timeout: DEFAULT_INFERENCE_TIMEOUT,
-            dtype: options.dtype,
             runtime,
+            presentation,
             responses_proxy,
             responses_fetch,
             runner_key,
             assurance: options.assurance,
             strategy: configured_strategy(options),
-            model_cache: Arc::new(RwLock::new(HashMap::new())),
-            model_load_locks: Arc::new(Mutex::new(HashMap::new())),
         })
-    }
-
-    fn resolve_model(&self, request_model: &str) -> String {
-        self.force_model
-            .clone()
-            .unwrap_or_else(|| request_model.to_string())
     }
 
     /// The strategy this request runs under, or the refusal of a gateway
@@ -241,92 +265,24 @@ impl GatewayState {
         })
     }
 
-    /// This model's tokenizer and template, downloading them if this
-    /// machine does not have them.
-    ///
-    /// # Why this may download, and what a deployer takes on by exposing
-    /// it
-    ///
-    /// [`Reach::Download`] is deliberate here and is *not* the mistake
-    /// the quote path had. The gateway is the operator's own client-side
-    /// process: it tokenizes for requests it is itself submitting, so
-    /// fetching a model it does not hold is work done on its owner's
-    /// behalf. Nothing inside the executor may do this, which is why the
-    /// reach is named at every call site rather than defaulted.
-    ///
-    /// The property that makes it safe is *who can reach it*, and that
-    /// is no longer only a deployment decision:
-    ///
-    /// - `hellas gateway` refuses to bind anywhere but loopback
-    ///   ([`crate::access::loopback_addr`]), so `--host 0.0.0.0` is an
-    ///   error rather than an exposure, and every route in front of this
-    ///   requires the run's credential ([`crate::access::BearerLayer`]).
-    ///   A caller that cannot present it never names a model.
-    /// - A container port publish or a reverse proxy pointed at the
-    ///   loopback port still puts the port within someone else's reach.
-    ///   What it does not hand them is the fetch primitive: without the
-    ///   credential, which lives only in this process's memory and on
-    ///   the operator's terminal, the request is refused before the
-    ///   model id in its body is read.
-    /// - `--force-model` remains the way to take the choice away from
-    ///   callers who *are* credentialled: it replaces the request's model
-    ///   before it reaches here.
-    async fn model_assets(&self, model: &str) -> anyhow::Result<Arc<ModelAssets>> {
-        {
-            let cache = self.model_cache.read().await;
-            if let Some(assets) = cache.get(model) {
-                return Ok(assets.clone());
-            }
-        }
-
-        let load_lock = {
-            let mut locks = self.model_load_locks.lock().await;
-            locks
-                .entry(model.to_string())
-                .or_insert_with(|| Arc::new(Mutex::new(())))
-                .clone()
-        };
-        let _load_guard = load_lock.lock().await;
-
-        {
-            let cache = self.model_cache.read().await;
-            if let Some(assets) = cache.get(model) {
-                return Ok(assets.clone());
-            }
-        }
-
-        let model_name = model.to_string();
-        let dtype = self.dtype;
-        let assets = tokio::task::spawn_blocking(move || {
-            ModelAssets::load(&model_name, dtype, Reach::Download)
-        })
-        .await
-        .context("local model loader panicked")??;
-
-        let assets = Arc::new(assets);
-        let mut cache = self.model_cache.write().await;
-        cache.insert(model.to_string(), assets.clone());
-        Ok(assets)
-    }
-
     /// Drive the executor quote step and assemble a `PreparedGeneration`
     /// from already-prepared wire-adaptor inputs.
     async fn finalize_generation(
         &self,
-        assets: Arc<ModelAssets>,
         prepared_prompt: PreparedPrompt,
         max_tokens: u32,
         prepare_error: &str,
         retention: Retention,
     ) -> Result<PreparedGeneration, HttpError> {
         let prompt_tokens = prepared_prompt.input_ids.len() as u32;
-        let stop_token_ids = prepared_prompt.stop_token_ids.clone();
         let request = ExecutionRequest::new(
             self.runtime.clone(),
-            assets.clone(),
-            prepared_prompt,
+            self.package_name.clone(),
+            prepared_prompt.input_ids,
+            prepared_prompt.stop_token_ids,
             ExecutionRequestOptions {
-                max_seq: max_tokens,
+                max_new_tokens: max_tokens,
+                execution_package: self.execution_package,
                 assurance: self.assurance,
                 retention,
             },
@@ -344,11 +300,10 @@ impl GatewayState {
         let provenance = prepared.provenance().cloned();
 
         Ok(PreparedGeneration {
-            assets,
+            presentation: self.presentation.clone(),
             prepared,
             provenance,
             prompt_tokens,
-            stop_token_ids,
             inference_timeout: self.inference_timeout,
         })
     }
@@ -363,52 +318,29 @@ impl GatewayState {
             .sampling
             .max_output_tokens
             .unwrap_or(self.default_max_tokens);
-        let model = self.resolve_model(&req.canonical.model.name);
-        let assets = self.model_assets(&model).await.map_err(|err| HttpError {
-            status: StatusCode::BAD_REQUEST,
-            message: format!("Failed to load local model assets for `{model}`: {err}"),
-        })?;
-
         let prepared_prompt = match &req.canonical.input {
-            Input::Text(prompt) => assets.prepare_plain(prompt).map_err(|err| HttpError {
-                status: StatusCode::BAD_REQUEST,
-                message: format!(
-                    "Failed to prepare completion prompt: {}",
-                    format_error_causes(&err)
-                ),
-            })?,
-            Input::Messages(messages) => {
-                let messages = wire_messages_to_template(messages)?;
-                let tools = wire_tools_to_raw(req);
-                assets
-                    .prepare_chat_with_options(
-                        &messages,
-                        (!tools.is_empty()).then_some(tools.as_slice()),
-                        req.canonical.reasoning.is_some(),
-                    )
+            Input::Text(prompt)
+                if req.canonical.tools.is_empty() && req.canonical.reasoning.is_none() =>
+            {
+                self.presentation
+                    .prepare_plain(prompt)
                     .map_err(|err| HttpError {
                         status: StatusCode::BAD_REQUEST,
-                        message: format!("Failed to prepare chat request: {err}"),
+                        message: format!(
+                            "Failed to tokenize completion prompt: {}",
+                            format_error_causes(err.as_ref())
+                        ),
                     })?
             }
-            Input::Items(items) => {
-                let messages = wire_items_to_template_messages(items)?;
-                let tools = wire_tools_to_raw(req);
-                assets
-                    .prepare_chat_with_options(
-                        &messages,
-                        (!tools.is_empty()).then_some(tools.as_slice()),
-                        req.canonical.reasoning.is_some(),
-                    )
-                    .map_err(|err| HttpError {
-                        status: StatusCode::BAD_REQUEST,
-                        message: format!("Failed to prepare Responses input: {err}"),
-                    })?
+            Input::Text(_) | Input::Messages(_) | Input::Items(_) => {
+                return Err(HttpError {
+                    status: StatusCode::BAD_REQUEST,
+                    message: "the configured text presentation has no chat/tool template; use plain text completions or select the proxy/fetch Responses backend".to_string(),
+                });
             }
         };
 
         self.finalize_generation(
-            assets,
             prepared_prompt,
             max_tokens,
             "Failed to prepare Responses input",
@@ -416,89 +348,6 @@ impl GatewayState {
         )
         .await
     }
-}
-
-fn wire_tools_to_raw(req: &WireExecutionRequest) -> Vec<serde_json::Value> {
-    req.canonical
-        .tools
-        .iter()
-        .map(|tool| tool.raw.clone())
-        .collect()
-}
-
-fn wire_messages_to_template(messages: &[WireMessage]) -> Result<Vec<ChatMessage>, HttpError> {
-    messages
-        .iter()
-        .map(|message| {
-            let content = content_parts_to_text(&message.content)?;
-            Ok(ChatMessage {
-                role: message.role.clone(),
-                content: Some(content),
-                tool_calls: Vec::new(),
-                tool_call_id: None,
-                name: message.name.clone(),
-            })
-        })
-        .collect()
-}
-
-fn wire_items_to_template_messages(items: &[InputItem]) -> Result<Vec<ChatMessage>, HttpError> {
-    let mut out = Vec::new();
-    for item in items {
-        match item {
-            InputItem::Message(message) => {
-                out.extend(wire_messages_to_template(std::slice::from_ref(message))?);
-            }
-            InputItem::ToolCall {
-                id,
-                name,
-                arguments,
-            } => {
-                out.push(ChatMessage {
-                    role: "assistant".to_string(),
-                    content: None,
-                    tool_calls: vec![serde_json::json!({
-                        "id": id,
-                        "type": "function",
-                        "function": { "name": name, "arguments": arguments }
-                    })],
-                    tool_call_id: None,
-                    name: None,
-                });
-            }
-            InputItem::ToolResult { call_id, output } => {
-                out.push(ChatMessage {
-                    role: "tool".to_string(),
-                    content: Some(content_parts_to_text(output)?),
-                    tool_calls: Vec::new(),
-                    tool_call_id: Some(call_id.clone()),
-                    name: None,
-                });
-            }
-            InputItem::Raw(value) => {
-                out.push(ChatMessage::user(value.to_string()));
-            }
-        }
-    }
-    Ok(out)
-}
-
-fn content_parts_to_text(parts: &[WireContentPart]) -> Result<String, HttpError> {
-    let mut out = String::new();
-    for part in parts {
-        match part {
-            WireContentPart::Text { text } => out.push_str(text),
-            WireContentPart::Json(value) => out.push_str(&value.to_string()),
-            WireContentPart::Image { .. } | WireContentPart::File { .. } => {
-                return Err(HttpError {
-                    status: StatusCode::BAD_REQUEST,
-                    message: "local Hellas backend does not support image or file Responses input"
-                        .to_string(),
-                });
-            }
-        }
-    }
-    Ok(out)
 }
 
 impl PreparedGeneration {
@@ -581,9 +430,13 @@ mod tests {
             queue_size: 1,
             retries: 2,
             default_max_tokens: 128,
-            force_model: None,
+            package_name: "smollm2-135m".to_string(),
+            execution_package: Some(hellas_rpc::ExecutionPackageId::from_bytes([8; 32])),
+            package_dir: Some("packages/smollm2".into()),
+            package_artifact_dir: Some("cache/smollm2-135m".into()),
+            tokenizer: "tokenizer.json".into(),
+            stop_token_ids: Vec::new(),
             metrics_port: None,
-            dtype: Dtype::F32,
             responses_backend: ResponsesBackend::Hellas,
             responses_proxy_url: String::new(),
             responses_proxy_api_key_env: String::new(),

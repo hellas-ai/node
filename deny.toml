@@ -1,12 +1,10 @@
 [advisories]
 ignore = [
     { id = "RUSTSEC-2024-0436", reason = "Transitive through commonware/gemm; no safe upgrade is available." },
-    { id = "RUSTSEC-2025-0119", reason = "Transitive through hf-hub/tokenizers; no safe upgrade is available." },
 ]
 
 [licenses]
 allow = [
-    "0BSD",
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
     "BSD-1-Clause",
@@ -19,11 +17,15 @@ allow = [
     "MIT",
     "MIT-0",
     "MPL-2.0",
-    "NCSA",
     "Unicode-3.0",
     "Unlicense",
     "Zlib",
 ]
+
+[licenses.private]
+# catena-runner is an unpublished sibling interface proposal. Its owners must
+# add the intended licence and licence texts before public distribution.
+ignore = true
 
 [bans]
 multiple-versions = "allow"
@@ -31,5 +33,4 @@ multiple-versions = "allow"
 [sources]
 allow-git = [
     "https://github.com/commonwarexyz/monorepo",
-    "https://github.com/georgewhewell/catgrad",
 ]

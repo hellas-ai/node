@@ -3,7 +3,8 @@
   system,
   nixpkgs,
   rust-overlay,
-  catgrad,
+  catena-runner,
+  exploratory-catena,
 }:
 let
   nativePkg = import ./package.nix {
@@ -12,6 +13,8 @@ let
       system
       nixpkgs
       rust-overlay
+      catena-runner
+      exploratory-catena
       ;
   };
   inherit (nativePkg)
@@ -109,8 +112,6 @@ let
         touch "$out"
       '';
 
-  hfCaches = pkgs.hellasLib.hf;
-
   packagesFor =
     crossSystem:
     let
@@ -120,45 +121,43 @@ let
           system
           nixpkgs
           rust-overlay
+          catena-runner
+          exploratory-catena
           crossSystem
           ;
       };
-      inherit (pkgSpec.pkgs.stdenv) hostPlatform;
     in
     {
       cli = pkgSpec.mkHellasPackage {
         buildNoDefaultFeatures = true;
-        # `gateway` is the slim HTTP gateway: model assets + network routing,
-        # no executor backend or telemetry exporter. Local execution and OTEL
-        # need a candle variant.
+        # Full network surface, but no local Catena runtime.
         buildFeatures = [
           "chain"
           "gateway"
+        ]
+        ++ lib.optionals (crossSystem == null) [
+          "node"
+          "otel"
         ];
       };
       cli-validator = pkgSpec.mkHellasPackage {
         buildNoDefaultFeatures = true;
         buildFeatures = [ "validator" ];
       };
-      cli-candle = pkgSpec.mkHellasPackage {
-        buildNoDefaultFeatures = true;
-        buildFeatures = [
-          "chain"
-          "candle"
-          "otel"
-        ];
-      };
     }
-    // lib.optionalAttrs hostPlatform.isDarwin {
-      cli-candle-metal = pkgSpec.mkHellasPackage {
-        buildNoDefaultFeatures = true;
-        buildFeatures = [
-          "chain"
-          "candle-metal"
-          "otel"
-        ];
-      };
-    };
+    # The current runner is HIP-only. Do not advertise a local Catena runtime
+    # on platforms where its execution backend cannot work.
+    //
+      lib.optionalAttrs (crossSystem == null && pkgSpec.pkgs.stdenv.hostPlatform.system == "x86_64-linux")
+        {
+          cli-catena = pkgSpec.mkHellasPackage {
+            buildNoDefaultFeatures = true;
+            buildFeatures = [
+              "evaluate"
+              "otel"
+            ];
+          };
+        };
 
   crossTargets = {
     "aarch64-linux" = nixpkgs.lib.systems.examples.aarch64-multiplatform;
@@ -174,6 +173,20 @@ let
 
   nativePackages = packagesFor null;
   isX86_64Linux = pkgs.stdenv.hostPlatform.system == "x86_64-linux";
+  rocmPath = lib.optionalAttrs isX86_64Linux {
+    path = pkgs.symlinkJoin {
+      name = "hellas-rocm-path";
+      paths = [
+        pkgs.rocmPackages.clang
+        pkgs.rocmPackages.clr
+        pkgs.rocmPackages.hip-common
+        pkgs.rocmPackages.hipcc
+        pkgs.rocmPackages.rocm-core
+        pkgs.rocmPackages.rocm-device-libs
+        pkgs.rocmPackages.rocm-runtime
+      ];
+    };
+  };
   # Flat `cross-<target>-<name>` packages. Nested `packages.<sys>.cross.<target>.<name>`
   # violates the flake schema (each entry must be a derivation), which `nix flake check`
   # rightly flags.
@@ -216,46 +229,44 @@ let
       docker = import ./docker.nix {
         inherit
           pkgs
-          lib
           rustToolchain
-          catgrad
-          system
           ;
-        inherit (nativePkg) mkHellasPackage;
-        cliCandle = nativePackages.cli-candle;
+        inherit (nativePackages) cli;
       };
 
       nixosTests = lib.optionalAttrs isX86_64Linux (
         import ./tests {
           inherit self pkgs lib;
-          package = nativePackages.cli-candle;
+          package = nativePackages.cli-catena;
+          networkPackage = nativePackages.cli;
           validatorPackage = nativePackages.cli-validator;
         }
       );
     in
     {
-      packages = {
-        cli-candle-cuda = docker.defaultCudaCli;
-        docker-cuda = docker.defaultCudaImage;
-      }
-      // lib.mapAttrs' (name: value: lib.nameValuePair "docker-${name}" value) docker.dockerImages
-      // lib.mapAttrs' (
-        name: value: lib.nameValuePair "cli-candle-cuda-${name}" value
-      ) docker.cudaCliPackages;
+      packages.docker = docker.image;
 
       apps."docker-push-all" = {
         type = "app";
-        program = "${docker.pushAll}/bin/docker-push-all";
-        meta.description = "Push all Hellas Docker images";
+        program = "${docker.push}/bin/docker-push";
+        meta.description = "Push the Hellas network-node Docker image";
       };
 
-      devShells.cuda = pkgs.mkShell {
-        packages = devShellPackages;
-        shellHook = envShellHook;
-        inherit (docker.defaultCudaEnv) nativeBuildInputs;
-        inherit (docker.defaultCudaEnv) buildInputs;
-        inherit (docker.defaultCudaEnv) CUDA_COMPUTE_CAP CUDA_TOOLKIT_ROOT_DIR;
-        LD_LIBRARY_PATH = "${docker.defaultCudaEnv.runtimeLibraryPath}:${docker.defaultCudaEnv.driverLink}/lib";
+      devShells = lib.optionalAttrs isX86_64Linux {
+        rocm = pkgs.mkShellNoCC {
+          packages = devShellPackages ++ [
+            pkgs.rocmPackages.clang
+            pkgs.rocmPackages.hipcc
+          ];
+          shellHook = envShellHook + ''
+            export ROCM_PATH=${rocmPath.path}
+            export HIP_PATH=${rocmPath.path}
+            export HIP_CLANG_PATH=${pkgs.rocmPackages.clang}/bin
+            export DEVICE_LIB_PATH=${pkgs.rocmPackages.rocm-device-libs}/amdgcn/bitcode
+            export HIP_FLAGS="--rocm-path=${rocmPath.path} --rocm-device-lib-path=${pkgs.rocmPackages.rocm-device-libs}/amdgcn/bitcode"
+            export LD_LIBRARY_PATH=${rocmPath.path}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+          '';
+        };
       };
 
       inherit nixosTests;
@@ -330,13 +341,14 @@ let
   };
 
   hydraPackages = {
-    inherit (nativePackages) cli cli-candle cli-validator;
+    inherit (nativePackages) cli cli-validator;
   }
   // lib.optionalAttrs isX86_64Linux {
+    inherit (nativePackages) cli-catena;
     static-x86_64 = crossPackages.cross-x86_64-linux-musl-cli;
     static-aarch64 = crossPackages.cross-aarch64-linux-musl-cli;
     static-windows = crossPackages.cross-x86_64-windows-cli;
-    inherit (linuxOutputs.packages) docker-cuda;
+    inherit (linuxOutputs.packages) docker;
     "hellas-rpc-wasm" = hellasRpcWasm;
   };
 
@@ -358,8 +370,6 @@ in
     // crossPackages
     // {
       default = nativePackages.cli;
-      "hf-cache-lfm2-350m" = hfCaches.lfm2_350MCache;
-      "hf-cache-qwen3-0_6b" = hfCaches.qwen3_0_6BCache;
       "hellas-rpc-wasm" = hellasRpcWasm;
     }
     // (linuxOutputs.packages or { });

@@ -239,7 +239,6 @@ fn a_substituter_can_answer_for_content_the_store_lacks() {
 }
 
 /// `have` must not claim content that has been deleted underneath it.
-/// A quote answered on a stale entry commits to weights that are gone.
 #[test]
 fn have_is_false_once_the_file_is_gone() {
     let fixture = Fixture::new("vanish");

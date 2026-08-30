@@ -78,6 +78,7 @@ pub struct FetchChunkVerifier {
     producer_key: Option<PublicKey>,
     assurance: Assurance,
     events: Vec<OutputEventEnvelope>,
+    finalized: bool,
 }
 
 impl FetchChunkVerifier {
@@ -93,6 +94,17 @@ impl FetchChunkVerifier {
             producer_key: None,
             assurance,
             events: Vec::new(),
+            finalized: false,
+        }
+    }
+
+    fn ensure_open(&self) -> ClientResult<()> {
+        if self.finalized {
+            Err(ClientError::protocol(
+                "fetch stream emitted an event after its terminal outcome",
+            ))
+        } else {
+            Ok(())
         }
     }
 
@@ -100,6 +112,7 @@ impl FetchChunkVerifier {
         &mut self,
         event: OutputEventEnvelope,
     ) -> ClientResult<(u64, OutputEventEnvelope)> {
+        self.ensure_open()?;
         let public_key = *event.event().public_key();
         match self.producer_key {
             Some(expected) if expected != public_key => {
@@ -171,7 +184,17 @@ impl FetchChunkVerifier {
         Ok((self.next_position, event))
     }
 
-    pub fn verify_terminal(&self, output_events: &[OutputEventEnvelope]) -> ClientResult<()> {
+    pub fn verify_terminal(&mut self, output_events: &[OutputEventEnvelope]) -> ClientResult<()> {
+        self.ensure_open()?;
+        let expected_event_count = self.events.len().checked_add(1).ok_or_else(|| {
+            ClientError::protocol("fetch terminal transcript event count exceeds usize range")
+        })?;
+        if output_events.len() != expected_event_count {
+            return Err(ClientError::protocol(format!(
+                "fetch terminal transcript must extend the streamed prefix by exactly one terminal event: expected {expected_event_count} events, got {}",
+                output_events.len()
+            )));
+        }
         // `verify_terminal_continuation` checks every signature against the
         // first event's key, so binding that key here covers the transcript.
         if let Some(first) = output_events.first() {
@@ -192,8 +215,20 @@ impl FetchChunkVerifier {
                 }
             }
         }
-        hellas_rpc::fetch::verify_terminal_continuation(self.assurance, &self.events, output_events)
-            .map_err(|source| ClientError::FetchTranscript { source })
+        hellas_rpc::fetch::verify_terminal_continuation(
+            self.assurance,
+            &self.events,
+            output_events,
+        )
+        .map_err(|source| ClientError::FetchTranscript { source })?;
+        self.finalized = true;
+        Ok(())
+    }
+
+    fn verify_failed_terminal(&mut self) -> ClientResult<()> {
+        self.ensure_open()?;
+        self.finalized = true;
+        Ok(())
     }
 }
 
@@ -215,8 +250,11 @@ pub fn verify_fetch_work_event(
             })
         }
         DecodedFetchWireEvent::Done(outcome) => {
-            if let FetchOutcome::Completed { output_events, .. } = &outcome {
-                verifier.verify_terminal(output_events)?;
+            match &outcome {
+                FetchOutcome::Completed { output_events, .. } => {
+                    verifier.verify_terminal(output_events)?;
+                }
+                FetchOutcome::Failed { .. } => verifier.verify_failed_terminal()?,
             }
             Ok(FetchExecutionEvent::Done(outcome))
         }
@@ -446,6 +484,28 @@ mod tests {
     }
 
     #[test]
+    fn verifier_rejects_events_after_terminal_outcome() {
+        let caller = key(1);
+        let producer = key(2);
+        let request = fetch_request(&caller, "echo", "run", br#"{"x":1}"#);
+        let input = input_commitment_for(&request);
+        let mut verifier = FetchChunkVerifier::new(input, TEST_ASSURANCE, trust_in(&[&producer]));
+        let failed = || WorkEvent {
+            kind: Some(work_event::Kind::Failed(pb::WorkFailed {
+                position: 0,
+                error: "failed".to_string(),
+            })),
+        };
+
+        assert!(matches!(
+            verify_fetch_work_event(&mut verifier, failed(), input).unwrap(),
+            FetchExecutionEvent::Done(FetchOutcome::Failed { .. })
+        ));
+        let error = verify_fetch_work_event(&mut verifier, failed(), input).unwrap_err();
+        assert!(error.to_string().contains("after its terminal outcome"));
+    }
+
+    #[test]
     fn verify_terminal_rejects_untrusted_producer_without_streamed_chunks() {
         let caller = key(1);
         let producer = key(2);
@@ -460,7 +520,7 @@ mod tests {
         )
         .unwrap();
 
-        let verifier =
+        let mut verifier =
             FetchChunkVerifier::new(input, TEST_ASSURANCE, trust_in(&[&trusted_producer]));
         let err = verifier.verify_terminal(&output_events).unwrap_err();
         assert!(err.to_string().contains("untrusted producer key"));
@@ -480,8 +540,25 @@ mod tests {
         )
         .unwrap();
 
-        let verifier = FetchChunkVerifier::new(input, TEST_ASSURANCE, trust_in(&[&producer]));
+        let mut verifier = FetchChunkVerifier::new(input, TEST_ASSURANCE, trust_in(&[&producer]));
         verifier.verify_terminal(&output_events).unwrap();
+    }
+
+    #[test]
+    fn fetch_terminal_cannot_hide_an_unstreamed_response_event() {
+        let caller = key(1);
+        let producer = key(2);
+        let request = fetch_request(&caller, "echo", "run", br#"{"x":1}"#);
+        let input = input_commitment_for(&request);
+        let mut builder = FetchOutputTranscriptBuilder::new(input, TEST_ASSURANCE, &producer);
+        builder
+            .push_event(br#"{"delta":"hidden"}"#.to_vec())
+            .unwrap();
+        let output_events = builder.finish(finished_terminal_payload()).unwrap();
+        let mut verifier = FetchChunkVerifier::new(input, TEST_ASSURANCE, trust_in(&[&producer]));
+
+        let error = verifier.verify_terminal(&output_events).unwrap_err();
+        assert!(error.to_string().contains("exactly one terminal event"));
     }
 
     #[test]

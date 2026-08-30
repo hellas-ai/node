@@ -16,6 +16,27 @@ let
   chainSettlementTaker = "236h7pukvqi6u8ADu53erbWyLYXNyNEuB9BRNMXtVKUfZ";
   chainSettlementNative = "jesTu2BpszP8DKSoi1R5G6ggjHrsrVnboLdx6V47vkoR";
 
+  # Presentation is deliberately independent of every Catena execution
+  # package. The proxy test never runs inference, but the gateway still
+  # requires an explicit tokenizer and stop policy at its text boundary.
+  testTokenizer = pkgs.writeText "hellas-test-tokenizer.json" ''
+    {
+      "version": "1.0",
+      "truncation": null,
+      "padding": null,
+      "added_tokens": [],
+      "normalizer": null,
+      "pre_tokenizer": { "type": "Whitespace" },
+      "post_processor": null,
+      "decoder": null,
+      "model": {
+        "type": "WordLevel",
+        "vocab": { "hello": 0, "world": 1, "<unk>": 2 },
+        "unk_token": "<unk>"
+      }
+    }
+  '';
+
   responsesMock = pkgs.writeText "responses-mock.py" ''
     import json
     from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -309,6 +330,10 @@ in
             gateway = {
               enable = true;
               port = gatewayPort;
+              executionPackageName = "smollm2-135m";
+              packageId = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+              tokenizer = testTokenizer;
+              stopTokenIds = [ 2 ];
               responsesBackend = "proxy";
               responsesProxyUrl = "http://127.0.0.1:18080/v1/responses";
               responsesProxyApiKeyEnv = "OPENAI_API_KEY";

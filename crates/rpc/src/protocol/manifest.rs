@@ -1,4 +1,4 @@
-use core::fmt;
+use core::{fmt, str::FromStr};
 
 use crate::{ContentId, DagCborEncoder};
 
@@ -31,6 +31,58 @@ impl fmt::Display for ExecutionPackageId {
         Ok(())
     }
 }
+
+impl FromStr for ExecutionPackageId {
+    type Err = ExecutionPackageIdParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.len() != Self::LEN * 2 {
+            return Err(ExecutionPackageIdParseError::Length(value.len()));
+        }
+        let mut bytes = [0_u8; Self::LEN];
+        for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+            let high = hex_nibble(pair[0])
+                .ok_or(ExecutionPackageIdParseError::Hex(index.saturating_mul(2)))?;
+            let low = hex_nibble(pair[1]).ok_or(ExecutionPackageIdParseError::Hex(
+                index.saturating_mul(2).saturating_add(1),
+            ))?;
+            bytes[index] = (high << 4) | low;
+        }
+        Ok(Self::from_bytes(bytes))
+    }
+}
+
+const fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExecutionPackageIdParseError {
+    Length(usize),
+    Hex(usize),
+}
+
+impl fmt::Display for ExecutionPackageIdParseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Length(length) => write!(
+                formatter,
+                "Catena execution package ID must be exactly 64 hexadecimal characters (got {length})"
+            ),
+            Self::Hex(index) => write!(
+                formatter,
+                "Catena execution package ID contains a non-hexadecimal character at byte {index}"
+            ),
+        }
+    }
+}
+
+impl core::error::Error for ExecutionPackageIdParseError {}
 
 /// The token-level execution contract implemented by this manifest schema.
 ///

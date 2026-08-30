@@ -1,5 +1,4 @@
-{ pkgs }:
-{
+_: {
   apiFlavor = {
     anthropic = "anthropic-messages";
     openai = "openai-completions";
@@ -12,5 +11,4 @@
   # module as HOME / WorkingDirectory, and as the base for any documented
   # path examples.
   defaultStateDir = "/var/lib/hellas";
-  hf = import ./hf.nix { inherit pkgs; };
 }

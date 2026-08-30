@@ -23,12 +23,13 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
 use futures::Stream;
-use hellas_rpc::{Dtype, ProducerSigningKey};
+use hellas_rpc::ProducerSigningKey;
 use iroh::{EndpointId, SecretKey};
 use serde::Serialize;
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -58,9 +59,22 @@ pub struct GatewayOptions {
     pub queue_size: usize,
     pub retries: usize,
     pub default_max_tokens: u32,
-    pub force_model: Option<String>,
+    /// Fixed local alias sent to Hellas executors. Request-body `model`
+    /// fields are presentation labels and cannot select package paths.
+    pub package_name: String,
+    /// Exact Catena identity pinned by a remote-only caller. Local and
+    /// verify-local gateways derive it from the verified package instead.
+    pub execution_package: Option<hellas_rpc::ExecutionPackageId>,
+    /// Local Catena manifest directory. Required only when a local execution
+    /// leg is configured; the name remains routing metadata only.
+    pub package_dir: Option<PathBuf>,
+    pub package_artifact_dir: Option<PathBuf>,
+    /// Application-selected tokenizer used only before and after execution.
+    /// It is not part of the Catena package or Hellas execution claim.
+    pub tokenizer: PathBuf,
+    /// Application-selected stop IDs sent explicitly with every request.
+    pub stop_token_ids: Vec<u32>,
     pub metrics_port: Option<u16>,
-    pub dtype: Dtype,
     pub responses_backend: ResponsesBackend,
     pub responses_proxy_url: String,
     pub responses_proxy_api_key_env: String,
@@ -126,13 +140,10 @@ pub async fn run(options: GatewayOptions) -> anyhow::Result<()> {
 
     #[cfg(feature = "evaluate")]
     if state.local {
-        info!(
-            "local catgrad execution, queue size: {}",
-            options.queue_size
-        );
+        info!("local Catena execution, queue size: {}", options.queue_size);
     } else if state.verify_local {
         info!(
-            "local catgrad verification, queue size: {}",
+            "local Catena verification, queue size: {}",
             options.queue_size
         );
     } else if let Some(verify_node) = state.verify_node_id.as_ref() {
@@ -144,9 +155,11 @@ pub async fn run(options: GatewayOptions) -> anyhow::Result<()> {
     }
 
     info!("timeout: {}s", state.inference_timeout.as_secs());
-    if let Some(model) = state.force_model.as_deref() {
-        info!("Forcing request model override to `{model}`");
-    }
+    info!(
+        package = %state.package_name,
+        execution_package = %state.execution_package,
+        "using configured Hellas package"
+    );
 
     let wrap_child = if let Some(cmd) = options.wrap.as_deref() {
         // The listener is loopback by construction, so the address we
