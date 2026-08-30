@@ -19,10 +19,9 @@ use hellas_rpc::Dtype;
 use hellas_rpc::call::WithTrailer;
 use hellas_rpc::pb::courtesy::{
     DecodeTokensRequest, DecodeTokensResponse, GetArtifactRequest, GetArtifactResponse,
-    GetModelStatsRequest, GetModelStatsResponse, GetStatsRequest, GetStatsResponse,
-    ListModelsRequest, ListModelsResponse, PutArtifactRequest, PutArtifactResponse,
-    QuoteChatPromptRequest, QuoteChatPromptResponse, QuotePreparedTextRequest,
-    QuotePreparedTextResponse, QuotePromptRequest, QuotePromptResponse,
+    GetPackageStatsRequest, GetPackageStatsResponse, GetStatsRequest, GetStatsResponse,
+    ListPackagesRequest, ListPackagesResponse, PutArtifactRequest, PutArtifactResponse,
+    QuoteChatPromptRequest, QuotePromptRequest, QuoteResponse, QuoteTokensRequest,
 };
 use hellas_rpc::pb::evaluate::EvaluateRequest as PbEvaluateRequest;
 use hellas_rpc::pb::execute::{OpenRequest, OpenResponse, RunTicketRequest, Ticket, WorkEvent};
@@ -35,9 +34,6 @@ use hellas_rpc::services::fetch::FetchHandler;
 use hellas_wire::{Metadata, WireCode, WireStatus};
 use tokio::sync::oneshot;
 use tokio_stream::wrappers::ReceiverStream;
-
-#[cfg(feature = "evaluate")]
-use crate::state::model_spec;
 
 use super::{ExecuteOutcome, ExecutorHandle, ExecutorMessage, TicketOutcome};
 
@@ -78,23 +74,23 @@ impl ExecutorHandle {
     pub async fn quote_prompt(
         &self,
         request: QuotePromptRequest,
-    ) -> Result<TicketOutcome<QuotePromptResponse>, ExecutorError> {
+    ) -> Result<TicketOutcome<QuoteResponse>, ExecutorError> {
         self.send(|reply| ExecutorMessage::QuotePrompt { request, reply })
             .await
     }
 
-    pub async fn quote_prepared_text(
+    pub async fn quote_tokens(
         &self,
-        request: QuotePreparedTextRequest,
-    ) -> Result<TicketOutcome<QuotePreparedTextResponse>, ExecutorError> {
-        self.send(|reply| ExecutorMessage::QuotePreparedText { request, reply })
+        request: QuoteTokensRequest,
+    ) -> Result<TicketOutcome<QuoteResponse>, ExecutorError> {
+        self.send(|reply| ExecutorMessage::QuoteTokens { request, reply })
             .await
     }
 
     pub async fn quote_chat_prompt(
         &self,
         request: QuoteChatPromptRequest,
-    ) -> Result<TicketOutcome<QuoteChatPromptResponse>, ExecutorError> {
+    ) -> Result<TicketOutcome<QuoteResponse>, ExecutorError> {
         self.send(|reply| ExecutorMessage::QuoteChatPrompt { request, reply })
             .await
     }
@@ -118,8 +114,8 @@ impl ExecutorHandle {
             .await
     }
 
-    pub async fn list_models_handle(&self) -> Result<ListModelsResponse, ExecutorError> {
-        self.send(|reply| ExecutorMessage::ListModels { reply })
+    pub async fn list_packages_handle(&self) -> Result<ListPackagesResponse, ExecutorError> {
+        self.send(|reply| ExecutorMessage::ListPackages { reply })
             .await
     }
 
@@ -145,11 +141,11 @@ impl ExecutorHandle {
         self.send(|reply| ExecutorMessage::GetStats { reply }).await
     }
 
-    pub async fn get_model_stats_handle(
+    pub async fn get_package_stats_handle(
         &self,
-        request: GetModelStatsRequest,
-    ) -> Result<GetModelStatsResponse, ExecutorError> {
-        self.send(|reply| ExecutorMessage::GetModelStats { request, reply })
+        request: GetPackageStatsRequest,
+    ) -> Result<GetPackageStatsResponse, ExecutorError> {
+        self.send(|reply| ExecutorMessage::GetPackageStats { request, reply })
             .await
     }
 }
@@ -227,17 +223,17 @@ impl CourtesyHandler for ExecutorHandle {
     async fn quote_prompt(
         &self,
         request: QuotePromptRequest,
-    ) -> Result<WithTrailer<QuotePromptResponse>, WireStatus> {
+    ) -> Result<WithTrailer<QuoteResponse>, WireStatus> {
         let outcome = self.quote_prompt(request).await?;
         let result = with_provenance(outcome);
         Ok(result)
     }
 
-    async fn quote_prepared_text(
+    async fn quote_tokens(
         &self,
-        request: QuotePreparedTextRequest,
-    ) -> Result<WithTrailer<QuotePreparedTextResponse>, WireStatus> {
-        let outcome = self.quote_prepared_text(request).await?;
+        request: QuoteTokensRequest,
+    ) -> Result<WithTrailer<QuoteResponse>, WireStatus> {
+        let outcome = self.quote_tokens(request).await?;
         let result = with_provenance(outcome);
         Ok(result)
     }
@@ -245,7 +241,7 @@ impl CourtesyHandler for ExecutorHandle {
     async fn quote_chat_prompt(
         &self,
         request: QuoteChatPromptRequest,
-    ) -> Result<WithTrailer<QuoteChatPromptResponse>, WireStatus> {
+    ) -> Result<WithTrailer<QuoteResponse>, WireStatus> {
         let outcome = self.quote_chat_prompt(request).await?;
         let result = with_provenance(outcome);
         Ok(result)
@@ -265,22 +261,22 @@ impl CourtesyHandler for ExecutorHandle {
         Ok(self.get_artifact_handle(request).await?)
     }
 
-    async fn list_models(
+    async fn list_packages(
         &self,
-        _request: ListModelsRequest,
-    ) -> Result<ListModelsResponse, WireStatus> {
-        Ok(self.list_models_handle().await?)
+        _request: ListPackagesRequest,
+    ) -> Result<ListPackagesResponse, WireStatus> {
+        Ok(self.list_packages_handle().await?)
     }
 
     async fn get_stats(&self, _request: GetStatsRequest) -> Result<GetStatsResponse, WireStatus> {
         Ok(self.get_stats_handle().await?)
     }
 
-    async fn get_model_stats(
+    async fn get_package_stats(
         &self,
-        request: GetModelStatsRequest,
-    ) -> Result<GetModelStatsResponse, WireStatus> {
-        Ok(self.get_model_stats_handle(request).await?)
+        request: GetPackageStatsRequest,
+    ) -> Result<GetPackageStatsResponse, WireStatus> {
+        Ok(self.get_package_stats_handle(request).await?)
     }
 
     async fn decode_tokens(
@@ -312,17 +308,8 @@ fn decode_tokens_stream(
         while let Some(item) = requests.next().await {
             let request = item?;
             if decoder.is_none() {
-                let assets = load_decode_assets(
-                    request.huggingface_model_id.clone(),
-                    request.huggingface_revision.clone(),
-                    dtype,
-                )
-                .await?;
-                decoder = Some(DecodeSession::new(
-                    request.huggingface_model_id.clone(),
-                    request.huggingface_revision.clone(),
-                    assets,
-                ));
+                let assets = load_decode_assets(request.package.clone(), dtype).await?;
+                decoder = Some(DecodeSession::new(request.package.clone(), assets));
             }
 
             let session = decoder
@@ -341,23 +328,18 @@ fn decode_tokens_stream(
 }
 
 #[cfg(feature = "evaluate")]
-async fn load_decode_assets(
-    model_id: String,
-    revision: String,
-    dtype: Dtype,
-) -> Result<Arc<ModelAssets>, WireStatus> {
-    if model_id.is_empty() {
+async fn load_decode_assets(package: String, dtype: Dtype) -> Result<Arc<ModelAssets>, WireStatus> {
+    if package.is_empty() {
         return Err(WireStatus::new(
             WireCode::InvalidArgument,
-            "huggingface_model_id is required on the first decode_tokens request",
+            "package is required on the first decode_tokens request",
         ));
     }
-    let spec = model_spec(&model_id, &revision);
     // `decode_tokens` is a courtesy convenience any peer can call with a
-    // model id it chooses. Local reach, like every other peer-reachable
+    // package it chooses. Local reach, like every other peer-reachable
     // path: it detokenizes with what this node holds or it refuses.
     let assets = tokio::task::spawn_blocking(move || {
-        ModelAssets::load(&spec, dtype, hellas_models::Reach::Local)
+        ModelAssets::load(&package, dtype, hellas_models::Reach::Local)
     })
     .await
     .map_err(|err| WireStatus::internal(format!("tokenizer load task failed: {err}")))??;
@@ -366,29 +348,22 @@ async fn load_decode_assets(
 
 #[cfg(feature = "evaluate")]
 struct DecodeSession {
-    model_id: String,
-    revision: String,
+    package: String,
     decoder: TextOutputDecoder,
 }
 
 #[cfg(feature = "evaluate")]
 impl DecodeSession {
-    fn new(model_id: String, revision: String, assets: Arc<ModelAssets>) -> Self {
+    fn new(package: String, assets: Arc<ModelAssets>) -> Self {
         let decoder = TextOutputDecoder::for_model(assets);
-        Self {
-            model_id,
-            revision,
-            decoder,
-        }
+        Self { package, decoder }
     }
 
     fn validate_request_model(&self, request: &DecodeTokensRequest) -> Result<(), WireStatus> {
-        if request.huggingface_model_id.is_empty() && request.huggingface_revision.is_empty() {
+        if request.package.is_empty() {
             return Ok(());
         }
-        if request.huggingface_model_id == self.model_id
-            && request.huggingface_revision == self.revision
-        {
+        if request.package == self.package {
             return Ok(());
         }
         Err(WireStatus::new(

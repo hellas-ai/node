@@ -45,7 +45,7 @@ use hellas_rpc::ProducerSigningKey;
 use hellas_rpc::Retention;
 use hellas_rpc::evaluate::EvaluateStopReason;
 use hellas_rpc::pb::courtesy::{
-    EvaluateGenesisStart, EvaluateStart, QuotePreparedTextRequest, evaluate_start,
+    EvaluateGenesisStart, EvaluateStart, QuoteTokensRequest, evaluate_start,
 };
 use hellas_rpc::pb::execute::Ticket;
 use hellas_rpc::pb::execute::WorkEvent;
@@ -170,7 +170,7 @@ fn validate_evaluate_ticket(ticket: &Ticket, requested: i32) -> ExecutionResult<
 
 pub struct ExecutionRequest {
     runtime: CliRuntime,
-    quote_req: QuotePreparedTextRequest,
+    quote_req: QuoteTokensRequest,
     strategy: ExecutionStrategy,
     runner_key: Arc<ProducerSigningKey>,
 }
@@ -192,16 +192,20 @@ impl ExecutionRequest {
         runner_key: ProducerSigningKey,
     ) -> ExecutionResult<Self> {
         let quote = assets.prepare_quote(&prepared_prompt);
-        let quote_req = QuotePreparedTextRequest {
-            huggingface_model_id: quote.huggingface_model_id,
-            huggingface_revision: quote.huggingface_revision,
+        let revision = quote.huggingface_revision.trim();
+        let package = if revision.is_empty() {
+            quote.huggingface_model_id.clone()
+        } else {
+            format!("{}@{revision}", quote.huggingface_model_id)
+        };
+        let quote_req = QuoteTokensRequest {
+            package,
             prompt_token_ids: quote.prompt_token_ids,
             max_new_tokens: options.max_seq,
             stop_token_ids: quote.stop_token_ids,
             start: Some(EvaluateStart {
                 kind: Some(evaluate_start::Kind::Genesis(EvaluateGenesisStart {})),
             }),
-            accept_dtypes: vec![quote.accept_dtype],
             runner_public_key: Some(hellas_client::runner_public_key(&runner_key)),
             assurance: options.assurance.to_byte().into(),
             retain: Some(options.retention.should_retain()),
@@ -420,7 +424,7 @@ impl PreparedRoute {
     #[instrument(skip_all, fields(?route))]
     async fn prepare(
         runtime: &CliRuntime,
-        quote_req: &QuotePreparedTextRequest,
+        quote_req: &QuoteTokensRequest,
         route: &ExecutionRoute,
         runner_key: Arc<ProducerSigningKey>,
     ) -> ExecutionResult<Self> {
@@ -434,22 +438,20 @@ impl PreparedRoute {
                 {
                     let handle = require_local_executor(runtime)?;
                     handle
-                        .materialize_model(local_model_spec(quote_req))
+                        .materialize_model(quote_req.package.clone())
                         .await
                         .exec_context("failed to load local model metadata")?;
                     let outcome = handle
-                        .quote_prepared_text(quote_req.clone())
+                        .quote_tokens(quote_req.clone())
                         .await
-                        .exec_context("local quote_prepared_text failed")?;
+                        .exec_context("local quote_tokens failed")?;
                     let ticket = outcome.response.ticket.clone().ok_or_else(|| {
-                        ExecutionError::protocol(
-                            "local quote_prepared_text response missing ticket",
-                        )
+                        ExecutionError::protocol("local quote_tokens response missing ticket")
                     })?;
                     let evaluate_response =
                         outcome.response.evaluate_request.as_ref().ok_or_else(|| {
                             ExecutionError::protocol(
-                                "local quote_prepared_text response missing evaluate_request",
+                                "local quote_tokens response missing evaluate_request",
                             )
                         })?;
                     if evaluate_response.assurance != quote_req.assurance {
@@ -474,7 +476,7 @@ impl PreparedRoute {
             }
             ExecutionRoute::RemoteDirect(target) => {
                 let (ticket, provenance) =
-                    hellas_client::iroh::quote_prepared_text(runtime, target, quote_req).await?;
+                    hellas_client::iroh::quote_tokens(runtime, target, quote_req).await?;
                 validate_evaluate_ticket(&ticket, quote_req.assurance)?;
                 let execute_transport =
                     hellas_client::iroh::execute_transport(runtime, target).await?;
@@ -655,16 +657,6 @@ fn stop_reason_from_evaluate(value: EvaluateStopReason) -> ExecutionResult<StopR
         other => Err(ExecutionError::EvaluateTranscript {
             source: hellas_rpc::evaluate::EvaluateProtocolError::UnknownStopReason(other),
         }),
-    }
-}
-
-#[cfg(feature = "evaluate")]
-fn local_model_spec(quote_req: &QuotePreparedTextRequest) -> String {
-    let revision = quote_req.huggingface_revision.trim();
-    if revision.is_empty() {
-        quote_req.huggingface_model_id.clone()
-    } else {
-        format!("{}@{revision}", quote_req.huggingface_model_id)
     }
 }
 

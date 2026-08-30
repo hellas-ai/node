@@ -16,7 +16,7 @@ use crate::fetch_registry::FetchRouteRegistry;
 use crate::metrics::ExecutorMetrics;
 use crate::scheme::SchemeEngine;
 use crate::state::ExecutorState;
-use hellas_rpc::pb::courtesy::{GetModelStatsResponse, GetStatsResponse, ModelTokenStats};
+use hellas_rpc::pb::courtesy::{GetPackageStatsResponse, GetStatsResponse, PackageTokenStats};
 use hellas_rpc::policy::ExecutePolicy;
 use hellas_rpc::{Assurance, Dtype, ProducerSigningKey};
 use std::collections::VecDeque;
@@ -270,9 +270,9 @@ impl Executor {
                     };
                     let _ = reply.send(result);
                 }
-                ExecutorMessage::QuotePreparedText { request, reply } => {
+                ExecutorMessage::QuoteTokens { request, reply } => {
                     let result = match self.evaluate.as_mut() {
-                        Some(engine) => engine.quote_prepared_text(&mut self.store, request).await,
+                        Some(engine) => engine.quote_tokens(&mut self.store, request).await,
                         None => Err(evaluate_disabled()),
                     };
                     let _ = reply.send(result);
@@ -324,32 +324,32 @@ impl Executor {
                 ExecutorMessage::FetchFinished(completion) => {
                     self.handle_fetch_finished(completion).await;
                 }
-                ExecutorMessage::ListModels { reply } => {
-                    let models = match self.evaluate.as_ref() {
-                        Some(engine) => engine.list_models().await,
+                ExecutorMessage::ListPackages { reply } => {
+                    let packages = match self.evaluate.as_ref() {
+                        Some(engine) => engine.list_packages().await,
                         None => Default::default(),
                     };
-                    let _ = reply.send(Ok(models));
+                    let _ = reply.send(Ok(packages));
                 }
                 ExecutorMessage::GetStats { reply } => {
-                    let model_stats = self
+                    let package_stats = self
                         .metrics
                         .known_model_ids()
                         .into_iter()
-                        .map(|model_id| ModelTokenStats {
-                            stats: Some(self.metrics.model_snapshot(&model_id)),
-                            model_id,
+                        .map(|package| PackageTokenStats {
+                            stats: Some(self.metrics.model_snapshot(&package)),
+                            package,
                         })
                         .collect();
                     let _ = reply.send(Ok(GetStatsResponse {
                         stats: Some(self.metrics.global_snapshot()),
-                        model_stats,
+                        package_stats,
                     }));
                 }
-                ExecutorMessage::GetModelStats { request, reply } => {
-                    let _ = reply.send(Ok(GetModelStatsResponse {
-                        stats: Some(self.metrics.model_snapshot(&request.model_id)),
-                        model_id: request.model_id,
+                ExecutorMessage::GetPackageStats { request, reply } => {
+                    let _ = reply.send(Ok(GetPackageStatsResponse {
+                        stats: Some(self.metrics.model_snapshot(&request.package)),
+                        package: request.package,
                     }));
                 }
             }

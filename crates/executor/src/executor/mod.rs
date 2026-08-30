@@ -5,10 +5,9 @@ use crate::ExecutorError;
 #[cfg(feature = "evaluate")]
 use hellas_rpc::Dtype;
 use hellas_rpc::pb::courtesy::{
-    GetArtifactRequest, GetArtifactResponse, GetModelStatsRequest, GetModelStatsResponse,
-    GetStatsResponse, ListModelsResponse, PutArtifactRequest, PutArtifactResponse,
-    QuoteChatPromptRequest, QuoteChatPromptResponse, QuotePreparedTextRequest,
-    QuotePreparedTextResponse, QuotePromptRequest, QuotePromptResponse,
+    GetArtifactRequest, GetArtifactResponse, GetPackageStatsRequest, GetPackageStatsResponse,
+    GetStatsResponse, ListPackagesResponse, PutArtifactRequest, PutArtifactResponse,
+    QuoteChatPromptRequest, QuotePromptRequest, QuoteResponse, QuoteTokensRequest,
 };
 use hellas_rpc::pb::evaluate::EvaluateRequest as PbEvaluateRequest;
 use hellas_rpc::pb::execute::{RunTicketRequest, Ticket, WorkEvent};
@@ -67,15 +66,15 @@ pub(crate) enum ExecutorMessage {
     },
     QuotePrompt {
         request: QuotePromptRequest,
-        reply: oneshot::Sender<Result<TicketOutcome<QuotePromptResponse>, ExecutorError>>,
+        reply: oneshot::Sender<Result<TicketOutcome<QuoteResponse>, ExecutorError>>,
     },
-    QuotePreparedText {
-        request: QuotePreparedTextRequest,
-        reply: oneshot::Sender<Result<TicketOutcome<QuotePreparedTextResponse>, ExecutorError>>,
+    QuoteTokens {
+        request: QuoteTokensRequest,
+        reply: oneshot::Sender<Result<TicketOutcome<QuoteResponse>, ExecutorError>>,
     },
     QuoteChatPrompt {
         request: QuoteChatPromptRequest,
-        reply: oneshot::Sender<Result<TicketOutcome<QuoteChatPromptResponse>, ExecutorError>>,
+        reply: oneshot::Sender<Result<TicketOutcome<QuoteResponse>, ExecutorError>>,
     },
     PutArtifact {
         request: PutArtifactRequest,
@@ -110,15 +109,15 @@ pub(crate) enum ExecutorMessage {
     #[cfg(feature = "evaluate")]
     SchemeFinished(Box<dyn crate::scheme::SchemeCompletion>),
     FetchFinished(FetchCompletion),
-    ListModels {
-        reply: oneshot::Sender<Result<ListModelsResponse, ExecutorError>>,
+    ListPackages {
+        reply: oneshot::Sender<Result<ListPackagesResponse, ExecutorError>>,
     },
     GetStats {
         reply: oneshot::Sender<Result<GetStatsResponse, ExecutorError>>,
     },
-    GetModelStats {
-        request: GetModelStatsRequest,
-        reply: oneshot::Sender<Result<GetModelStatsResponse, ExecutorError>>,
+    GetPackageStats {
+        request: GetPackageStatsRequest,
+        reply: oneshot::Sender<Result<GetPackageStatsResponse, ExecutorError>>,
     },
 }
 

@@ -12,9 +12,8 @@ use hellas_rpc::evaluate::{
 };
 use hellas_rpc::pb::courtesy::{
     EvaluateGenesisStart, EvaluateStart, GetArtifactRequest, GetArtifactResponse,
-    ListModelsResponse, ModelInfo, ModelStatus, PutArtifactRequest, PutArtifactResponse,
-    QuoteChatPromptRequest, QuoteChatPromptResponse, QuotePreparedTextRequest,
-    QuotePreparedTextResponse, QuotePromptRequest, QuotePromptResponse, evaluate_start,
+    ListPackagesResponse, PackageInfo, PackageStatus, PutArtifactRequest, PutArtifactResponse,
+    QuoteChatPromptRequest, QuotePromptRequest, QuoteResponse, QuoteTokensRequest, evaluate_start,
 };
 use hellas_rpc::pb::evaluate::EvaluateRequest as PbEvaluateRequest;
 use hellas_rpc::pb::execute::{PublicKey as PbPublicKey, Ticket};
@@ -35,8 +34,8 @@ use crate::metrics::ExecutorMetrics;
 use crate::scheme::{SchemeEngine, SchemeJob, SchemeRunContext};
 use crate::state::{
     ExecutorState, Invocation, LocalModelStatus, ModelLocator, QUOTE_AMOUNT, QUOTE_TTL, QuoteKind,
-    QuotePlan, QuoteRecord, StopReason, Termination, evaluate_request_to_pb, model_spec,
-    new_execution_id, quote_ticket, refusal_for, resolve_accept_dtypes,
+    QuotePlan, QuoteRecord, StopReason, Termination, evaluate_request_to_pb, new_execution_id,
+    quote_ticket, refusal_for,
 };
 use crate::worker::{
     EnqueueError, ExecuteJob, ExecuteWorker, WorkerCompletion, WorkerCompletionResult,
@@ -225,10 +224,6 @@ impl EvaluateEngine {
         Ok((Termination::Completed { output_events }, billable_units))
     }
 
-    fn resolve_accept_dtypes(&self, prefs: &[String]) -> Result<Dtype, ExecutorError> {
-        resolve_accept_dtypes(prefs, &self.supported_dtypes)
-    }
-
     /// Resolves one request into the job that would execute it, and
     /// refuses it if this node may not.
     ///
@@ -323,11 +318,11 @@ impl SchemeEngine for EvaluateEngine {
         })
     }
 
-    async fn quote_prepared_text(
+    async fn quote_tokens(
         &mut self,
         store: &mut ExecutorState,
-        request: QuotePreparedTextRequest,
-    ) -> Result<TicketOutcome<QuotePreparedTextResponse>, ExecutorError> {
+        request: QuoteTokensRequest,
+    ) -> Result<TicketOutcome<QuoteResponse>, ExecutorError> {
         let total_start = Instant::now();
         store.prune_expired_quotes(Instant::now());
         // Off the actor task: building a plan resolves and may download
@@ -339,7 +334,7 @@ impl SchemeEngine for EvaluateEngine {
         let supported_dtypes = self.supported_dtypes.clone();
         let execute_policy = self.execute_policy.clone();
         let plan = tokio::task::spawn_blocking(move || {
-            QuotePlan::from_prepared_text_request(request, &supported_dtypes, &execute_policy)
+            QuotePlan::from_tokens_request(request, &supported_dtypes, &execute_policy)
         })
         .await
         .map_err(|err| {
@@ -363,7 +358,6 @@ impl SchemeEngine for EvaluateEngine {
         let commitment_id = request_commitment.digest();
         let model_id = plan.locator.spec();
         let prompt_tokens = plan.invocation.input_ids.len() as u32;
-        let dtype_wire = plan.locator.dtype.as_wire().to_string();
         let request_commitment_bytes = store.create_quote(QuoteRecord {
             terms,
             expires_at: Instant::now() + QUOTE_TTL,
@@ -383,14 +377,13 @@ impl SchemeEngine for EvaluateEngine {
             prompt_tokens,
             amount = QUOTE_AMOUNT,
             total_ms = total_start.elapsed().as_millis(),
-            "quoted prepared evaluate text execution"
+            "quoted token evaluate execution"
         );
 
         Ok(TicketOutcome {
-            response: QuotePreparedTextResponse {
+            response: QuoteResponse {
                 ticket: Some(ticket),
                 prompt_tokens,
-                dtype: dtype_wire,
                 evaluate_request: Some(evaluate_request_pb),
             },
             provenance: ExecutionProvenance {
@@ -403,50 +396,31 @@ impl SchemeEngine for EvaluateEngine {
         &mut self,
         store: &mut ExecutorState,
         request: QuotePromptRequest,
-    ) -> Result<TicketOutcome<QuotePromptResponse>, ExecutorError> {
-        let dtype = self.resolve_accept_dtypes(&request.accept_dtypes)?;
-        let assets = load_assets(
-            &request.huggingface_model_id,
-            &request.huggingface_revision,
-            dtype,
-        )?;
+    ) -> Result<TicketOutcome<QuoteResponse>, ExecutorError> {
+        let dtype = self.preferred_dtype();
+        let assets = load_assets(&request.package, dtype)?;
         let prepared = assets.prepare_plain(&request.prompt)?;
-        let prompt_tokens = prepared.input_ids.len() as u32;
         let runner_public_key = parse_runner_public_key(request.runner_public_key)?;
         let retention = hellas_rpc::Retention::from_retain(request.retain.unwrap_or(true));
         let quote = assets.prepare_quote(&prepared);
-        let prepared_request = quote_prepared_text_request(
+        let tokens_request = quote_tokens_request(
+            request.package,
             quote,
             request.max_new_tokens,
-            dtype.as_wire().to_string(),
             &runner_public_key,
             request.assurance,
             retention,
         );
-        let inner = self.quote_prepared_text(store, prepared_request).await?;
-
-        Ok(TicketOutcome {
-            response: QuotePromptResponse {
-                ticket: inner.response.ticket,
-                prompt_tokens,
-                dtype: inner.response.dtype,
-                evaluate_request: inner.response.evaluate_request,
-            },
-            provenance: inner.provenance,
-        })
+        self.quote_tokens(store, tokens_request).await
     }
 
     async fn quote_chat_prompt(
         &mut self,
         store: &mut ExecutorState,
         request: QuoteChatPromptRequest,
-    ) -> Result<TicketOutcome<QuoteChatPromptResponse>, ExecutorError> {
-        let dtype = self.resolve_accept_dtypes(&request.accept_dtypes)?;
-        let assets = load_assets(
-            &request.huggingface_model_id,
-            &request.huggingface_revision,
-            dtype,
-        )?;
+    ) -> Result<TicketOutcome<QuoteResponse>, ExecutorError> {
+        let dtype = self.preferred_dtype();
+        let assets = load_assets(&request.package, dtype)?;
 
         let mut messages = Vec::new();
         if !request.system_prompt.is_empty() {
@@ -460,29 +434,18 @@ impl SchemeEngine for EvaluateEngine {
             messages.push(msg);
         }
         let prepared = assets.prepare_chat(&messages)?;
-        let prompt_tokens = prepared.input_ids.len() as u32;
         let runner_public_key = parse_runner_public_key(request.runner_public_key)?;
         let retention = hellas_rpc::Retention::from_retain(request.retain.unwrap_or(true));
         let quote = assets.prepare_quote(&prepared);
-        let prepared_request = quote_prepared_text_request(
+        let tokens_request = quote_tokens_request(
+            request.package,
             quote,
             request.max_new_tokens,
-            dtype.as_wire().to_string(),
             &runner_public_key,
             request.assurance,
             retention,
         );
-        let inner = self.quote_prepared_text(store, prepared_request).await?;
-
-        Ok(TicketOutcome {
-            response: QuoteChatPromptResponse {
-                ticket: inner.response.ticket,
-                prompt_tokens,
-                dtype: inner.response.dtype,
-                evaluate_request: inner.response.evaluate_request,
-            },
-            provenance: inner.provenance,
-        })
+        self.quote_tokens(store, tokens_request).await
     }
 
     async fn materialize_model(&mut self, model: String) -> Result<(), ExecutorError> {
@@ -543,24 +506,23 @@ impl SchemeEngine for EvaluateEngine {
         Ok(GetArtifactResponse { canonical_artifact })
     }
 
-    async fn list_models(&self) -> ListModelsResponse {
-        let models = self
+    async fn list_packages(&self) -> ListPackagesResponse {
+        let packages = self
             .models
             .iter()
             .map(|(locator, status)| {
                 let (proto_status, error) = match status {
-                    LocalModelStatus::Ready => (ModelStatus::Ready, String::new()),
-                    LocalModelStatus::Failed(err) => (ModelStatus::Failed, err.clone()),
+                    LocalModelStatus::Ready => (PackageStatus::Ready, String::new()),
+                    LocalModelStatus::Failed(err) => (PackageStatus::Failed, err.clone()),
                 };
-                ModelInfo {
-                    model_id: locator.model_id.clone(),
-                    revision: locator.revision.clone(),
+                PackageInfo {
+                    name: locator.spec(),
                     status: proto_status.into(),
                     error,
                 }
             })
             .collect();
-        ListModelsResponse { models }
+        ListPackagesResponse { packages }
     }
 
     fn start(
@@ -749,27 +711,25 @@ impl SchemeEngine for EvaluateEngine {
     }
 }
 
-/// Assemble the wire `QuotePreparedTextRequest` from the model-domain
+/// Assemble the wire `QuoteTokensRequest` from the model-domain
 /// [`PreparedQuote`] plus the protocol framing (genesis start marker,
 /// runner key) the model layer deliberately leaves to callers.
-fn quote_prepared_text_request(
+fn quote_tokens_request(
+    package: String,
     quote: PreparedQuote,
     max_new_tokens: u32,
-    accept_dtype: String,
     runner_public_key: &hellas_rpc::PublicKey,
     assurance: i32,
     retention: hellas_rpc::Retention,
-) -> QuotePreparedTextRequest {
-    QuotePreparedTextRequest {
-        huggingface_model_id: quote.huggingface_model_id,
-        huggingface_revision: quote.huggingface_revision,
+) -> QuoteTokensRequest {
+    QuoteTokensRequest {
+        package,
         prompt_token_ids: quote.prompt_token_ids,
         max_new_tokens,
         stop_token_ids: quote.stop_token_ids,
         start: Some(EvaluateStart {
             kind: Some(evaluate_start::Kind::Genesis(EvaluateGenesisStart {})),
         }),
-        accept_dtypes: vec![accept_dtype],
         runner_public_key: Some(public_key_to_pb(runner_public_key)),
         assurance,
         retain: Some(retention.should_retain()),
@@ -807,12 +767,11 @@ fn digest_from_slice(bytes: &[u8], field: &str) -> Result<Digest, ExecutorError>
 /// Tokenizer and config for a quote, from what this node already holds.
 ///
 /// `quote_prompt` and `quote_chat_prompt` are reachable by any peer that
-/// can dial us and take a model id from the request, so they get the
+/// can dial us and take a package from the request, so they get the
 /// same local reach the manifest does. A repo's `tokenizer.json` is
 /// small only because its author chose to make it small.
-fn load_assets(model_id: &str, revision: &str, dtype: Dtype) -> Result<ModelAssets, ExecutorError> {
-    let spec = model_spec(model_id, revision);
-    ModelAssets::load(&spec, dtype, Reach::Local).map_err(|err| refusal_for(&spec, err))
+fn load_assets(package: &str, dtype: Dtype) -> Result<ModelAssets, ExecutorError> {
+    ModelAssets::load(package, dtype, Reach::Local).map_err(|err| refusal_for(package, err))
 }
 
 fn hex32(bytes: &[u8; 32]) -> String {
@@ -865,20 +824,20 @@ mod tests {
         let runner = key(3).public_key();
 
         let err = engine
-            .quote_prepared_text(
+            .quote_tokens(
                 &mut store,
-                QuotePreparedTextRequest {
-                    huggingface_model_id: "hellas-test/not-on-this-node".to_string(),
+                QuoteTokensRequest {
                     // Pinned, and to a commit no cache holds: nothing but
                     // a download could resolve this.
-                    huggingface_revision: "c1899de289a04d12100db370d81485cdf75e47ca".to_string(),
+                    package:
+                        "hellas-test/not-on-this-node@c1899de289a04d12100db370d81485cdf75e47ca"
+                            .to_string(),
                     prompt_token_ids: vec![1, 2, 3],
                     max_new_tokens: 4,
                     stop_token_ids: Vec::new(),
                     start: Some(EvaluateStart {
                         kind: Some(evaluate_start::Kind::Genesis(EvaluateGenesisStart {})),
                     }),
-                    accept_dtypes: vec![Dtype::F32.as_wire().to_string()],
                     runner_public_key: Some(public_key_to_pb(&runner)),
                     assurance: Assurance::ProducerSigned.to_byte().into(),
                     retain: Some(false),
@@ -930,18 +889,16 @@ mod tests {
             let runner = key(3).public_key();
 
             let err = engine
-                .quote_prepared_text(
+                .quote_tokens(
                     &mut store,
-                    QuotePreparedTextRequest {
-                        huggingface_model_id: "hellas-test/not-on-this-node".to_string(),
-                        huggingface_revision: revision.to_string(),
+                    QuoteTokensRequest {
+                        package: format!("hellas-test/not-on-this-node@{revision}"),
                         prompt_token_ids: vec![1, 2, 3],
                         max_new_tokens: 4,
                         stop_token_ids: Vec::new(),
                         start: Some(EvaluateStart {
                             kind: Some(evaluate_start::Kind::Genesis(EvaluateGenesisStart {})),
                         }),
-                        accept_dtypes: vec![Dtype::F32.as_wire().to_string()],
                         runner_public_key: Some(public_key_to_pb(&runner)),
                         assurance: Assurance::ProducerSigned.to_byte().into(),
                         retain: Some(false),

@@ -7,11 +7,11 @@ use hellas_attestation::{
     AnchorTime, AppleCredential, ApplePolicy, AssertionCounterStore, RegisteredAppleCredential,
     apple_app_attest_root_ca, apple_app_id_hash, register_apple, verify_apple_assertion,
 };
-use hellas_rpc::pb::courtesy::QuotePreparedTextRequest;
+use hellas_rpc::pb::courtesy::QuoteTokensRequest;
 use hellas_rpc::pb::execute::{OpenRequest, OpenResponse, Ticket, open_response};
 use hellas_rpc::pb::fetch::FetchRequest;
 use hellas_rpc::provenance::ExecutionProvenance;
-use hellas_rpc::services::courtesy::{Courtesy, Open as CourtesyOpen, QuotePreparedText};
+use hellas_rpc::services::courtesy::{Courtesy, Open as CourtesyOpen, QuoteTokens};
 use hellas_rpc::services::execute::{Execute, ExecuteClientImpl};
 use hellas_rpc::services::fetch::{Fetch, FetchClientImpl, Open as FetchOpen};
 use hellas_rpc::{
@@ -446,18 +446,18 @@ fn validate_provider_trust_assurance(
     }
 }
 
-/// Quote prepared text on a specific peer and return its ticket and provenance.
-pub async fn quote_prepared_text<L>(
+/// Quote prepared tokens on a specific peer and return its ticket and provenance.
+pub async fn quote_tokens<L>(
     runtime: &ExecutionRuntime<L>,
     target: &RemoteNodeTarget,
-    quote_req: &QuotePreparedTextRequest,
+    quote_req: &QuoteTokensRequest,
 ) -> ClientResult<(Ticket, ExecutionProvenance)> {
     let requested_assurance = hellas_rpc::run_ticket::assurance_from_pb(quote_req.assurance)
         .map_err(|source| ClientError::source("invalid requested assurance", source))?;
     validate_provider_trust_assurance(&target.provider_trust, requested_assurance)?;
     let transport = runtime.remote_transport::<Courtesy>(target).await?;
     confidential_open::<CourtesyOpen>(&transport, &target.provider_trust).await?;
-    let with_trailer = hellas_rpc::call::unary_with_trailer::<_, QuotePreparedText>(
+    let with_trailer = hellas_rpc::call::unary_with_trailer::<_, QuoteTokens>(
         &transport,
         quote_req.clone(),
         Metadata::new(),
@@ -465,20 +465,20 @@ pub async fn quote_prepared_text<L>(
     .await
     .map_err(|status| {
         ClientError::wire(
-            format!("node {} declined quote_prepared_text", target.node_id()),
+            format!("node {} declined quote_tokens", target.node_id()),
             status,
         )
     })?;
     let response = with_trailer.response;
     let evaluate_request = response.evaluate_request.ok_or_else(|| {
         ClientError::protocol(format!(
-            "quote_prepared_text response from {} missing evaluate_request",
+            "quote_tokens response from {} missing evaluate_request",
             target.node_id()
         ))
     })?;
     let ticket = response.ticket.ok_or_else(|| {
         ClientError::protocol(format!(
-            "quote_prepared_text response from {} missing ticket",
+            "quote_tokens response from {} missing ticket",
             target.node_id()
         ))
     })?;
@@ -500,7 +500,7 @@ pub async fn quote_prepared_text<L>(
 /// Discover Courtesy peers until one returns a valid quote.
 pub async fn discover_and_quote(
     registry: &ServiceRegistry,
-    quote_req: &QuotePreparedTextRequest,
+    quote_req: &QuoteTokensRequest,
     retries: usize,
     provider_trust: &ProviderTrustAnchor,
 ) -> ClientResult<(RemoteNodeTarget, Ticket, ExecutionProvenance)> {
@@ -546,7 +546,7 @@ pub async fn discover_and_quote(
             continue;
         }
 
-        let with_trailer = match hellas_rpc::call::unary_with_trailer::<_, QuotePreparedText>(
+        let with_trailer = match hellas_rpc::call::unary_with_trailer::<_, QuoteTokens>(
             &transport,
             quote_req.clone(),
             Metadata::new(),
@@ -556,7 +556,7 @@ pub async fn discover_and_quote(
             Ok(response) => response,
             Err(status) => {
                 last_error = Some(ClientError::wire(
-                    format!("node {peer_id} declined quote_prepared_text"),
+                    format!("node {peer_id} declined quote_tokens"),
                     status,
                 ));
                 if attempts >= max_attempts {
@@ -569,7 +569,7 @@ pub async fn discover_and_quote(
         let response = with_trailer.response;
         let Some(evaluate_request) = response.evaluate_request else {
             last_error = Some(ClientError::protocol(format!(
-                "quote_prepared_text response from {peer_id} missing evaluate_request"
+                "quote_tokens response from {peer_id} missing evaluate_request"
             )));
             if attempts >= max_attempts {
                 break;
@@ -578,7 +578,7 @@ pub async fn discover_and_quote(
         };
         let Some(ticket) = response.ticket else {
             last_error = Some(ClientError::protocol(format!(
-                "quote_prepared_text response from {peer_id} missing ticket"
+                "quote_tokens response from {peer_id} missing ticket"
             )));
             if attempts >= max_attempts {
                 break;

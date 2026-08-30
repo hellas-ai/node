@@ -5,9 +5,9 @@ use std::any::Any;
 use crate::ExecutorError;
 use async_trait::async_trait;
 use hellas_rpc::pb::courtesy::{
-    GetArtifactRequest, GetArtifactResponse, ListModelsResponse, PutArtifactRequest,
-    PutArtifactResponse, QuoteChatPromptRequest, QuoteChatPromptResponse, QuotePreparedTextRequest,
-    QuotePreparedTextResponse, QuotePromptRequest, QuotePromptResponse,
+    GetArtifactRequest, GetArtifactResponse, ListPackagesResponse, PutArtifactRequest,
+    PutArtifactResponse, QuoteChatPromptRequest, QuotePromptRequest, QuoteResponse,
+    QuoteTokensRequest,
 };
 use hellas_rpc::pb::evaluate::EvaluateRequest as PbEvaluateRequest;
 use hellas_rpc::pb::execute::Ticket;
@@ -44,23 +44,23 @@ pub trait SchemeEngine: Send + Sync {
         request: PbEvaluateRequest,
     ) -> Result<TicketOutcome<Ticket>, ExecutorError>;
 
-    async fn quote_prepared_text(
+    async fn quote_tokens(
         &mut self,
         store: &mut ExecutorState,
-        request: QuotePreparedTextRequest,
-    ) -> Result<TicketOutcome<QuotePreparedTextResponse>, ExecutorError>;
+        request: QuoteTokensRequest,
+    ) -> Result<TicketOutcome<QuoteResponse>, ExecutorError>;
 
     async fn quote_prompt(
         &mut self,
         store: &mut ExecutorState,
         request: QuotePromptRequest,
-    ) -> Result<TicketOutcome<QuotePromptResponse>, ExecutorError>;
+    ) -> Result<TicketOutcome<QuoteResponse>, ExecutorError>;
 
     async fn quote_chat_prompt(
         &mut self,
         store: &mut ExecutorState,
         request: QuoteChatPromptRequest,
-    ) -> Result<TicketOutcome<QuoteChatPromptResponse>, ExecutorError>;
+    ) -> Result<TicketOutcome<QuoteResponse>, ExecutorError>;
 
     /// Makes a model available on this node, **downloading** it if it is
     /// not here.
@@ -82,7 +82,7 @@ pub trait SchemeEngine: Send + Sync {
         request: GetArtifactRequest,
     ) -> Result<GetArtifactResponse, ExecutorError>;
 
-    async fn list_models(&self) -> ListModelsResponse;
+    async fn list_packages(&self) -> ListPackagesResponse;
 
     fn start(
         &mut self,
