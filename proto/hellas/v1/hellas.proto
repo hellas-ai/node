@@ -26,6 +26,8 @@ message JobTerms {
 
 // Numeric values are canonical protocol tags and must not be renumbered.
 enum Assurance {
+  // Producer-signed is the defined baseline assurance, not an absent value.
+  // buf:lint:ignore ENUM_ZERO_VALUE_SUFFIX
   ASSURANCE_PRODUCER_SIGNED = 0;
   ASSURANCE_APPLE_APP_ATTEST = 1;
 }

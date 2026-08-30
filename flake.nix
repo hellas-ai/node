@@ -11,15 +11,15 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     rust-overlay.url = "github:oxalica/rust-overlay";
-    # Temporary sibling input while the runner API is developed in tandem.
-    # package.nix rewrites Cargo's relative path to this immutable store path.
+    # Temporary sibling declaration while the runner API is developed in
+    # tandem. Pure builds must override it with an absolute path as documented
+    # in the README because the sibling is outside this flake's source tree.
     catena-runner = {
       url = "path:../catena-runner";
       flake = false;
     };
-    # The exact Catena revision embedded by the runner. This second local
-    # input keeps clean Nix builds independent of private GitHub credentials;
-    # both path inputs go away when the tandem branches are published.
+    # The sibling Catena checkout used by the runner's temporary Cargo patch.
+    # Both local inputs go away once the tandem branches are published.
     exploratory-catena = {
       url = "path:../exploratory-catena";
       flake = false;

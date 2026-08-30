@@ -230,7 +230,9 @@ cargo run --no-default-features --features chain -- \
 The Catena interface is being developed in tandem in the sibling
 `catena-runner` and `exploratory-catena` checkouts. Until those branches are
 published, override both temporary path inputs explicitly (replace the paths
-if your checkout layout differs):
+if your checkout layout differs). A relative flake input cannot archive a
+sibling outside the Hellas source tree, so pure `nix build` and CI commands
+need these overrides too:
 
 ```bash
 nix develop \
