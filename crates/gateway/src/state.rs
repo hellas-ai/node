@@ -10,7 +10,7 @@ use hellas_adaptors::{ExecutionRequest as WireExecutionRequest, Input};
 use hellas_client::{ExecutionRoute, ProducerTrust, RemoteNodeTarget};
 #[cfg(feature = "evaluate")]
 use hellas_executor::{Executor, PackageSource};
-use hellas_presentation::{PreparedPrompt, TextPresentation};
+use hellas_presentation::TextPresentation;
 use hellas_rpc::Retention;
 #[cfg(feature = "evaluate")]
 use hellas_rpc::policy::ExecutePolicy;
@@ -37,6 +37,7 @@ pub(super) struct GatewayState {
     pub(super) inference_timeout: Duration,
     runtime: CliRuntime,
     presentation: Arc<TextPresentation>,
+    stop_token_ids: Vec<u32>,
     pub(super) responses_proxy: Option<Arc<ResponsesProxy>>,
     pub(super) responses_fetch: Option<Arc<super::fetch_backend::ResponsesFetchBackend>>,
     runner_key: Arc<hellas_rpc::ProducerSigningKey>,
@@ -126,9 +127,8 @@ impl GatewayState {
         );
         let runner_key = Arc::new(options.producer_key.clone());
         let tokenizer = options.tokenizer.clone();
-        let stop_token_ids = options.stop_token_ids.clone();
         let presentation = Arc::new(
-            tokio::task::spawn_blocking(move || TextPresentation::load(&tokenizer, stop_token_ids))
+            tokio::task::spawn_blocking(move || TextPresentation::load(&tokenizer))
                 .await
                 .context("tokenizer loader panicked")??,
         );
@@ -246,6 +246,7 @@ impl GatewayState {
             inference_timeout: DEFAULT_INFERENCE_TIMEOUT,
             runtime,
             presentation,
+            stop_token_ids: options.stop_token_ids.clone(),
             responses_proxy,
             responses_fetch,
             runner_key,
@@ -269,17 +270,17 @@ impl GatewayState {
     /// from already-prepared wire-adaptor inputs.
     async fn finalize_generation(
         &self,
-        prepared_prompt: PreparedPrompt,
+        input_ids: Vec<u32>,
         max_tokens: u32,
         prepare_error: &str,
         retention: Retention,
     ) -> Result<PreparedGeneration, HttpError> {
-        let prompt_tokens = prepared_prompt.input_ids.len() as u32;
+        let prompt_tokens = input_ids.len() as u32;
         let request = ExecutionRequest::new(
             self.runtime.clone(),
             self.package_name.clone(),
-            prepared_prompt.input_ids,
-            prepared_prompt.stop_token_ids,
+            input_ids,
+            self.stop_token_ids.clone(),
             ExecutionRequestOptions {
                 max_new_tokens: max_tokens,
                 execution_package: self.execution_package,
@@ -318,19 +319,17 @@ impl GatewayState {
             .sampling
             .max_output_tokens
             .unwrap_or(self.default_max_tokens);
-        let prepared_prompt = match &req.canonical.input {
+        let input_ids = match &req.canonical.input {
             Input::Text(prompt)
                 if req.canonical.tools.is_empty() && req.canonical.reasoning.is_none() =>
             {
-                self.presentation
-                    .prepare_plain(prompt)
-                    .map_err(|err| HttpError {
-                        status: StatusCode::BAD_REQUEST,
-                        message: format!(
-                            "Failed to tokenize completion prompt: {}",
-                            format_error_causes(err.as_ref())
-                        ),
-                    })?
+                self.presentation.encode(prompt).map_err(|err| HttpError {
+                    status: StatusCode::BAD_REQUEST,
+                    message: format!(
+                        "Failed to tokenize completion prompt: {}",
+                        format_error_causes(err.as_ref())
+                    ),
+                })?
             }
             Input::Text(_) | Input::Messages(_) | Input::Items(_) => {
                 return Err(HttpError {
@@ -341,7 +340,7 @@ impl GatewayState {
         };
 
         self.finalize_generation(
-            prepared_prompt,
+            input_ids,
             max_tokens,
             "Failed to prepare Responses input",
             retention,

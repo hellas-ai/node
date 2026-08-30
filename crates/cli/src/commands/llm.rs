@@ -60,11 +60,8 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
 
     // Presentation is an explicitly separate local input. Hellas commits the
     // resulting token IDs, not this tokenizer or the decoded text it produces.
-    let presentation = Arc::new(TextPresentation::load(
-        &options.tokenizer,
-        options.stop_token_ids,
-    )?);
-    let prepared = presentation.prepare_plain(&options.prompt)?;
+    let presentation = Arc::new(TextPresentation::load(&options.tokenizer)?);
+    let input_ids = presentation.encode(&options.prompt)?;
     let mut decoder = TextOutputDecoder::new(presentation);
     let package_name = options.package_name;
     let runner_key = options.producer_key.clone();
@@ -155,8 +152,8 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
     let request = ExecutionRequest::new(
         runtime,
         package_name,
-        prepared.input_ids,
-        prepared.stop_token_ids,
+        input_ids,
+        options.stop_token_ids,
         ExecutionRequestOptions {
             max_new_tokens: options.max_new_tokens,
             execution_package,

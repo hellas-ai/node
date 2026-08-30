@@ -11,47 +11,33 @@ use std::{path::Path, sync::Arc};
 use anyhow::{Context, Result};
 use tokenizers::Tokenizer;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PreparedPrompt {
-    pub input_ids: Vec<u32>,
-    pub stop_token_ids: Vec<u32>,
-}
-
 pub struct TextPresentation {
     tokenizer: Tokenizer,
-    stop_token_ids: Vec<u32>,
 }
 
 impl TextPresentation {
-    /// Load an application-selected tokenizer and stop-token policy.
+    /// Load an application-selected tokenizer.
     ///
     /// This performs local file I/O only. It deliberately has no package
     /// directory, URL, or model-name argument: neither Catena nor an RPC peer
     /// selects presentation for the caller.
-    pub fn load(tokenizer_path: &Path, stop_token_ids: Vec<u32>) -> Result<Self> {
+    pub fn load(tokenizer_path: &Path) -> Result<Self> {
         let tokenizer = Tokenizer::from_file(tokenizer_path)
             .map_err(anyhow::Error::msg)
             .with_context(|| format!("failed to load tokenizer {}", tokenizer_path.display()))?;
-        Ok(Self {
-            tokenizer,
-            stop_token_ids,
-        })
+        Ok(Self { tokenizer })
     }
 
     /// Plain text tokenization. Chat rendering is deliberately absent until a
     /// separately specified presentation policy supplies an exact template.
-    pub fn prepare_plain(&self, text: &str) -> Result<PreparedPrompt> {
-        let input_ids = self
+    pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
+        Ok(self
             .tokenizer
             .encode(text, true)
             .map_err(anyhow::Error::msg)
             .context("failed to tokenize prompt")?
             .get_ids()
-            .to_vec();
-        Ok(PreparedPrompt {
-            input_ids,
-            stop_token_ids: self.stop_token_ids.clone(),
-        })
+            .to_vec())
     }
 
     pub fn decode(&self, tokens: &[u32]) -> Result<String> {
@@ -105,18 +91,13 @@ mod tests {
             br#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":{"type":"Whitespace"},"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"hello":0,"world":1,"<unk>":2},"unk_token":"<unk>"}}"#,
         )
         .unwrap();
-        Arc::new(TextPresentation {
-            tokenizer,
-            stop_token_ids: vec![2],
-        })
+        Arc::new(TextPresentation { tokenizer })
     }
 
     #[test]
     fn plain_text_is_only_local_presentation() {
         let presentation = presentation();
-        let prepared = presentation.prepare_plain("hello world").unwrap();
-        assert_eq!(prepared.input_ids, [0, 1]);
-        assert_eq!(prepared.stop_token_ids, [2]);
+        assert_eq!(presentation.encode("hello world").unwrap(), [0, 1]);
     }
 
     #[test]

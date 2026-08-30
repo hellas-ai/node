@@ -9,5 +9,5 @@ documentation.workspace = true
 
 [dependencies]
 anyhow = "1"
-hellas-rpc = { workspace = true }
+hellas-rpc = { workspace = true, features = ["execute"] }
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
