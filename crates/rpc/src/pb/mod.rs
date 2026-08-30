@@ -157,13 +157,13 @@ mod id_pins {
     #[test]
     fn courtesy_ids_are_stable() {
         use super::services::courtesy::{
-            Courtesy, Open, QuoteChatPrompt, QuotePreparedText, QuotePrompt,
+            Courtesy, Open, QuoteChatPrompt, QuotePrompt, QuoteTokens,
         };
-        assert_eq!(<Courtesy as ServiceMarker>::SERVICE_ID, 0xfcc334c3);
+        assert_eq!(<Courtesy as ServiceMarker>::SERVICE_ID, 0x3dd5f428);
         assert_eq!(<Open as MethodMarker>::METHOD_ID, 0x18351e7d);
-        assert_eq!(<QuotePreparedText as MethodMarker>::METHOD_ID, 0x58689a09);
-        assert_eq!(<QuotePrompt as MethodMarker>::METHOD_ID, 0x6174018e);
-        assert_eq!(<QuoteChatPrompt as MethodMarker>::METHOD_ID, 0xae272694);
+        assert_eq!(<QuoteTokens as MethodMarker>::METHOD_ID, 0x75d627e8);
+        assert_eq!(<QuotePrompt as MethodMarker>::METHOD_ID, 0xc0b019d5);
+        assert_eq!(<QuoteChatPrompt as MethodMarker>::METHOD_ID, 0xb222fc3d);
     }
 
     #[cfg(feature = "work")]

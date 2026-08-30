@@ -4,8 +4,9 @@ package hellas.evaluate.v1;
 
 import "hellas/v1/hellas.proto";
 
-// Binding/verifiable evaluation work. This is the protocol-level Catgrad path:
-// all large artifacts are named by ContentIds and fetched outside protobuf.
+// Binding/verifiable token evaluation. The execution environment commits to
+// an exact Catena executable package; tokenization and text decoding are
+// convenience layers outside this protocol.
 
 service Evaluate {
   rpc CreateTicket(EvaluateRequest) returns (.hellas.v1.Ticket);

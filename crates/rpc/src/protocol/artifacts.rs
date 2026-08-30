@@ -22,7 +22,7 @@
 
 use crate::protocol::value::{CanonicalDecodeError, CanonicalDecoder};
 use crate::{ContentId, DagCborEncoder, Digest};
-use std::{format, marker::PhantomData, str, string::String, vec::Vec};
+use std::{format, marker::PhantomData, str, vec::Vec};
 
 const SOURCE_INPUT_SCHEMA: &str = "hellas.evaluate.source.input.v1";
 const SOURCE_OUTPUT_SCHEMA: &str = "hellas.evaluate.source.output.v1";
@@ -959,6 +959,8 @@ fn decode_text_artifact(
 
 #[cfg(test)]
 mod tests {
+    use crate::ExecutionPackageId;
+
     use super::{
         BoundTerm, Canonical, CanonicalDecode, InputAddressed, OutputAddressed, OutputId,
         SourceRef, TextArtifact, TextExecution, TextPolicy, TextState, TokenId, TokenIds,
@@ -1010,21 +1012,20 @@ mod tests {
             )
         );
 
-        let identity = TextArtifact::identity(output_id::<BoundTerm>(7), "model", "main", "f32");
+        let identity = TextArtifact::identity(
+            output_id::<BoundTerm>(7),
+            ExecutionPackageId::from_bytes([8; 32]),
+        );
         assert_eq!(
             hex(&identity.canonical_bytes()),
             concat!(
-                "85", // array(5)
+                "83", // array(3)
                 "7829",
-                "68656c6c61732e6576616c756174652e746578742e61727469666163742e6964656e746974792e7631",
+                "68656c6c61732e6576616c756174652e746578742e61727469666163742e6964656e746974792e7632",
                 "5820",
                 "0707070707070707070707070707070707070707070707070707070707070707",
-                "65",
-                "6d6f64656c", // "model"
-                "64",
-                "6d61696e", // "main"
-                "63",
-                "663332", // "f32"
+                "5820",
+                "0808080808080808080808080808080808080808080808080808080808080808",
             )
         );
 
@@ -1137,8 +1138,14 @@ mod tests {
 
     #[test]
     fn identity_is_output_addressed_genesis() {
-        let identity = TextArtifact::identity(output_id::<BoundTerm>(7), "model", "main", "f32");
-        let other_model = TextArtifact::identity(output_id::<BoundTerm>(7), "other", "main", "f32");
+        let identity = TextArtifact::identity(
+            output_id::<BoundTerm>(7),
+            ExecutionPackageId::from_bytes([8; 32]),
+        );
+        let other_package = TextArtifact::identity(
+            output_id::<BoundTerm>(7),
+            ExecutionPackageId::from_bytes([9; 32]),
+        );
         let prompt_tokens = TokenIds::from([1]).output_id();
         let policy = TextPolicy::from_u32_stop_tokens(4, []).output_id();
         let execution = TextExecution::new(
@@ -1147,7 +1154,7 @@ mod tests {
             policy,
         );
 
-        assert_ne!(identity.output_id(), other_model.output_id());
+        assert_ne!(identity.output_id(), other_package.output_id());
         assert_ne!(
             execution.input_id().as_bytes(),
             identity.output_id().as_bytes()
@@ -1156,7 +1163,10 @@ mod tests {
 
     #[test]
     fn execution_input_id_changes_when_source_changes() {
-        let identity = TextArtifact::identity(output_id::<BoundTerm>(7), "model", "main", "f32");
+        let identity = TextArtifact::identity(
+            output_id::<BoundTerm>(7),
+            ExecutionPackageId::from_bytes([8; 32]),
+        );
         let prompt_tokens = TokenIds::from([1]).output_id();
         let policy = TextPolicy::from_u32_stop_tokens(4, []).output_id();
         let first = TextExecution::new(
@@ -1173,8 +1183,11 @@ mod tests {
     fn output_artifact_id_changes_when_generated_tokens_change() {
         let execution = TextExecution::new(
             SourceRef::output(
-                TextArtifact::identity(output_id::<BoundTerm>(7), "model", "main", "f32")
-                    .output_id(),
+                TextArtifact::identity(
+                    output_id::<BoundTerm>(7),
+                    ExecutionPackageId::from_bytes([8; 32]),
+                )
+                .output_id(),
             ),
             TokenIds::from([1]).output_id(),
             TextPolicy::from_u32_stop_tokens(4, []).output_id(),
@@ -1216,7 +1229,10 @@ mod tests {
             state
         );
 
-        let identity = TextArtifact::identity(output_id::<BoundTerm>(7), "model", "main", "f32");
+        let identity = TextArtifact::identity(
+            output_id::<BoundTerm>(7),
+            ExecutionPackageId::from_bytes([8; 32]),
+        );
         assert_eq!(
             TextArtifact::from_canonical_bytes(&identity.canonical_bytes()).unwrap(),
             identity
