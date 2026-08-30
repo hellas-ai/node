@@ -90,11 +90,6 @@ impl PackageArg {
             Ok(())
         }
     }
-
-    #[cfg(test)]
-    pub fn artifact_dir(&self, cache: &std::path::Path) -> PathBuf {
-        cache.join(&self.name)
-    }
 }
 
 impl FromStr for PackageArg {
@@ -164,10 +159,6 @@ mod tests {
         assert_eq!(
             package.package_dir(),
             Some(std::path::Path::new("../catena-runner/models/smollm2"))
-        );
-        assert_eq!(
-            package.artifact_dir(std::path::Path::new("cache")),
-            std::path::Path::new("cache/smollm2-135m")
         );
     }
 

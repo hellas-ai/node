@@ -233,7 +233,10 @@ impl EvaluateArtifactStore {
 
         let prompt_tokens = TokenIds::from(plan.invocation.input_ids.clone());
         let prompt_tokens_id = prompt_tokens.output_id();
-        let policy = text_policy(&plan.invocation);
+        let policy = TextPolicy::from_u32_stop_tokens(
+            plan.invocation.max_new_tokens,
+            plan.invocation.stop_token_ids.iter().copied(),
+        );
         let policy_id = policy.output_id();
         let execution = TextExecution::new(from, prompt_tokens_id, policy_id);
         let execution_id = execution.input_id();
@@ -407,8 +410,9 @@ impl EvaluateArtifactStore {
         match source {
             SourceRef::Input(execution_id) => {
                 let artifact_id = self.output_artifact_for_execution(*execution_id).await?;
-                self.materialize_execution_output(*execution_id, artifact_id)
-                    .await
+                let artifact = self.text_artifact(artifact_id).await?;
+                validate_execution_output_mapping(*execution_id, artifact_id, &artifact)?;
+                self.materialize_artifact(artifact_id).await
             }
             SourceRef::Output(artifact_id) => self.materialize_artifact(*artifact_id).await,
         }
@@ -515,16 +519,6 @@ impl EvaluateArtifactStore {
             execution_environment,
             tokens,
         })
-    }
-
-    async fn materialize_execution_output(
-        &mut self,
-        execution_id: TextExecutionId,
-        artifact_id: TextArtifactId,
-    ) -> Result<MaterializedTextSource, ExecutorError> {
-        let artifact = self.text_artifact(artifact_id).await?;
-        validate_execution_output_mapping(execution_id, artifact_id, &artifact)?;
-        self.materialize_artifact(artifact_id).await
     }
 
     async fn output_artifact_for_execution(
@@ -718,13 +712,6 @@ fn token_ids_to_u32(tokens: &TokenIds) -> Vec<u32> {
         .iter()
         .map(|token| token.as_u32())
         .collect()
-}
-
-fn text_policy(invocation: &Invocation) -> TextPolicy {
-    TextPolicy::from_u32_stop_tokens(
-        invocation.max_new_tokens,
-        invocation.stop_token_ids.iter().copied(),
-    )
 }
 
 #[cfg(test)]
