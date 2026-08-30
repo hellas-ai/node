@@ -79,14 +79,14 @@ impl Executor {
             return Ok(outcome);
         }
         #[cfg(feature = "evaluate")]
-        if let Some(engine) = self.evaluate.as_ref()
-            && let Some(outcome) = engine
-                .replay_completed(
-                    request_commitment_id,
-                    &verified_run.public_key,
-                    verified_run.terms.assurance,
-                )
-                .await?
+        if let Some(outcome) = self
+            .evaluate
+            .replay_completed(
+                request_commitment_id,
+                &verified_run.public_key,
+                verified_run.terms.assurance,
+            )
+            .await?
         {
             info!(
                 request_commitment = %format_request_commitment(&request_commitment),
@@ -117,15 +117,8 @@ impl Executor {
         }
         match &quote.kind {
             #[cfg(feature = "evaluate")]
-            QuoteKind::Scheme(job) => {
-                let evaluate = job
-                    .clone_box()
-                    .into_any()
-                    .downcast::<crate::evaluate::EvaluateJob>()
-                    .map_err(|_| {
-                        ExecutorError::InvalidQuoteRequest("scheme job type mismatch".into())
-                    })?;
-                if evaluate.evaluate_request.assurance != verified_run.terms.assurance {
+            QuoteKind::Evaluate(job) => {
+                if job.evaluate_request.assurance != verified_run.terms.assurance {
                     return Err(ExecutorError::InvalidQuoteRequest(
                         "evaluate request assurance does not match ticket terms".into(),
                     ));
@@ -147,19 +140,10 @@ impl Executor {
         let dispatched: Result<ExecuteOutcome, ExecutorError> = async {
             match quote.kind {
                 #[cfg(feature = "evaluate")]
-                QuoteKind::Scheme(job) => {
-                    let execution_id = new_execution_id();
-                    let engine = self
-                        .evaluate
-                        .as_mut()
-                        .ok_or_else(super::evaluate_disabled)?;
-                    let outcome = engine.start(
-                        job,
-                        crate::scheme::SchemeRunContext {
-                            execution_id,
-                            request_commitment: request_commitment_id,
-                        },
-                    )?;
+                QuoteKind::Evaluate(job) => {
+                    let outcome =
+                        self.evaluate
+                            .start(*job, new_execution_id(), request_commitment_id)?;
                     let _ = self.store.remove_quote(&request_commitment);
                     Ok(outcome)
                 }
@@ -791,12 +775,14 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "evaluate")]
+    use crate::ArtifactStoreConfig;
     use crate::ExecutorError;
     use crate::{
-        ArtifactStoreConfig, CallerAccess, Executor, ExecutorMetrics, ExecutorSpawnConfig,
-        FetchAccessPolicy, FetchProjectionError, FetchProjectionSession, FetchProjector,
-        FetchProjectorFactory, FetchProvider, FetchProviderFuture, FetchProviderRequest,
-        FetchProviderStream, FetchRequestView, FetchRoute, FetchRouteGrant, FetchRoutePolicy,
+        CallerAccess, Executor, ExecutorMetrics, ExecutorSpawnConfig, FetchAccessPolicy,
+        FetchProjectionError, FetchProjectionSession, FetchProjector, FetchProjectorFactory,
+        FetchProvider, FetchProviderFuture, FetchProviderRequest, FetchProviderStream,
+        FetchRequestView, FetchRoute, FetchRouteGrant, FetchRoutePolicy,
         FetchTranscriptStoreBackend, MockFetchProvider, ProjectedFetch,
     };
     use futures_util::stream;
@@ -1025,6 +1011,7 @@ mod tests {
             fetch_max_in_flight,
             fetch_queue_capacity,
             fetch_store: FetchTranscriptStoreBackend::memory(),
+            #[cfg(feature = "evaluate")]
             artifact_store: ArtifactStoreConfig::memory(),
         })
         .await
@@ -1203,6 +1190,7 @@ mod tests {
             fetch_max_in_flight: 1,
             fetch_queue_capacity: 1,
             fetch_store: FetchTranscriptStoreBackend::fs(dir.join("fetch-transcripts")),
+            #[cfg(feature = "evaluate")]
             artifact_store: ArtifactStoreConfig::memory(),
         })
         .await
@@ -1267,6 +1255,7 @@ mod tests {
             fetch_max_in_flight: 1,
             fetch_queue_capacity: 1,
             fetch_store: FetchTranscriptStoreBackend::memory(),
+            #[cfg(feature = "evaluate")]
             artifact_store: ArtifactStoreConfig::memory(),
         })
         .await

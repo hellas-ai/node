@@ -322,7 +322,7 @@ pub(crate) fn validate_job_terms(
 #[derive(Clone)]
 pub enum QuoteKind {
     #[cfg(feature = "evaluate")]
-    Scheme(Box<dyn crate::scheme::SchemeJob>),
+    Evaluate(Box<crate::evaluate::EvaluateJob>),
     Fetch {
         request: FetchProviderRequest,
     },

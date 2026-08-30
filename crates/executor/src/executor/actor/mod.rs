@@ -12,7 +12,6 @@ use crate::fetch::{FetchCallerPolicy, FetchStateMachine, FetchTranscriptStoreBac
 use crate::fetch_policy::FetchAccessPolicy;
 use crate::fetch_registry::FetchRouteRegistry;
 use crate::metrics::ExecutorMetrics;
-use crate::scheme::SchemeEngine;
 use crate::state::ExecutorState;
 use hellas_rpc::pb::courtesy::{GetPackageStatsResponse, GetStatsResponse, PackageTokenStats};
 use hellas_rpc::policy::ExecutePolicy;
@@ -27,7 +26,8 @@ pub struct Executor {
     pub(super) rx: mpsc::UnboundedReceiver<ExecutorMessage>,
     pub(super) tx: mpsc::UnboundedSender<ExecutorMessage>,
     pub(super) store: ExecutorState,
-    pub(super) evaluate: Option<Box<dyn SchemeEngine>>,
+    #[cfg(feature = "evaluate")]
+    pub(super) evaluate: EvaluateEngine,
     pub(super) metrics: Arc<ExecutorMetrics>,
     pub(super) provider: ProviderContext,
     pub(super) fetch_state: FetchStateMachine<FetchTranscriptStoreBackend>,
@@ -164,22 +164,19 @@ impl Executor {
         })?;
         let fetch_caller_policy = FetchCallerPolicy::new(config.fetch_access_policy.caller_keys());
         #[cfg(feature = "evaluate")]
-        let evaluate: Option<Box<dyn SchemeEngine>> = {
-            Some(Box::new(EvaluateEngine::new(
-                config.artifacts,
-                config.queue_capacity,
-                config.execute_policy,
-                config.metrics.clone(),
-                config.provider.clone(),
-                tx.clone(),
-            )))
-        };
-        #[cfg(not(feature = "evaluate"))]
-        let evaluate: Option<Box<dyn SchemeEngine>> = None;
+        let evaluate = EvaluateEngine::new(
+            config.artifacts,
+            config.queue_capacity,
+            config.execute_policy,
+            config.metrics.clone(),
+            config.provider.clone(),
+            tx.clone(),
+        );
         let executor = Self {
             rx,
             tx: tx.clone(),
             store: ExecutorState::new(),
+            #[cfg(feature = "evaluate")]
             evaluate,
             metrics: config.metrics,
             provider: config.provider,
@@ -199,9 +196,12 @@ impl Executor {
         while let Some(message) = self.rx.recv().await {
             match message {
                 ExecutorMessage::QuoteEvaluate { request, reply } => {
-                    let result = match self.evaluate.as_mut() {
-                        Some(engine) => engine.quote_evaluate(&mut self.store, request).await,
-                        None => Err(evaluate_disabled()),
+                    #[cfg(feature = "evaluate")]
+                    let result = self.evaluate.quote_evaluate(&mut self.store, request).await;
+                    #[cfg(not(feature = "evaluate"))]
+                    let result = {
+                        let _ = request;
+                        Err(evaluate_disabled())
                     };
                     let _ = reply.send(result);
                 }
@@ -209,9 +209,12 @@ impl Executor {
                     let _ = reply.send(self.handle_quote_fetch(request).await);
                 }
                 ExecutorMessage::QuoteTokens { request, reply } => {
-                    let result = match self.evaluate.as_mut() {
-                        Some(engine) => engine.quote_tokens(&mut self.store, request).await,
-                        None => Err(evaluate_disabled()),
+                    #[cfg(feature = "evaluate")]
+                    let result = self.evaluate.quote_tokens(&mut self.store, request).await;
+                    #[cfg(not(feature = "evaluate"))]
+                    let result = {
+                        let _ = request;
+                        Err(evaluate_disabled())
                     };
                     let _ = reply.send(result);
                 }
@@ -220,51 +223,52 @@ impl Executor {
                     canonical_artifact,
                     reply,
                 } => {
-                    let result = match self.evaluate.as_mut() {
-                        Some(engine) => engine.publish_canonical_artifact(canonical_artifact).await,
-                        None => Err(evaluate_disabled()),
-                    };
+                    let result = self
+                        .evaluate
+                        .publish_canonical_artifact(canonical_artifact)
+                        .await;
                     let _ = reply.send(result);
                 }
                 ExecutorMessage::GetArtifact { request, reply } => {
-                    let result = match self.evaluate.as_mut() {
-                        Some(engine) => engine.get_artifact(request).await,
-                        None => Err(evaluate_disabled()),
+                    #[cfg(feature = "evaluate")]
+                    let result = self.evaluate.get_artifact(request).await;
+                    #[cfg(not(feature = "evaluate"))]
+                    let result = {
+                        let _ = request;
+                        Err(evaluate_disabled())
                     };
                     let _ = reply.send(result);
                 }
                 #[cfg(feature = "evaluate")]
                 ExecutorMessage::MaterializePackage { source, reply } => {
-                    let result = match self.evaluate.as_mut() {
-                        Some(engine) => engine.materialize_package(source).await,
-                        None => Err(evaluate_disabled()),
-                    };
+                    let result = self.evaluate.materialize_package(source).await;
                     let _ = reply.send(result);
                 }
                 ExecutorMessage::Execute { request, reply } => {
                     let _ = reply.send(self.handle_execute(request).await);
                 }
                 ExecutorMessage::RunPaidEvaluate { request, reply } => {
-                    let result = match self.evaluate.as_mut() {
-                        Some(engine) => engine.start_request(request).await,
-                        None => Err(evaluate_disabled()),
+                    #[cfg(feature = "evaluate")]
+                    let result = self.evaluate.start_request(request).await;
+                    #[cfg(not(feature = "evaluate"))]
+                    let result = {
+                        let _ = request;
+                        Err(evaluate_disabled())
                     };
                     let _ = reply.send(result);
                 }
                 #[cfg(feature = "evaluate")]
-                ExecutorMessage::SchemeFinished(completion) => {
-                    if let Some(engine) = self.evaluate.as_mut() {
-                        engine.on_completion(completion).await;
-                    }
+                ExecutorMessage::EvaluateFinished(completion) => {
+                    self.evaluate.on_completion(*completion).await;
                 }
                 ExecutorMessage::FetchFinished(completion) => {
                     self.handle_fetch_finished(completion).await;
                 }
                 ExecutorMessage::ListPackages { reply } => {
-                    let packages = match self.evaluate.as_ref() {
-                        Some(engine) => engine.list_packages().await,
-                        None => Default::default(),
-                    };
+                    #[cfg(feature = "evaluate")]
+                    let packages = self.evaluate.list_packages().await;
+                    #[cfg(not(feature = "evaluate"))]
+                    let packages = Default::default();
                     let _ = reply.send(Ok(packages));
                 }
                 ExecutorMessage::GetStats { reply } => {
@@ -296,6 +300,7 @@ impl Executor {
     }
 }
 
+#[cfg(not(feature = "evaluate"))]
 fn evaluate_disabled() -> ExecutorError {
     ExecutorError::PolicyDenied("evaluate scheme is not enabled on this node".to_string())
 }

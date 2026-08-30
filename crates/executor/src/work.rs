@@ -30,7 +30,7 @@
 //! the engine's completed-execution map. That map is keyed by request
 //! commitment, so a second paid job carrying the same request would be
 //! answered out of the first one's transcript, with nothing invoked and
-//! a price charged. `SchemeEngine::start_request` starts.
+//! a price charged. `EvaluateEngine::start_request` starts.
 //!
 //! # What is not covered by a test here
 //!

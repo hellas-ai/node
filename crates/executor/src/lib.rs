@@ -21,7 +21,6 @@ mod fetch_registry;
 mod metrics;
 #[cfg(feature = "evaluate")]
 mod package;
-mod scheme;
 mod state;
 mod work;
 #[cfg(feature = "evaluate")]

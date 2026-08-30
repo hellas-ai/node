@@ -1,10 +1,8 @@
-use std::any::Any;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 
 use crate::ExecutorError;
-use async_trait::async_trait;
 use hellas_rpc::ExecutionPackageId;
 use hellas_rpc::evaluate::{
     EvaluateOutputTranscriptBuilder, EvaluateStopReason, EvaluateTerminal, EvaluateUsage,
@@ -27,7 +25,6 @@ use crate::artifacts::{EvaluateArtifactStore, PreparedTextArtifacts};
 use crate::executor::{ExecuteOutcome, ExecutorMessage, ProviderContext, TicketOutcome};
 use crate::metrics::ExecutorMetrics;
 use crate::package::PackageSource;
-use crate::scheme::{SchemeEngine, SchemeJob, SchemeRunContext};
 use crate::state::{
     ExecutorState, Invocation, LocalPackageStatus, QUOTE_AMOUNT, QUOTE_TTL, QuoteKind, QuotePlan,
     QuoteRecord, StopReason, Termination, evaluate_request_to_pb, new_execution_id, quote_ticket,
@@ -47,22 +44,6 @@ pub struct EvaluateJob {
     pub invocation: Invocation,
     pub package_name: String,
     pub prepared_artifacts: Option<PreparedTextArtifacts>,
-}
-
-impl SchemeJob for EvaluateJob {
-    fn into_any(self: Box<Self>) -> Box<dyn Any + Send> {
-        self
-    }
-
-    fn clone_box(&self) -> Box<dyn SchemeJob> {
-        Box::new(self.clone())
-    }
-}
-
-impl crate::scheme::SchemeCompletion for WorkerCompletion {
-    fn into_any(self: Box<Self>) -> Box<dyn Any + Send> {
-        self
-    }
 }
 
 enum StartExecutionError {
@@ -317,9 +298,8 @@ fn evaluate_stop_reason(stop_reason: StopReason) -> EvaluateStopReason {
     }
 }
 
-#[async_trait]
-impl SchemeEngine for EvaluateEngine {
-    async fn quote_evaluate(
+impl EvaluateEngine {
+    pub(crate) async fn quote_evaluate(
         &mut self,
         store: &mut ExecutorState,
         request: PbEvaluateRequest,
@@ -337,7 +317,7 @@ impl SchemeEngine for EvaluateEngine {
             terms,
             expires_at: Instant::now() + QUOTE_TTL,
             runner_public_key: job.evaluate_request.runner_public_key,
-            kind: QuoteKind::Scheme(Box::new(job)),
+            kind: QuoteKind::Evaluate(Box::new(job)),
         })?;
 
         Ok(TicketOutcome {
@@ -348,7 +328,7 @@ impl SchemeEngine for EvaluateEngine {
         })
     }
 
-    async fn quote_tokens(
+    pub(crate) async fn quote_tokens(
         &mut self,
         store: &mut ExecutorState,
         request: QuoteTokensRequest,
@@ -403,7 +383,7 @@ impl SchemeEngine for EvaluateEngine {
             terms,
             expires_at: Instant::now() + QUOTE_TTL,
             runner_public_key: evaluate_request.runner_public_key,
-            kind: QuoteKind::Scheme(Box::new(EvaluateJob {
+            kind: QuoteKind::Evaluate(Box::new(EvaluateJob {
                 evaluate_request,
                 execution_package: resolved.execution_package,
                 invocation: resolved.invocation,
@@ -433,7 +413,12 @@ impl SchemeEngine for EvaluateEngine {
         })
     }
 
-    async fn materialize_package(
+    /// Fetches, verifies, and loads one Catena package on this node.
+    ///
+    /// This is the one serving-process path that may spend bandwidth on a
+    /// package. It is deliberately not an RPC: peer-reachable paths consult
+    /// only the exact-identity registry populated here.
+    pub(crate) async fn materialize_package(
         &mut self,
         source: PackageSource,
     ) -> Result<hellas_rpc::ExecutionPackageId, ExecutorError> {
@@ -462,7 +447,8 @@ impl SchemeEngine for EvaluateEngine {
         }
     }
 
-    async fn publish_canonical_artifact(
+    /// Publishes one canonical artifact through the owner-only handle path.
+    pub(crate) async fn publish_canonical_artifact(
         &mut self,
         canonical_artifact: Vec<u8>,
     ) -> Result<Digest, ExecutorError> {
@@ -471,7 +457,7 @@ impl SchemeEngine for EvaluateEngine {
             .await
     }
 
-    async fn get_artifact(
+    pub(crate) async fn get_artifact(
         &mut self,
         request: GetArtifactRequest,
     ) -> Result<GetArtifactResponse, ExecutorError> {
@@ -485,7 +471,7 @@ impl SchemeEngine for EvaluateEngine {
         Ok(GetArtifactResponse { canonical_artifact })
     }
 
-    async fn list_packages(&self) -> ListPackagesResponse {
+    pub(crate) async fn list_packages(&self) -> ListPackagesResponse {
         let packages = self
             .packages
             .iter()
@@ -511,27 +497,24 @@ impl SchemeEngine for EvaluateEngine {
         ListPackagesResponse { packages }
     }
 
-    fn start(
+    pub(crate) fn start(
         &mut self,
-        job: Box<dyn SchemeJob>,
-        ctx: SchemeRunContext,
+        job: EvaluateJob,
+        execution_id: String,
+        request_commitment: [u8; 32],
     ) -> Result<ExecuteOutcome, ExecutorError> {
-        let job = job
-            .into_any()
-            .downcast::<EvaluateJob>()
-            .map_err(|_| ExecutorError::InvalidQuoteRequest("scheme job type mismatch".into()))?;
         let EvaluateJob {
             evaluate_request,
             execution_package,
             invocation,
             package_name,
             prepared_artifacts,
-        } = *job;
+        } = job;
         let stat_prompt = invocation.input_ids.len() as u64;
         let (sender, receiver) = mpsc::channel(PER_EXECUTION_CHANNEL_CAPACITY);
         let execute_job = ExecuteJob {
-            execution_id: ctx.execution_id.clone(),
-            request_commitment: ctx.request_commitment,
+            execution_id: execution_id.clone(),
+            request_commitment,
             package_name: package_name.clone(),
             evaluate_request,
             execution_package,
@@ -564,8 +547,8 @@ impl SchemeEngine for EvaluateEngine {
         );
 
         info!(
-            execution_id = %ctx.execution_id,
-            request_commitment = %hex32(&ctx.request_commitment),
+            execution_id = %execution_id,
+            request_commitment = %hex32(&request_commitment),
             queued,
             queue_len = self.pending_executions.len(),
             "accepted evaluate execution"
@@ -573,13 +556,17 @@ impl SchemeEngine for EvaluateEngine {
 
         Ok(ExecuteOutcome {
             provenance: ExecutionProvenance {
-                commitment_id: ctx.request_commitment,
+                commitment_id: request_commitment,
             },
             events: receiver,
         })
     }
 
-    async fn start_request(
+    /// Resolves and starts a paid request without a quote or ticket lookup.
+    ///
+    /// The paid endpoint's durable journal, rather than the transient quote
+    /// store, admits this call. The owner-only handle is its sole entry point.
+    pub(crate) async fn start_request(
         &mut self,
         request: EvaluateRequest,
     ) -> Result<ExecuteOutcome, ExecutorError> {
@@ -590,33 +577,10 @@ impl SchemeEngine for EvaluateEngine {
         // same request out of the first one's transcript, without
         // invoking anything. A paid job is invoked because its journal
         // says so, and this is the invocation.
-        self.start(
-            Box::new(job),
-            SchemeRunContext {
-                execution_id: new_execution_id(),
-                request_commitment,
-            },
-        )
+        self.start(job, new_execution_id(), request_commitment)
     }
 
-    async fn replay_completed(
-        &self,
-        request_commitment: [u8; 32],
-        runner_public_key: &PublicKey,
-        assurance: Assurance,
-    ) -> Result<Option<ExecuteOutcome>, ExecutorError> {
-        EvaluateEngine::replay_completed(self, request_commitment, runner_public_key, assurance)
-            .await
-    }
-
-    async fn on_completion(&mut self, completion: Box<dyn crate::scheme::SchemeCompletion>) {
-        let completion = match completion.into_any().downcast::<WorkerCompletion>() {
-            Ok(completion) => *completion,
-            Err(_) => {
-                warn!("evaluate engine received a non-evaluate scheme completion");
-                return;
-            }
-        };
+    pub(crate) async fn on_completion(&mut self, completion: WorkerCompletion) {
         let WorkerCompletion {
             execution_id,
             request_commitment,

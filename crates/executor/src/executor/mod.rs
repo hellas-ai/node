@@ -5,6 +5,8 @@ use crate::ExecutorError;
 #[cfg(feature = "evaluate")]
 use crate::PackageSource;
 #[cfg(feature = "evaluate")]
+use crate::worker::WorkerCompletion;
+#[cfg(feature = "evaluate")]
 use hellas_rpc::ExecutionPackageId;
 use hellas_rpc::pb::courtesy::{
     GetArtifactRequest, GetArtifactResponse, GetPackageStatsRequest, GetPackageStatsResponse,
@@ -102,7 +104,7 @@ pub(crate) enum ExecutorMessage {
         reply: oneshot::Sender<Result<ExecuteOutcome, ExecutorError>>,
     },
     #[cfg(feature = "evaluate")]
-    SchemeFinished(Box<dyn crate::scheme::SchemeCompletion>),
+    EvaluateFinished(Box<WorkerCompletion>),
     FetchFinished(FetchCompletion),
     ListPackages {
         reply: oneshot::Sender<Result<ListPackagesResponse, ExecutorError>>,

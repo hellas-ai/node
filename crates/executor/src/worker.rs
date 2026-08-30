@@ -201,7 +201,7 @@ fn worker_loop(
             }
         };
 
-        let _ = executor_tx.send(ExecutorMessage::SchemeFinished(Box::new(
+        let _ = executor_tx.send(ExecutorMessage::EvaluateFinished(Box::new(
             WorkerCompletion {
                 execution_id,
                 request_commitment,
