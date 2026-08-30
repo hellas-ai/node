@@ -306,7 +306,6 @@ fn evaluate_stop_reason(stop_reason: StopReason) -> EvaluateStopReason {
     match stop_reason {
         StopReason::StopToken => EvaluateStopReason::STOP_TOKEN,
         StopReason::MaxNewTokens => EvaluateStopReason::MAX_OUTPUT,
-        StopReason::Cancelled => unreachable!("cancellation is not a success terminal"),
     }
 }
 
@@ -627,45 +626,33 @@ impl SchemeEngine for EvaluateEngine {
                 stop_reason,
                 output_tokens,
                 output_events,
-            } => {
-                if stop_reason == StopReason::Cancelled {
+            } => match self
+                .completed_evaluate_termination(
+                    &evaluate_request,
+                    &invocation,
+                    stop_reason,
+                    output_tokens,
+                    output_events,
+                    prepared_artifacts.as_ref(),
+                )
+                .await
+            {
+                Ok((termination, billable_units)) => (termination, Some(billable_units)),
+                Err(err) => {
+                    let msg = format!("{err:#}");
+                    warn!(
+                        %execution_id,
+                        "execute worker failed while recording/signing output transcript"
+                    );
                     (
                         Termination::Failed {
                             position: generated,
-                            error: "execution cancelled".to_string(),
+                            error: msg,
                         },
                         None,
                     )
-                } else {
-                    match self
-                        .completed_evaluate_termination(
-                            &evaluate_request,
-                            &invocation,
-                            stop_reason,
-                            output_tokens,
-                            output_events,
-                            prepared_artifacts.as_ref(),
-                        )
-                        .await
-                    {
-                        Ok((termination, billable_units)) => (termination, Some(billable_units)),
-                        Err(err) => {
-                            let msg = format!("{err:#}");
-                            warn!(
-                                %execution_id,
-                                "execute worker failed while recording/signing output transcript"
-                            );
-                            (
-                                Termination::Failed {
-                                    position: generated,
-                                    error: msg,
-                                },
-                                None,
-                            )
-                        }
-                    }
                 }
-            }
+            },
             WorkerCompletionResult::Failed { position, error } => {
                 (Termination::Failed { position, error }, None)
             }

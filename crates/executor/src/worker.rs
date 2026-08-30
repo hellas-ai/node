@@ -16,7 +16,7 @@ use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::time::Instant;
 use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 use tracing::warn;
-use zeroize::Zeroize;
+use zeroize::Zeroizing;
 
 pub(crate) struct ExecuteWorker {
     tx: SyncSender<WorkerCommand>,
@@ -48,25 +48,6 @@ pub(crate) struct ExecuteJob {
     pub accepted_at: Instant,
     pub sender: tokio_mpsc::Sender<Result<PbWorkEvent, WireStatus>>,
     pub producer_key: Arc<ProducerSigningKey>,
-}
-
-struct GenerationOutcome {
-    stop_reason: StopReason,
-    output_tokens: Vec<u32>,
-}
-
-struct SensitiveInputIds(Vec<u32>);
-
-impl SensitiveInputIds {
-    fn new(input_ids: Vec<u32>) -> Self {
-        Self(input_ids)
-    }
-}
-
-impl Drop for SensitiveInputIds {
-    fn drop(&mut self) {
-        self.0.zeroize();
-    }
 }
 
 pub(crate) struct WorkerCompletion {
@@ -197,9 +178,9 @@ fn worker_loop(
         let termination = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run_job(job, on_progress, &mut runners)
         })) {
-            Ok(Ok(outcome)) => WorkerCompletionResult::Completed {
-                stop_reason: outcome.stop_reason,
-                output_tokens: outcome.output_tokens,
+            Ok(Ok((stop_reason, output_tokens))) => WorkerCompletionResult::Completed {
+                stop_reason,
+                output_tokens,
                 output_events,
             },
             Ok(Err(err)) => {
@@ -237,9 +218,9 @@ fn worker_loop(
 
 fn run_job(
     job: ExecuteJob,
-    mut on_progress: impl FnMut(u64, u32) -> Result<(), crate::ExecutorError>,
+    mut on_progress: impl FnMut(u32) -> Result<(), crate::ExecutorError>,
     runners: &mut HashMap<hellas_rpc::ExecutionPackageId, PackageRunner>,
-) -> Result<GenerationOutcome, crate::ExecutorError> {
+) -> Result<(StopReason, Vec<u32>), crate::ExecutorError> {
     let ExecuteJob {
         execution_id,
         locator,
@@ -259,17 +240,15 @@ fn run_job(
     let runner = runners.get(&locator.execution_package).ok_or_else(|| {
         crate::ExecutorError::PackageNotLoaded(locator.execution_package.to_string())
     })?;
-    let input_ids = SensitiveInputIds::new(invocation.input_ids);
-    let mut generated = 0u64;
+    let input_ids = Zeroizing::new(invocation.input_ids);
 
     let result = runner
         .generate_tokens_streaming(
-            &input_ids.0,
+            input_ids.as_slice(),
             invocation.max_new_tokens,
             &invocation.stop_token_ids,
             |token| {
-                generated += 1;
-                on_progress(generated, token)?;
+                on_progress(token)?;
                 Ok(GenerationControl::Continue)
             },
         )
@@ -281,13 +260,12 @@ fn run_job(
     let stop_reason = match result.termination {
         GenerationTermination::StopToken(_) => StopReason::StopToken,
         GenerationTermination::MaxNewTokens => StopReason::MaxNewTokens,
-        GenerationTermination::Cancelled => StopReason::Cancelled,
+        GenerationTermination::Cancelled => {
+            unreachable!("Hellas generation callback always returns Continue")
+        }
     };
 
-    Ok(GenerationOutcome {
-        stop_reason,
-        output_tokens: result.generated_tokens,
-    })
+    Ok((stop_reason, result.generated_tokens))
 }
 
 fn load_package(
@@ -318,8 +296,8 @@ fn make_on_progress<'a, 'b>(
     execution_id: String,
     output_builder: &'a mut EvaluateOutputTranscriptBuilder<'b>,
     output_events: &'a mut Vec<OutputEventEnvelope>,
-) -> impl FnMut(u64, u32) -> Result<(), crate::ExecutorError> + Send + 'a {
-    move |progress: u64, token_id: u32| {
+) -> impl FnMut(u32) -> Result<(), crate::ExecutorError> + Send + 'a {
+    move |token_id: u32| {
         // Leave one permit for the actor's terminal frame. Without this
         // reservation a perfectly bounded chunk stream can fill the channel
         // and make its own required terminal outcome impossible to deliver.
@@ -350,7 +328,7 @@ fn make_on_progress<'a, 'b>(
                 return Err(crate::ExecutorError::ChannelClosed);
             }
         }
-        *position = progress;
+        *position += 1;
         output_events.push(output_event);
         Ok(())
     }
@@ -388,8 +366,8 @@ mod tests {
             &mut output_events,
         );
 
-        progress(1, 11).unwrap();
-        let error = progress(2, 12).expect_err("the full channel must not block");
+        progress(11).unwrap();
+        let error = progress(12).expect_err("the full channel must not block");
         assert!(matches!(error, crate::ExecutorError::Execution(_)));
         drop(progress);
         assert_eq!(position, 1);

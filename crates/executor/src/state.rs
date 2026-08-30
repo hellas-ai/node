@@ -404,7 +404,6 @@ fn make_id(prefix: &str) -> String {
 pub enum StopReason {
     StopToken,
     MaxNewTokens,
-    Cancelled,
 }
 
 #[cfg(feature = "evaluate")]
