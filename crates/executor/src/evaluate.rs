@@ -5,6 +5,7 @@ use std::time::Instant;
 
 use crate::ExecutorError;
 use async_trait::async_trait;
+use hellas_rpc::ExecutionPackageId;
 use hellas_rpc::evaluate::{
     EvaluateOutputTranscriptBuilder, EvaluateStopReason, EvaluateTerminal, EvaluateUsage,
     input_commitment,
@@ -28,9 +29,8 @@ use crate::metrics::ExecutorMetrics;
 use crate::package::PackageSource;
 use crate::scheme::{SchemeEngine, SchemeJob, SchemeRunContext};
 use crate::state::{
-    ExecutorState, Invocation, LocalPackageStatus, PackageLocator, QUOTE_AMOUNT, QUOTE_TTL,
-    QuoteKind, QuotePlan, QuoteRecord, StopReason, Termination, evaluate_request_to_pb,
-    new_execution_id, quote_ticket,
+    ExecutorState, Invocation, LocalPackageStatus, QUOTE_AMOUNT, QUOTE_TTL, QuoteKind, QuotePlan,
+    QuoteRecord, StopReason, Termination, evaluate_request_to_pb, new_execution_id, quote_ticket,
 };
 use crate::worker::{
     EnqueueError, ExecuteJob, ExecuteWorker, WorkerCompletion, WorkerCompletionResult,
@@ -43,7 +43,7 @@ const COMPLETED_EXECUTION_CACHE_CAPACITY: usize = 1024;
 #[derive(Clone)]
 pub struct EvaluateJob {
     pub evaluate_request: EvaluateRequest,
-    pub locator: PackageLocator,
+    pub execution_package: ExecutionPackageId,
     pub invocation: Invocation,
     pub package_name: String,
     pub prepared_artifacts: Option<PreparedTextArtifacts>,
@@ -252,11 +252,12 @@ impl EvaluateEngine {
             .artifacts
             .resolve_evaluate_request(evaluate_request.clone())
             .await?;
-        let loaded = self.loaded_package_for(resolved.locator).ok_or_else(|| {
-            ExecutorError::PackageNotLoaded(resolved.locator.execution_package.to_string())
-        })?;
+        let execution_package = resolved.execution_package;
+        let loaded = self
+            .loaded_package_for(execution_package)
+            .ok_or_else(|| ExecutorError::PackageNotLoaded(execution_package.to_string()))?;
         loaded.validate_invocation(&resolved.invocation)?;
-        let execution_package = resolved.locator.execution_package.to_string();
+        let execution_package = execution_package.to_string();
         if !self
             .execute_policy
             .allows_execution_package(&execution_package)
@@ -266,25 +267,27 @@ impl EvaluateEngine {
             )));
         }
         let package_name = self
-            .package_names_for(resolved.locator)
+            .package_names_for(resolved.execution_package)
             .into_iter()
             .next()
             .expect("a resolved loaded package has at least one local alias");
         Ok(EvaluateJob {
             evaluate_request,
-            locator: resolved.locator,
+            execution_package: resolved.execution_package,
             invocation: resolved.invocation,
             package_name,
             prepared_artifacts: resolved.prepared_artifacts,
         })
     }
 
-    fn package_names_for(&self, locator: PackageLocator) -> Vec<String> {
+    fn package_names_for(&self, execution_package: ExecutionPackageId) -> Vec<String> {
         let mut names = self
             .packages
             .iter()
             .filter_map(|(name, status)| match status {
-                LocalPackageStatus::Ready(loaded) if loaded.locator == locator => {
+                LocalPackageStatus::Ready(loaded)
+                    if loaded.execution_package == execution_package =>
+                {
                     Some(name.clone())
                 }
                 LocalPackageStatus::Ready(_) | LocalPackageStatus::Failed(_) => None,
@@ -294,9 +297,14 @@ impl EvaluateEngine {
         names
     }
 
-    fn loaded_package_for(&self, locator: PackageLocator) -> Option<crate::state::LoadedPackage> {
+    fn loaded_package_for(
+        &self,
+        execution_package: ExecutionPackageId,
+    ) -> Option<crate::state::LoadedPackage> {
         self.packages.values().find_map(|status| match status {
-            LocalPackageStatus::Ready(loaded) if loaded.locator == locator => Some(*loaded),
+            LocalPackageStatus::Ready(loaded) if loaded.execution_package == execution_package => {
+                Some(*loaded)
+            }
             LocalPackageStatus::Ready(_) | LocalPackageStatus::Failed(_) => None,
         })
     }
@@ -364,13 +372,13 @@ impl SchemeEngine for EvaluateEngine {
                 return Err(ExecutorError::PackageNotLoaded(package_name.to_string()));
             }
         };
-        if !self.execute_policy.allows_execute(
-            &package.locator.execution_package.to_string(),
-            Some(&package_name),
-        ) {
+        if !self
+            .execute_policy
+            .allows_execute(&package.execution_package.to_string(), Some(&package_name))
+        {
             return Err(ExecutorError::PolicyDenied(format!(
                 "execute policy denied package {package_name} ({})",
-                package.locator.execution_package,
+                package.execution_package,
             )));
         }
         let plan = QuotePlan::from_tokens_request(request, package)?;
@@ -397,7 +405,7 @@ impl SchemeEngine for EvaluateEngine {
             runner_public_key: evaluate_request.runner_public_key,
             kind: QuoteKind::Scheme(Box::new(EvaluateJob {
                 evaluate_request,
-                locator: resolved.locator,
+                execution_package: resolved.execution_package,
                 invocation: resolved.invocation,
                 package_name,
                 prepared_artifacts: resolved.prepared_artifacts,
@@ -441,10 +449,10 @@ impl SchemeEngine for EvaluateEngine {
                     .insert(name.clone(), LocalPackageStatus::Ready(loaded));
                 info!(
                     package = %name,
-                    execution_package = %loaded.locator.execution_package,
+                    execution_package = %loaded.execution_package,
                     "loaded Catena package"
                 );
-                Ok(loaded.locator.execution_package)
+                Ok(loaded.execution_package)
             }
             Err(error) => {
                 self.packages
@@ -485,7 +493,7 @@ impl SchemeEngine for EvaluateEngine {
                 let (proto_status, execution_package, error) = match status {
                     LocalPackageStatus::Ready(loaded) => (
                         PackageStatus::Ready,
-                        loaded.locator.execution_package.as_bytes().to_vec(),
+                        loaded.execution_package.as_bytes().to_vec(),
                         String::new(),
                     ),
                     LocalPackageStatus::Failed(err) => {
@@ -514,7 +522,7 @@ impl SchemeEngine for EvaluateEngine {
             .map_err(|_| ExecutorError::InvalidQuoteRequest("scheme job type mismatch".into()))?;
         let EvaluateJob {
             evaluate_request,
-            locator,
+            execution_package,
             invocation,
             package_name,
             prepared_artifacts,
@@ -526,7 +534,7 @@ impl SchemeEngine for EvaluateEngine {
             request_commitment: ctx.request_commitment,
             package_name: package_name.clone(),
             evaluate_request,
-            locator,
+            execution_package,
             invocation,
             prepared_artifacts,
             accepted_at: Instant::now(),
@@ -743,12 +751,12 @@ mod tests {
         )
     }
 
-    fn artifact_plan(locator: PackageLocator) -> QuotePlan {
+    fn artifact_plan(execution_package: ExecutionPackageId) -> QuotePlan {
         QuotePlan {
-            locator,
+            execution_package,
             vocabulary_size: u64::from(u32::MAX) + 1,
             maximum_capacity: u64::MAX,
-            execution_environment: QuotePlan::execution_environment(locator),
+            execution_environment: QuotePlan::execution_environment(execution_package),
             invocation: Invocation {
                 input_ids: vec![1, 2, 3],
                 max_new_tokens: 8,
@@ -781,9 +789,7 @@ mod tests {
     fn token_quote_pins_the_exact_package_and_normalizes_stop_ids() {
         let actual = hellas_rpc::ExecutionPackageId::from_bytes([6; 32]);
         let loaded = crate::state::LoadedPackage {
-            locator: PackageLocator {
-                execution_package: actual,
-            },
+            execution_package: actual,
             vocabulary_size: 100,
             maximum_capacity: 100,
         };
@@ -801,7 +807,7 @@ mod tests {
     fn token_quote_defaults_only_an_absent_output_limit() {
         let execution_package = hellas_rpc::ExecutionPackageId::from_bytes([6; 32]);
         let loaded = crate::state::LoadedPackage {
-            locator: PackageLocator { execution_package },
+            execution_package,
             vocabulary_size: 100,
             maximum_capacity: 100,
         };
@@ -825,9 +831,7 @@ mod tests {
     fn token_quote_bounds_stop_policy_work_before_normalizing() {
         let actual = hellas_rpc::ExecutionPackageId::from_bytes([6; 32]);
         let loaded = crate::state::LoadedPackage {
-            locator: PackageLocator {
-                execution_package: actual,
-            },
+            execution_package: actual,
             vocabulary_size: 100,
             maximum_capacity: 100,
         };
@@ -946,10 +950,8 @@ mod tests {
     async fn quoting_an_artifact_bound_to_an_unloaded_package_is_refused() {
         let mut engine = test_engine(Arc::new(key(2)));
         let mut store = ExecutorState::new();
-        let locator = PackageLocator {
-            execution_package: hellas_rpc::ExecutionPackageId::from_bytes([6; 32]),
-        };
-        let plan = artifact_plan(locator);
+        let execution_package = hellas_rpc::ExecutionPackageId::from_bytes([6; 32]);
+        let plan = artifact_plan(execution_package);
         let recorded = engine
             .artifacts
             .record_prepared_text(&plan)
@@ -967,7 +969,7 @@ mod tests {
         match &err {
             ExecutorError::PackageNotLoaded(message) => {
                 assert!(
-                    message.contains(&locator.execution_package.to_string()),
+                    message.contains(&execution_package.to_string()),
                     "{message}"
                 );
             }
@@ -979,15 +981,13 @@ mod tests {
     async fn artifact_quote_requires_an_exact_id_policy_rule() {
         let mut engine = test_engine(Arc::new(key(2)));
         let mut store = ExecutorState::new();
-        let locator = PackageLocator {
-            execution_package: hellas_rpc::ExecutionPackageId::from_bytes([6; 32]),
-        };
-        let plan = artifact_plan(locator);
+        let execution_package = hellas_rpc::ExecutionPackageId::from_bytes([6; 32]);
+        let plan = artifact_plan(execution_package);
         let recorded = engine.artifacts.record_prepared_text(&plan).await.unwrap();
         engine.packages.insert(
             "smollm2-135m".to_string(),
             LocalPackageStatus::Ready(crate::state::LoadedPackage {
-                locator,
+                execution_package,
                 vocabulary_size: plan.vocabulary_size,
                 maximum_capacity: plan.maximum_capacity,
             }),
@@ -1003,9 +1003,7 @@ mod tests {
             .expect_err("an alias rule cannot authorize an alias-free artifact request");
         assert!(matches!(error, ExecutorError::PolicyDenied(_)));
 
-        engine.execute_policy = format!("allow(id/{})", locator.execution_package)
-            .parse()
-            .unwrap();
+        engine.execute_policy = format!("allow(id/{execution_package})").parse().unwrap();
         engine
             .quote_evaluate(
                 &mut store,

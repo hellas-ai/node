@@ -1,14 +1,14 @@
 use crate::artifacts::PreparedTextArtifacts;
 use crate::executor::ExecutorMessage;
 use crate::package::PackageSource;
-use crate::state::{Invocation, LoadedPackage, PackageLocator, StopReason};
+use crate::state::{Invocation, LoadedPackage, StopReason};
 use catena_runner::{GenerationControl, GenerationTermination, PackageRunner};
 use hellas_rpc::evaluate::{EvaluateOutputTranscriptBuilder, input_commitment};
 use hellas_rpc::pb::execute::{
     WorkChunk as PbChunk, WorkEvent as PbWorkEvent, work_event::Kind as PbEvent,
 };
 use hellas_rpc::stream::output_event_to_pb;
-use hellas_rpc::{EvaluateRequest, OutputEventEnvelope, ProducerSigningKey};
+use hellas_rpc::{EvaluateRequest, ExecutionPackageId, OutputEventEnvelope, ProducerSigningKey};
 use hellas_wire::WireStatus;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -42,7 +42,7 @@ pub(crate) struct ExecuteJob {
     pub request_commitment: [u8; 32],
     pub package_name: String,
     pub evaluate_request: EvaluateRequest,
-    pub locator: PackageLocator,
+    pub execution_package: ExecutionPackageId,
     pub invocation: Invocation,
     pub prepared_artifacts: Option<PreparedTextArtifacts>,
     pub accepted_at: Instant,
@@ -223,7 +223,7 @@ fn run_job(
 ) -> Result<(StopReason, Vec<u32>), crate::ExecutorError> {
     let ExecuteJob {
         execution_id,
-        locator,
+        execution_package,
         invocation,
         accepted_at,
         ..
@@ -237,9 +237,9 @@ fn run_job(
         "execute worker starting"
     );
 
-    let runner = runners.get(&locator.execution_package).ok_or_else(|| {
-        crate::ExecutorError::PackageNotLoaded(locator.execution_package.to_string())
-    })?;
+    let runner = runners
+        .get(&execution_package)
+        .ok_or_else(|| crate::ExecutorError::PackageNotLoaded(execution_package.to_string()))?;
     let input_ids = Zeroizing::new(invocation.input_ids);
 
     let result = runner
@@ -284,7 +284,7 @@ fn load_package(
         .get(&execution_package)
         .expect("package runner was inserted before describing it");
     Ok(LoadedPackage {
-        locator: PackageLocator { execution_package },
+        execution_package,
         vocabulary_size: runner.vocabulary_size(),
         maximum_capacity: runner.maximum_capacity(),
     })

@@ -34,15 +34,9 @@ pub(crate) const QUOTE_TTL: Duration = Duration::from_secs(30);
 pub(crate) const MAX_OUTSTANDING_QUOTES: usize = 1024;
 
 #[cfg(feature = "evaluate")]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct PackageLocator {
-    pub execution_package: ExecutionPackageId,
-}
-
-#[cfg(feature = "evaluate")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct LoadedPackage {
-    pub locator: PackageLocator,
+    pub execution_package: ExecutionPackageId,
     pub vocabulary_size: u64,
     pub maximum_capacity: u64,
 }
@@ -64,7 +58,7 @@ pub struct Invocation {
 
 #[cfg(feature = "evaluate")]
 pub(crate) struct QuotePlan {
-    pub locator: PackageLocator,
+    pub execution_package: ExecutionPackageId,
     pub vocabulary_size: u64,
     pub maximum_capacity: u64,
     pub execution_environment: ContentId,
@@ -84,11 +78,8 @@ impl QuotePlan {
     /// The Hellas content ID binding the exact verified Catena execution
     /// package. This is pure and cheap: package bytes were verified once by
     /// the owner-only loading path, never while handling an RPC.
-    pub(crate) fn execution_environment(locator: PackageLocator) -> ContentId {
-        ProgramManifest::Evaluate(EvaluateProgramManifest {
-            execution_package: locator.execution_package,
-        })
-        .content_id()
+    pub(crate) fn execution_environment(execution_package: ExecutionPackageId) -> ContentId {
+        ProgramManifest::Evaluate(EvaluateProgramManifest { execution_package }).content_id()
     }
 
     /// Builds a token-native quote after the peer-supplied package alias has
@@ -101,10 +92,10 @@ impl QuotePlan {
             &request.execution_package,
             "execution_package",
         )?);
-        if requested_package != package.locator.execution_package {
+        if requested_package != package.execution_package {
             return Err(ExecutorError::InvalidQuoteRequest(format!(
                 "package alias resolved to {}, but caller pinned {requested_package}",
-                package.locator.execution_package
+                package.execution_package
             )));
         }
         let max_new_tokens = request.max_new_tokens.unwrap_or(DEFAULT_MAX_NEW_TOKENS);
@@ -132,9 +123,9 @@ impl QuotePlan {
         let assurance = hellas_rpc::run_ticket::assurance_from_pb(request.assurance)
             .map_err(|err| ExecutorError::InvalidQuoteRequest(err.to_string()))?;
         let retention = Retention::from_retain(request.retain.unwrap_or(true));
-        let execution_environment = Self::execution_environment(package.locator);
+        let execution_environment = Self::execution_environment(package.execution_package);
         let plan = Self {
-            locator: package.locator,
+            execution_package: package.execution_package,
             vocabulary_size: package.vocabulary_size,
             maximum_capacity: package.maximum_capacity,
             execution_environment,

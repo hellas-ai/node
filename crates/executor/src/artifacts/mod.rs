@@ -2,10 +2,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::ExecutorError;
-use hellas_rpc::{ContentId, Digest, EvaluateRequest};
+use hellas_rpc::{ContentId, Digest, EvaluateRequest, ExecutionPackageId};
 
 use crate::artifact_store::{ArtifactStorage, ArtifactStoreConfig};
-use crate::state::{Invocation, PackageLocator, QuotePlan};
+use crate::state::{Invocation, QuotePlan};
 
 use hellas_rpc::protocol::artifacts::{
     BoundTermId, Canonical, CanonicalDecode, InputAddressed, OutputAddressed, SourceRef,
@@ -20,7 +20,7 @@ const MAX_TEXT_ARTIFACT_CHAIN_DEPTH: usize = 1024;
 #[derive(Clone, Debug)]
 pub(crate) struct ResolvedEvaluateExecution {
     pub evaluate_request: EvaluateRequest,
-    pub locator: PackageLocator,
+    pub execution_package: ExecutionPackageId,
     pub invocation: Invocation,
     pub prepared_artifacts: Option<PreparedTextArtifacts>,
 }
@@ -47,7 +47,7 @@ pub(crate) struct EvaluateArtifactStore {
 }
 
 struct MaterializedTextSource {
-    locator: PackageLocator,
+    execution_package: ExecutionPackageId,
     execution_environment: hellas_rpc::ContentId,
     tokens: Vec<u32>,
 }
@@ -207,7 +207,7 @@ impl EvaluateArtifactStore {
             Some(artifact_id) => {
                 let artifact_id = TextArtifactId::from_digest(artifact_id);
                 let source = self.materialize_artifact(artifact_id).await?;
-                if source.locator != plan.locator
+                if source.execution_package != plan.execution_package
                     || source.execution_environment != execution_environment
                 {
                     return Err(ExecutorError::InvalidQuoteRequest(
@@ -217,8 +217,7 @@ impl EvaluateArtifactStore {
                 (SourceRef::output(artifact_id), source.tokens, None)
             }
             None => {
-                let identity =
-                    TextArtifact::identity(bound_term_id, plan.locator.execution_package);
+                let identity = TextArtifact::identity(bound_term_id, plan.execution_package);
                 let identity_id = identity.output_id();
                 (SourceRef::output(identity_id), Vec::new(), Some(identity))
             }
@@ -249,7 +248,7 @@ impl EvaluateArtifactStore {
 
         Ok(ResolvedEvaluateExecution {
             evaluate_request,
-            locator: plan.locator,
+            execution_package: plan.execution_package,
             invocation,
             prepared_artifacts: Some(PreparedTextArtifacts {
                 identity: identity_to_insert,
@@ -315,7 +314,7 @@ impl EvaluateArtifactStore {
 
         Ok(ResolvedEvaluateExecution {
             evaluate_request,
-            locator: source.locator,
+            execution_package: source.execution_package,
             invocation: Invocation {
                 input_ids,
                 max_new_tokens: policy.max_new_tokens(),
@@ -431,7 +430,7 @@ impl EvaluateArtifactStore {
         let mut visited_artifacts = HashSet::new();
         let mut visited_executions = HashSet::new();
         let mut steps = Vec::new();
-        let (locator, execution_environment) = loop {
+        let (execution_package, execution_environment) = loop {
             if !visited_artifacts.insert(current) {
                 return Err(ExecutorError::InvalidQuoteRequest(format!(
                     "evaluate artifact graph contains a cycle at {current}"
@@ -443,15 +442,15 @@ impl EvaluateArtifactStore {
                     bound_term,
                     execution_package,
                 } => {
-                    let locator = PackageLocator { execution_package };
                     let execution_environment = ContentId::from_bytes(*bound_term.as_bytes());
-                    if execution_environment != QuotePlan::execution_environment(locator) {
+                    if execution_environment != QuotePlan::execution_environment(execution_package)
+                    {
                         return Err(ExecutorError::InvalidQuoteRequest(
                             "identity artifact bound term does not match its Catena package"
                                 .to_string(),
                         ));
                     }
-                    break (locator, execution_environment);
+                    break (execution_package, execution_environment);
                 }
                 TextArtifact::Output(output) => {
                     if steps.len() >= MAX_TEXT_ARTIFACT_CHAIN_DEPTH {
@@ -512,7 +511,7 @@ impl EvaluateArtifactStore {
         }
 
         Ok(MaterializedTextSource {
-            locator,
+            execution_package,
             execution_environment,
             tokens,
         })
@@ -754,14 +753,12 @@ mod tests {
     }
 
     fn plan() -> QuotePlan {
-        let locator = PackageLocator {
-            execution_package: ExecutionPackageId::from_bytes([8; 32]),
-        };
+        let execution_package = ExecutionPackageId::from_bytes([8; 32]);
         QuotePlan {
-            locator,
+            execution_package,
             vocabulary_size: u64::from(u32::MAX) + 1,
             maximum_capacity: u64::MAX,
-            execution_environment: QuotePlan::execution_environment(locator),
+            execution_environment: QuotePlan::execution_environment(execution_package),
             invocation: Invocation {
                 input_ids: vec![1, 2, 3],
                 max_new_tokens: 8,
@@ -784,7 +781,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(resolved.evaluate_request, recorded.evaluate_request);
-        assert_eq!(resolved.locator, recorded.locator);
+        assert_eq!(resolved.execution_package, recorded.execution_package);
         assert_eq!(resolved.invocation.input_ids, recorded.invocation.input_ids);
         assert_eq!(
             resolved.invocation.max_new_tokens,
@@ -863,8 +860,8 @@ mod tests {
     async fn followup_rejects_an_artifact_from_another_package() {
         let mut store = EvaluateArtifactStore::default();
         let mut other = plan();
-        other.locator.execution_package = ExecutionPackageId::from_bytes([9; 32]);
-        other.execution_environment = QuotePlan::execution_environment(other.locator);
+        other.execution_package = ExecutionPackageId::from_bytes([9; 32]);
+        other.execution_environment = QuotePlan::execution_environment(other.execution_package);
         let first = store.record_prepared_text(&other).await.unwrap();
         let first_artifact = store
             .record_completed_text(&first.evaluate_request, &first.invocation, &[10, 11])
