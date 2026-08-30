@@ -46,6 +46,7 @@ pub struct EvaluateChunkVerifier {
     max_output_tokens: u64,
     assurance: Assurance,
     events: Vec<OutputEventEnvelope>,
+    finalized: bool,
 }
 
 impl EvaluateChunkVerifier {
@@ -66,6 +67,7 @@ impl EvaluateChunkVerifier {
             max_output_tokens: u64::from(max_output_tokens),
             assurance,
             events: Vec::new(),
+            finalized: false,
         }
     }
 
@@ -77,6 +79,7 @@ impl EvaluateChunkVerifier {
         &mut self,
         event: OutputEventEnvelope,
     ) -> ClientResult<(u64, EvaluateTokenDelta)> {
+        self.ensure_active()?;
         let public_key = *event.event().public_key();
         if public_key != self.expected_producer_key {
             return Err(ClientError::protocol(
@@ -154,9 +157,10 @@ impl EvaluateChunkVerifier {
     }
 
     pub fn verify_terminal(
-        &self,
+        &mut self,
         output_events: &[OutputEventEnvelope],
     ) -> ClientResult<EvaluateOutput> {
+        self.ensure_active()?;
         let first = output_events.first().ok_or_else(|| {
             ClientError::protocol("evaluate terminal transcript must not be empty")
         })?;
@@ -188,7 +192,28 @@ impl EvaluateChunkVerifier {
         )
         .map_err(|source| ClientError::EvaluateTranscript { source })?;
         self.ensure_output_position(output.terminal.final_position)?;
+        self.finalized = true;
         Ok(output)
+    }
+
+    fn verify_failure(&mut self, position: u64) -> ClientResult<()> {
+        self.ensure_active()?;
+        self.ensure_output_position(position)?;
+        if position != self.next_position {
+            return Err(ClientError::protocol(format!(
+                "evaluate failure position mismatch: expected {}, got {position}",
+                self.next_position
+            )));
+        }
+        self.finalized = true;
+        Ok(())
+    }
+
+    fn ensure_active(&self) -> ClientResult<()> {
+        if self.finalized {
+            return Err(ClientError::protocol("evaluate stream already finalized"));
+        }
+        Ok(())
     }
 
     fn ensure_output_position(&self, position: u64) -> ClientResult<()> {
@@ -231,6 +256,7 @@ pub fn verify_evaluate_work_event(
     let Some(event) = event.kind else {
         return Err(ClientError::protocol("wire event with no body"));
     };
+    verifier.ensure_active()?;
     match event {
         work_event::Kind::Chunk(chunk) => {
             let output_event = chunk.output_event.ok_or_else(|| {
@@ -261,6 +287,7 @@ pub fn verify_evaluate_work_event(
             }))
         }
         work_event::Kind::Failed(failed) => {
+            verifier.verify_failure(failed.position)?;
             Ok(EvaluateExecutionEvent::Done(EvaluateOutcome::Failed {
                 position: failed.position,
                 error: failed.error,
@@ -276,7 +303,7 @@ mod tests {
         EvaluateOutputTranscriptBuilder, EvaluateProtocolError, EvaluateStopReason,
         EvaluateTerminal, EvaluateUsage, input_commitment,
     };
-    use hellas_rpc::pb::execute::{WorkChunk, WorkEvent, WorkFinished, work_event};
+    use hellas_rpc::pb::execute::{WorkChunk, WorkEvent, WorkFailed, WorkFinished, work_event};
     use hellas_rpc::stream::output_event_to_pb;
     use hellas_rpc::{
         ContentId, EvaluateRequest, ProducerSigningKey, Signature, SignedOutputEvent,
@@ -371,7 +398,7 @@ mod tests {
             })
             .unwrap();
 
-        let wrong_producer =
+        let mut wrong_producer =
             EvaluateChunkVerifier::new(input, TEST_ASSURANCE, other.public_key(), 2);
         assert!(
             wrong_producer
@@ -382,7 +409,7 @@ mod tests {
         );
 
         let other_input = InputCommitment::from_digest(Digest::from_bytes([6; 32]));
-        let wrong_input =
+        let mut wrong_input =
             EvaluateChunkVerifier::new(other_input, TEST_ASSURANCE, producer.public_key(), 2);
         assert!(
             wrong_input
@@ -392,7 +419,8 @@ mod tests {
                 .contains("input commitment mismatch")
         );
 
-        let too_small = EvaluateChunkVerifier::new(input, TEST_ASSURANCE, producer.public_key(), 1);
+        let mut too_small =
+            EvaluateChunkVerifier::new(input, TEST_ASSURANCE, producer.public_key(), 1);
         assert!(
             too_small
                 .verify_terminal(&output_events)
@@ -401,7 +429,8 @@ mod tests {
                 .contains("exceeds requested maximum 1")
         );
 
-        let verifier = EvaluateChunkVerifier::new(input, TEST_ASSURANCE, producer.public_key(), 2);
+        let mut verifier =
+            EvaluateChunkVerifier::new(input, TEST_ASSURANCE, producer.public_key(), 2);
         assert_eq!(
             verifier
                 .verify_terminal(&output_events)
@@ -527,5 +556,176 @@ mod tests {
             event,
             EvaluateExecutionEvent::Done(EvaluateOutcome::Completed { .. })
         ));
+    }
+
+    #[test]
+    fn finished_latch_is_atomic_and_rejects_later_events() {
+        let producer = key(2);
+        let input = InputCommitment::from_digest(Digest::from_bytes([4; 32]));
+        let mut builder = EvaluateOutputTranscriptBuilder::new(input, TEST_ASSURANCE, &producer);
+        let chunk = builder.push_token_delta(vec![10]).unwrap();
+        let output_events = builder
+            .finish(EvaluateTerminal {
+                final_position: 1,
+                stop_reason: EvaluateStopReason::MAX_OUTPUT,
+                text_artifact: Digest::from_bytes([5; 32]),
+                usage: EvaluateUsage {
+                    input_units: 3,
+                    output_units: 1,
+                },
+                billable_units: 4,
+            })
+            .unwrap();
+        let mut verifier =
+            EvaluateChunkVerifier::new(input, TEST_ASSURANCE, producer.public_key(), 1);
+
+        verify_evaluate_work_event(
+            &mut verifier,
+            WorkEvent {
+                kind: Some(work_event::Kind::Chunk(WorkChunk {
+                    output_event: Some(output_event_to_pb(&chunk)),
+                })),
+            },
+            input,
+        )
+        .unwrap();
+
+        let malformed = verify_evaluate_work_event(
+            &mut verifier,
+            WorkEvent {
+                kind: Some(work_event::Kind::Finished(WorkFinished {
+                    output_events: Vec::new(),
+                    assurance_evidence: Vec::new(),
+                })),
+            },
+            input,
+        )
+        .unwrap_err();
+        assert!(malformed.to_string().contains("must not be empty"));
+
+        let completed = verify_evaluate_work_event(
+            &mut verifier,
+            WorkEvent {
+                kind: Some(work_event::Kind::Finished(WorkFinished {
+                    output_events: output_events.iter().map(output_event_to_pb).collect(),
+                    assurance_evidence: Vec::new(),
+                })),
+            },
+            input,
+        )
+        .unwrap();
+        assert!(matches!(
+            completed,
+            EvaluateExecutionEvent::Done(EvaluateOutcome::Completed { .. })
+        ));
+
+        let second_terminal = verify_evaluate_work_event(
+            &mut verifier,
+            WorkEvent {
+                kind: Some(work_event::Kind::Finished(WorkFinished {
+                    output_events: output_events.iter().map(output_event_to_pb).collect(),
+                    assurance_evidence: Vec::new(),
+                })),
+            },
+            input,
+        )
+        .unwrap_err();
+        assert!(second_terminal.to_string().contains("already finalized"));
+
+        let later_chunk = verify_evaluate_work_event(
+            &mut verifier,
+            WorkEvent {
+                kind: Some(work_event::Kind::Chunk(WorkChunk {
+                    output_event: Some(output_event_to_pb(&chunk)),
+                })),
+            },
+            input,
+        )
+        .unwrap_err();
+        assert!(later_chunk.to_string().contains("already finalized"));
+    }
+
+    #[test]
+    fn work_failed_position_must_match_prefix_and_consumes_terminal_latch() {
+        let producer = key(2);
+        let input = InputCommitment::from_digest(Digest::from_bytes([4; 32]));
+        let chunk = EvaluateOutputTranscriptBuilder::new(input, TEST_ASSURANCE, &producer)
+            .push_token_delta(vec![10])
+            .unwrap();
+        let mut verifier =
+            EvaluateChunkVerifier::new(input, TEST_ASSURANCE, producer.public_key(), 2);
+
+        verify_evaluate_work_event(
+            &mut verifier,
+            WorkEvent {
+                kind: Some(work_event::Kind::Chunk(WorkChunk {
+                    output_event: Some(output_event_to_pb(&chunk)),
+                })),
+            },
+            input,
+        )
+        .unwrap();
+
+        let wrong_position = verify_evaluate_work_event(
+            &mut verifier,
+            WorkEvent {
+                kind: Some(work_event::Kind::Failed(WorkFailed {
+                    position: 0,
+                    error: "wrong position".to_string(),
+                })),
+            },
+            input,
+        )
+        .unwrap_err();
+        assert!(wrong_position.to_string().contains("expected 1, got 0"));
+
+        let over_limit = verify_evaluate_work_event(
+            &mut verifier,
+            WorkEvent {
+                kind: Some(work_event::Kind::Failed(WorkFailed {
+                    position: 3,
+                    error: "over limit".to_string(),
+                })),
+            },
+            input,
+        )
+        .unwrap_err();
+        assert!(
+            over_limit
+                .to_string()
+                .contains("exceeds requested maximum 2")
+        );
+
+        let failed = verify_evaluate_work_event(
+            &mut verifier,
+            WorkEvent {
+                kind: Some(work_event::Kind::Failed(WorkFailed {
+                    position: 1,
+                    error: "worker stopped".to_string(),
+                })),
+            },
+            input,
+        )
+        .unwrap();
+        assert!(matches!(
+            failed,
+            EvaluateExecutionEvent::Done(EvaluateOutcome::Failed {
+                position: 1,
+                ref error
+            }) if error == "worker stopped"
+        ));
+
+        let second_terminal = verify_evaluate_work_event(
+            &mut verifier,
+            WorkEvent {
+                kind: Some(work_event::Kind::Finished(WorkFinished {
+                    output_events: Vec::new(),
+                    assurance_evidence: Vec::new(),
+                })),
+            },
+            input,
+        )
+        .unwrap_err();
+        assert!(second_terminal.to_string().contains("already finalized"));
     }
 }
