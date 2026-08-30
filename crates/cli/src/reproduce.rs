@@ -152,29 +152,20 @@ mod tests {
         PreparedPaidInputV1, SourceRef, TextArtifact, TextExecution, TextPolicy, TokenIds,
     };
     use hellas_rpc::{
-        Assurance, ContentId, EvaluateProgramManifest, EvaluateRequest, ProducerSigningKey,
-        ProgramManifest,
+        Assurance, EvaluateProgramManifest, EvaluateRequest, ExecutionPackageId,
+        ProducerSigningKey, ProgramManifest,
     };
 
     fn manifest() -> ProgramManifest {
         ProgramManifest::Evaluate(EvaluateProgramManifest {
-            weights: vec![ContentId::from_bytes([0x11; 32])],
-            graph: ContentId::from_bytes([0x12; 32]),
-            config: ContentId::from_bytes([0x13; 32]),
-            tokenizer: ContentId::from_bytes([0x14; 32]),
-            resolved_revision: "main".into(),
-            numeric_profile: "f32-cpu".into(),
-            backend_profile: "catena-v1".into(),
-            build: ContentId::from_bytes([0x15; 32]),
+            execution_package: ExecutionPackageId::from_bytes([0x16; 32]),
         })
     }
 
     fn identity_artifact() -> TextArtifact {
         TextArtifact::identity(
             BoundTermId::from_digest(manifest().content_id().digest()),
-            "test-model",
-            "main",
-            "f32",
+            ExecutionPackageId::from_bytes([0x16; 32]),
         )
     }
 

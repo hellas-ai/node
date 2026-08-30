@@ -36,7 +36,7 @@ use hellas_rpc::protocol::work_setup::{
     ObservedChannel, OmissionMeasurements, ReadyChannel, WorkChannelConfig, WorkChannelDescriptor,
     payment_terms_hash,
 };
-use hellas_rpc::protocol::{ContentId, Digest};
+use hellas_rpc::protocol::Digest;
 use hellas_rpc::services::work::{Work, WorkServer};
 use hellas_rpc::work::{
     ClientEndpoint, EndpointError, JobProposal, ProposeError, ProviderEndpoint, WorkRefusal,
@@ -50,7 +50,8 @@ use hellas_rpc::work_store::{
     TerminalOutcome,
 };
 use hellas_rpc::{
-    Assurance, Evaluate, EvaluateProgramManifest, EvaluateRequest, ProgramManifest, PublicKey,
+    Assurance, Evaluate, EvaluateProgramManifest, EvaluateRequest, ExecutionPackageId,
+    ProgramManifest, PublicKey,
 };
 use hellas_wire::mux::{MessagePipe, MuxConfig, MuxTransport, Role as MuxRole};
 use hellas_wire::{DefaultClock, Dispatcher, ServiceMarker, StreamTransport};
@@ -313,14 +314,7 @@ fn provider_endpoint(root: &std::path::Path) -> ProviderEndpoint {
 
 fn manifest() -> ProgramManifest {
     ProgramManifest::Evaluate(EvaluateProgramManifest {
-        weights: vec![ContentId::from_bytes([0x11; 32])],
-        graph: ContentId::from_bytes([0x12; 32]),
-        config: ContentId::from_bytes([0x13; 32]),
-        tokenizer: ContentId::from_bytes([0x14; 32]),
-        resolved_revision: "main".into(),
-        numeric_profile: "f32-cpu".into(),
-        backend_profile: "catena-v1".into(),
-        build: ContentId::from_bytes([0x15; 32]),
+        execution_package: ExecutionPackageId::from_bytes([0x16; 32]),
     })
 }
 
@@ -335,9 +329,7 @@ fn text_policy() -> TextPolicy {
 fn identity_artifact() -> TextArtifact {
     TextArtifact::identity(
         BoundTermId::from_digest(manifest().content_id().digest()),
-        "test-model",
-        "main",
-        "f32",
+        ExecutionPackageId::from_bytes([0x16; 32]),
     )
 }
 

@@ -1056,7 +1056,7 @@ mod tests {
                 "7820",
                 "68656c6c61732e6576616c756174652e736f757263652e6f75747075742e7631",
                 "5820",
-                "f343b61a66133adec0c1c8ebee47989b00eb65a6db9b2dc63d743d9329515e1e",
+                "810baa4e4f998b88a46b3140d1601a16d7d4f5b8ea71057a137c6cd14f9f023d",
                 "5820",
                 "2ea3d70455fb7c175feeffc0a307b7c97fb60980926e66118b8baf8fd0cd6db2",
                 "5820",
@@ -1077,7 +1077,7 @@ mod tests {
                 "7827",
                 "68656c6c61732e6576616c756174652e746578742e61727469666163742e6f75747075742e7631",
                 "5820",
-                "6d0ea1474c6b42b534024ba508d444fc0fd7c1db10243cd7d289711523775cfd",
+                "a81853afe18adf094c2dc1fe000d894ab167dda735b4d03341bff43e085cba31",
                 "03", // position
                 "5820",
                 "4a7cc97833bc25d2340ce377de92c012f336858cfeb8e2859f67fd12975916b8",
@@ -1088,11 +1088,11 @@ mod tests {
 
         assert_eq!(
             hex(identity.output_id().as_bytes()),
-            "f343b61a66133adec0c1c8ebee47989b00eb65a6db9b2dc63d743d9329515e1e"
+            "810baa4e4f998b88a46b3140d1601a16d7d4f5b8ea71057a137c6cd14f9f023d"
         );
         assert_eq!(
             hex(execution.input_id().as_bytes()),
-            "6d0ea1474c6b42b534024ba508d444fc0fd7c1db10243cd7d289711523775cfd"
+            "a81853afe18adf094c2dc1fe000d894ab167dda735b4d03341bff43e085cba31"
         );
     }
 

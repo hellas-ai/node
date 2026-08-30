@@ -28,15 +28,15 @@ use hellas_rpc::protocol::work::{
     payment_binding_digest, prepared_input_digest, private_policy_commitment, result_digest,
     terminal_result, work_id,
 };
-use hellas_rpc::protocol::{ContentId, Digest};
+use hellas_rpc::protocol::Digest;
 use hellas_rpc::work_store::journal::{Journal, JournalError, JournalId, JournalKind};
 use hellas_rpc::work_store::{
     ChannelRecord, ChannelStateError, ChannelStore, JobPhase, JobState, Role, SetupOrigin,
     TerminalOutcome, WorkStoreError,
 };
 use hellas_rpc::{
-    Assurance, Evaluate, EvaluateProgramManifest, EvaluateRequest, OutputEventEnvelope,
-    ProducerSigningKey, ProgramManifest, PublicKey,
+    Assurance, Evaluate, EvaluateProgramManifest, EvaluateRequest, ExecutionPackageId,
+    OutputEventEnvelope, ProducerSigningKey, ProgramManifest, PublicKey,
 };
 
 // ── Fixture ───────────────────────────────────────────────────────────
@@ -178,14 +178,7 @@ fn payload(digest: Digest) -> PayloadHash {
 
 fn manifest() -> ProgramManifest {
     ProgramManifest::Evaluate(EvaluateProgramManifest {
-        weights: vec![ContentId::from_bytes([0x11; 32])],
-        graph: ContentId::from_bytes([0x12; 32]),
-        config: ContentId::from_bytes([0x13; 32]),
-        tokenizer: ContentId::from_bytes([0x14; 32]),
-        resolved_revision: "main".into(),
-        numeric_profile: "f32-cpu".into(),
-        backend_profile: "catena-v1".into(),
-        build: ContentId::from_bytes([0x15; 32]),
+        execution_package: ExecutionPackageId::from_bytes([0x16; 32]),
     })
 }
 
@@ -200,9 +193,7 @@ fn text_policy() -> TextPolicy {
 fn identity_artifact() -> TextArtifact {
     TextArtifact::identity(
         BoundTermId::from_digest(manifest().content_id().digest()),
-        "test-model",
-        "main",
-        "f32",
+        ExecutionPackageId::from_bytes([0x16; 32]),
     )
 }
 

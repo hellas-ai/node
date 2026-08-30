@@ -30,8 +30,8 @@ use hellas_rpc::protocol::work::{
     propose_authorization, terminal_result, work_id,
 };
 use hellas_rpc::{
-    Assurance, ContentId, Digest, EvaluateProgramManifest, EvaluateRequest, OutputEventEnvelope,
-    ProducerSigningKey, ProgramManifest, PublicKey,
+    Assurance, ContentId, Digest, EvaluateProgramManifest, EvaluateRequest, ExecutionPackageId,
+    OutputEventEnvelope, ProducerSigningKey, ProgramManifest, PublicKey,
 };
 
 // ── Fixture ───────────────────────────────────────────────────────────
@@ -43,9 +43,7 @@ const HORIZON: u64 = 500;
 const PROMPT: [u32; 4] = [9, 8, 7, 6];
 /// The answer an honest provider returns for it.
 const ANSWER: [u32; 3] = [101, 102, 103];
-const MODEL: &str = "test-model";
-const REVISION: &str = "main";
-const DTYPE: &str = "f32";
+const EXECUTION_PACKAGE: ExecutionPackageId = ExecutionPackageId::from_bytes([0x16; 32]);
 const MAX_NEW_TOKENS: u32 = 64;
 const STOP_TOKENS: [u32; 2] = [1, 2];
 
@@ -119,23 +117,14 @@ fn channel() -> PaidChannel {
 
 fn manifest() -> ProgramManifest {
     ProgramManifest::Evaluate(EvaluateProgramManifest {
-        weights: vec![ContentId::from_bytes([0x11; 32])],
-        graph: ContentId::from_bytes([0x12; 32]),
-        config: ContentId::from_bytes([0x13; 32]),
-        tokenizer: ContentId::from_bytes([0x14; 32]),
-        resolved_revision: REVISION.into(),
-        numeric_profile: "f32-cpu".into(),
-        backend_profile: "catena-v1".into(),
-        build: ContentId::from_bytes([0x15; 32]),
+        execution_package: EXECUTION_PACKAGE,
     })
 }
 
 fn identity_artifact() -> TextArtifact {
     TextArtifact::identity(
         BoundTermId::from_digest(manifest().content_id().digest()),
-        MODEL,
-        REVISION,
-        DTYPE,
+        EXECUTION_PACKAGE,
     )
 }
 
@@ -345,9 +334,7 @@ fn the_question_comes_from_the_accepted_bundle() {
     let Ok(plan) = plan(&bundle()) else {
         panic!("the fixture bundle plans");
     };
-    assert_eq!(plan.model_id, MODEL);
-    assert_eq!(plan.revision, REVISION);
-    assert_eq!(plan.dtype, DTYPE);
+    assert_eq!(plan.execution_package, EXECUTION_PACKAGE);
     assert_eq!(plan.environment, manifest().content_id());
     assert_eq!(plan.prompt_token_ids, PROMPT);
     assert_eq!(plan.max_new_tokens, MAX_NEW_TOKENS);

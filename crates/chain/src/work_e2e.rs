@@ -133,8 +133,8 @@ use hellas_rpc::work_handshake::{PaymentAdmission, SetupEndpoint, SetupService};
 use hellas_rpc::work_open::{SetupAdvance, SetupProgress, SetupStep, advance_setup};
 use hellas_rpc::work_store::{Role, SetupOrigin, SetupScan, SetupStore};
 use hellas_rpc::{
-    Assurance, EvaluateProgramManifest, EvaluateRequest, OutputEventEnvelope, ProducerSigningKey,
-    ProgramManifest, PublicKey as RpcPublicKey,
+    Assurance, EvaluateProgramManifest, EvaluateRequest, ExecutionPackageId, OutputEventEnvelope,
+    ProducerSigningKey, ProgramManifest, PublicKey as RpcPublicKey,
 };
 use hellas_wire::mux::{MessagePipe, MuxConfig, MuxTransport, Role as MuxRole};
 use hellas_wire::{DefaultClock, Dispatcher, StreamTransport as _, TransportContext};
@@ -1016,14 +1016,7 @@ fn transcript_for(
 
 fn manifest() -> ProgramManifest {
     ProgramManifest::Evaluate(EvaluateProgramManifest {
-        weights: vec![ContentId::from_bytes([0x11; 32])],
-        graph: ContentId::from_bytes([0x12; 32]),
-        config: ContentId::from_bytes([0x13; 32]),
-        tokenizer: ContentId::from_bytes([0x14; 32]),
-        resolved_revision: "main".into(),
-        numeric_profile: "f32-cpu".into(),
-        backend_profile: "catena-v1".into(),
-        build: ContentId::from_bytes([0x15; 32]),
+        execution_package: ExecutionPackageId::from_bytes([0x16; 32]),
     })
 }
 
@@ -1038,9 +1031,7 @@ fn text_policy() -> TextPolicy {
 fn identity_artifact() -> TextArtifact {
     TextArtifact::identity(
         BoundTermId::from_digest(manifest().content_id().digest()),
-        "test-model",
-        "main",
-        "f32",
+        ExecutionPackageId::from_bytes([0x16; 32]),
     )
 }
 

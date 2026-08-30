@@ -56,7 +56,7 @@ use hellas_rpc::protocol::artifacts::{
     OutputAddressed as _, PreparedPaidInputV1, TextArtifact, TextExecutionId, completed_text,
 };
 use hellas_rpc::protocol::work::{PaidJobResultV1, canonical_output_digest};
-use hellas_rpc::{ContentId, Digest};
+use hellas_rpc::{ContentId, Digest, ExecutionPackageId};
 
 /// Why a result could not be reproduced at all.
 ///
@@ -92,12 +92,8 @@ pub enum ReproduceFault {
 /// clients holding the same authorization ask the same question.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReproductionRequest {
-    /// The model the identity artifact names.
-    pub model_id: String,
-    /// The revision of it.
-    pub revision: String,
-    /// The numeric type it runs in.
-    pub dtype: String,
+    /// The exact verified Catena execution package the identity artifact names.
+    pub execution_package: ExecutionPackageId,
     /// The environment manifest the execution is bound to.
     pub environment: ContentId,
     /// The whole prompt, in token ids.
@@ -173,10 +169,7 @@ pub fn plan(bundle: &PreparedPaidInputV1) -> Result<ReproductionRequest, Reprodu
         .parts()
         .map_err(|error| ReproduceFault::Body(error.to_string()))?;
     let TextArtifact::Identity {
-        model_id,
-        revision,
-        dtype,
-        ..
+        execution_package, ..
     } = &parts.identity_artifact
     else {
         return Err(ReproduceFault::Unsupported {
@@ -184,9 +177,7 @@ pub fn plan(bundle: &PreparedPaidInputV1) -> Result<ReproductionRequest, Reprodu
         });
     };
     Ok(ReproductionRequest {
-        model_id: model_id.clone(),
-        revision: revision.clone(),
-        dtype: dtype.clone(),
+        execution_package: *execution_package,
         environment: parts.evaluate_request.execution_environment,
         prompt_token_ids: parts
             .prompt_tokens

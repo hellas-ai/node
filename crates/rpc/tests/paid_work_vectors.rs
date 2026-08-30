@@ -32,7 +32,7 @@ use hellas_rpc::protocol::work::{
 };
 use hellas_rpc::{
     Assurance, ContentId, Digest, Evaluate, EvaluateProgramManifest, EvaluateRequest,
-    EventCommitment, ProgramManifest, PublicKey, RequestCommitment,
+    EventCommitment, ExecutionPackageId, ProgramManifest, PublicKey, RequestCommitment,
 };
 
 // ── Fixtures ──────────────────────────────────────────────────────────
@@ -162,14 +162,7 @@ fn channel_policy() -> PaidChannelPolicyV1 {
 
 fn manifest() -> ProgramManifest {
     ProgramManifest::Evaluate(EvaluateProgramManifest {
-        weights: vec![ContentId::from_bytes([0x11; 32])],
-        graph: ContentId::from_bytes([0x12; 32]),
-        config: ContentId::from_bytes([0x13; 32]),
-        tokenizer: ContentId::from_bytes([0x14; 32]),
-        resolved_revision: "main".into(),
-        numeric_profile: "f32-cpu".into(),
-        backend_profile: "catena-v1".into(),
-        build: ContentId::from_bytes([0x15; 32]),
+        execution_package: ExecutionPackageId::from_bytes([0x16; 32]),
     })
 }
 
@@ -184,9 +177,7 @@ fn text_policy() -> TextPolicy {
 fn identity_artifact() -> TextArtifact {
     TextArtifact::identity(
         BoundTermId::from_digest(manifest().content_id().digest()),
-        "test-model",
-        "main",
-        "f32",
+        ExecutionPackageId::from_bytes([0x16; 32]),
     )
 }
 
@@ -578,7 +569,7 @@ fn golden_digests_bind_the_encoded_network() {
     );
     assert_eq!(
         hex(&work_id(&channel, &authorization()).into_bytes()),
-        "31da0ee655712af1122b16e94eccb2d9a511089bfc9cb7cdbcbffbb871b8873a"
+        "d4bdc659d47820c35f494066192e2e688897ca8595373dcf4baa7607505cb453"
     );
 
     let other = channel_on(
@@ -1641,11 +1632,7 @@ fn each_graph_binding_is_checked_on_its_own() {
 
     // A manifest that is not the environment the request commits to.
     let other_manifest = ProgramManifest::Evaluate(EvaluateProgramManifest {
-        graph: ContentId::from_bytes([0x99; 32]),
-        ..match manifest() {
-            ProgramManifest::Evaluate(evaluate) => evaluate,
-            ProgramManifest::Fetch(_) => panic!("the fixture manifest is an evaluate manifest"),
-        }
+        execution_package: ExecutionPackageId::from_bytes([0x99; 32]),
     });
     assert_ne!(other_manifest.content_id(), manifest().content_id());
     let mismatched_manifest = PreparedPaidInputV1::new(
@@ -1712,9 +1699,7 @@ fn each_graph_binding_is_checked_on_its_own() {
     // the model out of this end of it.
     let elsewhere = TextArtifact::identity(
         BoundTermId::from_bytes([0x83; 32]),
-        "test-model",
-        "main",
-        "f32",
+        ExecutionPackageId::from_bytes([0x16; 32]),
     );
     let mut rebound_policy = policy;
     rebound_policy.identity_source_digest =
@@ -2462,7 +2447,7 @@ fn digest_preimages_are_reproducible_by_hand() {
     assert_eq!(preimage.len(), 30 + 16 + 32 + 98);
     assert_eq!(
         hex(&Digest::hash(&preimage).into_bytes()),
-        "b87ec7409ea7ff0fa55527d526aec7a5140d8181384b82b7f5a3ab7d73c9134d"
+        "6682628fc23bc3b1b19fee524dfc9cd32ebf2d7d59f66bef5004d2f225ac2c70"
     );
 
     // The payment binding, whose three fields are all 32 bytes: a round
@@ -2541,7 +2526,7 @@ fn the_canonical_output_preimage_is_reproducible_by_hand() {
     );
     assert_eq!(
         hex(&Digest::hash(&preimage).into_bytes()),
-        "9482ac37fa8dd59fb55d95f1cf48d7299b168ccebfa838ceae7d72c58ef60878"
+        "aa27535cce25ae5c1169e6306804d6e784298319a6a0ed8ac30ad50c2fedca7c"
     );
 }
 

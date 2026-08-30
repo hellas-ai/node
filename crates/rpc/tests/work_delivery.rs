@@ -40,7 +40,7 @@ use hellas_rpc::protocol::work_setup::{
     ObservedChannel, OmissionMeasurements, ReadyChannel, WorkChannelConfig, WorkChannelDescriptor,
     WorkSetupError, payment_terms_hash,
 };
-use hellas_rpc::protocol::{ContentId, Digest};
+use hellas_rpc::protocol::Digest;
 use hellas_rpc::services::work::{WorkClientImpl, WorkServer};
 use hellas_rpc::work::{
     BackendFault, ClientEndpoint, DeliverError, PaidEvaluateBackend, ProviderEndpoint, RunError,
@@ -49,8 +49,8 @@ use hellas_rpc::work::{
 use hellas_rpc::work_close::{FinalizedWork, observe};
 use hellas_rpc::work_store::{ChannelRecord, ChannelStore, JobPhase, JobState, Role, SetupOrigin};
 use hellas_rpc::{
-    Assurance, EvaluateProgramManifest, EvaluateRequest, OutputEventEnvelope, ProducerSigningKey,
-    ProgramManifest, PublicKey,
+    Assurance, EvaluateProgramManifest, EvaluateRequest, ExecutionPackageId, OutputEventEnvelope,
+    ProducerSigningKey, ProgramManifest, PublicKey,
 };
 use hellas_wire::mux::{MessagePipe, MuxConfig, MuxTransport, Role as MuxRole};
 use hellas_wire::{DefaultClock, Dispatcher, StreamTransport};
@@ -320,14 +320,7 @@ fn commit(store: &mut ChannelStore, record: ChannelRecord) {
 
 fn manifest() -> ProgramManifest {
     ProgramManifest::Evaluate(EvaluateProgramManifest {
-        weights: vec![ContentId::from_bytes([0x11; 32])],
-        graph: ContentId::from_bytes([0x12; 32]),
-        config: ContentId::from_bytes([0x13; 32]),
-        tokenizer: ContentId::from_bytes([0x14; 32]),
-        resolved_revision: "main".into(),
-        numeric_profile: "f32-cpu".into(),
-        backend_profile: "catena-v1".into(),
-        build: ContentId::from_bytes([0x15; 32]),
+        execution_package: ExecutionPackageId::from_bytes([0x16; 32]),
     })
 }
 
@@ -342,9 +335,7 @@ fn text_policy() -> TextPolicy {
 fn identity_artifact() -> TextArtifact {
     TextArtifact::identity(
         BoundTermId::from_digest(manifest().content_id().digest()),
-        "test-model",
-        "main",
-        "f32",
+        ExecutionPackageId::from_bytes([0x16; 32]),
     )
 }
 
