@@ -1,6 +1,6 @@
 use hellas_rpc::evaluate::{
     EvaluateOutput, EvaluateTokenDelta, TOKEN_DELTA_EVENT_KIND, decode_token_delta_payload,
-    output_canonicalization, verify_output_events, verify_terminal_continuation,
+    output_canonicalization, verify_terminal_continuation,
 };
 use hellas_rpc::pb::execute::{WorkEvent, work_event};
 use hellas_rpc::stream::output_event_from_pb;
@@ -17,7 +17,7 @@ pub enum EvaluateExecutionEvent {
     Chunk {
         /// Cumulative token position after this chunk.
         position: u64,
-        /// Little-endian `u32` token IDs, ready for `DecodeTokens`.
+        /// Little-endian `u32` token IDs for caller-selected local decoding.
         tokens: Vec<u8>,
     },
     Done(EvaluateOutcome),
@@ -42,13 +42,19 @@ pub struct EvaluateChunkVerifier {
     previous_event: EventCommitment,
     next_sequence: u64,
     next_position: u64,
-    producer_key: Option<PublicKey>,
+    expected_producer_key: PublicKey,
+    max_output_tokens: u64,
     assurance: Assurance,
     events: Vec<OutputEventEnvelope>,
 }
 
 impl EvaluateChunkVerifier {
-    pub fn new(input: InputCommitment, assurance: Assurance) -> Self {
+    pub fn new(
+        input: InputCommitment,
+        assurance: Assurance,
+        expected_producer_key: PublicKey,
+        max_output_tokens: u32,
+    ) -> Self {
         let stream_id = StreamId::from_input_commitment(input);
         Self {
             input,
@@ -56,7 +62,8 @@ impl EvaluateChunkVerifier {
             previous_event: output_genesis(input, stream_id),
             next_sequence: 0,
             next_position: 0,
-            producer_key: None,
+            expected_producer_key,
+            max_output_tokens: u64::from(max_output_tokens),
             assurance,
             events: Vec::new(),
         }
@@ -71,21 +78,19 @@ impl EvaluateChunkVerifier {
         event: OutputEventEnvelope,
     ) -> ClientResult<(u64, EvaluateTokenDelta)> {
         let public_key = *event.event().public_key();
-        match self.producer_key {
-            Some(expected) if expected != public_key => {
-                return Err(ClientError::protocol(
-                    "evaluate output chunk producer key changed mid-stream",
-                ));
-            }
-            Some(_) => {}
-            None => self.producer_key = Some(public_key),
+        if public_key != self.expected_producer_key {
+            return Err(ClientError::protocol(
+                "evaluate output chunk signed by the wrong producer key",
+            ));
         }
-        event.verify(&public_key).map_err(|source| {
-            ClientError::source(
-                "evaluate output chunk signature verification failed",
-                source,
-            )
-        })?;
+        event
+            .verify(&self.expected_producer_key)
+            .map_err(|source| {
+                ClientError::source(
+                    "evaluate output chunk signature verification failed",
+                    source,
+                )
+            })?;
         let body = event.event().body();
         if body.scheme() != scheme_id(Operation::Evaluate, self.assurance) {
             return Err(ClientError::protocol(
@@ -133,28 +138,67 @@ impl EvaluateChunkVerifier {
                 self.next_position, delta.start_position
             )));
         }
-        self.next_position = delta
+        let next_position = delta
             .end_position()
             .map_err(|source| ClientError::EvaluateTranscript { source })?;
+        self.ensure_output_position(next_position)?;
+        let next_sequence = self.next_sequence.checked_add(1).ok_or_else(|| {
+            ClientError::protocol("evaluate output chunk sequence exceeds u64 range")
+        })?;
+
+        self.next_position = next_position;
         self.previous_event = event.event_commitment();
-        self.next_sequence = self.next_sequence.saturating_add(1);
+        self.next_sequence = next_sequence;
         self.events.push(event);
         Ok((self.next_position, delta))
     }
 
-    pub fn verify_terminal(&self, output_events: &[OutputEventEnvelope]) -> ClientResult<()> {
-        if let Some(first) = output_events.first() {
-            let first_key = *first.event().public_key();
-            if let Some(pinned) = self.producer_key
-                && pinned != first_key
-            {
-                return Err(ClientError::protocol(
-                    "evaluate terminal transcript producer key does not match streamed chunks",
-                ));
-            }
+    pub fn verify_terminal(
+        &self,
+        output_events: &[OutputEventEnvelope],
+    ) -> ClientResult<EvaluateOutput> {
+        let first = output_events.first().ok_or_else(|| {
+            ClientError::protocol("evaluate terminal transcript must not be empty")
+        })?;
+        if *first.event().public_key() != self.expected_producer_key {
+            return Err(ClientError::protocol(
+                "evaluate terminal transcript signed by the wrong producer key",
+            ));
         }
-        verify_terminal_continuation(self.assurance, &self.events, output_events)
-            .map_err(|source| ClientError::EvaluateTranscript { source })
+        if first.event().body().input() != self.input {
+            return Err(ClientError::protocol(
+                "evaluate terminal transcript input commitment mismatch",
+            ));
+        }
+        let event_count = u64::try_from(output_events.len()).map_err(|_| {
+            ClientError::protocol("evaluate terminal transcript event count exceeds u64 range")
+        })?;
+        let max_event_count = self.max_output_tokens + 1;
+        if event_count > max_event_count {
+            return Err(ClientError::protocol(format!(
+                "evaluate terminal transcript has {event_count} events, exceeding the limit of {max_event_count}"
+            )));
+        }
+        let output = verify_terminal_continuation(
+            self.input,
+            self.assurance,
+            &self.expected_producer_key,
+            &self.events,
+            output_events,
+        )
+        .map_err(|source| ClientError::EvaluateTranscript { source })?;
+        self.ensure_output_position(output.terminal.final_position)?;
+        Ok(output)
+    }
+
+    fn ensure_output_position(&self, position: u64) -> ClientResult<()> {
+        if position > self.max_output_tokens {
+            return Err(ClientError::protocol(format!(
+                "evaluate output position {position} exceeds requested maximum {}",
+                self.max_output_tokens
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -179,6 +223,11 @@ pub fn verify_evaluate_work_event(
     event: WorkEvent,
     input_commitment: InputCommitment,
 ) -> ClientResult<EvaluateExecutionEvent> {
+    if input_commitment != verifier.input {
+        return Err(ClientError::protocol(
+            "evaluate work verifier input commitment mismatch",
+        ));
+    }
     let Some(event) = event.kind else {
         return Err(ClientError::protocol("wire event with no body"));
     };
@@ -205,10 +254,7 @@ pub fn verify_evaluate_work_event(
                 .map_err(|source| {
                     ClientError::source("evaluate output event decode failed", source)
                 })?;
-            verifier.verify_terminal(&output_events)?;
-            let output =
-                verify_output_events(input_commitment, verifier.assurance(), &output_events)
-                    .map_err(|source| ClientError::EvaluateTranscript { source })?;
+            let output = verifier.verify_terminal(&output_events)?;
             Ok(EvaluateExecutionEvent::Done(EvaluateOutcome::Completed {
                 output,
                 output_events,
@@ -232,12 +278,138 @@ mod tests {
     };
     use hellas_rpc::pb::execute::{WorkChunk, WorkEvent, WorkFinished, work_event};
     use hellas_rpc::stream::output_event_to_pb;
-    use hellas_rpc::{ContentId, EvaluateRequest, ProducerSigningKey};
+    use hellas_rpc::{
+        ContentId, EvaluateRequest, ProducerSigningKey, Signature, SignedOutputEvent,
+    };
 
     const TEST_ASSURANCE: Assurance = Assurance::ProducerSigned;
 
     fn key(byte: u8) -> ProducerSigningKey {
         ProducerSigningKey::from_secret_bytes([byte; 32]).expect("valid test key")
+    }
+
+    fn corrupt_signature(event: &OutputEventEnvelope) -> OutputEventEnvelope {
+        let signature = match *event.event().signature() {
+            Signature::Secp256k1(mut bytes) => {
+                bytes[7] ^= 0x01;
+                Signature::Secp256k1(bytes)
+            }
+            _ => panic!("the fixture uses a secp256k1 producer key"),
+        };
+        let signed = SignedOutputEvent::from_parts(
+            event.event().body().clone(),
+            signature,
+            *event.event().public_key(),
+        )
+        .unwrap();
+        OutputEventEnvelope::new(signed, event.payload().to_vec()).unwrap()
+    }
+
+    #[test]
+    fn rejected_producer_and_signature_do_not_advance_verifier_state() {
+        let producer = key(2);
+        let attacker = key(3);
+        let input = InputCommitment::from_digest(Digest::from_bytes([4; 32]));
+        let valid = EvaluateOutputTranscriptBuilder::new(input, TEST_ASSURANCE, &producer)
+            .push_token_delta(vec![10])
+            .unwrap();
+        let attacker_event = EvaluateOutputTranscriptBuilder::new(input, TEST_ASSURANCE, &attacker)
+            .push_token_delta(vec![99])
+            .unwrap();
+        let invalid_signature = corrupt_signature(&valid);
+        let mut verifier =
+            EvaluateChunkVerifier::new(input, TEST_ASSURANCE, producer.public_key(), 1);
+
+        assert!(matches!(
+            verifier.verify_chunk(attacker_event),
+            Err(ClientError::Protocol(_))
+        ));
+        assert!(matches!(
+            verifier.verify_chunk(invalid_signature),
+            Err(ClientError::Source { .. })
+        ));
+        let (position, delta) = verifier.verify_chunk(valid).unwrap();
+        assert_eq!(position, 1);
+        assert_eq!(delta.token_ids, vec![10]);
+    }
+
+    #[test]
+    fn output_position_cannot_exceed_requested_maximum() {
+        let producer = key(2);
+        let input = InputCommitment::from_digest(Digest::from_bytes([4; 32]));
+        let oversized = EvaluateOutputTranscriptBuilder::new(input, TEST_ASSURANCE, &producer)
+            .push_token_delta(vec![10, 11, 12])
+            .unwrap();
+        let valid = EvaluateOutputTranscriptBuilder::new(input, TEST_ASSURANCE, &producer)
+            .push_token_delta(vec![10, 11])
+            .unwrap();
+        let mut verifier =
+            EvaluateChunkVerifier::new(input, TEST_ASSURANCE, producer.public_key(), 2);
+
+        let error = verifier.verify_chunk(oversized).unwrap_err();
+        assert!(error.to_string().contains("exceeds requested maximum 2"));
+        assert_eq!(verifier.verify_chunk(valid).unwrap().0, 2);
+    }
+
+    #[test]
+    fn terminal_first_transcript_checks_input_producer_and_limit() {
+        let producer = key(2);
+        let other = key(3);
+        let input = InputCommitment::from_digest(Digest::from_bytes([4; 32]));
+        let mut builder = EvaluateOutputTranscriptBuilder::new(input, TEST_ASSURANCE, &producer);
+        builder.push_token_delta(vec![10, 11]).unwrap();
+        let output_events = builder
+            .finish(EvaluateTerminal {
+                final_position: 2,
+                stop_reason: EvaluateStopReason::MAX_OUTPUT,
+                text_artifact: Digest::from_bytes([5; 32]),
+                usage: EvaluateUsage {
+                    input_units: 3,
+                    output_units: 2,
+                },
+                billable_units: 5,
+            })
+            .unwrap();
+
+        let wrong_producer =
+            EvaluateChunkVerifier::new(input, TEST_ASSURANCE, other.public_key(), 2);
+        assert!(
+            wrong_producer
+                .verify_terminal(&output_events)
+                .unwrap_err()
+                .to_string()
+                .contains("wrong producer key")
+        );
+
+        let other_input = InputCommitment::from_digest(Digest::from_bytes([6; 32]));
+        let wrong_input =
+            EvaluateChunkVerifier::new(other_input, TEST_ASSURANCE, producer.public_key(), 2);
+        assert!(
+            wrong_input
+                .verify_terminal(&output_events)
+                .unwrap_err()
+                .to_string()
+                .contains("input commitment mismatch")
+        );
+
+        let too_small = EvaluateChunkVerifier::new(input, TEST_ASSURANCE, producer.public_key(), 1);
+        assert!(
+            too_small
+                .verify_terminal(&output_events)
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds requested maximum 1")
+        );
+
+        let verifier = EvaluateChunkVerifier::new(input, TEST_ASSURANCE, producer.public_key(), 2);
+        assert_eq!(
+            verifier
+                .verify_terminal(&output_events)
+                .unwrap()
+                .terminal
+                .final_position,
+            2
+        );
     }
 
     #[test]
@@ -258,7 +430,7 @@ mod tests {
         let output_events = builder
             .finish(EvaluateTerminal {
                 final_position: 2,
-                stop_reason: EvaluateStopReason::END_OF_SEQUENCE,
+                stop_reason: EvaluateStopReason::STOP_TOKEN,
                 text_artifact: Digest::from_bytes([4; 32]),
                 usage: EvaluateUsage {
                     input_units: 3,
@@ -268,7 +440,8 @@ mod tests {
             })
             .unwrap();
 
-        let mut verifier = EvaluateChunkVerifier::new(input, TEST_ASSURANCE);
+        let mut verifier =
+            EvaluateChunkVerifier::new(input, TEST_ASSURANCE, producer.public_key(), 2);
         let (position, delta) = verifier.verify_chunk(token_event).unwrap();
         assert_eq!(position, 2);
         assert_eq!(delta.token_ids, vec![10, 11]);
@@ -309,7 +482,7 @@ mod tests {
         let output_events = builder
             .finish(EvaluateTerminal {
                 final_position: 2,
-                stop_reason: EvaluateStopReason::END_OF_SEQUENCE,
+                stop_reason: EvaluateStopReason::STOP_TOKEN,
                 text_artifact: Digest::from_bytes([4; 32]),
                 usage: EvaluateUsage {
                     input_units: 3,
@@ -319,7 +492,8 @@ mod tests {
             })
             .unwrap();
 
-        let mut verifier = EvaluateChunkVerifier::new(input, TEST_ASSURANCE);
+        let mut verifier =
+            EvaluateChunkVerifier::new(input, TEST_ASSURANCE, producer.public_key(), 2);
         let event = verify_evaluate_work_event(
             &mut verifier,
             WorkEvent {
