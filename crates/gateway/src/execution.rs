@@ -284,6 +284,7 @@ impl ExecutionRequest {
                 )
                 .await?,
                 shadow: None,
+                runtime: self.runtime,
             }),
             ExecutionStrategy::Verify { primary, shadow } => Ok(PreparedExecution {
                 primary: PreparedRoute::prepare(
@@ -302,6 +303,7 @@ impl ExecutionRequest {
                     )
                     .await?,
                 ),
+                runtime: self.runtime,
             }),
         }
     }
@@ -330,6 +332,9 @@ impl ExecutionRequest {
 pub struct PreparedExecution {
     primary: PreparedRoute,
     shadow: Option<PreparedRoute>,
+    // Owns the remote endpoint from quote through the terminal Execute
+    // trailer. A transport alone does not keep its endpoint alive.
+    runtime: CliRuntime,
 }
 
 impl PreparedExecution {
@@ -344,8 +349,20 @@ impl PreparedExecution {
     /// withhold every primary chunk until its terminal artifact matches; a
     /// mismatch exposes only `Done(Failed)`, never unverified text.
     pub fn stream(self) -> BoxStream<'static, ExecutionResult<ExecutionEvent>> {
-        let Self { primary, shadow } = self;
-        reconcile_execution_streams(primary.stream(), shadow.map(PreparedRoute::stream))
+        let Self {
+            primary,
+            shadow,
+            runtime,
+        } = self;
+        let inner =
+            reconcile_execution_streams(primary.stream(), shadow.map(PreparedRoute::stream));
+        Box::pin(try_stream! {
+            let _runtime = runtime;
+            let mut inner = inner;
+            while let Some(event) = inner.next().await {
+                yield event?;
+            }
+        })
     }
 }
 
@@ -565,13 +582,11 @@ impl PreparedRoute {
                 }
             }
             ExecutionRoute::RemoteDirect(target) => {
-                let (ticket, provenance, producer_key, text_execution) =
+                let (transport, ticket, provenance, producer_key, text_execution) =
                     hellas_client::iroh::quote_tokens(runtime, target, quote_req).await?;
                 validate_evaluate_ticket(&ticket, quote_req.assurance)?;
-                let execute_transport =
-                    hellas_client::iroh::execute_transport(runtime, target).await?;
                 Ok(Self::RemoteDirect {
-                    transport: execute_transport,
+                    transport,
                     ticket,
                     provenance,
                     runner_key,
@@ -586,7 +601,7 @@ impl PreparedRoute {
                 retries,
                 provider_trust,
             } => {
-                let (target, ticket, provenance, producer_key, text_execution) =
+                let (transport, ticket, provenance, producer_key, text_execution) =
                     hellas_client::iroh::discover_and_quote(
                         runtime.remote_registry()?,
                         quote_req,
@@ -595,10 +610,8 @@ impl PreparedRoute {
                     )
                     .await?;
                 validate_evaluate_ticket(&ticket, quote_req.assurance)?;
-                let execute_transport =
-                    hellas_client::iroh::execute_transport(runtime, &target).await?;
                 Ok(Self::RemoteDirect {
-                    transport: execute_transport,
+                    transport,
                     ticket,
                     provenance,
                     runner_key,
@@ -716,7 +729,7 @@ fn local_execute_stream(
 }
 
 // ---------------------------------------------------------------------------
-// Remote execute streams — dial Execute service via IrohTransport
+// Remote execute streams — run on the already Open-bound IrohTransport
 // ---------------------------------------------------------------------------
 
 fn remote_execute_stream(
@@ -988,6 +1001,396 @@ mod request_tests {
             &output[1],
             Ok(ExecutionEvent::Done(Outcome::Completed { .. }))
         ));
+    }
+}
+
+#[cfg(test)]
+mod remote_lifetime_tests {
+    use super::*;
+    use futures::stream;
+    use hellas_client::{ProviderTrustAnchor, RemoteNodeTarget};
+    use hellas_rpc::call::WithTrailer;
+    use hellas_rpc::open::{OpenDispatcher, OpenHandler};
+    use hellas_rpc::pb::courtesy::{
+        GetArtifactRequest, GetArtifactResponse, GetPackageStatsRequest, GetPackageStatsResponse,
+        GetStatsRequest, GetStatsResponse, ListPackagesRequest, ListPackagesResponse,
+        QuoteResponse,
+    };
+    use hellas_rpc::pb::execute::{
+        OpenRequest, OpenResponse, RunTicketRequest, WorkFailed, open_response, work_event,
+    };
+    use hellas_rpc::protocol::artifacts::{
+        BoundTermId, InputAddressed, OutputAddressed, SourceRef, TextArtifact, TextExecution,
+        TextPolicy, TokenIds,
+    };
+    use hellas_rpc::serve::MethodDispatcher;
+    use hellas_rpc::services::courtesy::{
+        Courtesy, CourtesyHandler, CourtesyServer, Open as CourtesyOpen, QuoteTokens,
+    };
+    use hellas_rpc::services::execute::{ExecuteHandler, ExecuteServer, RunTicket};
+    use hellas_rpc::{
+        Assurance, Evaluate, EvaluateProgramManifest, JobTerms, PlatformCredential,
+        PlatformEnrollment, ProgramManifest, ProviderEnrollmentBundle, ProviderGenesisStatement,
+        RootKind, RootProof, SignedProviderGenesis,
+    };
+    use hellas_wire::{
+        Dispatcher, Metadata, MethodMarker, ServiceMarker, StreamTransport, TransportContext,
+    };
+    use iroh::endpoint::{Connection, presets};
+    use iroh::{Endpoint, EndpointAddr, SecretKey, TransportAddr};
+    use std::time::Duration;
+    use tokio::sync::oneshot;
+
+    #[derive(Clone)]
+    struct FixtureProvider {
+        producer: ProducerSigningKey,
+        enrollment: ProviderEnrollmentBundle,
+    }
+
+    impl FixtureProvider {
+        fn new(transport_key: &SecretKey) -> Self {
+            let root = ProducerSigningKey::from_secret_bytes([0x53; 32])
+                .expect("the fixture root key is valid");
+            let producer = ProducerSigningKey::from_secret_bytes([0x54; 32])
+                .expect("the fixture producer key is valid");
+            let statement = ProviderGenesisStatement {
+                root_kind: RootKind::Software,
+                root_public_key: root.public_key(),
+                producer_public_key: producer.public_key(),
+                transport_public_key: PublicKey::Ed25519(*transport_key.public().as_bytes()),
+                platform_credential: PlatformCredential::Absent,
+                installation_nonce: [0x55; 32],
+            };
+            let genesis = SignedProviderGenesis {
+                root_proof: RootProof::Software(
+                    root.sign_digest(Digest::hash(&statement.canonical_bytes()))
+                        .expect("the fixture root signs"),
+                ),
+                statement,
+            };
+            Self {
+                producer,
+                enrollment: ProviderEnrollmentBundle {
+                    genesis,
+                    platform: PlatformEnrollment::Absent,
+                },
+            }
+        }
+
+        fn trust(&self) -> ProviderTrustAnchor {
+            ProviderTrustAnchor {
+                expected_genesis: self.enrollment.content_id(),
+                required_assurance: Assurance::ProducerSigned,
+                apple_app_attest: None,
+            }
+        }
+
+        fn quote(&self, request: QuoteTokensRequest) -> WithTrailer<QuoteResponse> {
+            let execution_package = ExecutionPackageId::from_bytes(
+                request
+                    .execution_package
+                    .as_slice()
+                    .try_into()
+                    .expect("the fixture request has a package identity"),
+            );
+            let manifest = ProgramManifest::Evaluate(EvaluateProgramManifest { execution_package });
+            let execution_environment = manifest.content_id();
+            let identity = TextArtifact::identity(
+                BoundTermId::from_digest(execution_environment.digest()),
+                execution_package,
+            );
+            let prompt = TokenIds::from_u32s(request.prompt_token_ids.iter().copied());
+            let max_new_tokens = request
+                .max_new_tokens
+                .unwrap_or(hellas_rpc::DEFAULT_MAX_NEW_TOKENS);
+            let policy = TextPolicy::from_u32_stop_tokens(
+                max_new_tokens,
+                request.stop_token_ids.iter().copied(),
+            );
+            let text_execution = TextExecution::new(
+                SourceRef::output(identity.output_id()),
+                prompt.output_id(),
+                policy.output_id(),
+            );
+            let runner_public_key = hellas_rpc::run_ticket::public_key_from_pb(
+                request
+                    .runner_public_key
+                    .expect("the fixture request has a runner key"),
+            )
+            .expect("the fixture runner key decodes");
+            let assurance = hellas_rpc::run_ticket::assurance_from_pb(request.assurance)
+                .expect("the fixture assurance decodes");
+            let evaluate = hellas_rpc::EvaluateRequest {
+                text_execution: text_execution.input_id().digest(),
+                runner_public_key,
+                execution_environment,
+                nonce: [0x56; 32],
+                assurance,
+                retain: request.retain.unwrap_or(true),
+            };
+            let request_commitment = Evaluate::commit_request(&evaluate);
+            let provider_genesis = self.enrollment.canonical_bytes();
+            let ticket = hellas_rpc::run_ticket::ticket_to_pb(
+                JobTerms {
+                    request: request_commitment,
+                    provider_genesis: self.enrollment.content_id(),
+                    assurance,
+                    amount: 1,
+                    ttl_ms: 1_000,
+                },
+                provider_genesis,
+            )
+            .expect("the fixture ticket matches its enrollment");
+            let mut metadata = Metadata::new();
+            hellas_rpc::provenance::write_provenance_metadata(
+                &mut metadata,
+                &ExecutionProvenance {
+                    commitment_id: *request_commitment.as_bytes(),
+                },
+            );
+            WithTrailer::with_metadata(
+                QuoteResponse {
+                    ticket: Some(ticket),
+                    prompt_tokens: request.prompt_token_ids.len() as u32,
+                    evaluate_request: Some(hellas_rpc::pb::evaluate::EvaluateRequest {
+                        text_execution: evaluate.text_execution.as_bytes().to_vec(),
+                        runner_public_key: Some(hellas_rpc::run_ticket::public_key_to_pb(
+                            &evaluate.runner_public_key,
+                        )),
+                        execution_environment: evaluate.execution_environment.as_bytes().to_vec(),
+                        nonce: evaluate.nonce.to_vec(),
+                        assurance: evaluate.assurance.to_byte().into(),
+                        retain: Some(evaluate.retain),
+                    }),
+                },
+                metadata,
+            )
+        }
+    }
+
+    impl OpenHandler for FixtureProvider {
+        async fn open(
+            &self,
+            request: OpenRequest,
+            context: TransportContext,
+            alpn: &'static [u8],
+        ) -> Result<OpenResponse, WireStatus> {
+            let nonce: [u8; 32] = request
+                .nonce
+                .try_into()
+                .map_err(|_| WireStatus::internal("invalid fixture nonce"))?;
+            let exporter = context
+                .open_exporter
+                .ok_or_else(|| WireStatus::internal("missing fixture exporter"))?;
+            let binding = hellas_rpc::open_proof_binding(
+                &exporter,
+                &nonce,
+                &self.enrollment.genesis.statement.producer_public_key,
+                self.enrollment.content_id(),
+                alpn,
+            );
+            let signature = self
+                .producer
+                .sign_digest(binding)
+                .map_err(|_| WireStatus::internal("fixture signing failed"))?;
+            Ok(OpenResponse {
+                provider_genesis: self.enrollment.canonical_bytes(),
+                proof: Some(open_response::Proof::ProducerSignature(
+                    hellas_rpc::run_ticket::signature_to_pb(&signature),
+                )),
+            })
+        }
+    }
+
+    #[allow(refining_impl_trait)]
+    impl CourtesyHandler for FixtureProvider {
+        async fn open(&self, _request: OpenRequest) -> Result<OpenResponse, WireStatus> {
+            Err(WireStatus::internal("fixture Open dispatcher was bypassed"))
+        }
+
+        async fn quote_tokens(
+            &self,
+            request: QuoteTokensRequest,
+        ) -> Result<WithTrailer<QuoteResponse>, WireStatus> {
+            Ok(self.quote(request))
+        }
+
+        async fn get_artifact(
+            &self,
+            _request: GetArtifactRequest,
+        ) -> Result<GetArtifactResponse, WireStatus> {
+            Err(WireStatus::unimplemented(
+                "unused by endpoint lifetime test",
+            ))
+        }
+
+        async fn list_packages(
+            &self,
+            _request: ListPackagesRequest,
+        ) -> Result<ListPackagesResponse, WireStatus> {
+            Err(WireStatus::unimplemented(
+                "unused by endpoint lifetime test",
+            ))
+        }
+
+        async fn get_stats(
+            &self,
+            _request: GetStatsRequest,
+        ) -> Result<GetStatsResponse, WireStatus> {
+            Err(WireStatus::unimplemented(
+                "unused by endpoint lifetime test",
+            ))
+        }
+
+        async fn get_package_stats(
+            &self,
+            _request: GetPackageStatsRequest,
+        ) -> Result<GetPackageStatsResponse, WireStatus> {
+            Err(WireStatus::unimplemented(
+                "unused by endpoint lifetime test",
+            ))
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct ExecuteWitness;
+
+    impl ExecuteHandler for ExecuteWitness {
+        async fn run_ticket(
+            &self,
+            _request: RunTicketRequest,
+        ) -> Result<BoxStream<'static, Result<WorkEvent, WireStatus>>, WireStatus> {
+            Ok(Box::pin(stream::iter([Ok(WorkEvent {
+                kind: Some(work_event::Kind::Failed(WorkFailed {
+                    position: 0,
+                    error: "execute reached after prepare".to_string(),
+                })),
+            })])))
+        }
+    }
+
+    async fn accept_alpn(endpoint: &Endpoint, expected: &'static str) -> Connection {
+        let incoming = endpoint
+            .accept()
+            .await
+            .expect("the fixture receives a dial");
+        let accepting = incoming.accept().expect("the fixture accepts the dial");
+        let connection = accepting.await.expect("the fixture handshake completes");
+        assert_eq!(connection.alpn(), expected.as_bytes());
+        connection
+    }
+
+    #[tokio::test]
+    async fn prepared_remote_execution_keeps_endpoint_alive_until_execute() {
+        let server_key = SecretKey::from_bytes(&[0x51; 32]);
+        let provider = FixtureProvider::new(&server_key);
+        let server = Endpoint::builder(presets::Minimal)
+            .secret_key(server_key)
+            .alpns(vec![Courtesy::ALPN.as_bytes().to_vec()])
+            .bind_addr(
+                "127.0.0.1:0"
+                    .parse::<std::net::SocketAddr>()
+                    .expect("a loopback socket"),
+            )
+            .expect("the fixture has a valid bind address")
+            .bind()
+            .await
+            .expect("the fixture server binds");
+        let target = EndpointAddr::from_parts(
+            server.id(),
+            server.bound_sockets().into_iter().map(TransportAddr::Ip),
+        );
+        let (quote_dispatched, quote_is_dispatched) = oneshot::channel();
+        let (release_run_ticket, run_ticket_released) = oneshot::channel();
+        let (event_consumed, event_is_consumed) = oneshot::channel();
+        let serving_endpoint = server.clone();
+        let serving_provider = provider.clone();
+        let serving = tokio::spawn(async move {
+            let courtesy = IrohTransport::new(accept_alpn(&serving_endpoint, Courtesy::ALPN).await);
+            let courtesy_server = OpenDispatcher::<_, _, CourtesyOpen>::new(
+                MethodDispatcher::<_, _, RunTicket>::new(
+                    ExecuteServer(ExecuteWitness),
+                    CourtesyServer(serving_provider.clone()),
+                ),
+                serving_provider,
+            );
+            for expected_method in [CourtesyOpen::METHOD_ID, QuoteTokens::METHOD_ID] {
+                let inbound = courtesy
+                    .accept()
+                    .await
+                    .expect("Courtesy transport remains live")
+                    .expect("Courtesy receives Open and QuoteTokens");
+                assert_eq!(inbound.method_id, expected_method);
+                Dispatcher::<IrohTransport>::dispatch(&courtesy_server, inbound)
+                    .await
+                    .expect("Courtesy request dispatches");
+            }
+
+            let _ = quote_dispatched.send(());
+            let _ = run_ticket_released.await;
+            let inbound = courtesy
+                .accept()
+                .await
+                .expect("Courtesy transport remains live after prepare")
+                .expect("Courtesy receives RunTicket");
+            assert_eq!(inbound.method_id, RunTicket::METHOD_ID);
+            Dispatcher::<IrohTransport>::dispatch(&courtesy_server, inbound)
+                .await
+                .expect("RunTicket dispatches on Courtesy");
+            let _ = event_is_consumed.await;
+        });
+
+        let runtime = CliRuntime::remote(SecretKey::from_bytes(&[0x52; 32]))
+            .await
+            .expect("the fixture client binds");
+        let request = ExecutionRequest::new(
+            runtime,
+            "fixture-package".to_string(),
+            vec![1, 2],
+            Vec::new(),
+            ExecutionRequestOptions {
+                max_new_tokens: 1,
+                execution_package: ExecutionPackageId::from_bytes([0x57; 32]),
+                assurance: Assurance::ProducerSigned,
+                retention: Retention::Ephemeral,
+            },
+            ExecutionStrategy::Run(ExecutionRoute::RemoteDirect(RemoteNodeTarget {
+                addr: target,
+                provider_trust: provider.trust(),
+            })),
+            ProducerSigningKey::from_secret_bytes([0x58; 32])
+                .expect("the fixture runner key is valid"),
+        )
+        .expect("the fixture request is valid");
+        let prepared = tokio::time::timeout(Duration::from_secs(10), request.prepare())
+            .await
+            .expect("remote prepare does not hang")
+            .expect("remote quote prepares");
+        tokio::time::timeout(Duration::from_secs(10), quote_is_dispatched)
+            .await
+            .expect("the server reaches its post-quote barrier")
+            .expect("the fixture reports that QuoteTokens dispatched");
+        tokio::task::yield_now().await;
+        let _ = release_run_ticket.send(());
+
+        let mut output = prepared.stream();
+        let event = tokio::time::timeout(Duration::from_secs(10), output.next())
+            .await
+            .expect("Execute response does not hang")
+            .expect("Execute returns one terminal event")
+            .expect("the fixture failure is a valid terminal event");
+        assert!(matches!(
+            event,
+            ExecutionEvent::Done(Outcome::Failed { position: 0, error })
+                if error == "execute reached after prepare"
+        ));
+        let _ = event_consumed.send(());
+        drop(output);
+        tokio::time::timeout(Duration::from_secs(10), serving)
+            .await
+            .expect("the fixture server finishes")
+            .expect("the fixture server task succeeds");
+        server.close().await;
     }
 }
 

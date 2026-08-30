@@ -31,106 +31,56 @@ Artifact-addressed requests carry no alias and therefore require an `id/...`
 execute-policy rule (or `eager`); an alias rule cannot authorize them by
 accident.
 
-## Quickstart: SmolLM2
+## SmolLM2 tutorial
 
-The examples assume the sibling Catena Runner checkout and an independently
-obtained tokenizer JSON:
+The [complete SmolLM2 tutorial](docs/tutorials/smollm2.md) starts from the four
+Catena package manifests and a digest-pinned tokenizer, then verifies the exact
+package ID, runs a known eight-token ROCm result, serves the package, sends the
+same request over Hellas, and shows the corresponding NixOS configuration.
 
-```bash
-PACKAGE=smollm2-135m=../catena-runner/models/smollm2
-TOKENIZER=/path/to/smollm2-tokenizer.json
-```
-
-Fetch and verify the package, then print the exact ID. The command writes only
-the digest to stdout, so it is safe to use in a script:
-
-```bash
-PACKAGE_ID=$(cargo run -q -p hellas-cli --features evaluate -- \
-  package id --package "$PACKAGE")
-printf '%s\n' "$PACKAGE_ID"
-```
-
-Distribute that ID with the package through a trusted release channel. Do not
-learn it from the node whose execution you are trying to verify.
-
-Run locally. This fetches package artifacts into
-`$HOME/.hellas/packages`, verifies them, compiles the package once, and then
-executes it:
-
-```bash
-cargo run -p hellas-cli --features evaluate -- \
-  llm --local --package "$PACKAGE" --tokenizer "$TOKENIZER" \
-  --prompt 'The capital of France is'
-```
-
-Serve that package to remote callers:
-
-```bash
-cargo run -p hellas-cli --features evaluate -- serve \
-  --execute-policy 'allow(package/smollm2-135m)' \
-  --package "$PACKAGE"
-```
-
-`serve` loads every repeated `--package NAME=PATH` before binding. Its default
-execution policy is `skip`; use `eager` only when intentionally serving every
-package the operator loaded.
-
-Run against a known node. `--provider` is the out-of-band 32-byte content ID
-that anchors the remote node's identity; omit `NODE_ID` to use discovery:
-
-```bash
-cargo run -p hellas-cli --features evaluate -- \
-  --provider "$PROVIDER_CONTENT_ID" \
-  llm "$NODE_ID" --package smollm2-135m --package-id "$PACKAGE_ID" \
-  --tokenizer "$TOKENIZER" \
-  --prompt 'The capital of France is'
-```
-
-For a remote result checked against local Catena execution, use
-`--verify-local` and pass `NAME=PATH`:
-
-```bash
-cargo run -p hellas-cli --features evaluate -- \
-  --provider "$PROVIDER_CONTENT_ID" \
-  llm "$NODE_ID" --verify-local --package "$PACKAGE" \
-  --tokenizer "$TOKENIZER" --prompt 'The capital of France is'
-```
-
-Defaults are 16 new tokens, two discovery retries, retained artifacts, and no
-stop IDs. Use `--retain=false` when the executor must not retain prompt- or
-token-bearing artifacts.
+It also shows how an operator publishes a node ID and enrollment pin with
+`identity show-node-id` and `identity show-enrollment-id`. A remote caller sends
+only an alias, exact package ID, and token-level invocation; package paths and
+objects remain local to the executing node.
 
 ## Qwen3-30B-A3B
 
 Qwen is deliberately opt-in: its current Catena package names about 56.9 GiB
-of weights. Use its own independent tokenizer and explicit stop policy. The
-runner example currently uses stop IDs `151643` and `151645`:
-
-```bash
-cargo run -p hellas-cli --features evaluate -- \
-  llm --local \
-  --package qwen3-30b-a3b=../catena-runner/models/qwen \
-  --tokenizer /path/to/qwen-tokenizer.json \
-  --stop-token 151643 --stop-token 151645 \
-  --prompt 'The capital of France is'
-```
+of weights, before runtime buffers. It uses an independently selected tokenizer
+and explicit stop policy; the Runner example uses IDs `151643` and `151645`.
+Trex cannot execute that package on its approximately 8 GiB GPU, so the
+SmolLM2 tutorial is the maintained runnable example rather than implying Qwen
+runtime coverage this hardware does not have.
 
 ## HTTP gateway
 
-Run a local gateway:
+After completing the tutorial setup, reuse its `HELLAS`, `CLIENT_IDENTITY`,
+`PACKAGE`, `PACKAGE_CACHE`, and `TOKENIZER` values to run a local gateway:
 
 ```bash
-cargo run -p hellas-cli --features evaluate -- gateway --local \
-  --package "$PACKAGE" --tokenizer "$TOKENIZER"
+"$HELLAS" \
+  --identity "$CLIENT_IDENTITY" \
+  --software-root \
+  gateway --local \
+  --package "$PACKAGE" \
+  --package-cache "$PACKAGE_CACHE" \
+  --tokenizer "$TOKENIZER"
 ```
 
-Or route it to a remote node:
+Or reuse its `NODE_ID`, `NODE_ADDR`, `ENROLLMENT_ID`, and `PACKAGE_ID` to route
+the gateway to that remote node:
 
 ```bash
-cargo run -p hellas-cli --features gateway -- \
-  --provider "$PROVIDER_CONTENT_ID" gateway \
-  --node-id "$NODE_ID" --package smollm2-135m \
-  --package-id "$PACKAGE_ID" --tokenizer "$TOKENIZER"
+"$HELLAS" \
+  --identity "$CLIENT_IDENTITY" \
+  --software-root \
+  --provider "$ENROLLMENT_ID" \
+  gateway \
+  --node-id "$NODE_ID" \
+  --node-addr "$NODE_ADDR" \
+  --package smollm2-135m \
+  --package-id "$PACKAGE_ID" \
+  --tokenizer "$TOKENIZER"
 ```
 
 The gateway binds loopback and prints a fresh bearer token at startup. The

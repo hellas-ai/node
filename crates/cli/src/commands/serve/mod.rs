@@ -70,6 +70,7 @@ pub struct ServeOptions {
     /// with.
     pub settlement_key: Secp256k1Signer,
     pub provider_genesis: Vec<u8>,
+    pub open_identity: Arc<crate::identity::OpenIdentity>,
     pub assurance: Assurance,
 }
 
@@ -208,6 +209,7 @@ async fn run_with_store(
         secret_key: options.secret_key,
         producer_key: options.producer_key,
         provider_genesis: options.provider_genesis,
+        open_identity: options.open_identity,
         assurance: options.assurance,
         metrics: metrics.clone(),
         #[cfg(feature = "evaluate")]

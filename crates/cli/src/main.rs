@@ -35,7 +35,8 @@ fn parse_hex_array<const N: usize>(s: &str) -> Result<[u8; N], String> {
 }
 
 fn parse_content_id_hex(s: &str) -> Result<hellas_rpc::ContentId, String> {
-    parse_hex_array::<32>(s).map(hellas_rpc::ContentId::from_bytes)
+    s.parse()
+        .map_err(|error| format!("invalid ContentId: {error}"))
 }
 
 fn parse_assurance(s: &str) -> Result<hellas_rpc::Assurance, String> {
@@ -69,9 +70,9 @@ fn validate_serve_assurance(
 /// Loads the identity this command runs under, creating one only where
 /// creating one is what the operator asked for.
 ///
-/// Three commands read the file and never write it. `show-node-id` is a
-/// query, and creating an identity as a side effect of one would race
-/// with a running service's own creator. The other two settle paid work:
+/// Identity queries read the file and create nothing as a side effect: doing
+/// so could race with a running service's own creator. Two other commands read
+/// an existing identity because they settle paid work:
 /// a `serve` that was handed a work configuration, and the `provision`
 /// that stakes the bond such a node offers. Both sign with the stored
 /// identity's key, so the key must be one an operator already made —
@@ -102,7 +103,7 @@ fn load_command_identity(
         || matches!(
             command,
             Commands::Identity {
-                command: IdentityCommand::ShowNodeId,
+                command: IdentityCommand::ShowNodeId | IdentityCommand::ShowEnrollmentId,
             }
         );
     if read_only {
@@ -230,6 +231,8 @@ enum IdentityCommand {
     Init,
     /// Print the node ID (hex public key) derived from the identity file
     ShowNodeId,
+    /// Print the ContentId of the canonical enrollment bundle
+    ShowEnrollmentId,
 }
 
 #[derive(Subcommand)]
@@ -940,6 +943,7 @@ async fn main() {
                     // with, taken from the identity loaded above and
                     // never made here.
                     let settlement_key = identity::settlement_signer(&local_identity);
+                    let open_identity = local_identity.open_identity();
                     commands::serve::run(commands::serve::ServeOptions {
                         port,
                         execute_policy,
@@ -959,6 +963,7 @@ async fn main() {
                         producer_key: local_identity.producer_key,
                         settlement_key,
                         provider_genesis: local_identity.enrollment.canonical_bytes(),
+                        open_identity,
                         assurance,
                     })
                     .await
@@ -1227,6 +1232,9 @@ async fn main() {
         Commands::Identity { command } => match command {
             IdentityCommand::Init => Ok(()),
             IdentityCommand::ShowNodeId => commands::identity::show_node_id(&secret_key),
+            IdentityCommand::ShowEnrollmentId => {
+                commands::identity::show_enrollment_id(&local_identity.enrollment)
+            }
         },
         Commands::ProducerKey { .. } => unreachable!("producer-key handled before identity load"),
         Commands::CodexAuth { .. } => unreachable!("codex-auth handled before identity load"),
@@ -1337,6 +1345,17 @@ mod tests {
             cli.command,
             Commands::Identity {
                 command: IdentityCommand::Init,
+            }
+        ));
+    }
+
+    #[test]
+    fn identity_enrollment_id_has_an_explicit_dispatch_command() {
+        let cli = Cli::try_parse_from(["hellas", "identity", "show-enrollment-id"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Identity {
+                command: IdentityCommand::ShowEnrollmentId,
             }
         ));
     }
@@ -2199,5 +2218,14 @@ mod tests {
             }
             _ => panic!("expected codex-auth import command"),
         }
+    }
+
+    #[test]
+    fn content_id_parser_round_trips_xet_text_encoding() {
+        let displayed = "87d327b23e941d6932610a282834a2d7d5edd761fe0a1b948e5f0d7ca73392ca";
+        assert_eq!(
+            parse_content_id_hex(displayed).unwrap().to_string(),
+            displayed
+        );
     }
 }

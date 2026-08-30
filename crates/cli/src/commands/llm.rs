@@ -149,6 +149,7 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
         provider_trust.expect("remote route requires provider trust"),
     ));
 
+    let remote_runtime = uses_remote.then(|| runtime.clone());
     let request = ExecutionRequest::new(
         runtime,
         package_name,
@@ -195,6 +196,9 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
 
     if uses_remote {
         crate::tracing_config::suppress_execute_tail_logs();
+    }
+    if let Some(runtime) = remote_runtime {
+        runtime.close_remote().await;
     }
     result
 }

@@ -25,6 +25,7 @@
         ${package}/bin/hellas-cli package id --help | grep -F -- "--package <NAME=PATH>"
         ${package}/bin/hellas-cli serve --help | grep -F -- "--package"
         ${package}/bin/hellas-cli serve --help | grep -F -- "--package-cache"
+        ${package}/bin/hellas-cli identity --help | grep -F -- "show-enrollment-id"
 
         # The ordinary package must expose remote LLM presentation without
         # accidentally pulling in the local Catena evaluator.
@@ -34,6 +35,8 @@
         ${package}/bin/hellas-cli --identity "$TMPDIR/identity" --software-root \
           monitor --timeout-secs 1 >/dev/null 2>&1 || true
         ${package}/bin/hellas-cli --identity "$TMPDIR/identity" identity show-node-id \
+          | grep -E '^[0-9a-f]{64}$'
+        ${package}/bin/hellas-cli --identity "$TMPDIR/identity" identity show-enrollment-id \
           | grep -E '^[0-9a-f]{64}$'
 
         touch "$out"

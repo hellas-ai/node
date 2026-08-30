@@ -23,10 +23,11 @@ use hellas_chain::{
 #[cfg(feature = "evaluate")]
 use hellas_executor::ArtifactStoreConfig;
 use hellas_executor::{
-    Executor, ExecutorMetrics, ExecutorSpawnConfig, FetchAccessPolicy, FetchQuotaStoreBackend,
-    FetchRouteRegistry, FetchTranscriptStoreBackend,
+    CourtesyServer, ExecuteServer, Executor, ExecutorMetrics, ExecutorSpawnConfig,
+    FetchAccessPolicy, FetchQuotaStoreBackend, FetchRouteRegistry, FetchTranscriptStoreBackend,
 };
 use hellas_kernel::{EdgeId, NetworkId, Secp256k1Signer, Secp256k1Verifier};
+use hellas_rpc::open::OpenDispatcher;
 use hellas_rpc::pb::work::{
     AcceptWorkRequest, AcceptWorkResponse, AdmitCertificateRequest, AdmitCertificateResponse,
     DeliverResultRequest, DeliverResultResponse, ExchangeSetupRequest, ExchangeSetupResponse,
@@ -42,7 +43,9 @@ use hellas_rpc::protocol::work::{
 use hellas_rpc::protocol::work_setup::{
     ProviderChannelPolicy, ReadyChannel, WorkChannelDescriptor,
 };
-use hellas_rpc::serve::AccountingDispatcher;
+use hellas_rpc::serve::{AccountingDispatcher, MethodDispatcher};
+use hellas_rpc::services::courtesy::{Courtesy, Open as CourtesyOpen};
+use hellas_rpc::services::execute::RunTicket;
 use hellas_rpc::services::node::{Node, NodeServer};
 use hellas_rpc::services::work::{Work, WorkHandler, WorkServer};
 use hellas_rpc::services::work_setup::{WorkSetup, WorkSetupHandler, WorkSetupServer};
@@ -56,7 +59,7 @@ use hellas_rpc::work_open::{
 };
 use hellas_rpc::work_store::{ChannelStore, Role, SetupStore, discover_setups};
 use hellas_rpc::{Assurance, ProducerSigningKey};
-use hellas_wire::iroh::IrohTransport;
+use hellas_wire::iroh::{IrohTransport, IrohTransportError};
 use hellas_wire::{Dispatcher, ServiceMarker, StreamTransport, TransportContext, WireStatus};
 use iroh::{Endpoint, EndpointId, SecretKey, endpoint::Connection, endpoint::presets};
 use tokio::sync::{Mutex as AsyncMutex, oneshot};
@@ -66,6 +69,7 @@ use tracing::{debug, info, warn};
 use super::node_handler::NodeHandlerImpl;
 use super::work_config::WorkRoutes;
 use crate::commands::discovery::{DiscoveryAdvertiser, served_alpns, start_server_advertising};
+use crate::identity::OpenIdentity;
 
 type ProductionWorkSource = WorkBlocks<VerifiedRemoteLightClient>;
 
@@ -143,10 +147,17 @@ pub(super) struct NodeConfig {
     pub(super) secret_key: SecretKey,
     pub(super) producer_key: ProducerSigningKey,
     pub(super) provider_genesis: Vec<u8>,
+    pub(super) open_identity: Arc<OpenIdentity>,
     pub(super) assurance: Assurance,
     pub(super) metrics: Arc<ExecutorMetrics>,
     #[cfg(feature = "evaluate")]
     pub(super) artifact_store: ArtifactStoreConfig,
+}
+
+#[derive(Clone)]
+struct RemoteExecutionServices {
+    executor: hellas_executor::ExecutorHandle,
+    open_identity: Arc<OpenIdentity>,
 }
 
 pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle> {
@@ -228,9 +239,13 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
     //    and given the same mount slot the accept loop reads: the runner
     //    publishes the channel it is handed, and `Work` is answered from
     //    it from that moment on.
-    // Owner-selected package loading is complete before bind. The paid driver
-    // owns the executor handle from here on; its clones live in the mount and
-    // every mounted handler that can submit later work to the actor.
+    // Owner-selected package loading is complete before bind. Clones of the
+    // executor handle live in every remote-execution handler and, when paid
+    // work is configured, in its mount as well.
+    let remote_execution = RemoteExecutionServices {
+        executor: handle.clone(),
+        open_identity: config.open_identity,
+    };
     let work_mount: MountedWork<ProductionWorkSource> = MountedWork::with_backend(handle);
     let setup_mount = MountedSetup::default();
     let work = config.work.map(|work| {
@@ -271,6 +286,7 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
             };
             let node_handler_for_conn = node_handler.clone();
             let manager_for_conn = directory.manager();
+            let execution_for_conn = remote_execution.clone();
             let work_for_conn = serves_work.clone();
             let setup_for_conn = serves_setup.clone();
             tokio::spawn(async move {
@@ -282,9 +298,14 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
                     }
                 };
                 let alpn = conn.alpn().to_vec();
+                debug!(
+                    alpn = %String::from_utf8_lossy(&alpn),
+                    "accepted RPC connection"
+                );
                 if let Err(e) = serve_connection(
                     alpn,
                     conn,
+                    execution_for_conn,
                     node_handler_for_conn,
                     manager_for_conn,
                     setup_for_conn,
@@ -312,6 +333,7 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
 async fn serve_connection<S>(
     alpn: Vec<u8>,
     conn: Connection,
+    remote_execution: RemoteExecutionServices,
     node_handler: NodeHandlerImpl,
     manager: PeerManager,
     setup: Option<MountedSetup>,
@@ -329,7 +351,19 @@ where
     // of the data that `PeerDirectory::ranked_known_peers` consumes
     // when surfacing `Node/get_known_peers`; without this wrapper
     // the directory the node hands out is always empty.
-    if alpn == <Node as ServiceMarker>::ALPN.as_bytes() {
+    if alpn == <Courtesy as ServiceMarker>::ALPN.as_bytes() {
+        let server = AccountingDispatcher::new(
+            OpenDispatcher::<_, _, CourtesyOpen>::new(
+                MethodDispatcher::<_, _, RunTicket>::new(
+                    ExecuteServer(remote_execution.executor.clone()),
+                    CourtesyServer(remote_execution.executor.clone()),
+                ),
+                remote_execution.open_identity.clone(),
+            ),
+            manager,
+        );
+        serve_loop(&transport, &server).await
+    } else if alpn == <Node as ServiceMarker>::ALPN.as_bytes() {
         let server = AccountingDispatcher::new(NodeServer(node_handler), manager);
         serve_loop(&transport, &server).await
     } else if let Some(setup) =
@@ -1328,7 +1362,13 @@ where
     S: Dispatcher<IrohTransport> + Send + Sync,
     S::Error: Send + Sync + 'static,
 {
-    while let Ok(Some(inbound)) = transport.accept().await {
+    loop {
+        let inbound = match transport.accept().await {
+            Ok(Some(inbound)) => inbound,
+            Ok(None) => break,
+            Err(IrohTransportError::Connection(_)) => break,
+            Err(error) => return Err(anyhow::anyhow!("transport accept failed: {error}")),
+        };
         if server.dispatch(inbound).await.is_err() {
             // RPC errors can be derived from request content. Keep the trace
             // useful without copying prompt or token material into logs.
@@ -1558,6 +1598,7 @@ mod tests {
             serve_connection::<TestChain>(
                 connection.alpn().to_vec(),
                 connection,
+                test_remote_execution(),
                 handler,
                 directory.manager(),
                 Some(setup),
@@ -2118,6 +2159,25 @@ mod tests {
         {
             Ok(dir) => dir,
             Err(error) => panic!("a temporary directory: {error}"),
+        }
+    }
+
+    fn test_remote_execution() -> RemoteExecutionServices {
+        let directory = temp();
+        let identity_path = directory.path().join("identity");
+        let identity = crate::identity::load_or_create(Some(&identity_path), true)
+            .expect("the test remote-execution identity is created");
+        let executor = Executor::spawn_with_producer_key(
+            ExecutePolicy::Skip,
+            hellas_rpc::DEFAULT_EXECUTION_QUEUE_CAPACITY,
+            identity.producer_key.clone(),
+            identity.enrollment.canonical_bytes(),
+            Assurance::ProducerSigned,
+        )
+        .expect("the test remote-execution actor starts");
+        RemoteExecutionServices {
+            executor,
+            open_identity: identity.open_identity(),
         }
     }
 
@@ -4081,6 +4141,7 @@ mod tests {
             let accepting_endpoint = endpoint.clone();
             let setup_for_accept = setup_mount.clone();
             let work_for_accept = work_mount.clone();
+            let execution_for_accept = test_remote_execution();
             let accept_task = tokio::spawn(async move {
                 while let Some(incoming) = accepting_endpoint.accept().await {
                     let accepting = match incoming.accept() {
@@ -4091,6 +4152,7 @@ mod tests {
                     let manager = directory.manager();
                     let setup = setup_for_accept.clone();
                     let work = work_for_accept.clone();
+                    let execution = execution_for_accept.clone();
                     tokio::spawn(async move {
                         let connection = match accepting.await {
                             Ok(connection) => connection,
@@ -4100,6 +4162,7 @@ mod tests {
                         if let Err(error) = serve_connection(
                             alpn,
                             connection,
+                            execution,
                             node_handler,
                             manager,
                             Some(setup),

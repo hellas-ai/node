@@ -182,7 +182,7 @@ impl ExecutionRoute {
 /// Bound endpoint plus the per-service registry and connection pools built on it.
 #[derive(Clone)]
 pub struct RemoteRpc {
-    _endpoint: ::iroh::Endpoint,
+    endpoint: ::iroh::Endpoint,
     registry: ServiceRegistry,
 }
 
@@ -209,10 +209,18 @@ impl<L> ExecutionRuntime<L> {
             ClientError::protocol(format!("failed to configure service discovery: {source:#}"))
         })?;
         self.remote = Some(RemoteRpc {
-            _endpoint: endpoint,
+            endpoint,
             registry: discovery.registry,
         });
         Ok(self)
+    }
+
+    /// Gracefully close the client endpoint after a finite remote operation.
+    /// Long-lived callers such as the HTTP gateway keep their runtime instead.
+    pub async fn close_remote(&self) {
+        if let Some(remote) = &self.remote {
+            remote.endpoint.close().await;
+        }
     }
 
     /// Access the discovery registry configured for remote dispatch.
@@ -629,12 +637,22 @@ pub fn validate_evaluate_quote_provenance(
     Ok(provenance)
 }
 
-/// Quote prepared tokens on a specific peer and return its ticket and provenance.
+/// Open and quote prepared tokens on a specific peer.
+///
+/// The returned transport is the exact Open-bound Courtesy connection. The
+/// caller must run the ticket on it rather than dialing a transferable Execute
+/// leg whose connection was never attested.
 pub async fn quote_tokens<L>(
     runtime: &ExecutionRuntime<L>,
     target: &RemoteNodeTarget,
     quote_req: &QuoteTokensRequest,
-) -> ClientResult<(Ticket, ExecutionProvenance, PublicKey, TextExecutionId)> {
+) -> ClientResult<(
+    IrohTransport,
+    Ticket,
+    ExecutionProvenance,
+    PublicKey,
+    TextExecutionId,
+)> {
     let requested_assurance = hellas_rpc::run_ticket::assurance_from_pb(quote_req.assurance)
         .map_err(|source| ClientError::source("invalid requested assurance", source))?;
     validate_provider_trust_assurance(&target.provider_trust, requested_assurance)?;
@@ -669,6 +687,7 @@ pub async fn quote_tokens<L>(
         })?;
     let provenance = validate_evaluate_quote_provenance(&validated.ticket, provenance)?;
     Ok((
+        transport,
         validated.ticket,
         provenance,
         validated.producer_key,
@@ -676,14 +695,15 @@ pub async fn quote_tokens<L>(
     ))
 }
 
-/// Discover Courtesy peers until one returns a valid quote.
+/// Discover Courtesy peers until one returns a valid quote, retaining that
+/// peer's Open-bound connection for RunTicket.
 pub async fn discover_and_quote(
     registry: &ServiceRegistry,
     quote_req: &QuoteTokensRequest,
     retries: usize,
     provider_trust: &ProviderTrustAnchor,
 ) -> ClientResult<(
-    RemoteNodeTarget,
+    IrohTransport,
     Ticket,
     ExecutionProvenance,
     PublicKey,
@@ -792,7 +812,7 @@ pub async fn discover_and_quote(
         };
 
         return Ok((
-            RemoteNodeTarget::direct(peer_id, provider_trust.clone()),
+            transport,
             validated.ticket,
             provenance,
             validated.producer_key,
