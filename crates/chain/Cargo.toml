@@ -190,12 +190,7 @@ url = { version = "2", optional = true }
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 commonware-consensus = { workspace = true, features = ["mocks"] }
 commonware-cryptography = { workspace = true, features = ["mocks"] }
-hellas-kernel = { workspace = true, features = ["test-support"] }
-# The settlement test drives the endpoint's own close builders against a
-# real database, so the bytes a provider would submit are the bytes
-# consensus is asked to accept. As a runtime dependency `hellas-rpc`
-# arrives without the work protocol; the settlement suite needs it.
-hellas-rpc = { workspace = true, features = ["work"] }
+ed25519-dalek.workspace = true
 # The end-to-end money test signs a payment only after the client's own
 # re-execution reproduced the provider's answer, and that gate — the
 # `Reproducer` seam and the matched/refuted journal transition around it
@@ -203,7 +198,12 @@ hellas-rpc = { workspace = true, features = ["work"] }
 # opinion about the very thing under test. `hellas-client` does not
 # depend on `hellas-chain`, so this edge is test-only and acyclic.
 hellas-client = { workspace = true, features = ["work"] }
-ed25519-dalek.workspace = true
+hellas-kernel = { workspace = true, features = ["test-support"] }
+# The settlement test drives the endpoint's own close builders against a
+# real database, so the bytes a provider would submit are the bytes
+# consensus is asked to accept. As a runtime dependency `hellas-rpc`
+# arrives without the work protocol; the settlement suite needs it.
+hellas-rpc = { workspace = true, features = ["work"] }
 itf = "0.4"
 proptest = "1.11"
 serde = { workspace = true, features = ["derive"] }

@@ -83,17 +83,17 @@ hellas-executor = { workspace = true, default-features = false, optional = true 
 hellas-gateway = { workspace = true, optional = true }
 hellas-kernel = { workspace = true, default-features = false, optional = true }
 hellas-presentation = { workspace = true, optional = true }
-hellas-store = { workspace = true }
-hellas-xet = { workspace = true }
 hellas-rpc = { workspace = true, default-features = false, features = [
     "all-protocols",
     "work",
 ] }
+hellas-store = { workspace = true }
 hellas-wire = { workspace = true, features = [
     "iroh",
     "discovery-dht",
     "discovery-mdns",
 ] }
+hellas-xet = { workspace = true }
 hex.workspace = true
 iroh = { workspace = true, features = ["tls-ring", "metrics"] }
 iroh-mdns-address-lookup = "0.4"

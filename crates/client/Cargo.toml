@@ -30,14 +30,14 @@ work = ["dep:hellas-kernel", "hellas-rpc/work"]
 [dependencies]
 async-stream = { version = "0.3", optional = true }
 futures = { workspace = true, optional = true }
-hellas-rpc = { workspace = true, features = ["execute", "fetch"] }
+hellas-attestation = { workspace = true, features = [
+    "apple-app-attest",
+], optional = true }
 # The re-execution names the network its outcome is bound to, and that
 # type is the consensus kernel's. `work` is the only feature that reaches
 # it.
 hellas-kernel = { workspace = true, optional = true }
-hellas-attestation = { workspace = true, features = [
-    "apple-app-attest",
-], optional = true }
+hellas-rpc = { workspace = true, features = ["execute", "fetch"] }
 hellas-wire.workspace = true
 iroh = { workspace = true, features = ["tls-ring"], optional = true }
 iroh-mdns-address-lookup = { version = "0.4", optional = true }

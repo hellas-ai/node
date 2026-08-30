@@ -10,8 +10,8 @@ documentation.workspace = true
 [dependencies]
 hellas-xet = { workspace = true, features = ["chunking"] }
 lz4_flex = { version = "0.14", default-features = false, features = ["frame"] }
-thiserror = { workspace = true }
 serde_json = { workspace = true }
+thiserror = { workspace = true }
 # Bundled Mozilla roots, matching the workspace `reqwest`. Deliberately
 # NOT `platform-verifier`: two HTTP clients in one binary trusting two
 # different sets of certificate authorities is a silent policy split,

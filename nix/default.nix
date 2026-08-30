@@ -279,7 +279,8 @@ let
     sort = mkHydraSourceCheck {
       name = "check-sort";
       inputs = [ pkgs.cargo-sort ];
-      command = "cargo-sort --workspace --check";
+      # Taplo owns TOML layout; cargo-sort owns table/key ordering.
+      command = "cargo-sort --workspace --check --no-format";
     };
 
     fmt = mkHydraSourceCheck {

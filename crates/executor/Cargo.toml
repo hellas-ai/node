@@ -9,15 +9,15 @@ documentation.workspace = true
 
 [features]
 default = ["evaluate"]
-evaluate = [
-    "dep:catena-runner",
-    "dep:commonware-runtime",
-]
+evaluate = ["dep:catena-runner", "dep:commonware-runtime"]
 
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
-catena-runner = { workspace = true, default-features = false, features = ["fetch", "runtime"], optional = true }
+catena-runner = { workspace = true, default-features = false, features = [
+    "fetch",
+    "runtime",
+], optional = true }
 commonware-runtime = { workspace = true, optional = true }
 futures-core = "0.3"
 futures-util = "0.3"
