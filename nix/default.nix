@@ -160,6 +160,9 @@ let
         };
 
   crossTargets = {
+    # The store's replacement-resistant file identity uses Unix device,
+    # inode, mtime, and ctime metadata. Do not advertise Windows until an
+    # equally strong platform-specific identity has an implementation/tests.
     "aarch64-linux" = nixpkgs.lib.systems.examples.aarch64-multiplatform;
     "riscv64-linux" = nixpkgs.lib.systems.examples.riscv64;
     "x86_64-linux-musl" = nixpkgs.lib.systems.examples.musl64 // {
@@ -168,7 +171,6 @@ let
     "aarch64-linux-musl" = nixpkgs.lib.systems.examples.aarch64-multiplatform-musl // {
       isStatic = true;
     };
-    "x86_64-windows" = nixpkgs.lib.systems.examples.mingwW64;
   };
 
   nativePackages = packagesFor null;
@@ -347,7 +349,6 @@ let
     inherit (nativePackages) cli-catena;
     static-x86_64 = crossPackages.cross-x86_64-linux-musl-cli;
     static-aarch64 = crossPackages.cross-aarch64-linux-musl-cli;
-    static-windows = crossPackages.cross-x86_64-windows-cli;
     inherit (linuxOutputs.packages) docker;
     "hellas-rpc-wasm" = hellasRpcWasm;
   };

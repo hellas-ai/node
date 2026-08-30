@@ -199,7 +199,6 @@ let
     cli-validator = "cli-validator";
     static-x86_64 = "cross-x86_64-linux-musl-cli";
     static-aarch64 = "cross-aarch64-linux-musl-cli";
-    static-windows = "cross-x86_64-windows-cli";
     hellas-rpc-wasm = "hellas-rpc-wasm";
   }
   // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
