@@ -30,7 +30,7 @@ const TOKEN_IDS_SCHEMA: &str = "hellas.evaluate.token_ids.v1";
 const TEXT_POLICY_SCHEMA: &str = "hellas.evaluate.text.policy.v1";
 const TEXT_EXECUTION_SCHEMA: &str = "hellas.evaluate.text.execution.v1";
 const TEXT_STATE_SCHEMA: &str = "hellas.evaluate.text.state.v1";
-const TEXT_ARTIFACT_IDENTITY_SCHEMA: &str = "hellas.evaluate.text.artifact.identity.v1";
+const TEXT_ARTIFACT_IDENTITY_SCHEMA: &str = "hellas.evaluate.text.artifact.identity.v2";
 const TEXT_ARTIFACT_OUTPUT_SCHEMA: &str = "hellas.evaluate.text.artifact.output.v1";
 
 pub trait Canonical {
@@ -521,25 +521,16 @@ impl TextOutput {
 pub enum TextArtifact {
     Identity {
         bound_term: BoundTermId,
-        model_id: String,
-        revision: String,
-        dtype: String,
+        execution_package: crate::ExecutionPackageId,
     },
     Output(TextOutput),
 }
 
 impl TextArtifact {
-    pub fn identity(
-        bound_term: BoundTermId,
-        model_id: impl Into<String>,
-        revision: impl Into<String>,
-        dtype: impl Into<String>,
-    ) -> Self {
+    pub fn identity(bound_term: BoundTermId, execution_package: crate::ExecutionPackageId) -> Self {
         Self::Identity {
             bound_term,
-            model_id: model_id.into(),
-            revision: revision.into(),
-            dtype: dtype.into(),
+            execution_package,
         }
     }
 
@@ -563,16 +554,12 @@ impl Canonical for TextArtifact {
         match self {
             Self::Identity {
                 bound_term,
-                model_id,
-                revision,
-                dtype,
+                execution_package,
             } => {
-                encoder.array(5);
+                encoder.array(3);
                 encoder.str(TEXT_ARTIFACT_IDENTITY_SCHEMA);
                 encoder.bytes(bound_term.as_bytes());
-                encoder.str(model_id);
-                encoder.str(revision);
-                encoder.str(dtype);
+                encoder.bytes(execution_package.as_bytes());
             }
             Self::Output(output) => {
                 encoder.array(5);
@@ -941,16 +928,14 @@ fn decode_text_artifact(
     let len = decoder.array_len()?;
     match decoder.str()? {
         TEXT_ARTIFACT_IDENTITY_SCHEMA => {
-            if len != 5 {
+            if len != 3 {
                 return Err(CanonicalDecodeError::new(format!(
-                    "{TEXT_ARTIFACT_IDENTITY_SCHEMA} expected array length 5, got {len}"
+                    "{TEXT_ARTIFACT_IDENTITY_SCHEMA} expected array length 3, got {len}"
                 )));
             }
             Ok(TextArtifact::identity(
                 BoundTermId::from_bytes(decoder.bytes_32()?),
-                decoder.str()?,
-                decoder.str()?,
-                decoder.str()?,
+                crate::ExecutionPackageId::from_bytes(decoder.bytes_32()?),
             ))
         }
         TEXT_ARTIFACT_OUTPUT_SCHEMA => {

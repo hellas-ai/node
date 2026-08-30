@@ -32,7 +32,10 @@ pub use identity::{
     ProviderIdentityV1, RootKind, RootProof, SignedProviderGenesis,
 };
 pub use job::{APPLE_APP_ATTEST, JobTerms};
-pub use manifest::{EvaluateProgramManifest, FetchProgramManifest, ProgramManifest};
+pub use manifest::{
+    CATENA_TOKEN_AUTOREGRESSIVE_PROFILE, EvaluateProgramManifest, ExecutionPackageId,
+    FetchProgramManifest, ProgramManifest,
+};
 pub use open::{
     OPEN_EXPORTER_LEN, OPEN_NONCE_LEN, OPEN_PROOF_DOMAIN, OPEN_PROVIDER_ROLE, open_proof_binding,
 };
