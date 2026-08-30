@@ -58,6 +58,40 @@ impl Default for EvaluateArtifactStore {
     }
 }
 
+macro_rules! typed_canonical_artifacts {
+    ($(
+        $load:ident,
+        $insert:ident,
+        $id:ty,
+        $value:ty,
+        $cache:ident,
+        $identity:ident;
+    )+) => {
+        $(
+            async fn $load(&mut self, id: $id) -> Result<$value, ExecutorError> {
+                if let Some(value) = self.$cache.get(&id).cloned() {
+                    return Ok(value);
+                }
+                let value = self
+                    .decode_canonical::<$value>(id.digest(), stringify!($value))
+                    .await?;
+                if value.$identity() != id {
+                    return Err(canonical_type_mismatch(stringify!($value), id.digest()));
+                }
+                self.$cache.insert(id, value.clone());
+                Ok(value)
+            }
+
+            async fn $insert(&mut self, value: $value) -> Result<$id, ExecutorError> {
+                let id = value.$identity();
+                self.insert_canonical(id.digest(), &value).await?;
+                self.$cache.entry(id).or_insert(value);
+                Ok(id)
+            }
+        )+
+    };
+}
+
 impl EvaluateArtifactStore {
     pub(crate) fn memory() -> Self {
         Self::new(None)
@@ -518,77 +552,12 @@ impl EvaluateArtifactStore {
         Ok(artifact)
     }
 
-    async fn token_ids(&mut self, id: TokenIdsId) -> Result<TokenIds, ExecutorError> {
-        if let Some(value) = self.token_ids.get(&id) {
-            return Ok(value.clone());
-        }
-        let value = self
-            .decode_canonical::<TokenIds>(id.digest(), "TokenIds")
-            .await?;
-        if value.output_id() != id {
-            return Err(canonical_type_mismatch("TokenIds", id.digest()));
-        }
-        self.token_ids.insert(id, value.clone());
-        Ok(value)
-    }
-
-    async fn text_policy(&mut self, id: TextPolicyId) -> Result<TextPolicy, ExecutorError> {
-        if let Some(value) = self.policies.get(&id) {
-            return Ok(value.clone());
-        }
-        let value = self
-            .decode_canonical::<TextPolicy>(id.digest(), "TextPolicy")
-            .await?;
-        if value.output_id() != id {
-            return Err(canonical_type_mismatch("TextPolicy", id.digest()));
-        }
-        self.policies.insert(id, value.clone());
-        Ok(value)
-    }
-
-    async fn text_execution(
-        &mut self,
-        id: TextExecutionId,
-    ) -> Result<TextExecution, ExecutorError> {
-        if let Some(value) = self.text_executions.get(&id) {
-            return Ok(value.clone());
-        }
-        let value = self
-            .decode_canonical::<TextExecution>(id.digest(), "TextExecution")
-            .await?;
-        if value.input_id() != id {
-            return Err(canonical_type_mismatch("TextExecution", id.digest()));
-        }
-        self.text_executions.insert(id, value.clone());
-        Ok(value)
-    }
-
-    async fn text_state(&mut self, id: TextStateId) -> Result<TextState, ExecutorError> {
-        if let Some(value) = self.text_states.get(&id) {
-            return Ok(*value);
-        }
-        let value = self
-            .decode_canonical::<TextState>(id.digest(), "TextState")
-            .await?;
-        if value.output_id() != id {
-            return Err(canonical_type_mismatch("TextState", id.digest()));
-        }
-        self.text_states.insert(id, value);
-        Ok(value)
-    }
-
-    async fn text_artifact(&mut self, id: TextArtifactId) -> Result<TextArtifact, ExecutorError> {
-        if let Some(value) = self.text_artifacts.get(&id) {
-            return Ok(value.clone());
-        }
-        let value = self
-            .decode_canonical::<TextArtifact>(id.digest(), "TextArtifact")
-            .await?;
-        if value.output_id() != id {
-            return Err(canonical_type_mismatch("TextArtifact", id.digest()));
-        }
-        self.text_artifacts.insert(id, value.clone());
-        Ok(value)
+    typed_canonical_artifacts! {
+        token_ids, insert_token_ids, TokenIdsId, TokenIds, token_ids, output_id;
+        text_policy, insert_policy, TextPolicyId, TextPolicy, policies, output_id;
+        text_execution, insert_text_execution, TextExecutionId, TextExecution, text_executions, input_id;
+        text_state, insert_text_state, TextStateId, TextState, text_states, output_id;
+        text_artifact, insert_text_artifact, TextArtifactId, TextArtifact, text_artifacts, output_id;
     }
 
     async fn decode_canonical<T: CanonicalDecode>(
@@ -615,47 +584,6 @@ impl EvaluateArtifactStore {
         })?;
         self.canonical_blobs.insert(digest, bytes.clone());
         Ok(bytes)
-    }
-
-    async fn insert_token_ids(&mut self, value: TokenIds) -> Result<TokenIdsId, ExecutorError> {
-        let id = value.output_id();
-        self.insert_canonical(id.digest(), &value).await?;
-        self.token_ids.entry(id).or_insert(value);
-        Ok(id)
-    }
-
-    async fn insert_policy(&mut self, value: TextPolicy) -> Result<TextPolicyId, ExecutorError> {
-        let id = value.output_id();
-        self.insert_canonical(id.digest(), &value).await?;
-        self.policies.entry(id).or_insert(value);
-        Ok(id)
-    }
-
-    async fn insert_text_execution(
-        &mut self,
-        value: TextExecution,
-    ) -> Result<TextExecutionId, ExecutorError> {
-        let id = value.input_id();
-        self.insert_canonical(id.digest(), &value).await?;
-        self.text_executions.entry(id).or_insert(value);
-        Ok(id)
-    }
-
-    async fn insert_text_state(&mut self, value: TextState) -> Result<TextStateId, ExecutorError> {
-        let id = value.output_id();
-        self.insert_canonical(id.digest(), &value).await?;
-        self.text_states.entry(id).or_insert(value);
-        Ok(id)
-    }
-
-    async fn insert_text_artifact(
-        &mut self,
-        value: TextArtifact,
-    ) -> Result<TextArtifactId, ExecutorError> {
-        let id = value.output_id();
-        self.insert_canonical(id.digest(), &value).await?;
-        self.text_artifacts.entry(id).or_insert(value);
-        Ok(id)
     }
 
     async fn insert_canonical(
