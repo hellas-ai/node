@@ -12,7 +12,6 @@ default = ["evaluate"]
 evaluate = ["dep:catena-runner", "dep:commonware-runtime"]
 
 [dependencies]
-anyhow = "1"
 async-trait = "0.1"
 catena-runner = { workspace = true, default-features = false, features = [
     "fetch",

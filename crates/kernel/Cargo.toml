@@ -43,7 +43,6 @@ proptest-state-machine = "0.8"
 # production path cross-validates that the two agree byte-for-byte.
 secp256k1 = { version = "0.31", features = ["alloc"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
 stateright = "0.31"
 
 [[bench]]

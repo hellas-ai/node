@@ -43,4 +43,3 @@ cc = { workspace = true, optional = true }
 
 [dev-dependencies]
 hex.workspace = true
-tokio.workspace = true

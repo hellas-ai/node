@@ -92,5 +92,4 @@ tokio = { version = "1", default-features = false, features = [
 ] }
 
 [dev-dependencies]
-proptest = "1"
 tokio = { workspace = true, features = ["full"] }
