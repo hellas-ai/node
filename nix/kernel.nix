@@ -203,11 +203,6 @@ let
   # Committed ITF traces are what the Rust replays read. If a model
   # changes and the traces are not regenerated, the replay keeps
   # asserting the OLD abstract behaviour and CI stays green — the
-  # correspondence silently becomes fiction. This check regenerates
-  # into a scratch tree and fails on any drift.
-  # Committed ITF traces are what the Rust replays read. If a model
-  # changes and the traces are not regenerated, the replay keeps
-  # asserting the OLD abstract behaviour and CI stays green — the
   # correspondence silently becomes fiction. This regenerates into a
   # scratch tree and fails on any drift.
   #
@@ -218,6 +213,8 @@ let
     scratch="$(mktemp -d)"
     trap 'rm -rf "$scratch"' EXIT
     committed="$repo_root/crates/${crate}/models/traces"
+    regenerated="$scratch/traces"
+    mkdir -p "$regenerated"
     canon() {
       for f in "$1"/*.itf.json; do
         printf '== %s\n' "$(basename "$f")"
@@ -226,9 +223,9 @@ let
     }
     canon "$committed" > "$scratch/committed.txt"
     ${lib.concatMapStringsSep "\n" (m: ''
-      quint test models/${m}.qnt --out-itf "models/traces/${m}_{test}.itf.json" --verbosity=0
+      quint test models/${m}.qnt --out-itf "$regenerated/${m}_{test}.itf.json" --verbosity=0
     '') models}
-    canon "$committed" > "$scratch/regenerated.txt"
+    canon "$regenerated" > "$scratch/regenerated.txt"
     if ! diff -u "$scratch/committed.txt" "$scratch/regenerated.txt"; then
       echo "ITF traces are stale: regenerate with 'nix run .#update-${crate}-model-fixtures'" >&2
       exit 1
