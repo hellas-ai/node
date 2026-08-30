@@ -1025,49 +1025,24 @@ async fn main() {
             wrap_args,
         } => {
             async {
+                let package_name = package.name().to_string();
                 #[cfg(feature = "evaluate")]
-                let materializes_package = local || verify_local;
-                #[cfg(not(feature = "evaluate"))]
-                let materializes_package = false;
-                if materializes_package && package_id.is_some() {
-                    anyhow::bail!(
-                        "--package-id is only for remote-only gateways; local package verification derives the exact ID"
-                    );
-                }
-                if !materializes_package && package_id.is_none() {
-                    anyhow::bail!(
-                        "remote gateway execution requires --package-id <64-hex Catena package ID>"
-                    );
-                }
-                if !materializes_package {
-                    package
-                        .require_remote_alias()
-                        .map_err(anyhow::Error::msg)?;
-                }
-                #[cfg(feature = "evaluate")]
-                if !materializes_package && package_cache.is_some() {
-                    anyhow::bail!("--package-cache is only used with --local or --verify-local");
-                }
-                #[cfg(feature = "evaluate")]
-                let (package_dir, package_artifact_dir) = if materializes_package {
+                let local_package = if local || verify_local {
                     let package_cache = package_cache
                         .map(Ok)
                         .unwrap_or_else(identity::default_package_cache_path)?;
-                    let package_dir = package.package_dir().ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "local Catena execution needs a manifest path; pass --package {}=PATH",
-                            package.name(),
-                        )
-                    })?;
-                    (
-                        Some(package_dir.to_path_buf()),
-                        Some(package.artifact_dir(&package_cache)),
-                    )
+                    Some(package.into_source(&package_cache)?)
                 } else {
-                    (None, None)
+                    package.require_remote_alias().map_err(anyhow::Error::msg)?;
+                    if package_cache.is_some() {
+                        anyhow::bail!(
+                            "--package-cache is only used with --local or --verify-local"
+                        );
+                    }
+                    None
                 };
                 #[cfg(not(feature = "evaluate"))]
-                let (package_dir, package_artifact_dir) = (None, None);
+                package.require_remote_alias().map_err(anyhow::Error::msg)?;
                 #[cfg(not(feature = "evaluate"))]
                 let local = false;
                 let provider_trust = gateway_provider_trust(
@@ -1092,10 +1067,10 @@ async fn main() {
                     queue_size,
                     retries,
                     default_max_tokens,
-                    package_name: package.name().to_string(),
+                    package_name,
                     execution_package: package_id,
-                    package_dir,
-                    package_artifact_dir,
+                    #[cfg(feature = "evaluate")]
+                    local_package,
                     tokenizer,
                     stop_token_ids,
                     metrics_port,
@@ -1161,9 +1136,7 @@ async fn main() {
                         .unwrap_or_else(identity::default_package_cache_path)?;
                     Some(package.into_source(&package_cache)?)
                 } else {
-                    package
-                        .require_remote_alias()
-                        .map_err(anyhow::Error::msg)?;
+                    package.require_remote_alias().map_err(anyhow::Error::msg)?;
                     if package_cache.is_some() {
                         anyhow::bail!(
                             "--package-cache is only used with --local or --verify-local"
@@ -1172,9 +1145,7 @@ async fn main() {
                     None
                 };
                 #[cfg(not(feature = "evaluate"))]
-                package
-                    .require_remote_alias()
-                    .map_err(anyhow::Error::msg)?;
+                package.require_remote_alias().map_err(anyhow::Error::msg)?;
                 commands::llm::run(
                     commands::llm::ExecuteOptions {
                         node_id,
@@ -1502,7 +1473,7 @@ mod tests {
 
     #[cfg(feature = "evaluate")]
     #[test]
-    fn gateway_accepts_local_mode() {
+    fn gateway_local_modes_derive_the_package_id() {
         let cli = parse_gateway_with_package(TEST_LOCAL_PACKAGE, &["--local"]).unwrap();
         match cli.command {
             Commands::Gateway {
@@ -1516,6 +1487,17 @@ mod tests {
                 assert!(local);
             }
             _ => panic!("expected gateway command"),
+        }
+
+        for mode in ["--local", "--verify-local"] {
+            assert!(
+                parse_gateway_with_package(
+                    TEST_LOCAL_PACKAGE,
+                    &[mode, "--package-id", TEST_PACKAGE_ID],
+                )
+                .is_err(),
+                "{mode} must conflict with an explicit --package-id",
+            );
         }
     }
 

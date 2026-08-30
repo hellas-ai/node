@@ -75,7 +75,7 @@ impl PackageArg {
         &self.name
     }
 
-    #[cfg(any(feature = "evaluate", test))]
+    #[cfg(test)]
     pub fn package_dir(&self) -> Option<&std::path::Path> {
         self.package_dir.as_deref()
     }
@@ -91,7 +91,7 @@ impl PackageArg {
         }
     }
 
-    #[cfg(any(feature = "evaluate", test))]
+    #[cfg(test)]
     pub fn artifact_dir(&self, cache: &std::path::Path) -> PathBuf {
         cache.join(&self.name)
     }

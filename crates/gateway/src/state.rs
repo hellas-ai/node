@@ -9,7 +9,7 @@ use axum::response::{IntoResponse, Response};
 use hellas_adaptors::{ExecutionRequest as WireExecutionRequest, Input};
 use hellas_client::{ExecutionRoute, ProducerTrust, RemoteNodeTarget};
 #[cfg(feature = "evaluate")]
-use hellas_executor::{Executor, PackageSource};
+use hellas_executor::Executor;
 use hellas_presentation::TextPresentation;
 use hellas_rpc::Retention;
 #[cfg(feature = "evaluate")]
@@ -142,15 +142,12 @@ impl GatewayState {
         };
 
         #[cfg(feature = "evaluate")]
-        let (runtime, execution_package) = if options.local || options.verify_local {
-            let package_dir = options
-                .package_dir
+        let (runtime, execution_package, package_name) = if options.local || options.verify_local {
+            let local_package = options
+                .local_package
                 .clone()
                 .context("local gateway execution requires --package NAME=PATH")?;
-            let package_artifact_dir = options
-                .package_artifact_dir
-                .clone()
-                .context("local gateway execution requires a package artifact cache")?;
+            let package_name = local_package.name().to_string();
             let handle = Executor::spawn_with_producer_key(
                 ExecutePolicy::Eager,
                 options.queue_size,
@@ -160,11 +157,7 @@ impl GatewayState {
             )
             .context("failed to initialize local Catena executor")?;
             let execution_package = handle
-                .materialize_package(PackageSource::new(
-                    options.package_name.clone(),
-                    package_dir,
-                    package_artifact_dir,
-                )?)
+                .materialize_package(local_package)
                 .await
                 .context("failed to load local Catena package")?;
             (
@@ -172,6 +165,7 @@ impl GatewayState {
                     .with_remote(options.secret_key.clone())
                     .await?,
                 execution_package,
+                package_name,
             )
         } else {
             let execution_package = options.execution_package.context(
@@ -180,14 +174,16 @@ impl GatewayState {
             (
                 CliRuntime::remote(options.secret_key.clone()).await?,
                 execution_package,
+                options.package_name.clone(),
             )
         };
         #[cfg(not(feature = "evaluate"))]
-        let (runtime, execution_package) = (
+        let (runtime, execution_package, package_name) = (
             CliRuntime::remote(options.secret_key.clone()).await?,
             options.execution_package.context(
                 "remote gateway execution requires --package-id <64-hex Catena package ID>",
             )?,
+            options.package_name.clone(),
         );
 
         let responses_fetch = match options.responses_backend {
@@ -241,7 +237,7 @@ impl GatewayState {
             verify_local: options.verify_local,
             verify_node_id: options.verify,
             default_max_tokens: options.default_max_tokens,
-            package_name: options.package_name.clone(),
+            package_name,
             execution_package,
             inference_timeout: DEFAULT_INFERENCE_TIMEOUT,
             runtime,
@@ -431,8 +427,8 @@ mod tests {
             default_max_tokens: 128,
             package_name: "smollm2-135m".to_string(),
             execution_package: Some(hellas_rpc::ExecutionPackageId::from_bytes([8; 32])),
-            package_dir: Some("packages/smollm2".into()),
-            package_artifact_dir: Some("cache/smollm2-135m".into()),
+            #[cfg(feature = "evaluate")]
+            local_package: None,
             tokenizer: "tokenizer.json".into(),
             stop_token_ids: Vec::new(),
             metrics_port: None,

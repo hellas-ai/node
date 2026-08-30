@@ -65,10 +65,9 @@ pub struct GatewayOptions {
     /// Exact Catena identity pinned by a remote-only caller. Local and
     /// verify-local gateways derive it from the verified package instead.
     pub execution_package: Option<hellas_rpc::ExecutionPackageId>,
-    /// Local Catena manifest directory. Required only when a local execution
-    /// leg is configured; the name remains routing metadata only.
-    pub package_dir: Option<PathBuf>,
-    pub package_artifact_dir: Option<PathBuf>,
+    /// Owner-selected Catena package source for a local execution leg.
+    #[cfg(feature = "evaluate")]
+    pub local_package: Option<hellas_executor::PackageSource>,
     /// Application-selected tokenizer used only before and after execution.
     /// It is not part of the Catena package or Hellas execution claim.
     pub tokenizer: PathBuf,
