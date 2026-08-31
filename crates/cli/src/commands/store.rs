@@ -1,8 +1,8 @@
 //! Operating the content store from the command line.
 //!
 //! These commands index existing content, inspect the persisted index, and
-//! fetch exact content-addressed files. Catena package materialization is a
-//! separate subsystem.
+//! fetch exact content-addressed files. Compilation and execution consume
+//! verified descriptors through the evaluator; the store does neither.
 
 use std::path::{Path, PathBuf};
 

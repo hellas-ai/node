@@ -1,15 +1,19 @@
 use super::proxy::ResponsesProxy;
 use super::{GatewayOptions, ResponsesBackend, json_error};
 use crate::execution::{
-    CliRuntime, ExecutionRequest, ExecutionRequestOptions, ExecutionStrategy, PreparedExecution,
+    CausalLmExecutionEnvironment, CliRuntime, ExecutionRequest, ExecutionRequestOptions,
+    ExecutionStrategy, PreparedExecution,
 };
 use anyhow::Context;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use hellas_adaptors::{ExecutionRequest as WireExecutionRequest, Input};
-use hellas_client::{ExecutionRoute, ProducerTrust, RemoteNodeTarget};
+use hellas_client::{ExecutionRoute, RemoteNodeTarget};
 #[cfg(feature = "evaluate")]
-use hellas_executor::Executor;
+use hellas_executor::{
+    ArtifactStoreConfig, Executor, ExecutorMetrics, ExecutorSpawnConfig, FetchAccessPolicy,
+    FetchRouteRegistry, FetchTranscriptStoreBackend, GpuConfig,
+};
 use hellas_presentation::TextPresentation;
 use hellas_rpc::Retention;
 #[cfg(feature = "evaluate")]
@@ -32,8 +36,8 @@ pub(super) struct GatewayState {
     pub(super) verify_local: bool,
     pub(super) verify_node_id: Option<EndpointId>,
     default_max_tokens: u32,
-    pub(super) package_name: String,
-    pub(super) execution_package: hellas_rpc::ExecutionPackageId,
+    pub(super) model_name: String,
+    pub(super) causal_lm: CausalLmExecutionEnvironment,
     pub(super) inference_timeout: Duration,
     runtime: CliRuntime,
     presentation: Arc<TextPresentation>,
@@ -101,6 +105,13 @@ fn configured_strategy(options: &GatewayOptions) -> Option<ExecutionStrategy> {
     Some(ExecutionStrategy::Run(primary))
 }
 
+#[cfg(feature = "evaluate")]
+fn local_runtime_needs_remote(options: &GatewayOptions) -> bool {
+    options.verify_local
+        || options.verify.is_some()
+        || matches!(options.responses_backend, ResponsesBackend::Fetch)
+}
+
 pub(super) struct PreparedGeneration {
     pub(super) prepared: PreparedExecution,
     /// Pre-flight provenance the executor committed to. `None` for routes
@@ -142,60 +153,44 @@ impl GatewayState {
         };
 
         #[cfg(feature = "evaluate")]
-        let (runtime, execution_package, package_name) = if options.local || options.verify_local {
-            let local_package = options
-                .local_package
+        let runtime = if options.local || options.verify_local {
+            let content_store = options
+                .local_content_store
                 .clone()
-                .context("local gateway execution requires --package NAME=PATH")?;
-            let package_name = local_package.name().to_string();
-            let handle = Executor::spawn_with_producer_key(
-                ExecutePolicy::Eager,
-                options.queue_size,
-                runner_key.as_ref().clone(),
-                options.provider_genesis.clone(),
-                options.assurance,
-            )
+                .context("local gateway execution requires a local content store")?;
+            let handle = Executor::spawn_configured(ExecutorSpawnConfig {
+                execute_policy: ExecutePolicy::Any,
+                queue_capacity: options.queue_size,
+                metrics: Arc::new(ExecutorMetrics::default()),
+                producer_key: runner_key.clone(),
+                provider_genesis: Arc::new(options.provider_genesis.clone()),
+                assurance: options.assurance,
+                fetch_access_policy: FetchAccessPolicy::trusted_callers([runner_key.public_key()]),
+                fetch_routes: FetchRouteRegistry::default(),
+                fetch_max_in_flight: hellas_rpc::DEFAULT_FETCH_MAX_IN_FLIGHT,
+                fetch_queue_capacity: hellas_rpc::DEFAULT_FETCH_QUEUE_CAPACITY,
+                fetch_replay_max_in_flight: hellas_rpc::DEFAULT_FETCH_REPLAY_MAX_IN_FLIGHT,
+                fetch_store: FetchTranscriptStoreBackend::memory(),
+                artifact_store: ArtifactStoreConfig::memory(),
+                content_store,
+                gpu_config: GpuConfig::default(),
+            })
+            .await
             .context("failed to initialize local Catena executor")?;
-            let execution_package = handle
-                .materialize_package(local_package)
-                .await
-                .context("failed to load local Catena package")?;
-            (
-                CliRuntime::local(handle)
-                    .with_remote(options.secret_key.clone())
-                    .await?,
-                execution_package,
-                package_name,
-            )
+            let runtime = CliRuntime::local(handle);
+            if local_runtime_needs_remote(options) {
+                runtime.with_remote(options.secret_key.clone()).await?
+            } else {
+                runtime
+            }
         } else {
-            let execution_package = options.execution_package.context(
-                "remote gateway execution requires --package-id <64-hex Catena package ID>",
-            )?;
-            (
-                CliRuntime::remote(options.secret_key.clone()).await?,
-                execution_package,
-                options.package_name.clone(),
-            )
+            CliRuntime::remote(options.secret_key.clone()).await?
         };
         #[cfg(not(feature = "evaluate"))]
-        let (runtime, execution_package, package_name) = (
-            CliRuntime::remote(options.secret_key.clone()).await?,
-            options.execution_package.context(
-                "remote gateway execution requires --package-id <64-hex Catena package ID>",
-            )?,
-            options.package_name.clone(),
-        );
+        let runtime = CliRuntime::remote(options.secret_key.clone()).await?;
 
         let responses_fetch = match options.responses_backend {
             ResponsesBackend::Fetch => {
-                // Mirrors the producer-side default for trusted callers: with
-                // no keys configured, only output signed by this gateway's own
-                // producer key verifies.
-                let producer_trust = if options.trusted_producer_public_keys.is_empty() {
-                    ProducerTrust::keys([runner_key.public_key()])
-                } else {
-                    ProducerTrust::keys(options.trusted_producer_public_keys.iter().copied())
-                };
                 Some(Arc::new(super::fetch_backend::ResponsesFetchBackend::new(
                     runtime.clone(),
                     ExecutionRoute::remote(
@@ -223,7 +218,6 @@ impl GatewayState {
                     ),
                     runner_key.as_ref().clone(),
                     options.assurance,
-                    producer_trust,
                     options.responses_fetch_request_overrides.clone(),
                 )))
             }
@@ -237,8 +231,8 @@ impl GatewayState {
             verify_local: options.verify_local,
             verify_node_id: options.verify,
             default_max_tokens: options.default_max_tokens,
-            package_name,
-            execution_package,
+            model_name: options.model_name.clone(),
+            causal_lm: options.causal_lm.clone(),
             inference_timeout: DEFAULT_INFERENCE_TIMEOUT,
             runtime,
             presentation,
@@ -274,12 +268,11 @@ impl GatewayState {
         let prompt_tokens = input_ids.len() as u32;
         let request = ExecutionRequest::new(
             self.runtime.clone(),
-            self.package_name.clone(),
+            self.causal_lm.clone(),
             input_ids,
             self.stop_token_ids.clone(),
             ExecutionRequestOptions {
                 max_new_tokens: max_tokens,
-                execution_package: self.execution_package,
                 assurance: self.assurance,
                 retention,
             },
@@ -425,10 +418,10 @@ mod tests {
             queue_size: 1,
             retries: 2,
             default_max_tokens: 128,
-            package_name: "smollm2-135m".to_string(),
-            execution_package: Some(hellas_rpc::ExecutionPackageId::from_bytes([8; 32])),
+            model_name: "smollm2-135m".to_string(),
+            causal_lm: crate::execution::test_causal_lm_environment(8),
             #[cfg(feature = "evaluate")]
-            local_package: None,
+            local_content_store: None,
             tokenizer: "tokenizer.json".into(),
             stop_token_ids: Vec::new(),
             metrics_port: None,
@@ -439,7 +432,6 @@ mod tests {
             responses_fetch_route_method: String::new(),
             responses_fetch_execution_environment: None,
             responses_fetch_request_overrides: Default::default(),
-            trusted_producer_public_keys: Vec::new(),
             provider_trust,
             producer_key: hellas_rpc::ProducerSigningKey::from_secret_bytes([3; 32])
                 .expect("valid test key"),
@@ -525,5 +517,20 @@ mod tests {
             configured_strategy(&options),
             Some(ExecutionStrategy::Run(ExecutionRoute::Local))
         );
+    }
+
+    #[cfg(feature = "evaluate")]
+    #[test]
+    fn pure_local_runtime_does_not_bind_remote_transport() {
+        let mut options = options(None);
+        options.local = true;
+        assert!(!local_runtime_needs_remote(&options));
+
+        options.verify_local = true;
+        assert!(local_runtime_needs_remote(&options));
+
+        options.verify_local = false;
+        options.responses_backend = ResponsesBackend::Fetch;
+        assert!(local_runtime_needs_remote(&options));
     }
 }

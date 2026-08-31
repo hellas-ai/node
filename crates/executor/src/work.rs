@@ -22,29 +22,29 @@
 //!
 //! Which is also to say what this is not: a paid gate on the executor's
 //! own front door. An owner of the [`ExecutorHandle`] can call it
-//! directly and get an execution for nothing — the same reach
-//! `materialize_package` has, and for the same reason, since the handle is
-//! held in-process and no RPC routes to either.
+//! directly and get an execution for nothing, because the handle is held
+//! in-process and no RPC route exposes it.
 //!
 //! One thing this file must not do, and deliberately does not: consult
 //! the engine's completed-execution map. That map is keyed by request
 //! commitment, so a second paid job carrying the same request would be
 //! answered out of the first one's transcript, with nothing invoked and
-//! a price charged. `EvaluateEngine::start_request` starts.
+//! a price charged. `EvaluateEngine::start_prepared_input` instead creates
+//! one fresh invocation and hands it to the actor's owed FIFO exactly once.
 //!
 //! # What is not covered by a test here
 //!
-//! That the exact loaded Catena package, given this request, produces that
-//! transcript. Running it needs the executable package, so no check in this
-//! repository executes this path end to end; what the gate does with a
-//! transcript, and how many times it asks for one, is tested against a
-//! counting double at this trait in `hellas-rpc`.
-
-use hellas_rpc::work::{BackendFault, PaidEvaluateBackend};
-use hellas_rpc::{EvaluateRequest, OutputEventEnvelope};
+//! That the exact Catena environment, given this request, produces that
+//! transcript. Running it needs a compatible GPU and the committed content,
+//! so the ordinary unit suite does not execute this path end to end; the ROCm
+//! integration test does. What the gate does with a transcript, and how many
+//! times it asks for one, is tested against a counting double at this trait in
+//! `hellas-rpc`.
 
 use crate::ExecutorError;
-use crate::executor::{ExecutorHandle, ExecutorMessage};
+use crate::executor::{ExecutorHandle, ExecutorOwedRequest};
+use hellas_rpc::OutputEventEnvelope;
+use hellas_rpc::work::{BackendFault, PaidEvaluateBackend, PreparedEvaluateInput};
 
 impl ExecutorHandle {
     /// Runs one already-authorized paid job to its terminal.
@@ -61,10 +61,16 @@ impl ExecutorHandle {
     /// failed, or when an event does not decode.
     pub async fn run_paid_evaluate(
         &self,
-        request: EvaluateRequest,
+        input: PreparedEvaluateInput,
     ) -> Result<Vec<OutputEventEnvelope>, ExecutorError> {
+        // The actor admits this durable obligation exactly once. If the GPU
+        // worker is occupied, EvaluateEngine retains it in its owed FIFO and
+        // dispatches it ahead of peer-admitted work.
         let outcome = self
-            .send(|reply| ExecutorMessage::RunPaidEvaluate { request, reply })
+            .send_owed(|reply| ExecutorOwedRequest::RunPaidEvaluate {
+                input: Box::new(input),
+                reply,
+            })
             .await?;
         drain_transcript(outcome).await
     }
@@ -82,21 +88,38 @@ async fn drain_transcript(
     use hellas_rpc::pb::execute::work_event;
 
     let mut events = outcome.events;
+    let mut transcript = Vec::new();
+    let mut terminal_seen = false;
     while let Some(event) = events.recv().await {
+        if terminal_seen {
+            return Err(ExecutorError::Execution(
+                "paid evaluate stream emitted an item after its terminal outcome".to_string(),
+            ));
+        }
         let event = event.map_err(|status| {
             ExecutorError::Execution(format!("paid evaluate stream failed: {status}"))
         })?;
         match event.kind {
+            Some(work_event::Kind::Chunk(chunk)) => {
+                let event = chunk.output_event.ok_or_else(|| {
+                    ExecutorError::Execution(
+                        "paid evaluate chunk is missing its signed output event".to_string(),
+                    )
+                })?;
+                transcript.push(hellas_rpc::stream::output_event_from_pb(event).map_err(
+                    |err| ExecutorError::Execution(format!("paid evaluate output event: {err}")),
+                )?);
+            }
             Some(work_event::Kind::Finished(finished)) => {
-                let mut transcript = Vec::with_capacity(finished.output_events.len());
-                for event in finished.output_events {
-                    transcript.push(hellas_rpc::stream::output_event_from_pb(event).map_err(
-                        |err| {
-                            ExecutorError::Execution(format!("paid evaluate terminal event: {err}"))
-                        },
-                    )?);
-                }
-                return Ok(transcript);
+                let event = finished.terminal_output_event.ok_or_else(|| {
+                    ExecutorError::Execution(
+                        "paid evaluate completion is missing its signed terminal event".to_string(),
+                    )
+                })?;
+                transcript.push(hellas_rpc::stream::output_event_from_pb(event).map_err(
+                    |err| ExecutorError::Execution(format!("paid evaluate terminal event: {err}")),
+                )?);
+                terminal_seen = true;
             }
             Some(work_event::Kind::Failed(failed)) => {
                 return Err(ExecutorError::Execution(format!(
@@ -104,25 +127,28 @@ async fn drain_transcript(
                     failed.position, failed.error
                 )));
             }
-            // Token chunks are the streaming half of the unpaid path.
-            // The paid answer is the signed transcript the terminal
-            // carries, so these are read past rather than served: this
-            // milestone releases no plaintext before the terminal is
-            // durable, and there is nothing here to release it to.
-            _ => {}
+            None => {
+                return Err(ExecutorError::Execution(
+                    "paid evaluate stream event has no body".to_string(),
+                ));
+            }
         }
     }
-    Err(ExecutorError::Execution(
-        "paid evaluate stream ended without a terminal".to_string(),
-    ))
+    if terminal_seen {
+        Ok(transcript)
+    } else {
+        Err(ExecutorError::Execution(
+            "paid evaluate stream ended without a terminal".to_string(),
+        ))
+    }
 }
 
 impl PaidEvaluateBackend for ExecutorHandle {
     async fn evaluate(
         &self,
-        request: EvaluateRequest,
+        input: PreparedEvaluateInput,
     ) -> Result<Vec<OutputEventEnvelope>, BackendFault> {
-        self.run_paid_evaluate(request)
+        self.run_paid_evaluate(input)
             .await
             .map_err(|error| BackendFault::new(error.to_string()))
     }
@@ -139,7 +165,9 @@ mod tests {
     use hellas_rpc::pb::execute::{WorkChunk, WorkEvent, WorkFailed, WorkFinished, work_event};
     use hellas_rpc::provenance::ExecutionProvenance;
     use hellas_rpc::stream::output_event_to_pb;
-    use hellas_rpc::{Assurance, ContentId, Digest, ProducerSigningKey, Retention};
+    use hellas_rpc::{
+        Assurance, ContentId, Digest, EvaluateRequest, ProducerSigningKey, Retention,
+    };
     use tokio::sync::mpsc;
 
     use crate::executor::ExecuteOutcome;
@@ -181,6 +209,7 @@ mod tests {
         let terminal = EvaluateTerminal {
             final_position: 2,
             stop_reason: EvaluateStopReason::STOP_TOKEN,
+            matched_stop_token_id: Some(1),
             text_artifact: Digest::from_bytes([0x77; 32]),
             usage,
             billable_units: 5,
@@ -192,10 +221,10 @@ mod tests {
     }
 
     /// An execution whose stream is exactly `events`, already ended.
-    fn outcome(events: Vec<WorkEvent>) -> ExecuteOutcome {
+    fn outcome_items(events: Vec<Result<WorkEvent, hellas_wire::WireStatus>>) -> ExecuteOutcome {
         let (sender, receiver) = mpsc::channel(events.len().max(1));
         for event in events {
-            if sender.try_send(Ok(event)).is_err() {
+            if sender.try_send(event).is_err() {
                 panic!("the fixture channel takes its own events");
             }
         }
@@ -208,10 +237,15 @@ mod tests {
         }
     }
 
+    fn outcome(events: Vec<WorkEvent>) -> ExecuteOutcome {
+        outcome_items(events.into_iter().map(Ok).collect())
+    }
+
     fn finished(transcript: &[OutputEventEnvelope]) -> WorkEvent {
+        let terminal = transcript.last().expect("fixture terminal event");
         WorkEvent {
             kind: Some(work_event::Kind::Finished(WorkFinished {
-                output_events: transcript.iter().map(output_event_to_pb).collect(),
+                terminal_output_event: Some(output_event_to_pb(terminal)),
                 assurance_evidence: Vec::new(),
             })),
         }
@@ -230,16 +264,41 @@ mod tests {
         }
     }
 
-    /// The answer is the transcript the terminal carries, and the token
-    /// chunks that streamed past it are not part of it.
+    /// Prefix chunks and the singular terminal frame reconstruct one transcript.
     #[tokio::test]
-    async fn the_answer_is_the_terminals_transcript_and_not_the_chunks() {
+    async fn the_answer_combines_prefix_chunks_and_terminal() {
         let expected = transcript();
-        let events = vec![chunk(), chunk(), finished(&expected)];
+        let events = vec![chunk(), finished(&expected)];
         match drain_transcript(outcome(events)).await {
             Ok(drained) => assert_eq!(drained, expected),
             Err(error) => panic!("a finished execution has a transcript: {error}"),
         }
+    }
+
+    #[tokio::test]
+    async fn a_post_terminal_event_is_a_protocol_fault() {
+        let transcript = transcript();
+        for suffix in [chunk(), finished(&transcript)] {
+            let events = vec![chunk(), finished(&transcript), suffix];
+            let error = drain_transcript(outcome(events))
+                .await
+                .expect_err("an event after WorkFinished must be rejected");
+            assert!(error.to_string().contains("after its terminal outcome"));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_post_terminal_stream_error_is_a_protocol_fault() {
+        let transcript = transcript();
+        let events = vec![
+            Ok(chunk()),
+            Ok(finished(&transcript)),
+            Err(hellas_wire::WireStatus::internal("late transport failure")),
+        ];
+        let error = drain_transcript(outcome_items(events))
+            .await
+            .expect_err("an error after WorkFinished must be rejected");
+        assert!(error.to_string().contains("after its terminal outcome"));
     }
 
     /// A failed execution is a fault, not an empty answer.
@@ -255,7 +314,7 @@ mod tests {
             WorkEvent {
                 kind: Some(work_event::Kind::Failed(WorkFailed {
                     position: 4,
-                    error: "the Catena package did not run".to_string(),
+                    error: "the Catena environment did not run".to_string(),
                 })),
             },
         ];
@@ -263,7 +322,10 @@ mod tests {
             panic!("a failed execution has no transcript");
         };
         let text = error.to_string();
-        assert!(text.contains("the Catena package did not run"), "{text}");
+        assert!(
+            text.contains("the Catena environment did not run"),
+            "{text}"
+        );
         assert!(text.contains('4'), "{text}");
     }
 
@@ -311,6 +373,7 @@ mod tests {
         let events = match builder.finish(EvaluateTerminal {
             final_position: 2,
             stop_reason: EvaluateStopReason::STOP_TOKEN,
+            matched_stop_token_id: Some(1),
             text_artifact: Digest::from_bytes([0x77; 32]),
             usage: EvaluateUsage {
                 input_units: 3,
@@ -322,7 +385,12 @@ mod tests {
             Err(error) => panic!("the fixture transcript finishes: {error}"),
         };
 
-        match drain_transcript(outcome(vec![finished(&events)])).await {
+        let prefix = WorkEvent {
+            kind: Some(work_event::Kind::Chunk(WorkChunk {
+                output_event: events.first().map(output_event_to_pb),
+            })),
+        };
+        match drain_transcript(outcome(vec![prefix, finished(&events)])).await {
             Ok(drained) => assert_eq!(drained, events),
             Err(error) => panic!("an ephemeral request still has a transcript: {error}"),
         }

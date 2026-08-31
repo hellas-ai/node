@@ -125,15 +125,15 @@ use hellas_rpc::services::work::WorkServer;
 use hellas_rpc::services::work_setup::WorkSetupHandler;
 use hellas_rpc::work::{
     BackendFault, ClientEndpoint, CloseEndpoint, JobProposal, PaidEvaluateBackend, PaymentError,
-    RunOutcome, WorkService, propose_work, run_accepted_work,
+    PreparedEvaluateInput, RunOutcome, WorkService, propose_work, run_accepted_work,
 };
 use hellas_rpc::work_close::{CloseProgress, TxSink, close_start};
 use hellas_rpc::work_handshake::{PaymentAdmission, SetupEndpoint, SetupService};
 use hellas_rpc::work_open::{SetupAdvance, SetupProgress, SetupStep, advance_setup};
 use hellas_rpc::work_store::{Role, SetupOrigin, SetupScan, SetupStore};
 use hellas_rpc::{
-    Assurance, EvaluateProgramManifest, EvaluateRequest, ExecutionPackageId, OutputEventEnvelope,
-    ProducerSigningKey, ProgramManifest, PublicKey as RpcPublicKey,
+    Application, Assurance, CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR, ContentId, EvaluateRequest,
+    OutputEventEnvelope, ProducerSigningKey, ProgramManifest, PublicKey as RpcPublicKey,
 };
 use hellas_wire::mux::{MessagePipe, MuxConfig, MuxTransport, Role as MuxRole};
 use hellas_wire::{DefaultClock, Dispatcher, StreamTransport as _, TransportContext};
@@ -940,13 +940,13 @@ struct ProviderBackend {
 impl PaidEvaluateBackend for ProviderBackend {
     fn evaluate(
         &self,
-        request: EvaluateRequest,
+        input: PreparedEvaluateInput,
     ) -> impl core::future::Future<Output = Result<Vec<OutputEventEnvelope>, BackendFault>> + Send
     {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let answer = FixtureExecutor::run(&self.prompt, execution_policy().max_new_tokens);
         let prompt = self.prompt.clone();
-        async move { Ok(transcript_for(&request, &prompt, &answer)) }
+        async move { Ok(transcript_for(input.evaluate_request(), &prompt, &answer)) }
     }
 }
 
@@ -968,6 +968,7 @@ impl Reproducer for ClientReexecution {
         Ok(Reproduced {
             output_token_ids: FixtureExecutor::run(&plan.prompt_token_ids, plan.max_new_tokens),
             stop_reason: EvaluateStopReason::STOP_TOKEN,
+            matched_stop_token_id: Some(1),
         })
     }
 }
@@ -1002,6 +1003,7 @@ fn transcript_for(
     match builder.finish(EvaluateTerminal {
         final_position: answer.len() as u64,
         stop_reason: EvaluateStopReason::STOP_TOKEN,
+        matched_stop_token_id: Some(1),
         text_artifact,
         usage,
         billable_units,
@@ -1013,10 +1015,12 @@ fn transcript_for(
 
 // ── The job's prepared inputs ─────────────────────────────────────────
 
+const CAUSAL_LM_ENVIRONMENT_ID: ContentId = ContentId::from_bytes([0x16; 32]);
+
 fn manifest() -> ProgramManifest {
-    ProgramManifest::Evaluate(EvaluateProgramManifest {
-        execution_package: ExecutionPackageId::from_bytes([0x16; 32]),
-    })
+    let application = Application::new(CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR)
+        .expect("the causal-LM application identity is valid");
+    ProgramManifest::new(application, CAUSAL_LM_ENVIRONMENT_ID)
 }
 
 fn prompt_tokens() -> TokenIds {
@@ -1028,10 +1032,7 @@ fn text_policy() -> TextPolicy {
 }
 
 fn identity_artifact() -> TextArtifact {
-    TextArtifact::identity(
-        BoundTermId::from_digest(manifest().content_id().digest()),
-        ExecutionPackageId::from_bytes([0x16; 32]),
-    )
+    TextArtifact::identity(BoundTermId::from_digest(manifest().content_id().digest()))
 }
 
 fn text_execution() -> TextExecution {

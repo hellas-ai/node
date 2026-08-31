@@ -1,94 +1,224 @@
 # Hellas
 
-Hellas executes exact, token-native Catena packages locally
-or across the network. The node owns package materialization; remote peers can
-select only an operator-configured alias and can never make it fetch or load an
-arbitrary path.
+Hellas commits exact work, runs it locally or over an adversarial network, and
+binds the result into a signed transcript. Execution identity is one canonical
+`ProgramManifest`:
+
+```text
+(evaluator, adaptor, content-addressed application root)
+```
+
+The two application identifiers are exact opaque strings. Hellas does not
+parse versions, negotiate compatibility, or consult a model/package registry.
 
 ## Execution boundary
 
-There are three deliberately separate layers:
+The application owns the meaning of its root. The two currently modelled
+shapes intentionally have different trust boundaries:
 
-| Layer | What it binds |
-| --- | --- |
-| Catena package identity | Exact program, executable artifacts, linking, executable token-ID/value adapter (not a tokenizer), vocabulary, and capacity |
-| Hellas request and signed transcript | Exact package identity, input token IDs, maximum output, caller-selected stop IDs, generated token IDs, and termination reason |
-| Local presentation | Prompt text, tokenizer, chat template, and decoded text |
+| Application | Root and trusted computation | Outside that guarantee |
+| --- | --- | --- |
+| `hellas/catena-gpu-0.0.1`, `causal-lm-0.0.1` | Exact Catena program, entrypoint, content-addressed static objects and borrowed slices, state sizing, vocabulary, capacity, and token-native invocation/result | Model acquisition, provider GPU/backend choice, tokenizer, chat template, text decoding, and API presentation |
+| `hellas/fetch-0.0.1`, `codex-responses-0.0.1` or `openai-responses-0.0.1` | A strict stateless Responses field set; typed reconstruction of provider-shaped JSON; `stream=true` and upstream `store=false`; the exact official Codex or OpenAI HTTPS endpoint; no redirects; and SSE response projection | The truth, correctness, and availability of the adversarial upstream service; provider route label; credentials/auth-file location; and access policy |
 
-Catena does not specify a tokenizer, chat template, decoder, or default stop
-tokens. Hellas does not attest them either. The CLI's `--tokenizer` turns local
-text into the token IDs that Hellas does bind, and turns verified output IDs
-back into text. Stop IDs are explicit caller policy: repeat `--stop-token` or
-comma-separate values. With no such option, only `--max-new-tokens` ends a
-normal generation.
+For causal LM work, the request and transcript bind the manifest, input token
+IDs, maximum output, explicit stop IDs, output token IDs, and termination.
+`--tokenizer` is a caller-side lens that encodes prompt text and decodes the
+verified IDs; it is not part of the Catena kernel claim. Hellas infers no stop
+tokens from it.
 
-Package aliases are local routing names, not identities. For a remote request,
-the caller supplies an exact package ID obtained through a trusted,
-out-of-band path. The node must prove that its alias resolves to that ID before
-the client accepts its quote. `ListPackages` is useful observation, but an
-adversarial node is not an authority for the ID the caller expects.
-Artifact-addressed requests carry no alias and therefore require an `id/...`
-execute-policy rule (or `eager`); an alias rule cannot authorize them by
-accident.
+Fetch is different. Its purpose is to attest the exact transformation around a
+remote request, so structuring and destructuring are inside that application's
+trusted path rather than presentation performed outside it. This proves which
+checks and transformation ran, not that the remote service's claims are true.
 
-## SmolLM2 tutorial
+A platform-backed Assurance authenticates the Fetch application. The
+`ProducerSigned` mode authenticates only the producer key and signed transcript;
+it does not authenticate a running binary. The Responses-facing `store` switch
+controls Hellas Courtesy transcript retention. The upstream call made by the
+attested app is always stateless and sends `store=false`. This first sealed adaptor accepts text
+and client-executed function tools; it rejects provider-account references,
+provider-side tools, file/image inputs, and unknown top-level fields.
 
-The [complete SmolLM2 tutorial](docs/tutorials/smollm2.md) starts from the four
-Catena package manifests and a digest-pinned tokenizer, then verifies the exact
-package ID, runs a known eight-token ROCm result, serves the package, sends the
-same request over Hellas, and shows the corresponding NixOS configuration.
+Retention is opt-in. `--retain` (or a request-level `retain=true` / `store=true`)
+publishes prompt- and token-bearing artifacts through content-addressed Courtesy
+`GetArtifact`; a digest is an address, not an authorization capability. Omission
+keeps the execution ephemeral. This is not a deletion promise for an accepted paid job: the signed
+prepared input remains in that channel's recovery/evidence journal as required
+to resume safely after a crash.
 
-It also shows how an operator publishes a node ID and enrollment pin with
-`identity show-node-id` and `identity show-enrollment-id`. A remote caller sends
-only an alias, exact package ID, and token-level invocation; package paths and
-objects remain local to the executing node.
+## Causal-LM environments
 
-## Qwen3-30B-A3B
+Human-readable settings live in [`examples/`](examples/). Their paths are
+local acquisition hints; canonical environment bytes contain only identities,
+lengths, and ABI data.
 
-Qwen is deliberately opt-in: its current Catena package names about 56.9 GiB
-of weights, before runtime buffers. It uses an independently selected tokenizer
-and explicit stop policy; the Runner example uses IDs `151643` and `151645`.
-Trex cannot execute that package on its approximately 8 GiB GPU, so the
-SmolLM2 tutorial is the maintained runnable example rather than implying Qwen
-runtime coverage this hardware does not have.
+```sh
+hellas-cli environment build \
+  --program model.hex \
+  --settings examples/smollm2.environment.toml \
+  --out smollm2.environment
+
+hellas-cli environment inspect --environment smollm2.environment
+
+# Prove one environment and all of its referenced content are provider-ready.
+hellas-cli environment verify \
+  --environment smollm2.environment \
+  --content-root /srv/hellas/content \
+  --content-index /var/lib/hellas/content.index
+```
+
+For `llm` and `gateway`, the caller selects the environment trust anchor before
+any route starts. By default, the exact local `--environment` file bytes are
+that anchor and the CLI derives their manifest ID. When a manifest ID was
+distributed separately, pass `--manifest-id <CONTENT_ID>`; a file deriving
+a different ID is rejected before network or GPU work. A provider never selects
+either value.
+
+A provider indexes ordinary runtime files and can accept any locally
+satisfiable supported environment; it need not register a model name:
+
+```sh
+hellas-cli --software-root serve \
+  --execute-policy any \
+  --content-root /srv/hellas/content
+```
+
+`QuoteTokens` strictly decodes the submitted manifest. The first binding opens
+its root by exact local content ID and verifies every declared program/static
+object; later quotes for that exact manifest may reuse the immutable verified
+binding without reopening or rehashing those files. Quoting neither fetches nor
+compiles. The authorized worker is the final availability and integrity
+boundary: before nonresident content enters the safe runtime, it reopens the
+descriptor and enforces the exact ID and length; an already-resident exact
+mapping is reused. The provider then compiles the Catena source for its visible
+ROCm device. Verified static files are lent by descriptor to a bounded
+persistent safe-runtime session, so an already prepared program and weights are
+reused across requests until the session is recycled or the service restarts.
+There is no client-supplied `gfx` target or provider architecture allow-list.
+Providers independently bound compilation with `--gpu-compile-timeout-secs`
+and each complete generation with `--gpu-execution-timeout-secs`; expiry kills
+the isolated worker process group and the next request starts a fresh session.
+`--gpu-max-generation-capacity` is additionally capped at 524288 tokens so a
+retained token transcript fits Hellas's 4 MiB unary artifact transport.
+
+Indexed provider content is an immutable local-cache assumption. Hellas pins
+the verified read-only descriptor and detects path/inode replacement; it does
+not defend against a separate local process that already holds a writable
+descriptor to the same inode and mutates it concurrently.
+
+The [SmolLM2 tutorial](docs/tutorials/smollm2.md) covers pinned acquisition,
+environment construction, local and remote execution, resident reuse, the
+HTTP gateway, NixOS serving, and the larger Qwen3 compile-only check.
+
+## Sealed Fetch
+
+Fetch route names are operator-defined routing labels. The sealed destination
+selects the trusted adaptor, fixed official endpoint, no-redirect HTTP driver,
+and response projector as one unit. A configuration cannot supply a URL or
+claim a different adaptor identity.
+
+For an OpenAI Responses route, first create the caller identity and obtain its
+producer public key:
+
+```sh
+hellas-cli --identity caller.identity --software-root identity init
+CALLER_KEY=$(hellas-cli --identity caller.identity producer-key show |
+  awk '$1 == "public_key:" { print $2 }')
+export CALLER_KEY
+export OPENAI_API_KEY='<provider-local credential>'
+```
+
+Write `fetch.json`; the model/output limits shown are optional:
+
+```json
+{
+  "routes": [{
+    "service": "openai",
+    "method": "responses",
+    "destination": {
+      "type": "openai-responses",
+      "api_key_env": "OPENAI_API_KEY"
+    },
+    "capabilities": {
+      "models": ["gpt-5.5"],
+      "max_output_tokens": 4096
+    }
+  }],
+  "callers": [{
+    "public_key": "REPLACE_WITH_CALLER_KEY",
+    "routes": [{
+      "service": "openai",
+      "method": "responses",
+      "models": ["gpt-5.5"],
+      "max_output_tokens": 512
+    }]
+  }]
+}
+```
+
+Replace `REPLACE_WITH_CALLER_KEY` with `$CALLER_KEY`, then start the provider
+and obtain its node and enrollment IDs through a trusted channel:
+
+```sh
+hellas-cli --identity provider.identity --software-root identity init
+NODE_ID=$(hellas-cli --identity provider.identity identity show-node-id)
+ENROLLMENT_ID=$(hellas-cli --identity provider.identity identity show-enrollment-id)
+
+hellas-cli --identity provider.identity --software-root serve \
+  --port 49152 \
+  --fetch-config fetch.json
+```
+
+The OpenAI sealed manifest ID is
+`a4ff1dbe22fe5d6888258bd95d21a288855c11d40b59c86ad834ab747033e8e8`.
+Run one strict provider-shaped request from another terminal:
+
+```sh
+hellas-cli --identity caller.identity --software-root fetch "$NODE_ID" \
+  --node-addr 127.0.0.1:49152 \
+  --provider "$ENROLLMENT_ID" \
+  --service openai \
+  --method responses \
+  --execution-environment openai-responses \
+  --payload '{"model":"gpt-5.5","input":"Say hello","stream":true,"store":false,"max_output_tokens":32}'
+```
+
+Output is JSON Lines of semantic response events followed by one terminal
+event; raw upstream SSE is never the signed result. The caller's exact input
+bytes are signed, but the trusted app parses and reconstructs a fresh upstream
+body before egress. Open, ticket creation, execution, and output-key
+verification all remain on the same confidentially opened transport.
+
+The Codex alternative uses destination type `codex-responses`, a local
+`auth_path` populated by `hellas-cli codex-auth login`, and sealed manifest ID
+`82ebed7724b614bfcca6082924710098821cafc95789f136f770667e16ef9785`.
+In both cases, `ProducerSigned` proves only the key and transcript. Claiming the
+trusted app itself requires a platform-backed assurance.
 
 ## HTTP gateway
 
-After completing the tutorial setup, reuse its `HELLAS`, `CLIENT_IDENTITY`,
-`PACKAGE`, `PACKAGE_CACHE`, and `TOKENIZER` values to run a local gateway:
+The gateway requires the same canonical causal-LM environment and an explicit
+presentation tokenizer. `--model` is only an API response label; when omitted,
+the manifest ID is used.
 
-```bash
-"$HELLAS" \
-  --identity "$CLIENT_IDENTITY" \
-  --software-root \
-  gateway --local \
-  --package "$PACKAGE" \
-  --package-cache "$PACKAGE_CACHE" \
-  --tokenizer "$TOKENIZER"
+```sh
+hellas-cli --software-root gateway \
+  --local \
+  --environment smollm2.environment \
+  --content-root /srv/hellas/content \
+  --tokenizer /srv/hellas-presentation/tokenizer.json \
+  --model smollm2-135m
 ```
 
-Or reuse its `NODE_ID`, `NODE_ADDR`, `ENROLLMENT_ID`, and `PACKAGE_ID` to route
-the gateway to that remote node:
-
-```bash
-"$HELLAS" \
-  --identity "$CLIENT_IDENTITY" \
-  --software-root \
-  --provider "$ENROLLMENT_ID" \
-  gateway \
-  --node-id "$NODE_ID" \
-  --node-addr "$NODE_ADDR" \
-  --package smollm2-135m \
-  --package-id "$PACKAGE_ID" \
-  --tokenizer "$TOKENIZER"
-```
-
-The gateway binds loopback and prints a fresh bearer token at startup. The
-Hellas execution backend accepts plain text at `/v1/completions` and simple
-text input at `/v1/responses`. Chat, message, reasoning, and tool inputs are
-rejected because no chat template is implicit. Select the proxy or Fetch
-Responses backend when those semantics come from another explicitly chosen
-service.
+It binds loopback and shows a fresh bearer credential once on its controlling
+terminal. The Hellas causal-LM backend accepts plain text at
+`/v1/completions` and simple text input at `/v1/responses`. It rejects chat,
+tool, and reasoning structures because no trusted or implicit chat template
+exists. The proxy and attested Fetch Responses backends have their own explicit
+semantics. `--responses-backend` changes only `/v1/responses`; every other
+route remains bound to the causal-LM environment, so `--environment` and
+`--tokenizer` are still required.
 
 The exposed routes are:
 
@@ -99,11 +229,7 @@ POST /v1/chat/completions
 POST /v1/messages
 ```
 
-Monitor discovery and peer health:
-
-```bash
-cargo run -p hellas-cli -- monitor --timeout-secs 30
-```
+Monitor discovery and peer health with `hellas-cli monitor --timeout-secs 30`.
 
 ## Chain
 
@@ -177,34 +303,91 @@ cargo run --no-default-features --features chain -- \
 
 ## Nix
 
-The Catena interface is being developed in tandem in the sibling
-`catena-runner` and `exploratory-catena` checkouts. Until those branches are
-published, override both temporary path inputs explicitly (replace the paths
-if your checkout layout differs). A relative flake input cannot archive a
-sibling outside the Hellas source tree, so pure `nix build` and CI commands
-need these overrides too:
-
-```bash
-nix develop \
-  --override-input catena-runner path:/mnt/Home/src/catena-runner \
-  --override-input exploratory-catena path:/mnt/Home/src/exploratory-catena \
-  --no-write-lock-file
-```
-
 The main outputs are `.#cli` (network client/node/gateway), `.#cli-catena`
-(x86_64 Linux plus local Catena execution), and `.#cli-validator`. The current
-runner is HIP-only, so the local evaluator is deliberately not advertised on
-other systems.
+(x86_64 Linux plus the Catena safe GPU runtime), and `.#cli-validator`.
+Hellas imports only `catena-lang` from the Catena workspace. During tandem
+development the flake uses its committed-only sibling Git branch; no build
+archives the sibling's `target/` tree. This becomes a published Git pin before
+a remote release.
 
-On an x86_64 Linux ROCm host, enter the evaluator shell with the same input
-overrides:
+Enter the x86_64 Linux ROCm development shell with:
 
-```bash
-nix develop .#rocm \
-  --override-input catena-runner path:/mnt/Home/src/catena-runner \
-  --override-input exploratory-catena path:/mnt/Home/src/exploratory-catena \
-  --no-write-lock-file
+```sh
+nix develop .#rocm --no-write-lock-file
 ```
+
+The NixOS provider module configures the ROCm toolchain, cache directory, and
+GPU device access when runtime content is enabled:
+
+```nix
+services.hellas = {
+  enable = true;
+  openFirewall = true;
+  executePolicy = "any";
+  contentRoots = [ "/srv/hellas/content" ];
+  extraArgs = [ "--software-root" ];
+};
+```
+
+Model weights, Catena programs, environment files, tokenizers, and generated
+compiler artifacts are runtime data. Keep them outside `/nix/store`; the
+module rejects store paths for these options. A provider chooses its actual
+ROCm device at execution time rather than baking a client-selected target into
+the environment.
+
+Fetch providers likewise use runtime files: set `fetchConfigFile` to the JSON
+configuration path and `environmentFile` to a systemd environment file holding
+provider-local secrets such as `OPENAI_API_KEY`. Do not put either file in a
+Nix expression or in the store. In particular, never interpolate the file as a
+Nix path and never use `builtins.readFile` on it: both operations expose its
+contents during evaluation, before any module assertion or runtime validation
+can protect it. Retained Fetch evidence is bounded across both
+completed transcripts and indeterminate running markers by
+`fetchRetainedTranscriptCapacity` (default 1024; zero disables new retention).
+`fetchReplayMaxInFlight` separately bounds replay consumers (default 16), and a
+slot remains occupied until its event stream is drained or dropped. The
+retention capacity is persisted per transcript-store root so processes sharing
+one root cannot disagree. Stop every such process before changing the capacity
+or removing its metadata; existing transcripts and running markers are never
+deleted, and an already over-cap root still starts and replays while refusing
+new retention.
+
+On Darwin, the Home Manager launch agent remains network-only but supports the
+same runtime-secret boundary:
+
+```nix
+programs.hellas = {
+  enable = true;
+  serve = {
+    enable = true;
+    fetchConfigFile = "/Users/alice/.config/hellas/fetch.json";
+    environmentFile = "/Users/alice/.config/hellas/provider.env";
+  };
+};
+```
+
+Provision the environment file outside Nix and restrict it to the user, with no
+group or other permission bits. The runtime wrapper resolves parent symlinks,
+rejects the Nix store, opens the final component without following symlinks and
+without blocking on special files, then requires that same opened descriptor to
+name a regular file owned by the agent's effective user. Its
+grammar is deliberately small: blank lines and `#` comments in column one are
+allowed; every other line is `NAME=VALUE`, with names matching
+`[A-Za-z_][A-Za-z0-9_]*`. Values are literal, so spaces, `#`, and `=` are kept
+and quotes, escapes, substitutions, and shell commands have no special
+meaning. Duplicate names, malformed lines, CR/NUL bytes, or any failed security
+check stop the agent before Hellas runs. The launchd plist contains the absolute
+file path, never its contents. As above, never use Nix interpolation or
+`builtins.readFile` for this file; validation cannot undo an evaluation-time
+secret leak.
+
+Retained Evaluate artifacts are separately bounded by
+`evaluateRetainedExecutionCapacity` (default 1024; zero disables new retained
+completions). Each unique execution reserves one persistent slot before its
+graph is published; a crash can leave that slot and up to eight canonical
+objects behind, but cannot grow the store past the configured execution bound.
+The Evaluate root is exclusively locked for the provider lifetime, and its
+capacity metadata must match on every restart.
 
 Work on the kernel Quint models:
 

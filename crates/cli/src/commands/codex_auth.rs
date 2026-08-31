@@ -1,13 +1,15 @@
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+#[cfg(feature = "node")]
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 #[cfg(feature = "node")]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use reqwest::Url;
-use reqwest::header::CONTENT_TYPE;
+use reqwest::header::{CONTENT_TYPE, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
@@ -17,8 +19,13 @@ const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const ISSUER: &str = "https://auth.openai.com";
 const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const AUTH_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+const AUTH_FILE_LOCK_TIMEOUT: Duration = Duration::from_secs(35);
 #[cfg(feature = "node")]
 const REFRESH_SKEW_SECONDS: u64 = 120;
+#[cfg(feature = "node")]
+const MAX_REFRESH_RESPONSE_BYTES: usize = 64 * 1024;
+#[cfg(feature = "node")]
+const MAX_REFRESH_ERROR_MESSAGE_BYTES: usize = 2 * 1024;
 
 pub(crate) async fn login(auth_path: Option<&Path>) -> anyhow::Result<()> {
     let store = CodexAuthStore::new(auth_path)?;
@@ -86,6 +93,10 @@ pub(crate) struct CodexAuthStore {
     path: PathBuf,
     #[cfg(feature = "node")]
     token_url: Url,
+    /// Prevent many callers in this process from occupying Tokio blocking
+    /// threads on the cross-process file lock while one refresh awaits HTTP.
+    #[cfg(feature = "node")]
+    refresh_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl CodexAuthStore {
@@ -98,12 +109,18 @@ impl CodexAuthStore {
             path,
             #[cfg(feature = "node")]
             token_url: Url::parse(TOKEN_URL).expect("Codex auth token URL is valid"),
+            #[cfg(feature = "node")]
+            refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
     #[cfg(all(test, feature = "node"))]
     pub(crate) fn with_token_url(path: PathBuf, token_url: Url) -> Self {
-        Self { path, token_url }
+        Self {
+            path,
+            token_url,
+            refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
+        }
     }
 
     pub(crate) fn path(&self) -> &Path {
@@ -112,6 +129,14 @@ impl CodexAuthStore {
 
     pub(crate) fn load(&self) -> Result<CodexAuthState, CodexAuthError> {
         self.load_unlocked()
+    }
+
+    #[cfg(feature = "node")]
+    pub(crate) fn account_id(&self) -> Result<String, CodexAuthError> {
+        self.load_unlocked()?
+            .tokens
+            .account_id
+            .ok_or(CodexAuthError::MissingAccountId)
     }
 
     fn load_unlocked(&self) -> Result<CodexAuthState, CodexAuthError> {
@@ -127,7 +152,11 @@ impl CodexAuthStore {
         if !self.path.exists() {
             return Err(CodexAuthError::Missing);
         }
-        let _guard = FileLock::lock(&self.path)?;
+        let _process_guard = self.refresh_lock.lock().await;
+        let auth_path = self.path.clone();
+        let _file_guard = tokio::task::spawn_blocking(move || FileLock::lock(&auth_path))
+            .await
+            .map_err(|error| CodexAuthError::LockTask(error.to_string()))??;
         let mut state = self.load_unlocked()?;
         if let Some(blocked) = &state.refresh_token_blocked {
             return Err(CodexAuthError::RefreshBlocked(blocked.message.clone()));
@@ -144,7 +173,7 @@ impl CodexAuthStore {
                 }
                 Err(err) if err.is_terminal() => {
                     state.refresh_token_blocked = Some(BlockedRefreshToken {
-                        message: err.to_string(),
+                        message: bounded_diagnostic(&err.to_string()),
                         blocked_at: now_timestamp(),
                     });
                     self.save_unlocked(&state)?;
@@ -172,7 +201,7 @@ impl CodexAuthStore {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct CodexAuthState {
     version: u8,
     tokens: CodexTokens,
@@ -191,17 +220,24 @@ impl CodexAuthState {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct CodexTokens {
     access_token: String,
     refresh_token: String,
+    #[serde(default, deserialize_with = "deserialize_optional_account_id")]
+    account_id: Option<String>,
 }
 
 #[cfg(all(test, feature = "node"))]
-pub(crate) fn test_tokens(access_token: &str, refresh_token: &str) -> CodexTokens {
+pub(crate) fn test_tokens_with_account_id(
+    access_token: &str,
+    refresh_token: &str,
+    account_id: &str,
+) -> CodexTokens {
     CodexTokens {
         access_token: access_token.to_string(),
         refresh_token: refresh_token.to_string(),
+        account_id: Some(validate_account_id(account_id).expect("valid test account id")),
     }
 }
 
@@ -218,6 +254,9 @@ pub(crate) enum CodexAuthError {
     #[cfg(feature = "node")]
     #[error("Codex auth refresh token is blocked: {0}")]
     RefreshBlocked(String),
+    #[cfg(feature = "node")]
+    #[error("Codex auth lock task failed: {0}")]
+    LockTask(String),
     #[error("Codex auth path has no parent directory: {0}")]
     InvalidPath(PathBuf),
     #[error("Codex auth file is invalid JSON: {0}")]
@@ -234,6 +273,11 @@ pub(crate) enum CodexAuthError {
     CodexCliAuthInvalidJson(serde_json::Error),
     #[error("Codex CLI auth file is missing tokens.access_token or tokens.refresh_token")]
     CodexCliAuthShape,
+    #[cfg(feature = "node")]
+    #[error("Codex ChatGPT credentials have no account id; re-import Codex CLI credentials")]
+    MissingAccountId,
+    #[error("Codex account id must be 1 to {MAX_ACCOUNT_ID_BYTES} valid HTTP-header bytes")]
+    InvalidAccountId,
     #[error("failed to request Codex device code: {0}")]
     DeviceCodeRequest(reqwest::Error),
     #[error("Codex device auth response is invalid JSON: {0}")]
@@ -461,18 +505,12 @@ async fn refresh_tokens(
             terminal: false,
         })?;
     let status = response.status();
+    let bytes = bounded_refresh_body(response).await?;
     if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
+        let body = String::from_utf8_lossy(&bytes);
         let (message, terminal) = refresh_error(status, &body);
         return Err(CodexAuthError::RefreshFailed { message, terminal });
     }
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|err| CodexAuthError::RefreshFailed {
-            message: format!("body read failed: {err}"),
-            terminal: false,
-        })?;
     // Deliberately non-terminal: a 2xx with an unparseable or incomplete
     // body means the *response* was bad, not the refresh token. Terminal
     // would persist `refresh_token_blocked` and brick a likely-valid
@@ -494,7 +532,39 @@ async fn refresh_tokens(
     Ok(CodexTokens {
         access_token,
         refresh_token,
+        account_id: tokens.account_id.clone(),
     })
+}
+
+#[cfg(feature = "node")]
+async fn bounded_refresh_body(mut response: reqwest::Response) -> Result<Vec<u8>, CodexAuthError> {
+    let mut body = Vec::new();
+    while let Some(chunk) =
+        response
+            .chunk()
+            .await
+            .map_err(|error| CodexAuthError::RefreshFailed {
+                message: format!("body read failed: {error}"),
+                terminal: false,
+            })?
+    {
+        let Some(next_len) = body.len().checked_add(chunk.len()) else {
+            return Err(refresh_body_too_large());
+        };
+        if next_len > MAX_REFRESH_RESPONSE_BYTES {
+            return Err(refresh_body_too_large());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+#[cfg(feature = "node")]
+fn refresh_body_too_large() -> CodexAuthError {
+    CodexAuthError::RefreshFailed {
+        message: format!("response body exceeds the {MAX_REFRESH_RESPONSE_BYTES}-byte limit"),
+        terminal: false,
+    }
 }
 
 fn tokens_from_json(value: JsonValue) -> Result<CodexTokens, CodexAuthError> {
@@ -505,7 +575,39 @@ fn tokens_from_json(value: JsonValue) -> Result<CodexTokens, CodexAuthError> {
     Ok(CodexTokens {
         access_token,
         refresh_token,
+        account_id: optional_account_id(&value)?,
     })
+}
+
+const MAX_ACCOUNT_ID_BYTES: usize = 256;
+
+fn optional_account_id(value: &JsonValue) -> Result<Option<String>, CodexAuthError> {
+    match value.get("account_id") {
+        None | Some(JsonValue::Null) => Ok(None),
+        Some(JsonValue::String(value)) => validate_account_id(value).map(Some),
+        Some(_) => Err(CodexAuthError::InvalidAccountId),
+    }
+}
+
+fn deserialize_optional_account_id<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer)?.map_or(Ok(None), |value| {
+        validate_account_id(&value)
+            .map(Some)
+            .map_err(serde::de::Error::custom)
+    })
+}
+
+fn validate_account_id(value: &str) -> Result<String, CodexAuthError> {
+    if value.is_empty()
+        || value.len() > MAX_ACCOUNT_ID_BYTES
+        || HeaderValue::from_str(value).is_err()
+    {
+        return Err(CodexAuthError::InvalidAccountId);
+    }
+    Ok(value.to_string())
 }
 
 fn tokens_from_codex_cli_json(value: &JsonValue) -> Result<CodexTokens, CodexAuthError> {
@@ -519,6 +621,7 @@ fn tokens_from_codex_cli_json(value: &JsonValue) -> Result<CodexTokens, CodexAut
     Ok(CodexTokens {
         access_token,
         refresh_token,
+        account_id: optional_account_id(tokens)?,
     })
 }
 
@@ -558,7 +661,29 @@ fn refresh_error(status: reqwest::StatusCode, body: &str) -> (String, bool) {
         Some("invalid_grant" | "invalid_token" | "invalid_request" | "refresh_token_reused")
     ) || matches!(status.as_u16(), 401 | 403);
     let message = message.unwrap_or_else(|| format!("HTTP {status}"));
+    let message = bounded_diagnostic(&message);
     (message, terminal)
+}
+
+#[cfg(feature = "node")]
+fn bounded_diagnostic(message: &str) -> String {
+    let mut output = String::with_capacity(message.len().min(MAX_REFRESH_ERROR_MESSAGE_BYTES));
+    for character in message.chars() {
+        let character = if character.is_control() {
+            ' '
+        } else {
+            character
+        };
+        if output.len() + character.len_utf8() > MAX_REFRESH_ERROR_MESSAGE_BYTES {
+            break;
+        }
+        output.push(character);
+    }
+    if output.is_empty() {
+        "upstream returned an empty error".to_string()
+    } else {
+        output
+    }
 }
 
 fn form_body(pairs: &[(&str, &str)]) -> String {
@@ -714,9 +839,27 @@ impl FileLock {
                 .mode(0o600)
                 .open(lock_path)
                 .map_err(CodexAuthError::Io)?;
-            let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-            if result != 0 {
-                return Err(CodexAuthError::Io(std::io::Error::last_os_error()));
+            let deadline = Instant::now() + AUTH_FILE_LOCK_TIMEOUT;
+            loop {
+                let result =
+                    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+                if result == 0 {
+                    break;
+                }
+                let error = std::io::Error::last_os_error();
+                if error.kind() != ErrorKind::WouldBlock {
+                    return Err(CodexAuthError::Io(error));
+                }
+                if Instant::now() >= deadline {
+                    return Err(CodexAuthError::Io(std::io::Error::new(
+                        ErrorKind::TimedOut,
+                        format!(
+                            "timed out after {} seconds waiting for Codex auth file lock",
+                            AUTH_FILE_LOCK_TIMEOUT.as_secs()
+                        ),
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(25));
             }
             Ok(Self { file })
         }
@@ -768,6 +911,7 @@ mod tests {
             CodexTokens {
                 access_token: "access".to_string(),
                 refresh_token: "refresh".to_string(),
+                account_id: None,
             },
             Some("1".to_string()),
         );
@@ -793,7 +937,7 @@ mod tests {
                     "id_token": "ignored",
                     "access_token": "access",
                     "refresh_token": "refresh",
-                    "account_id": "ignored"
+                    "account_id": "acct-1"
                 },
                 "last_refresh": "123"
             }))
@@ -810,7 +954,48 @@ mod tests {
 
         assert_eq!(loaded.tokens.access_token, "access");
         assert_eq!(loaded.tokens.refresh_token, "refresh");
+        assert_eq!(loaded.tokens.account_id.as_deref(), Some("acct-1"));
         assert_eq!(loaded.last_refresh.as_deref(), Some("123"));
+    }
+
+    #[test]
+    fn v1_auth_state_without_account_id_remains_loadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("codex-auth.json");
+        fs::write(
+            &path,
+            br#"{"version":1,"tokens":{"access_token":"access","refresh_token":"refresh"},"last_refresh":null,"refresh_token_blocked":null}"#,
+        )
+        .unwrap();
+        let store = CodexAuthStore::new(Some(&path)).unwrap();
+        assert_eq!(store.load().unwrap().tokens.account_id, None);
+        #[cfg(feature = "node")]
+        assert!(matches!(
+            store.account_id(),
+            Err(CodexAuthError::MissingAccountId)
+        ));
+    }
+
+    #[test]
+    fn import_rejects_invalid_account_ids() {
+        for account_id in [
+            JsonValue::String(String::new()),
+            JsonValue::String("account\r\nsmuggle".to_string()),
+            JsonValue::String("x".repeat(MAX_ACCOUNT_ID_BYTES + 1)),
+            JsonValue::Number(1.into()),
+        ] {
+            let value = serde_json::json!({
+                "tokens": {
+                    "access_token": "access",
+                    "refresh_token": "refresh",
+                    "account_id": account_id,
+                }
+            });
+            assert!(matches!(
+                tokens_from_codex_cli_json(&value),
+                Err(CodexAuthError::InvalidAccountId)
+            ));
+        }
     }
 
     #[cfg(feature = "node")]
@@ -847,6 +1032,7 @@ mod tests {
                 CodexTokens {
                     access_token: "expired".to_string(),
                     refresh_token: "old-refresh".to_string(),
+                    account_id: Some("acct-1".to_string()),
                 },
                 None,
             ))
@@ -854,10 +1040,82 @@ mod tests {
 
         let access = store.access_token().await.unwrap();
         assert_eq!(access, "new.access.token");
+        assert_eq!(
+            store.load().unwrap().tokens.account_id.as_deref(),
+            Some("acct-1")
+        );
         let body = capture.0.lock().await.clone().unwrap();
         assert!(body.contains("grant_type=refresh_token"));
         assert!(body.contains("refresh_token=old-refresh"));
         assert!(body.contains("client_id=app_EMoamEEZ73f0CkXaXp7hrann"));
+    }
+
+    #[cfg(feature = "node")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_refreshes_do_not_block_the_async_runtime_or_rotate_twice() {
+        #[derive(Clone)]
+        struct RefreshState {
+            calls: Arc<std::sync::atomic::AtomicUsize>,
+            access_token: String,
+        }
+
+        async fn token(State(state): State<RefreshState>) -> axum::Json<JsonValue> {
+            state
+                .calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            axum::Json(json!({
+                "access_token": state.access_token,
+                "refresh_token": "new-refresh"
+            }))
+        }
+
+        let payload =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"exp":4102444800}"#);
+        let access_token = format!("header.{payload}.signature");
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/token", post(token))
+            .with_state(RefreshState {
+                calls: Arc::clone(&calls),
+                access_token: access_token.clone(),
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = CodexAuthStore::with_token_url(
+            dir.path().join("codex-auth.json"),
+            Url::parse(&format!("http://{addr}/token")).unwrap(),
+        );
+        store
+            .save(&CodexAuthState::new(
+                CodexTokens {
+                    access_token: "expired".to_string(),
+                    refresh_token: "old-refresh".to_string(),
+                    account_id: None,
+                },
+                None,
+            ))
+            .unwrap();
+
+        let refreshes = (0..16).map(|_| {
+            let store = store.clone();
+            async move { store.access_token().await }
+        });
+        let tokens =
+            tokio::time::timeout(Duration::from_secs(2), futures::future::join_all(refreshes))
+                .await
+                .expect("file-lock contention must not block Tokio workers");
+        assert!(
+            tokens
+                .into_iter()
+                .all(|token| matches!(token, Ok(token) if token == access_token))
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[cfg(feature = "node")]
@@ -887,6 +1145,7 @@ mod tests {
                 CodexTokens {
                     access_token: "expired".to_string(),
                     refresh_token: "old-refresh".to_string(),
+                    account_id: None,
                 },
                 None,
             ))
@@ -894,6 +1153,86 @@ mod tests {
 
         assert!(store.access_token().await.is_err());
         assert!(store.load().unwrap().refresh_token_blocked.is_some());
+    }
+
+    #[cfg(feature = "node")]
+    #[tokio::test]
+    async fn persisted_terminal_refresh_diagnostic_is_bounded() {
+        async fn token() -> (axum::http::StatusCode, axum::Json<JsonValue>) {
+            (
+                axum::http::StatusCode::BAD_REQUEST,
+                axum::Json(json!({
+                    "error": {
+                        "code": "invalid_grant",
+                        "message": "x".repeat(MAX_REFRESH_ERROR_MESSAGE_BYTES * 2),
+                    }
+                })),
+            )
+        }
+
+        let app = Router::new().route("/token", post(token));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let store = CodexAuthStore::with_token_url(
+            dir.path().join("codex-auth.json"),
+            Url::parse(&format!("http://{addr}/token")).unwrap(),
+        );
+        store
+            .save(&CodexAuthState::new(
+                CodexTokens {
+                    access_token: "expired".to_string(),
+                    refresh_token: "old-refresh".to_string(),
+                    account_id: None,
+                },
+                None,
+            ))
+            .unwrap();
+
+        assert!(store.access_token().await.is_err());
+        let blocked = store
+            .load()
+            .unwrap()
+            .refresh_token_blocked
+            .expect("terminal error is persisted");
+        assert_eq!(blocked.message.len(), MAX_REFRESH_ERROR_MESSAGE_BYTES);
+    }
+
+    #[cfg(feature = "node")]
+    #[tokio::test]
+    async fn oversized_refresh_body_is_retryable_and_never_persisted() {
+        async fn token() -> String {
+            "x".repeat(MAX_REFRESH_RESPONSE_BYTES + 1)
+        }
+
+        let app = Router::new().route("/token", post(token));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let store = CodexAuthStore::with_token_url(
+            dir.path().join("codex-auth.json"),
+            Url::parse(&format!("http://{addr}/token")).unwrap(),
+        );
+        store
+            .save(&CodexAuthState::new(
+                CodexTokens {
+                    access_token: "expired".to_string(),
+                    refresh_token: "old-refresh".to_string(),
+                    account_id: None,
+                },
+                None,
+            ))
+            .unwrap();
+
+        let error = store.access_token().await.unwrap_err().to_string();
+        assert!(error.contains("response body exceeds"), "{error}");
+        assert!(store.load().unwrap().refresh_token_blocked.is_none());
     }
 
     #[cfg(feature = "node")]
@@ -920,6 +1259,7 @@ mod tests {
                 CodexTokens {
                     access_token: "expired".to_string(),
                     refresh_token: "old-refresh".to_string(),
+                    account_id: None,
                 },
                 None,
             ))

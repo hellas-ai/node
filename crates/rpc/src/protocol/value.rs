@@ -17,6 +17,12 @@ impl JsonBytes {
         &self.0
     }
 
+    /// Requested heap capacity retained by the owned JSON buffer.
+    #[must_use]
+    pub fn retained_heap_bytes(&self) -> usize {
+        self.0.capacity()
+    }
+
     pub fn into_bytes(self) -> Vec<u8> {
         self.0
     }

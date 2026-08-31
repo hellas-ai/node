@@ -179,6 +179,9 @@ impl WireAdaptor for AnthropicMessagesAdaptor {
                 AnthropicBlockKind::Text,
                 structured_delta_string(delta),
             ),
+            OutputEvent::Adaptor(_) => Err(AdaptorError::unsupported(
+                "Anthropic Messages cannot render adaptor-specific events",
+            )),
             OutputEvent::ToolCallStart(start) => render_tool_call_start(state, start),
             OutputEvent::ToolCallArgumentsDelta(delta) => {
                 render_tool_call_arguments_delta(state, delta.index, delta.delta)

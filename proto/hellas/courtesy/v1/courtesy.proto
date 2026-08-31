@@ -5,18 +5,21 @@ package hellas.courtesy.v1;
 import "hellas/evaluate/v1/evaluate.proto";
 import "hellas/v1/hellas.proto";
 
-// Non-core execution conveniences. Package-name resolution is not part of
-// Hellas's token-level execution guarantee. Callers independently reconstruct
-// and validate the returned EvaluateRequest from their exact package pin and
-// token request; a peer's interpretation is never authoritative.
+// Non-core execution conveniences for token-native Catena causal-LM programs.
+// Callers independently decode their local canonical environment, select the
+// expected manifest identity, and reconstruct the returned EvaluateRequest. A
+// library caller supplies that identity explicitly. The CLI accepts an explicit
+// --manifest-id; without one, its caller-selected local file bytes are the
+// trust anchor and their identity is derived before any network call. A peer's
+// interpretation is never authoritative. The provider resolves the manifest
+// root only from its verified local content store; quoting never fetches or
+// compiles it.
 
 service Courtesy {
   rpc Open(.hellas.v1.OpenRequest) returns (.hellas.v1.OpenResponse);
   rpc QuoteTokens(QuoteTokensRequest) returns (QuoteResponse);
   rpc GetArtifact(GetArtifactRequest) returns (GetArtifactResponse);
-  rpc ListPackages(ListPackagesRequest) returns (ListPackagesResponse);
   rpc GetStats(GetStatsRequest) returns (GetStatsResponse);
-  rpc GetPackageStats(GetPackageStatsRequest) returns (GetPackageStatsResponse);
 }
 
 message EvaluateStart {
@@ -34,11 +37,11 @@ message EvaluateArtifactStart {
 }
 
 message QuoteTokensRequest {
-  // Peer-local package name used only for routing.
-  string package = 1;
-  // Exact Catena execution-package identity expected by the caller; exactly
-  // 32 bytes. The provider must reject an alias resolving to any other ID.
-  bytes execution_package = 2;
+  reserved "package", "execution_package", "environment";
+  // Strict canonical ProgramManifest bytes. This Courtesy endpoint accepts
+  // only (hellas/catena-gpu-0.0.1, causal-lm-0.0.1).
+  bytes program_manifest = 1;
+  reserved 2;
   repeated uint32 prompt_token_ids = 3;
   // Absence selects DEFAULT_MAX_NEW_TOKENS; an explicit zero is invalid.
   optional uint32 max_new_tokens = 4;
@@ -47,7 +50,8 @@ message QuoteTokensRequest {
   reserved 7;
   .hellas.v1.PublicKey runner_public_key = 8;
   .hellas.v1.Assurance assurance = 9;
-  // Absence preserves the historical default: retain.
+  // Retention is opt-in. True publishes prompt- and token-bearing canonical
+  // artifacts through the content-addressed Courtesy GetArtifact API.
   optional bool retain = 10;
 }
 
@@ -59,38 +63,14 @@ message QuoteResponse {
 }
 
 message GetArtifactRequest {
-  // Xet content digest of canonical artifact bytes; exactly 32 bytes.
+  // Xet content digest of canonical artifact bytes; exactly 32 bytes. Retained
+  // artifacts are intentionally readable by digest: the digest is an address,
+  // not an authorization capability. Callers requiring privacy use retain=false.
   bytes digest = 1;
 }
 
 message GetArtifactResponse {
   bytes canonical_artifact = 1;
-}
-
-// List executable packages known to the executor and their readiness status.
-message ListPackagesRequest {}
-
-message PackageInfo {
-  string name = 1;
-  // Exact Catena execution-package identity currently behind this alias.
-  // Remote callers must compare it with an out-of-band pin; listing it does
-  // not make an adversarial peer authoritative for the expected identity.
-  bytes execution_package = 2;
-  PackageStatus status = 3;
-  // Human-readable error when status is FAILED.
-  string error = 4;
-}
-
-enum PackageStatus {
-  PACKAGE_STATUS_UNSPECIFIED = 0;
-  reserved 1, 2;
-  reserved "PACKAGE_STATUS_QUEUED", "PACKAGE_STATUS_LOADING";
-  PACKAGE_STATUS_READY = 3;
-  PACKAGE_STATUS_FAILED = 4;
-}
-
-message ListPackagesResponse {
-  repeated PackageInfo packages = 1;
 }
 
 // Cumulative token statistics since node start.
@@ -107,21 +87,8 @@ message TokenStats {
   uint64 generated_tokens = 8;
 }
 
-message PackageTokenStats {
-  string package = 1;
-  TokenStats stats = 2;
-}
-
 message GetStatsResponse {
   TokenStats stats = 1;
-  repeated PackageTokenStats package_stats = 2;
-}
-
-message GetPackageStatsRequest {
-  string package = 1;
-}
-
-message GetPackageStatsResponse {
-  string package = 1;
-  TokenStats stats = 2;
+  reserved 2;
+  reserved "package_stats";
 }

@@ -204,6 +204,9 @@ impl WireAdaptor for OpenAiChatCompletionsAdaptor {
                     None,
                 ),
             )]),
+            OutputEvent::Adaptor(_) => Err(AdaptorError::unsupported(
+                "Chat Completions cannot render adaptor-specific events",
+            )),
             OutputEvent::Usage(usage) => {
                 state.usage = Some(usage);
                 Ok(Vec::new())

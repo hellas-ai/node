@@ -11,10 +11,6 @@ use crate::{
 /// are writing and reading.
 const EVALUATE_REQUEST_SCHEMA: &str = "hellas.evaluate.request.v3";
 
-const fn retain_by_default() -> bool {
-    true
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvaluateRequest {
     /// Content-addressed TextExecution artifact.
@@ -23,7 +19,7 @@ pub struct EvaluateRequest {
     pub execution_environment: ContentId,
     pub nonce: [u8; 32],
     pub assurance: Assurance,
-    #[serde(default = "retain_by_default")]
+    #[serde(default)]
     pub retain: bool,
 }
 

@@ -17,25 +17,11 @@ let
   chainSettlementNative = "jesTu2BpszP8DKSoi1R5G6ggjHrsrVnboLdx6V47vkoR";
 
   # Presentation is deliberately independent of every Catena execution
-  # package. The proxy test never runs inference, but the gateway still
+  # environment. The proxy test never runs inference, but the gateway still
   # requires an explicit tokenizer and stop policy at its text boundary.
-  testTokenizer = pkgs.writeText "hellas-test-tokenizer.json" ''
-    {
-      "version": "1.0",
-      "truncation": null,
-      "padding": null,
-      "added_tokens": [],
-      "normalizer": null,
-      "pre_tokenizer": { "type": "Whitespace" },
-      "post_processor": null,
-      "decoder": null,
-      "model": {
-        "type": "WordLevel",
-        "vocab": { "hello": 0, "world": 1, "<unk>": 2 },
-        "unk_token": "<unk>"
-      }
-    }
-  '';
+  # Its bytes are materialized at VM runtime below, never by a store derivation.
+  testTokenizerPath = "/var/lib/hellas-gateway/test-tokenizer.json";
+  testEnvironmentPath = "/var/lib/hellas-gateway/test.environment";
 
   responsesMock = pkgs.writeText "responses-mock.py" ''
     import json
@@ -285,13 +271,30 @@ in
       config = lib.mkMerge [
         (mkBaseNode package)
         {
+          systemd.tmpfiles.rules = [
+            # The test creates its Catena program and canonical environments
+            # after the VM has booted.  Keeping only an empty runtime root here
+            # proves the provider did not receive a model/environment through
+            # Nix evaluation or the store.
+            "d /srv/hellas-content 0755 root root -"
+          ];
           services.hellas = {
             enable = true;
             inherit package;
+            environment.RUST_LOG = "hellas_executor=info";
             port = executorPort;
             openFirewall = true;
-            executePolicy = "skip";
+            executePolicy = "any";
             queueSize = 2;
+            contentRoots = [ "/srv/hellas-content" ];
+            contentIndex = "/var/lib/hellas/content-index.bin";
+            gpuSessionPrograms = 3;
+            gpuSessionAssetBytes = 1073741824;
+            memoryMaxBytes = 1879048192;
+            gpuMaxGenerationCapacity = 4096;
+            gpuMaxGenerationDeviceBytes = 536870912;
+            gpuCompileTimeoutSeconds = 600;
+            gpuExecutionTimeoutSeconds = 900;
             fetchMaxInFlight = 2;
             fetchQueueSize = 3;
             graffiti = "e2e-discovery";
@@ -304,6 +307,133 @@ in
     testScript = ''
       start_all()
       machine.wait_for_unit("hellas.service")
+      machine.succeed("test -e /var/lib/hellas/content-index.bin")
+
+      # Materialize three previously unknown environments entirely at VM
+      # runtime. All canonical roots are adopted from the configured content
+      # root on restart. The admitted case has both its program and weights;
+      # the two refusal cases independently omit one of them so quote
+      # preparation cannot confuse missing content with executePolicy.
+      machine.succeed(
+          "systemctl stop hellas.service; "
+          "install -d -m 0755 /var/lib/hellas-e2e; "
+          "nonce=$(tr -d - < /proc/sys/kernel/random/uuid); "
+          "printf 'not-valid-catena-%s\\n' \"$nonce\" > /srv/hellas-content/arbitrary.hex; "
+          "printf 'also-not-valid-catena-%s\\n' \"$nonce\" > /var/lib/hellas-e2e/missing.hex; "
+          "printf 'runtime-only-weights-%s' \"$nonce\" > /srv/hellas-content/weights.bin; "
+          "printf 'missing-runtime-weights-%s' \"$nonce\" > /var/lib/hellas-e2e/missing-weights.bin; "
+          "printf 'entrypoint = \"e2e_%s\"\\nstatic_objects = [\"/srv/hellas-content/weights.bin\"]\\nstatic_inputs = [{ object = 0, offset = 0, bytes = 16 }]\\nstate_bytes_per_capacity = [4]\\nvocabulary_size = 3\\nmaximum_capacity = 8\\n' \"$nonce\" > /var/lib/hellas-e2e/environment.toml; "
+          "printf 'entrypoint = \"e2e_%s\"\\nstatic_objects = [\"/var/lib/hellas-e2e/missing-weights.bin\"]\\nstatic_inputs = [{ object = 0, offset = 0, bytes = 16 }]\\nstate_bytes_per_capacity = [4]\\nvocabulary_size = 3\\nmaximum_capacity = 8\\n' \"$nonce\" > /var/lib/hellas-e2e/missing-static.toml; "
+          "printf '%s\\n' "
+          "'{\"version\":\"1.0\",\"truncation\":null,\"padding\":null,\"added_tokens\":[],\"normalizer\":null,\"pre_tokenizer\":{\"type\":\"Whitespace\"},\"post_processor\":null,\"decoder\":null,\"model\":{\"type\":\"WordLevel\",\"vocab\":{\"hello\":0,\"world\":1,\"<unk>\":2},\"unk_token\":\"<unk>\"}}' "
+          "> /var/lib/hellas-e2e/tokenizer.json; "
+          "${package}/bin/hellas-cli environment build "
+          "--program /srv/hellas-content/arbitrary.hex "
+          "--settings /var/lib/hellas-e2e/environment.toml "
+          "--out /srv/hellas-content/arbitrary.environment; "
+          "${package}/bin/hellas-cli environment build "
+          "--program /var/lib/hellas-e2e/missing.hex "
+          "--settings /var/lib/hellas-e2e/environment.toml "
+          "--out /srv/hellas-content/missing-program.environment; "
+          "${package}/bin/hellas-cli environment build "
+          "--program /srv/hellas-content/arbitrary.hex "
+          "--settings /var/lib/hellas-e2e/missing-static.toml "
+          "--out /srv/hellas-content/missing-static.environment; "
+          "chmod 0444 /srv/hellas-content/* /var/lib/hellas-e2e/*; "
+          "chmod 0555 /srv/hellas-content; "
+          "systemctl start hellas.service"
+      )
+      machine.wait_for_unit("hellas.service")
+      machine.succeed("test -s /var/lib/hellas/content-index.bin")
+
+      node_id = machine.succeed(
+          "HOME=/var/lib/hellas ${package}/bin/hellas-cli identity show-node-id"
+      ).strip()
+      provider = machine.succeed(
+          "HOME=/var/lib/hellas ${package}/bin/hellas-cli identity show-enrollment-id"
+      ).strip()
+      client = (
+          "HOME=/var/lib/hellas-e2e ${package}/bin/hellas-cli "
+          "--identity /var/lib/hellas-e2e/client.identity --software-root llm "
+          f"{node_id} --node-addr 127.0.0.1:${toString executorPort} "
+          f"--provider {provider} "
+          "--tokenizer /var/lib/hellas-e2e/tokenizer.json "
+          "--prompt hello --max-new-tokens 1"
+      )
+
+      missing = machine.succeed(
+          "set +e; "
+          f"{client} --environment /srv/hellas-content/missing-program.environment "
+          "> /var/lib/hellas-e2e/missing-program.log 2>&1; "
+          "status=$?; test \"$status\" -ne 0; "
+          "cat /var/lib/hellas-e2e/missing-program.log"
+      )
+      print(missing)
+      assert "is not locally available" in missing
+      assert "policy denied" not in missing
+      assert "execute policy denied" not in missing
+
+      missing_static = machine.succeed(
+          "set +e; "
+          f"{client} --environment /srv/hellas-content/missing-static.environment "
+          "> /var/lib/hellas-e2e/missing-static.log 2>&1; "
+          "status=$?; test \"$status\" -ne 0; "
+          "cat /var/lib/hellas-e2e/missing-static.log"
+      )
+      print(missing_static)
+      assert "is not locally available" in missing_static
+      assert "policy denied" not in missing_static
+      assert "execute policy denied" not in missing_static
+
+      admitted = machine.succeed(
+          "set +e; "
+          f"{client} --environment /srv/hellas-content/arbitrary.environment "
+          "> /var/lib/hellas-e2e/admitted.log 2>&1; "
+          "status=$?; test \"$status\" -ne 0; "
+          "cat /var/lib/hellas-e2e/admitted.log"
+      )
+      print(admitted)
+      assert (
+          "did not compile" in admitted
+          or "HIP GPU runtime is unavailable" in admitted
+      ), admitted
+      assert "policy denied" not in admitted
+      assert "is not locally available" not in admitted
+
+      provider_log = machine.succeed("journalctl -u hellas.service --no-pager")
+      print(provider_log)
+      assert "quoted causal-LM evaluate execution" in provider_log
+      assert "accepted evaluate execution" in provider_log
+      assert (
+          "Catena program compilation failed" in provider_log
+          or "failed to start Catena HIP session" in provider_log
+      ), provider_log
+
+      unit = machine.succeed(
+          "systemctl show hellas.service "
+          "--property=Environment --property=ExecStart --property=LimitMEMLOCK "
+          "--property=MemoryMax --property=MemorySwapMax --property=OOMPolicy"
+      )
+      assert "--execute-policy any" in unit
+      assert "--content-root /srv/hellas-content" in unit
+      assert "--content-index /var/lib/hellas/content-index.bin" in unit
+      assert "--gpu-session-programs 3" in unit
+      assert "--gpu-session-asset-bytes 1073741824" in unit
+      assert "LimitMEMLOCK=infinity" in unit
+      assert "MemoryMax=1879048192" in unit
+      assert "MemorySwapMax=0" in unit
+      assert "OOMPolicy=kill" in unit
+      assert "--gpu-max-generation-capacity 4096" in unit
+      assert "--gpu-max-generation-device-bytes 536870912" in unit
+      assert "--gpu-compile-timeout-secs 600" in unit
+      assert "--gpu-execution-timeout-secs 900" in unit
+      assert "TMPDIR=/var/cache/hellas" in unit
+      machine.succeed(
+          "test \"$(cat /sys/fs/cgroup/system.slice/hellas.service/memory.oom.group)\" = 1"
+      )
+      machine.succeed(
+          "test \"$(cat /sys/fs/cgroup/system.slice/hellas.service/memory.swap.max)\" = 0"
+      )
 
       machine.wait_until_succeeds(
           "${package}/bin/hellas-cli monitor --timeout-secs 5 > /tmp/hellas-monitor.log 2>&1"
@@ -330,9 +460,9 @@ in
             gateway = {
               enable = true;
               port = gatewayPort;
-              executionPackageName = "smollm2-135m";
-              packageId = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-              tokenizer = testTokenizer;
+              causalLmEnvironment = testEnvironmentPath;
+              model = "smollm2-135m";
+              tokenizer = testTokenizerPath;
               stopTokenIds = [ 2 ];
               responsesBackend = "proxy";
               responsesProxyUrl = "http://127.0.0.1:18080/v1/responses";
@@ -345,6 +475,36 @@ in
               ];
             };
           };
+          systemd.services.hellas-gateway.preStart = ''
+            cat > ${testTokenizerPath} <<'EOF'
+            {
+              "version": "1.0",
+              "truncation": null,
+              "padding": null,
+              "added_tokens": [],
+              "normalizer": null,
+              "pre_tokenizer": { "type": "Whitespace" },
+              "post_processor": null,
+              "decoder": null,
+              "model": {
+                "type": "WordLevel",
+                "vocab": { "hello": 0, "world": 1, "<unk>": 2 },
+                "unk_token": "<unk>"
+              }
+            }
+            EOF
+            printf 'test Catena source\n' > /var/lib/hellas-gateway/test.hex
+            cat > /var/lib/hellas-gateway/test.toml <<'EOF'
+            entrypoint = "test"
+            state_bytes_per_capacity = [4]
+            vocabulary_size = 3
+            maximum_capacity = 8
+            EOF
+            ${package}/bin/hellas-cli environment build \
+              --program /var/lib/hellas-gateway/test.hex \
+              --settings /var/lib/hellas-gateway/test.toml \
+              --out ${testEnvironmentPath}
+          '';
         }
       ];
     };
@@ -354,6 +514,11 @@ in
       gateway.succeed("python3 ${responsesMock} >/tmp/responses_mock.log 2>&1 &")
       gateway.wait_until_succeeds("curl -sS -o /dev/null -X POST -H 'content-type: application/json' -H 'authorization: Bearer proxy-secret' -d '{\"model\":\"probe\",\"input\":\"hi\"}' http://127.0.0.1:18080/v1/responses")
       gateway.wait_for_unit("hellas-gateway.service")
+      unit = gateway.succeed("systemctl show hellas-gateway.service --property=Environment --property=ExecStart")
+      assert "--environment ${testEnvironmentPath}" in unit
+      assert "--model smollm2-135m" in unit
+      assert "--tokenizer ${testTokenizerPath}" in unit
+      assert "TMPDIR=/var/cache/hellas-gateway" not in unit
       gateway.wait_for_open_port(${toString gatewayPort})
       gateway.wait_until_succeeds("test -e /var/lib/hellas-gateway/probed")
 

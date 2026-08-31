@@ -9,8 +9,6 @@ use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::registry::Registry;
-use std::collections::BTreeSet;
-use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
 
 type U64Counter = Counter<u64, AtomicU64>;
@@ -39,10 +37,6 @@ pub struct ExecutorMetrics {
     pub(crate) by_execution_prompt_tokens: Family<ExecutionLabel, U64Counter>,
     pub(crate) by_execution_prefill_tokens: Family<ExecutionLabel, U64Counter>,
     pub(crate) by_execution_generated_tokens: Family<ExecutionLabel, U64Counter>,
-
-    // `Family::read()` is private in prometheus-client, so we mirror the set
-    // of execution labels we've ever incremented to power the GetStats RPC.
-    seen_executions: Mutex<BTreeSet<(String, String)>>,
 }
 
 impl ExecutorMetrics {
@@ -123,16 +117,10 @@ impl ExecutorMetrics {
         }
     }
 
-    fn note_execution(&self, scheme: &str, name: &str) -> ExecutionLabel {
-        let key = (scheme.to_string(), name.to_string());
-        if let Ok(mut seen) = self.seen_executions.lock()
-            && !seen.contains(&key)
-        {
-            seen.insert(key.clone());
-        }
+    fn execution_label(scheme: &str, name: &str) -> ExecutionLabel {
         ExecutionLabel {
-            scheme: key.0,
-            name: key.1,
+            scheme: scheme.to_string(),
+            name: name.to_string(),
         }
     }
 
@@ -143,7 +131,7 @@ impl ExecutorMetrics {
         prompt: u64,
         prefill: u64,
     ) {
-        let label = self.note_execution(scheme, name);
+        let label = Self::execution_label(scheme, name);
         self.by_execution_started.get_or_create(&label).inc();
         if scheme == "evaluate" {
             self.evaluate_executions_started.inc();
@@ -159,7 +147,7 @@ impl ExecutorMetrics {
     }
 
     pub(crate) fn record_execution_completed(&self, scheme: &str, name: &str, generated: u64) {
-        let label = self.note_execution(scheme, name);
+        let label = Self::execution_label(scheme, name);
         self.by_execution_completed.get_or_create(&label).inc();
         if scheme == "evaluate" {
             self.evaluate_generated_tokens.inc_by(generated);
@@ -171,7 +159,7 @@ impl ExecutorMetrics {
     }
 
     pub(crate) fn record_execution_failed(&self, scheme: &str, name: &str, generated: u64) {
-        let label = self.note_execution(scheme, name);
+        let label = Self::execution_label(scheme, name);
         self.by_execution_failed.get_or_create(&label).inc();
         if scheme == "evaluate" {
             self.evaluate_generated_tokens.inc_by(generated);
@@ -192,44 +180,6 @@ impl ExecutorMetrics {
             prefill_tokens: self.evaluate_prefill_tokens.get(),
             generated_tokens: self.evaluate_generated_tokens.get(),
         }
-    }
-
-    /// Snapshot one scheme/name row. Only counters that have observed events
-    /// for this exact label are nonzero.
-    pub(crate) fn execution_snapshot(
-        &self,
-        scheme: &str,
-        name: &str,
-    ) -> hellas_rpc::pb::courtesy::TokenStats {
-        let label = ExecutionLabel {
-            scheme: scheme.to_string(),
-            name: name.to_string(),
-        };
-        let value = |family: &Family<ExecutionLabel, U64Counter>| {
-            family.get(&label).map(|counter| counter.get()).unwrap_or(0)
-        };
-        hellas_rpc::pb::courtesy::TokenStats {
-            executions_started: value(&self.by_execution_started),
-            executions_completed: value(&self.by_execution_completed),
-            executions_failed: value(&self.by_execution_failed),
-            prompt_tokens: value(&self.by_execution_prompt_tokens),
-            prefill_tokens: value(&self.by_execution_prefill_tokens),
-            generated_tokens: value(&self.by_execution_generated_tokens),
-        }
-    }
-
-    /// Iterate over names observed for one scheme. Fetch labels therefore
-    /// cannot appear in Courtesy's Catena-package rows.
-    pub(crate) fn known_execution_names(&self, scheme: &str) -> Vec<String> {
-        self.seen_executions
-            .lock()
-            .map(|seen| {
-                seen.iter()
-                    .filter(|(seen_scheme, _)| seen_scheme == scheme)
-                    .map(|(_, name)| name.clone())
-                    .collect()
-            })
-            .unwrap_or_default()
     }
 }
 
@@ -256,13 +206,5 @@ mod tests {
         assert_eq!(evaluate.prompt_tokens, 3);
         assert_eq!(evaluate.prefill_tokens, 3);
         assert_eq!(evaluate.generated_tokens, 2);
-    }
-
-    #[test]
-    fn reading_an_unknown_label_does_not_allocate_it() {
-        let metrics = ExecutorMetrics::default();
-        let snapshot = metrics.execution_snapshot("evaluate", "attacker-input");
-        assert_eq!(snapshot.executions_started, 0);
-        assert!(metrics.known_execution_names("evaluate").is_empty());
     }
 }

@@ -40,6 +40,7 @@ gateway = ["llm"]
 evaluate = [
     "node",
     "gateway",
+    "dep:catena-lang",
     "dep:commonware-runtime",
     "hellas-gateway/evaluate",
     "hellas-executor/evaluate",
@@ -76,6 +77,7 @@ anyhow = "1"
 async-stream = { version = "0.3", optional = true }
 axum = { version = "0.8", optional = true }
 base64.workspace = true
+catena-lang = { workspace = true, optional = true }
 clap = { version = "4", features = ["derive"] }
 commonware-runtime = { workspace = true, optional = true }
 futures = "0.3"
@@ -116,6 +118,7 @@ serde_json.workspace = true
 tempfile = "3"
 thiserror.workspace = true
 tokio.workspace = true
+toml.workspace = true
 tracing.workspace = true
 tracing-opentelemetry = { workspace = true, optional = true }
 tracing-subscriber.workspace = true

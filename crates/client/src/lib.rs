@@ -17,8 +17,8 @@ pub use evaluate::{
     evaluate_input_from_request_commitment, verify_evaluate_work_event,
 };
 pub use fetch::{
-    FetchChunkVerifier, FetchExecutionEvent, FetchOutcome, ProducerTrust, parse_fetch_finished,
-    validate_fetch_ticket, verified_fetch_input, verify_fetch_work_event,
+    FetchChunkVerifier, FetchExecutionEvent, FetchOutcome, ProducerTrust, validate_fetch_ticket,
+    verified_fetch_input, verify_fetch_work_event,
 };
 #[cfg(feature = "iroh")]
 pub use iroh::{AppleAppAttestTrust, ExecutionRoute, ProviderTrustAnchor, RemoteNodeTarget};

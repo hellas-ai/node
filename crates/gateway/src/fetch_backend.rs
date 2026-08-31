@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use crate::execution::CliRuntime;
 use hellas_client::iroh::fetch_execution_stream;
-use hellas_client::{ExecutionRoute, FetchExecutionEvent, FetchOutcome, ProducerTrust};
+use hellas_client::{ExecutionRoute, FetchExecutionEvent, FetchOutcome};
 
 #[derive(Clone)]
 pub(super) struct ResponsesFetchBackend {
@@ -25,7 +25,6 @@ pub(super) struct ResponsesFetchBackend {
     execution_environment: ContentId,
     caller_key: Arc<ProducerSigningKey>,
     assurance: Assurance,
-    producer_trust: ProducerTrust,
     request_overrides: JsonMap<String, JsonValue>,
 }
 
@@ -36,7 +35,6 @@ impl ResponsesFetchBackend {
         target: (&str, &str, ContentId),
         caller_key: ProducerSigningKey,
         assurance: Assurance,
-        producer_trust: ProducerTrust,
         request_overrides: JsonMap<String, JsonValue>,
     ) -> Self {
         let (service, method, execution_environment) = target;
@@ -48,9 +46,12 @@ impl ResponsesFetchBackend {
             execution_environment,
             caller_key: Arc::new(caller_key),
             assurance,
-            producer_trust,
             request_overrides,
         }
+    }
+
+    pub(super) fn is_codex_responses(&self) -> bool {
+        self.execution_environment == hellas_rpc::FetchEnvironment::CodexResponses.manifest_id()
     }
 }
 
@@ -77,9 +78,7 @@ impl ExecutionBackend for ResponsesFetchBackend {
                     self.runtime.clone(),
                     self.route.clone(),
                     fetch_request,
-                    self.producer_trust.clone(),
                     self.caller_key.clone(),
-                    payload,
                 ),
                 Some(Provenance {
                     call_commitment: Some(input_commitment),
@@ -118,12 +117,10 @@ fn fetch_events(
     runtime: CliRuntime,
     route: ExecutionRoute,
     request: FetchRequest,
-    trust: ProducerTrust,
     runner_key: Arc<ProducerSigningKey>,
-    _provider_payload: Bytes,
 ) -> impl futures::Stream<Item = Result<OutputEvent, BackendError>> + Send {
     try_stream! {
-        let stream = fetch_execution_stream(runtime, request, route, trust, runner_key);
+        let stream = fetch_execution_stream(runtime, request, route, runner_key);
         tokio::pin!(stream);
 
         while let Some(event) = stream.next().await {
@@ -170,7 +167,11 @@ fn provider_request_body(
         JsonValue::String(request.execution.canonical.model.name.clone()),
     );
     object.insert("stream".to_string(), JsonValue::Bool(true));
+    // The caller-facing Responses `store` switch controls Hellas Courtesy
+    // transcript retention. Upstream account storage is a different trust
+    // boundary: the sealed Fetch adaptor is always stateless.
     let retention = retention_from_json_object(&object)?;
+    object.insert("store".to_string(), JsonValue::Bool(false));
     let payload = serde_json::to_vec(&JsonValue::Object(object))
         .map(Bytes::from)
         .map_err(|source| {
@@ -192,7 +193,7 @@ fn retention_from_json_object(
     object: &JsonMap<String, JsonValue>,
 ) -> Result<Retention, BackendError> {
     match object.get("store") {
-        None => Ok(Retention::Retain),
+        None => Ok(Retention::Ephemeral),
         Some(JsonValue::Bool(store)) => Ok(Retention::from_retain(*store)),
         Some(_) => Err(BackendError::rejected("`store` must be a boolean")),
     }
@@ -240,8 +241,19 @@ mod tests {
         let value: JsonValue = serde_json::from_slice(&body.payload).unwrap();
 
         assert_eq!(value["stream"], true);
-        assert!(value.get("store").is_none());
+        assert_eq!(value["store"], false);
+        assert_eq!(body.retention, Retention::Ephemeral);
+    }
+
+    #[test]
+    fn responses_store_controls_hellas_retention_not_upstream_account_storage() {
+        let request = backend_request(br#"{"model":"m","input":"hello","store":true}"#, "m");
+
+        let body = provider_request_body(&request, &JsonMap::new()).unwrap();
+        let value: JsonValue = serde_json::from_slice(&body.payload).unwrap();
+
         assert_eq!(body.retention, Retention::Retain);
+        assert_eq!(value["store"], false);
     }
 
     #[test]

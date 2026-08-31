@@ -17,8 +17,8 @@ pub(super) async fn handle(State(state): State<Arc<GatewayState>>, body: Bytes) 
             Err(response) => return *response,
         };
     let stream = parsed.stream == Some(true);
-    parsed.model = state.package_name.clone();
-    request.execution.canonical.model.name = state.package_name.clone();
+    parsed.model = state.model_name.clone();
+    request.execution.canonical.model.name = state.model_name.clone();
     let backend = GatewayBackend::new(state);
     backend_wire_response(
         stream,

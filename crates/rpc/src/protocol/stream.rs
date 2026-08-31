@@ -476,6 +476,21 @@ impl OutputEventEnvelope {
         &self.payload
     }
 
+    /// Exact requested heap allocation retained by this envelope's variable
+    /// buffers, excluding the fixed-size [`OutputEventEnvelope`] value itself.
+    ///
+    /// `OutputEventBody` owns only its `kind` string; `Signature`, `PublicKey`,
+    /// commitments, identifiers, and counters are fixed-size values. The
+    /// envelope's opaque payload is its only other allocation.
+    #[must_use]
+    pub fn retained_heap_bytes(&self) -> Option<usize> {
+        self.event
+            .body
+            .kind
+            .capacity()
+            .checked_add(self.payload.capacity())
+    }
+
     pub fn event_commitment(&self) -> EventCommitment {
         self.event.event_commitment()
     }
@@ -770,16 +785,67 @@ pub fn verify_output_event_envelopes(
     producer_key: &PublicKey,
     events: &[OutputEventEnvelope],
 ) -> Result<EventCommitment, StreamVerifyError> {
-    for event in events {
-        event.verify(producer_key)?;
+    verify_output_event_envelope_iter(scheme, input, producer_key, events.iter())
+}
+
+/// Verify one signed output envelope as the exact next link in a stream.
+pub fn verify_output_event_continuation(
+    scheme: SchemeId,
+    input: InputCommitment,
+    producer_key: &PublicKey,
+    expected_sequence: u64,
+    expected_previous: EventCommitment,
+    event: &OutputEventEnvelope,
+) -> Result<EventCommitment, StreamVerifyError> {
+    event.verify(producer_key)?;
+    let body = event.event().body();
+    if body.scheme() != scheme {
+        return Err(StreamVerifyError::SchemeMismatch);
     }
-    verify_output_event_chain(
-        scheme,
-        input,
-        producer_key,
-        events.iter().map(OutputEventEnvelope::event),
-        false,
-    )
+    if body.input() != input {
+        return Err(StreamVerifyError::InputCommitmentMismatch);
+    }
+    if body.stream_id() != StreamId::from_input_commitment(input) {
+        return Err(StreamVerifyError::StreamIdMismatch);
+    }
+    if body.sequence() != expected_sequence {
+        return Err(StreamVerifyError::SequenceMismatch {
+            expected: expected_sequence,
+            actual: body.sequence(),
+        });
+    }
+    if body.previous_event() != expected_previous {
+        return Err(StreamVerifyError::PreviousEventMismatch);
+    }
+    Ok(event.event_commitment())
+}
+
+pub(crate) fn verify_output_event_envelope_iter<'a>(
+    scheme: SchemeId,
+    input: InputCommitment,
+    producer_key: &PublicKey,
+    events: impl Iterator<Item = &'a OutputEventEnvelope>,
+) -> Result<EventCommitment, StreamVerifyError> {
+    let mut previous = output_genesis(input, StreamId::from_input_commitment(input));
+    let mut saw_event = false;
+    for (expected_sequence, event) in events.enumerate() {
+        saw_event = true;
+        let expected_sequence =
+            u64::try_from(expected_sequence).map_err(|_| StreamVerifyError::SequenceOverflow)?;
+        previous = verify_output_event_continuation(
+            scheme,
+            input,
+            producer_key,
+            expected_sequence,
+            previous,
+            event,
+        )?;
+    }
+    if saw_event {
+        Ok(previous)
+    } else {
+        Err(StreamVerifyError::EmptyTranscript)
+    }
 }
 
 fn verify_output_event_chain<'a>(
@@ -935,6 +1001,38 @@ mod tests {
             &events,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn output_envelope_heap_accounting_uses_allocated_capacities() {
+        let caller = key(1);
+        let producer = key(2);
+        let (_, input) = input_transcript(&caller);
+        let (events, _) = output_transcript(&producer, input);
+        let original = &events[0];
+        let rebuilt = rebuild_output_envelope(original, &|parts| {
+            let mut kind = String::with_capacity(parts.kind.len() + 97);
+            kind.push_str(&parts.kind);
+            parts.kind = kind;
+        });
+        let mut payload = Vec::with_capacity(rebuilt.payload().len() + 113);
+        payload.extend_from_slice(rebuilt.payload());
+        let envelope = OutputEventEnvelope::new(rebuilt.event, payload)
+            .expect("capacity does not change signed bytes");
+
+        let expected = envelope
+            .event
+            .body
+            .kind
+            .capacity()
+            .checked_add(envelope.payload.capacity())
+            .unwrap();
+        assert_eq!(envelope.retained_heap_bytes(), Some(expected));
+        assert!(
+            expected > envelope.event().body().kind().len() + envelope.payload().len(),
+            "the fixture must distinguish allocation capacity from content length"
+        );
+        envelope.verify(&producer.public_key()).unwrap();
     }
 
     #[test]

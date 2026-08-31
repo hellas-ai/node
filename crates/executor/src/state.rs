@@ -1,8 +1,10 @@
 use std::collections::HashMap;
+#[cfg(feature = "evaluate")]
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::ExecutorError;
-use crate::fetch_provider::FetchProviderRequest;
+use crate::fetch_provider::FetchCall;
 #[cfg(feature = "evaluate")]
 use hellas_rpc::pb::courtesy::{
     EvaluateStart as PbEvaluateStart, QuoteTokensRequest, evaluate_start,
@@ -22,8 +24,8 @@ use hellas_rpc::stream::output_event_to_pb;
 use hellas_rpc::{Assurance, ContentId, Digest, JobTerms, PublicKey, RequestCommitment};
 #[cfg(feature = "evaluate")]
 use hellas_rpc::{
-    DEFAULT_MAX_NEW_TOKENS, EvaluateProgramManifest, EvaluateRequest, ExecutionPackageId,
-    MAX_STOP_TOKEN_IDS, OutputEventEnvelope, ProgramManifest, Retention, normalize_stop_token_ids,
+    DEFAULT_MAX_NEW_TOKENS, EvaluateRequest, MAX_STOP_TOKEN_IDS, OutputEventEnvelope, Retention,
+    normalize_stop_token_ids,
 };
 use uuid::Uuid;
 
@@ -32,21 +34,12 @@ pub use crate::StateError;
 pub(crate) const QUOTE_AMOUNT: u64 = 1000;
 pub(crate) const QUOTE_TTL: Duration = Duration::from_secs(30);
 pub(crate) const MAX_OUTSTANDING_QUOTES: usize = 1024;
-
-#[cfg(feature = "evaluate")]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct LoadedPackage {
-    pub execution_package: ExecutionPackageId,
-    pub vocabulary_size: u64,
-    pub maximum_capacity: u64,
-}
-
-#[cfg(feature = "evaluate")]
-impl LoadedPackage {
-    pub(crate) fn validate_invocation(self, invocation: &Invocation) -> Result<(), ExecutorError> {
-        validate_invocation(invocation, self.vocabulary_size, self.maximum_capacity)
-    }
-}
+/// Quotes are unauthenticated preparation and may carry large prompt bodies.
+/// Bound their conservative logical retained heap independently of entry
+/// count: fixed quote values and their directly owned allocations are charged,
+/// while shared environment metadata is deliberately charged once per quote.
+/// The entry cap separately bounds hash-table and allocator bookkeeping.
+pub(crate) const MAX_OUTSTANDING_QUOTE_BYTES: usize = 128 * 1024 * 1024;
 
 #[cfg(feature = "evaluate")]
 #[derive(Clone, Debug)]
@@ -58,7 +51,6 @@ pub struct Invocation {
 
 #[cfg(feature = "evaluate")]
 pub(crate) struct QuotePlan {
-    pub execution_package: ExecutionPackageId,
     pub vocabulary_size: u64,
     pub maximum_capacity: u64,
     pub execution_environment: ContentId,
@@ -71,31 +63,18 @@ pub(crate) struct QuotePlan {
 
 #[cfg(feature = "evaluate")]
 impl QuotePlan {
-    pub(crate) fn validate_invocation(&self, invocation: &Invocation) -> Result<(), ExecutorError> {
-        validate_invocation(invocation, self.vocabulary_size, self.maximum_capacity)
-    }
-
-    /// The Hellas content ID binding the exact verified Catena execution
-    /// package. This is pure and cheap: package bytes were verified once by
-    /// the owner-only loading path, never while handling an RPC.
-    pub(crate) fn execution_environment(execution_package: ExecutionPackageId) -> ContentId {
-        ProgramManifest::Evaluate(EvaluateProgramManifest { execution_package }).content_id()
-    }
-
-    /// Builds a token-native quote after the peer-supplied package alias has
-    /// already been resolved through the executor's loaded-package registry.
+    /// Builds a token-native quote from a locally bound canonical environment.
     pub(crate) fn from_tokens_request(
         request: QuoteTokensRequest,
-        package: LoadedPackage,
+        environment: &crate::CausalLmEnvironmentSource,
     ) -> Result<Self, ExecutorError> {
-        let requested_package = ExecutionPackageId::from_bytes(bytes32(
-            &request.execution_package,
-            "execution_package",
-        )?);
-        if requested_package != package.execution_package {
+        let manifest_id = environment.manifest_id();
+        let metadata = environment.environment();
+        let requested_manifest_id = ContentId::hash(&request.program_manifest);
+        if requested_manifest_id != manifest_id {
             return Err(ExecutorError::InvalidQuoteRequest(format!(
-                "package alias resolved to {}, but caller pinned {requested_package}",
-                package.execution_package
+                "loaded environment is {}, but caller pinned {}",
+                manifest_id, requested_manifest_id
             )));
         }
         let max_new_tokens = request.max_new_tokens.unwrap_or(DEFAULT_MAX_NEW_TOKENS);
@@ -122,13 +101,11 @@ impl QuotePlan {
             })?;
         let assurance = hellas_rpc::run_ticket::assurance_from_pb(request.assurance)
             .map_err(|err| ExecutorError::InvalidQuoteRequest(err.to_string()))?;
-        let retention = Retention::from_retain(request.retain.unwrap_or(true));
-        let execution_environment = Self::execution_environment(package.execution_package);
+        let retention = Retention::from_retain(request.retain.unwrap_or(false));
         let plan = Self {
-            execution_package: package.execution_package,
-            vocabulary_size: package.vocabulary_size,
-            maximum_capacity: package.maximum_capacity,
-            execution_environment,
+            vocabulary_size: metadata.vocabulary_size(),
+            maximum_capacity: metadata.maximum_capacity(),
+            execution_environment: manifest_id,
             invocation: Invocation {
                 input_ids,
                 max_new_tokens,
@@ -139,13 +116,17 @@ impl QuotePlan {
             assurance,
             retention,
         };
-        plan.validate_invocation(&plan.invocation)?;
+        validate_invocation(
+            &plan.invocation,
+            plan.vocabulary_size,
+            plan.maximum_capacity,
+        )?;
         Ok(plan)
     }
 }
 
 #[cfg(feature = "evaluate")]
-fn validate_invocation(
+pub(crate) fn validate_invocation(
     invocation: &Invocation,
     vocabulary_size: u64,
     maximum_capacity: u64,
@@ -176,7 +157,7 @@ fn validate_invocation(
             .find(|&token| u64::from(token) >= vocabulary_size)
         {
             return Err(ExecutorError::InvalidTokenPayload(format!(
-                "{field} contain token {token}, but package vocabulary size is {}",
+                "{field} contain token {token}, but environment vocabulary size is {}",
                 vocabulary_size
             )));
         }
@@ -186,7 +167,7 @@ fn validate_invocation(
         .saturating_add(u64::from(invocation.max_new_tokens));
     if total_tokens > maximum_capacity {
         return Err(ExecutorError::InvalidTokenPayload(format!(
-            "prompt plus max_new_tokens is {total_tokens} tokens, but package capacity is {}",
+            "prompt plus max_new_tokens is {total_tokens} tokens, but environment capacity is {}",
             maximum_capacity
         )));
     }
@@ -232,7 +213,7 @@ pub(crate) fn evaluate_request_from_pb(
         nonce: bytes32(&request.nonce, "nonce")?,
         assurance: hellas_rpc::run_ticket::assurance_from_pb(request.assurance)
             .map_err(|err| ExecutorError::InvalidQuoteRequest(err.to_string()))?,
-        retain: request.retain.unwrap_or(true),
+        retain: request.retain.unwrap_or(false),
     })
 }
 
@@ -268,13 +249,6 @@ fn bytes32(bytes: &[u8], field: &str) -> Result<[u8; 32], ExecutorError> {
 
 fn hex32(bytes: &[u8; 32]) -> String {
     Digest::from_bytes(*bytes).to_string()
-}
-
-#[cfg(feature = "evaluate")]
-#[derive(Clone, Debug)]
-pub(crate) enum LocalPackageStatus {
-    Ready(LoadedPackage),
-    Failed(String),
 }
 
 #[derive(Clone)]
@@ -324,13 +298,29 @@ pub enum QuoteKind {
     #[cfg(feature = "evaluate")]
     Evaluate(Box<crate::evaluate::EvaluateJob>),
     Fetch {
-        request: FetchProviderRequest,
+        call: FetchCall,
     },
+}
+
+impl QuoteRecord {
+    pub(crate) fn retained_heap_bytes(&self) -> Option<usize> {
+        let variable = match &self.kind {
+            #[cfg(feature = "evaluate")]
+            QuoteKind::Evaluate(job) => job.retained_heap_bytes()?,
+            QuoteKind::Fetch { call } => call
+                .service
+                .capacity()
+                .checked_add(call.method.capacity())?
+                .checked_add(call.body.retained_heap_bytes())?,
+        };
+        std::mem::size_of::<QuoteRecord>().checked_add(variable)
+    }
 }
 
 #[derive(Default)]
 pub struct ExecutorState {
     quotes: HashMap<[u8; 32], QuoteRecord>,
+    quote_bytes: usize,
 }
 
 impl ExecutorState {
@@ -339,13 +329,43 @@ impl ExecutorState {
     }
 
     pub fn create_quote(&mut self, quote: QuoteRecord) -> Result<[u8; 32], ExecutorError> {
+        self.create_quote_with_limits(quote, MAX_OUTSTANDING_QUOTES, MAX_OUTSTANDING_QUOTE_BYTES)
+    }
+
+    fn create_quote_with_limits(
+        &mut self,
+        quote: QuoteRecord,
+        entry_capacity: usize,
+        byte_capacity: usize,
+    ) -> Result<[u8; 32], ExecutorError> {
         let key = *quote.terms.request.as_bytes();
-        if !self.quotes.contains_key(&key) && self.quotes.len() >= MAX_OUTSTANDING_QUOTES {
+        if !self.quotes.contains_key(&key) && self.quotes.len() >= entry_capacity {
             return Err(ExecutorError::QueueFull {
-                capacity: MAX_OUTSTANDING_QUOTES,
+                capacity: entry_capacity,
             });
         }
+        let retained_bytes = quote.retained_heap_bytes().ok_or_else(|| {
+            ExecutorError::ResourceExhausted(
+                "outstanding quote logical retained-heap accounting overflowed".to_string(),
+            )
+        })?;
+        let replaced_bytes = self
+            .quotes
+            .get(&key)
+            .and_then(QuoteRecord::retained_heap_bytes)
+            .unwrap_or(0);
+        let next_bytes = self
+            .quote_bytes
+            .checked_sub(replaced_bytes)
+            .and_then(|bytes| bytes.checked_add(retained_bytes))
+            .filter(|bytes| *bytes <= byte_capacity)
+            .ok_or_else(|| {
+                ExecutorError::ResourceExhausted(format!(
+                    "outstanding quote logical retained-heap capacity of {byte_capacity} bytes is exhausted"
+                ))
+            })?;
         self.quotes.insert(key, quote);
+        self.quote_bytes = next_bytes;
         Ok(key)
     }
 
@@ -372,13 +392,26 @@ impl ExecutorState {
 
     pub fn remove_quote(&mut self, request_commitment: &[u8]) -> Option<QuoteRecord> {
         let key: [u8; 32] = request_commitment.try_into().ok()?;
-        self.quotes.remove(&key)
+        let quote = self.quotes.remove(&key)?;
+        self.quote_bytes = quote
+            .retained_heap_bytes()
+            .and_then(|removed| self.quote_bytes.checked_sub(removed))
+            // Stored quotes are immutable and were accounted before insert.
+            // Fail closed on an impossible internal mismatch.
+            .unwrap_or(usize::MAX);
+        Some(quote)
     }
 
     pub fn prune_expired_quotes(&mut self, now: Instant) -> usize {
-        let before = self.quotes.len();
-        self.quotes.retain(|_, quote| quote.expires_at > now);
-        before - self.quotes.len()
+        let expired = self
+            .quotes
+            .iter()
+            .filter_map(|(key, quote)| (quote.expires_at <= now).then_some(*key))
+            .collect::<Vec<_>>();
+        for key in &expired {
+            let _ = self.remove_quote(key);
+        }
+        expired.len()
     }
 }
 
@@ -393,7 +426,7 @@ fn make_id(prefix: &str) -> String {
 #[cfg(feature = "evaluate")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopReason {
-    StopToken,
+    StopToken(u32),
     MaxNewTokens,
 }
 
@@ -401,7 +434,8 @@ pub enum StopReason {
 #[derive(Debug, Clone)]
 pub enum Termination {
     Completed {
-        output_events: Vec<OutputEventEnvelope>,
+        streamed_prefix: Arc<[OutputEventEnvelope]>,
+        terminal_output_event: Box<OutputEventEnvelope>,
     },
     Failed {
         position: u64,
@@ -413,8 +447,11 @@ pub enum Termination {
 impl Termination {
     pub fn into_pb(self) -> PbWorkEvent {
         let kind = match self {
-            Self::Completed { output_events } => work_event::Kind::Finished(PbWorkFinished {
-                output_events: output_events.iter().map(output_event_to_pb).collect(),
+            Self::Completed {
+                terminal_output_event,
+                ..
+            } => work_event::Kind::Finished(PbWorkFinished {
+                terminal_output_event: Some(output_event_to_pb(terminal_output_event.as_ref())),
                 assurance_evidence: Vec::new(),
             }),
             Self::Failed { position, error } => {
@@ -430,6 +467,10 @@ mod tests {
     use super::*;
 
     fn quote(index: u32) -> QuoteRecord {
+        quote_with_body(index, Vec::new())
+    }
+
+    fn quote_with_body(index: u32, body: Vec<u8>) -> QuoteRecord {
         let mut bytes = [0_u8; 32];
         bytes[..4].copy_from_slice(&index.to_be_bytes());
         let digest = Digest::from_bytes(bytes);
@@ -447,12 +488,7 @@ mod tests {
                 .unwrap()
                 .public_key(),
             kind: QuoteKind::Fetch {
-                request: FetchProviderRequest::new(
-                    "test",
-                    "run",
-                    hellas_rpc::JsonBytes::new(Vec::new()),
-                    input,
-                ),
+                call: FetchCall::new("test", "run", hellas_rpc::JsonBytes::new(body), input),
             },
         }
     }
@@ -476,5 +512,76 @@ mod tests {
         // Repeating an existing deterministic commitment is replacement, not
         // attacker-controlled cardinality growth.
         state.create_quote(quote(0)).unwrap();
+    }
+
+    #[test]
+    fn outstanding_quote_heap_is_bounded_and_replacements_are_accounted() {
+        let first = quote_with_body(1, vec![1; 64]);
+        let per_quote = first.retained_heap_bytes().unwrap();
+        let empty_quote = quote_with_body(1, Vec::new())
+            .retained_heap_bytes()
+            .unwrap();
+        let two_full_quotes = per_quote.checked_mul(2).unwrap();
+        let byte_capacity = two_full_quotes.checked_add(empty_quote).unwrap();
+        let mut state = ExecutorState::new();
+
+        state
+            .create_quote_with_limits(first, 10, byte_capacity)
+            .unwrap();
+        state
+            .create_quote_with_limits(quote_with_body(2, vec![2; 64]), 10, byte_capacity)
+            .unwrap();
+        assert_eq!(state.quote_bytes, two_full_quotes);
+
+        let error = state
+            .create_quote_with_limits(quote_with_body(3, vec![3; 64]), 10, byte_capacity)
+            .unwrap_err();
+        assert!(matches!(error, ExecutorError::ResourceExhausted(_)));
+
+        state
+            .create_quote_with_limits(quote_with_body(1, Vec::new()), 10, byte_capacity)
+            .unwrap();
+        state
+            .create_quote_with_limits(quote_with_body(3, vec![3; 64]), 10, byte_capacity)
+            .unwrap();
+        assert!(state.quote_bytes <= byte_capacity);
+    }
+
+    #[test]
+    fn fetch_quote_heap_accounting_uses_owned_buffer_capacity() {
+        let mut body = Vec::with_capacity(4_096);
+        body.extend_from_slice(b"{}");
+        let body_capacity = body.capacity();
+        let quote = quote_with_body(9, body);
+        let call = match &quote.kind {
+            #[cfg(feature = "evaluate")]
+            QuoteKind::Evaluate(_) => unreachable!("fixture is a Fetch quote"),
+            QuoteKind::Fetch { call } => call,
+        };
+        let expected = std::mem::size_of::<QuoteRecord>()
+            + call.service.capacity()
+            + call.method.capacity()
+            + body_capacity;
+
+        assert_eq!(quote.retained_heap_bytes(), Some(expected));
+        assert!(body_capacity > call.body.as_bytes().len());
+    }
+
+    #[test]
+    fn removing_and_pruning_quotes_release_heap_accounting() {
+        let now = Instant::now();
+        let mut expired = quote_with_body(1, vec![1; 64]);
+        expired.expires_at = now;
+        let live = quote_with_body(2, vec![2; 64]);
+        let live_key = *live.terms.request.as_bytes();
+        let live_bytes = live.retained_heap_bytes().unwrap();
+        let mut state = ExecutorState::new();
+        state.create_quote(expired).unwrap();
+        state.create_quote(live).unwrap();
+
+        assert_eq!(state.prune_expired_quotes(now), 1);
+        assert_eq!(state.quote_bytes, live_bytes);
+        assert!(state.remove_quote(&live_key).is_some());
+        assert_eq!(state.quote_bytes, 0);
     }
 }

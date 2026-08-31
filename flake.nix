@@ -11,17 +11,12 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     rust-overlay.url = "github:oxalica/rust-overlay";
-    # Temporary sibling declaration while the runner API is developed in
-    # tandem. Pure builds must override it with an absolute path as documented
-    # in the README because the sibling is outside this flake's source tree.
-    catena-runner = {
-      url = "path:../catena-runner";
-      flake = false;
-    };
-    # The sibling Catena checkout used by the runner's temporary Cargo patch.
-    # Both local inputs go away once the tandem branches are published.
-    exploratory-catena = {
-      url = "path:../exploratory-catena";
+    # Temporary committed-only sibling while the safe runtime API is developed
+    # in tandem. Replace this local Git URL when that Catena branch is published.
+    catena-lang = {
+      # A Git input sees only committed files. In particular, it cannot sweep
+      # Catena's target/ tree into the Nix store as a raw path input could.
+      url = "git+file:../catena-lang?ref=grw/hellas-safe-runtime";
       flake = false;
     };
   };
@@ -31,8 +26,7 @@
       self,
       nixpkgs,
       rust-overlay,
-      catena-runner,
-      exploratory-catena,
+      catena-lang,
     }:
     let
       systems = [
@@ -54,8 +48,7 @@
             system
             nixpkgs
             rust-overlay
-            catena-runner
-            exploratory-catena
+            catena-lang
             ;
         }
       );

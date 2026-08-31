@@ -1,9 +1,9 @@
 //! Optional conversion between user-facing text and token IDs.
 //!
-//! Nothing in this crate is part of Catena's execution package or Hellas's
-//! execution guarantee. The protocol commits the resulting input token IDs,
-//! caller-selected generation policy, exact Catena execution package, and
-//! output token IDs. A caller or node operator selects this local presentation
+//! Nothing in this crate is part of the Catena causal-LM environment or
+//! Hellas's execution guarantee. The protocol commits the resulting input
+//! token IDs, caller-selected generation policy, exact execution environment,
+//! and output token IDs. A caller selects this local presentation
 //! configuration independently.
 
 use std::{path::Path, sync::Arc};
@@ -18,7 +18,7 @@ pub struct TextPresentation {
 impl TextPresentation {
     /// Load an application-selected tokenizer.
     ///
-    /// This performs local file I/O only. It deliberately has no package
+    /// This performs local file I/O only. It deliberately has no environment
     /// directory, URL, or model-name argument: neither Catena nor an RPC peer
     /// selects presentation for the caller.
     pub fn load(tokenizer_path: &Path) -> Result<Self> {

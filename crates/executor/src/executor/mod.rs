@@ -3,14 +3,9 @@ mod handle;
 
 use crate::ExecutorError;
 #[cfg(feature = "evaluate")]
-use crate::PackageSource;
-#[cfg(feature = "evaluate")]
 use crate::worker::WorkerCompletion;
-#[cfg(feature = "evaluate")]
-use hellas_rpc::ExecutionPackageId;
 use hellas_rpc::pb::courtesy::{
-    GetArtifactRequest, GetArtifactResponse, GetPackageStatsRequest, GetPackageStatsResponse,
-    GetStatsResponse, ListPackagesResponse, QuoteResponse, QuoteTokensRequest,
+    GetArtifactRequest, GetArtifactResponse, GetStatsResponse, QuoteResponse, QuoteTokensRequest,
 };
 use hellas_rpc::pb::evaluate::EvaluateRequest as PbEvaluateRequest;
 use hellas_rpc::pb::execute::{RunTicketRequest, Ticket, WorkEvent};
@@ -21,9 +16,11 @@ use hellas_wire::WireStatus;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
+#[cfg(all(test, feature = "evaluate"))]
+use crate::evaluate::EvaluateJob;
 use crate::fetch_policy::FetchQuotaReservation;
 use crate::fetch_projection::FetchProjector;
-use crate::fetch_provider::{FetchProvider, FetchProviderError, FetchProviderRequest};
+use crate::fetch_provider::{FetchProvider, FetchProviderError, PreparedFetchRequest};
 pub use actor::{Executor, ExecutorSpawnConfig};
 
 #[derive(Clone)]
@@ -58,7 +55,12 @@ pub struct ExecuteOutcome {
     pub events: ExecuteEventReceiver,
 }
 
-pub(crate) enum ExecutorMessage {
+/// Requests entering the executor actor from its in-process clients.
+///
+/// The channel carrying these is bounded because most senders are ultimately
+/// driven by peers. Completion notifications use a separate channel: an
+/// adversary filling this mailbox must not prevent accepted work from retiring.
+pub(crate) enum ExecutorRequest {
     QuoteEvaluate {
         request: PbEvaluateRequest,
         reply: oneshot::Sender<Result<TicketOutcome<Ticket>, ExecutorError>>,
@@ -71,19 +73,9 @@ pub(crate) enum ExecutorMessage {
         request: QuoteTokensRequest,
         reply: oneshot::Sender<Result<TicketOutcome<QuoteResponse>, ExecutorError>>,
     },
-    #[cfg(feature = "evaluate")]
-    PublishCanonicalArtifact {
-        canonical_artifact: Vec<u8>,
-        reply: oneshot::Sender<Result<hellas_rpc::Digest, ExecutorError>>,
-    },
     GetArtifact {
         request: GetArtifactRequest,
         reply: oneshot::Sender<Result<GetArtifactResponse, ExecutorError>>,
-    },
-    #[cfg(feature = "evaluate")]
-    MaterializePackage {
-        source: PackageSource,
-        reply: oneshot::Sender<Result<ExecutionPackageId, ExecutorError>>,
     },
     /// Single streaming entry point: validate the quote, accept the job
     /// (queueing if the worker is busy), and return a Receiver wired to
@@ -92,30 +84,51 @@ pub(crate) enum ExecutorMessage {
         request: RunTicketRequest,
         reply: oneshot::Sender<Result<ExecuteOutcome, ExecutorError>>,
     },
-    /// Start one already-authorized paid job.
-    ///
-    /// No ticket, no quote, and no admission of its own: the paid
-    /// endpoint decided this invocation was owed and made that decision
-    /// durable before this message was sent. What is left for the engine
-    /// is whether it *can* run the request — the artifacts, the policy,
-    /// and the exact package loaded on this node.
-    RunPaidEvaluate {
-        request: hellas_rpc::EvaluateRequest,
-        reply: oneshot::Sender<Result<ExecuteOutcome, ExecutorError>>,
-    },
-    #[cfg(feature = "evaluate")]
-    EvaluateFinished(Box<WorkerCompletion>),
-    FetchFinished(FetchCompletion),
-    ListPackages {
-        reply: oneshot::Sender<Result<ListPackagesResponse, ExecutorError>>,
-    },
     GetStats {
         reply: oneshot::Sender<Result<GetStatsResponse, ExecutorError>>,
     },
-    GetPackageStats {
-        request: GetPackageStatsRequest,
-        reply: oneshot::Sender<Result<GetPackageStatsResponse, ExecutorError>>,
+    #[cfg(all(test, feature = "evaluate"))]
+    StartEvaluateForTest {
+        job: Box<EvaluateJob>,
+        execution_id: String,
+        request_commitment: [u8; 32],
+        reply: oneshot::Sender<Result<ExecuteOutcome, ExecutorError>>,
     },
+    #[cfg(all(test, feature = "evaluate"))]
+    BarrierForTest {
+        entered: oneshot::Sender<()>,
+        release: oneshot::Receiver<()>,
+    },
+}
+
+/// Trusted work whose invocation has already been made durable by its owner.
+///
+/// This has a distinct bounded ingress so peer RPC traffic cannot delay its
+/// admission past queued best-effort execution.
+pub(crate) enum ExecutorOwedRequest {
+    /// Start one already-authorized paid job.
+    ///
+    /// No ticket, no quote, and no admission of its own: the paid endpoint
+    /// decided this invocation was owed and made that decision durable before
+    /// this message was sent.
+    RunPaidEvaluate {
+        input: Box<hellas_rpc::work::PreparedEvaluateInput>,
+        reply: oneshot::Sender<Result<ExecuteOutcome, ExecutorError>>,
+    },
+    #[cfg(all(test, feature = "evaluate"))]
+    StartEvaluateForTest {
+        job: Box<EvaluateJob>,
+        execution_id: String,
+        request_commitment: [u8; 32],
+        reply: oneshot::Sender<Result<ExecuteOutcome, ExecutorError>>,
+    },
+}
+
+/// Trusted notifications from the bounded set of active execution producers.
+pub(crate) enum ExecutorCompletion {
+    #[cfg(feature = "evaluate")]
+    EvaluateFinished(Box<WorkerCompletion>),
+    FetchFinished(Box<FetchCompletion>),
 }
 
 pub(crate) struct FetchCompletion {
@@ -132,6 +145,7 @@ pub(crate) type ExecuteEventReceiverSender = mpsc::Sender<Result<WorkEvent, Wire
 
 pub(crate) struct FetchProviderRun {
     pub output_events: Vec<OutputEventEnvelope>,
+    pub position: u64,
 }
 
 pub(crate) struct FetchProviderFailure {
@@ -140,7 +154,7 @@ pub(crate) struct FetchProviderFailure {
 }
 
 pub(crate) struct PendingFetch {
-    pub request: FetchProviderRequest,
+    pub request: PreparedFetchRequest,
     pub provider: Arc<dyn FetchProvider>,
     pub projector: Box<dyn FetchProjector>,
     pub quota_reservation: Option<FetchQuotaReservation>,
@@ -154,5 +168,6 @@ pub(crate) struct PendingFetch {
 
 #[derive(Clone)]
 pub struct ExecutorHandle {
-    pub(super) tx: mpsc::UnboundedSender<ExecutorMessage>,
+    pub(super) tx: mpsc::Sender<ExecutorRequest>,
+    pub(super) owed_tx: mpsc::Sender<ExecutorOwedRequest>,
 }

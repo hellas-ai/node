@@ -21,7 +21,7 @@
 //! under.
 
 use crate::protocol::value::{CanonicalDecodeError, CanonicalDecoder};
-use crate::{ContentId, DagCborEncoder, Digest};
+use crate::{DagCborEncoder, Digest};
 use std::{format, marker::PhantomData, str, vec::Vec};
 
 const SOURCE_INPUT_SCHEMA: &str = "hellas.evaluate.source.input.v1";
@@ -30,8 +30,16 @@ const TOKEN_IDS_SCHEMA: &str = "hellas.evaluate.token_ids.v1";
 const TEXT_POLICY_SCHEMA: &str = "hellas.evaluate.text.policy.v1";
 const TEXT_EXECUTION_SCHEMA: &str = "hellas.evaluate.text.execution.v1";
 const TEXT_STATE_SCHEMA: &str = "hellas.evaluate.text.state.v1";
-const TEXT_ARTIFACT_IDENTITY_SCHEMA: &str = "hellas.evaluate.text.artifact.identity.v2";
+const TEXT_ARTIFACT_IDENTITY_SCHEMA: &str = "hellas.evaluate.text.artifact.identity.v3";
 const TEXT_ARTIFACT_OUTPUT_SCHEMA: &str = "hellas.evaluate.text.artifact.output.v1";
+
+/// Conservative maximum number of token IDs in one retained token artifact.
+///
+/// Every possible artifact at this bound, including the five-byte DAG-CBOR
+/// encoding of `u32::MAX`, fits in one 4 MiB Courtesy response frame. Providers
+/// may choose a lower generation limit, but must not admit a retained execution
+/// whose prompt-plus-output artifact can no longer be retrieved.
+pub const MAX_RETRIEVABLE_TOKEN_IDS: u64 = 524_288;
 
 pub trait Canonical {
     fn encode(&self, encoder: &mut DagCborEncoder);
@@ -305,6 +313,14 @@ impl TokenIds {
     pub fn as_slice(&self) -> &[TokenId] {
         &self.tokens
     }
+
+    /// Requested heap capacity retained by this token buffer.
+    #[must_use]
+    pub fn retained_heap_bytes(&self) -> Option<usize> {
+        self.tokens
+            .capacity()
+            .checked_mul(std::mem::size_of::<TokenId>())
+    }
 }
 
 impl<const N: usize> From<[u32; N]> for TokenIds {
@@ -380,6 +396,14 @@ impl TextPolicy {
 
     pub fn stop_token_ids(&self) -> &[TokenId] {
         &self.stop_token_ids
+    }
+
+    /// Requested heap capacity retained by the stop-token buffer.
+    #[must_use]
+    pub fn retained_heap_bytes(&self) -> Option<usize> {
+        self.stop_token_ids
+            .capacity()
+            .checked_mul(std::mem::size_of::<TokenId>())
     }
 }
 
@@ -527,19 +551,22 @@ impl TextOutput {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TextArtifact {
+    /// The genesis artifact for one bound execution environment.
+    ///
+    /// `bound_term` is the content id of the complete [`crate::ProgramManifest`],
+    /// so it already commits to the exact evaluator, adaptor, and application
+    /// root. Repeating one application-specific content id here would add no
+    /// security binding and could disagree with the manifest it purported to
+    /// identify.
     Identity {
         bound_term: BoundTermId,
-        execution_package: crate::ExecutionPackageId,
     },
     Output(TextOutput),
 }
 
 impl TextArtifact {
-    pub fn identity(bound_term: BoundTermId, execution_package: crate::ExecutionPackageId) -> Self {
-        Self::Identity {
-            bound_term,
-            execution_package,
-        }
+    pub const fn identity(bound_term: BoundTermId) -> Self {
+        Self::Identity { bound_term }
     }
 
     pub const fn output(
@@ -560,14 +587,10 @@ impl TextArtifact {
 impl Canonical for TextArtifact {
     fn encode(&self, encoder: &mut DagCborEncoder) {
         match self {
-            Self::Identity {
-                bound_term,
-                execution_package,
-            } => {
-                encoder.array(3);
+            Self::Identity { bound_term } => {
+                encoder.array(2);
                 encoder.str(TEXT_ARTIFACT_IDENTITY_SCHEMA);
                 encoder.bytes(bound_term.as_bytes());
-                encoder.bytes(execution_package.as_bytes());
             }
             Self::Output(output) => {
                 encoder.array(5);
@@ -683,18 +706,15 @@ const LENGTH_PREFIX: usize = 4;
 
 /// The six bodies of a [`PreparedPaidInputV1`], parsed.
 ///
-/// The manifest is the one body that arrives as an id rather than a
-/// value: nothing in this milestone reads a field of it, and its content
-/// id is the hash of exactly the bytes carried, so comparing that id to
-/// the environment commitment fixes the bytes as completely as a decoder
-/// would. Giving it a second, unused parser would be inventing an
-/// opinion about manifest bytes that nothing checks.
+/// The manifest is retained as its parsed value. Parsing proves the carried
+/// bytes were canonical; re-encoding it therefore recovers those exact bytes
+/// for a backend after the journal is reopened.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PreparedPaidInputParts {
     /// The request whose commitment the authorization names.
     pub evaluate_request: crate::EvaluateRequest,
-    /// Content id of the carried environment manifest bytes.
-    pub manifest: ContentId,
+    /// The strictly decoded environment manifest carried by the bundle.
+    pub manifest: crate::ProgramManifest,
     /// The execution the request is addressed by.
     pub text_execution: TextExecution,
     /// Prompt tokens the execution names.
@@ -794,7 +814,7 @@ impl PreparedPaidInputV1 {
             evaluate_request: crate::protocol::schemes::evaluate::decode_evaluate_request(
                 &self.evaluate_request,
             )?,
-            manifest: ContentId::hash(&self.manifest),
+            manifest: crate::ProgramManifest::from_canonical_bytes(&self.manifest)?,
             text_execution: TextExecution::from_canonical_bytes(&self.text_execution)?,
             prompt_tokens: TokenIds::from_canonical_bytes(&self.prompt_tokens)?,
             text_policy: TextPolicy::from_canonical_bytes(&self.text_policy)?,
@@ -936,15 +956,14 @@ fn decode_text_artifact(
     let len = decoder.array_len()?;
     match decoder.str()? {
         TEXT_ARTIFACT_IDENTITY_SCHEMA => {
-            if len != 3 {
+            if len != 2 {
                 return Err(CanonicalDecodeError::new(format!(
-                    "{TEXT_ARTIFACT_IDENTITY_SCHEMA} expected array length 3, got {len}"
+                    "{TEXT_ARTIFACT_IDENTITY_SCHEMA} expected array length 2, got {len}"
                 )));
             }
-            Ok(TextArtifact::identity(
-                BoundTermId::from_bytes(decoder.bytes_32()?),
-                crate::ExecutionPackageId::from_bytes(decoder.bytes_32()?),
-            ))
+            Ok(TextArtifact::identity(BoundTermId::from_bytes(
+                decoder.bytes_32()?,
+            )))
         }
         TEXT_ARTIFACT_OUTPUT_SCHEMA => {
             if len != 5 {
@@ -967,8 +986,6 @@ fn decode_text_artifact(
 
 #[cfg(test)]
 mod tests {
-    use crate::ExecutionPackageId;
-
     use super::{
         BoundTerm, Canonical, CanonicalDecode, InputAddressed, OutputAddressed, OutputId,
         SourceRef, TextArtifact, TextExecution, TextPolicy, TextState, TokenId, TokenIds,
@@ -980,6 +997,47 @@ mod tests {
 
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    #[test]
+    fn token_artifact_heap_accounting_uses_owned_capacities() {
+        let mut token_buffer = Vec::with_capacity(32);
+        token_buffer.extend([TokenId::new(1), TokenId::new(2)]);
+        let tokens = TokenIds::new(token_buffer);
+
+        let mut stop_buffer = Vec::with_capacity(16);
+        stop_buffer.extend([TokenId::new(3), TokenId::new(4)]);
+        let policy = TextPolicy::new(8, stop_buffer);
+
+        assert_eq!(
+            tokens.retained_heap_bytes(),
+            Some(tokens.tokens.capacity() * std::mem::size_of::<TokenId>())
+        );
+        assert_eq!(
+            policy.retained_heap_bytes(),
+            Some(policy.stop_token_ids.capacity() * std::mem::size_of::<TokenId>())
+        );
+        assert!(tokens.tokens.capacity() > tokens.tokens.len());
+        assert!(policy.stop_token_ids.capacity() > policy.stop_token_ids.len());
+    }
+
+    #[cfg(feature = "courtesy")]
+    #[test]
+    fn maximum_token_artifact_fits_one_courtesy_wire_frame() {
+        use crate::pb::courtesy::GetArtifactResponse;
+        use hellas_wire::frame::MAX_FRAME_BYTES;
+        use prost::Message as _;
+
+        let count = usize::try_from(super::MAX_RETRIEVABLE_TOKEN_IDS).unwrap();
+        let canonical_artifact =
+            TokenIds::from_u32s(std::iter::repeat_n(u32::MAX, count)).canonical_bytes();
+        let response = GetArtifactResponse { canonical_artifact };
+        let protobuf_body = response.encode_to_vec();
+
+        // One byte is reserved for the wire frame kind in addition to the
+        // protobuf body emitted by unary dispatch.
+        assert_eq!(protobuf_body.len(), response.encoded_len());
+        assert!(protobuf_body.len() < MAX_FRAME_BYTES);
     }
 
     /// Golden bytes, captured from this schema's previous home in
@@ -1020,20 +1078,15 @@ mod tests {
             )
         );
 
-        let identity = TextArtifact::identity(
-            output_id::<BoundTerm>(7),
-            ExecutionPackageId::from_bytes([8; 32]),
-        );
+        let identity = TextArtifact::identity(output_id::<BoundTerm>(7));
         assert_eq!(
             hex(&identity.canonical_bytes()),
             concat!(
-                "83", // array(3)
+                "82", // array(2)
                 "7829",
-                "68656c6c61732e6576616c756174652e746578742e61727469666163742e6964656e746974792e7632",
+                "68656c6c61732e6576616c756174652e746578742e61727469666163742e6964656e746974792e7633",
                 "5820",
                 "0707070707070707070707070707070707070707070707070707070707070707",
-                "5820",
-                "0808080808080808080808080808080808080808080808080808080808080808",
             )
         );
 
@@ -1064,7 +1117,7 @@ mod tests {
                 "7820",
                 "68656c6c61732e6576616c756174652e736f757263652e6f75747075742e7631",
                 "5820",
-                "810baa4e4f998b88a46b3140d1601a16d7d4f5b8ea71057a137c6cd14f9f023d",
+                "d43171953821e475764c09fd8e520e17b486a50212fdf2be6465f83b8ca84544",
                 "5820",
                 "2ea3d70455fb7c175feeffc0a307b7c97fb60980926e66118b8baf8fd0cd6db2",
                 "5820",
@@ -1085,7 +1138,7 @@ mod tests {
                 "7827",
                 "68656c6c61732e6576616c756174652e746578742e61727469666163742e6f75747075742e7631",
                 "5820",
-                "a81853afe18adf094c2dc1fe000d894ab167dda735b4d03341bff43e085cba31",
+                "027834450d115db494c56e25410383db314f7e820f8dceb76da9ca7a45ca8080",
                 "03", // position
                 "5820",
                 "4a7cc97833bc25d2340ce377de92c012f336858cfeb8e2859f67fd12975916b8",
@@ -1096,11 +1149,11 @@ mod tests {
 
         assert_eq!(
             hex(identity.output_id().as_bytes()),
-            "810baa4e4f998b88a46b3140d1601a16d7d4f5b8ea71057a137c6cd14f9f023d"
+            "d43171953821e475764c09fd8e520e17b486a50212fdf2be6465f83b8ca84544"
         );
         assert_eq!(
             hex(execution.input_id().as_bytes()),
-            "a81853afe18adf094c2dc1fe000d894ab167dda735b4d03341bff43e085cba31"
+            "027834450d115db494c56e25410383db314f7e820f8dceb76da9ca7a45ca8080"
         );
     }
 
@@ -1146,14 +1199,8 @@ mod tests {
 
     #[test]
     fn identity_is_output_addressed_genesis() {
-        let identity = TextArtifact::identity(
-            output_id::<BoundTerm>(7),
-            ExecutionPackageId::from_bytes([8; 32]),
-        );
-        let other_package = TextArtifact::identity(
-            output_id::<BoundTerm>(7),
-            ExecutionPackageId::from_bytes([9; 32]),
-        );
+        let identity = TextArtifact::identity(output_id::<BoundTerm>(7));
+        let other_environment = TextArtifact::identity(output_id::<BoundTerm>(8));
         let prompt_tokens = TokenIds::from([1]).output_id();
         let policy = TextPolicy::from_u32_stop_tokens(4, []).output_id();
         let execution = TextExecution::new(
@@ -1162,7 +1209,7 @@ mod tests {
             policy,
         );
 
-        assert_ne!(identity.output_id(), other_package.output_id());
+        assert_ne!(identity.output_id(), other_environment.output_id());
         assert_ne!(
             execution.input_id().as_bytes(),
             identity.output_id().as_bytes()
@@ -1171,10 +1218,7 @@ mod tests {
 
     #[test]
     fn execution_input_id_changes_when_source_changes() {
-        let identity = TextArtifact::identity(
-            output_id::<BoundTerm>(7),
-            ExecutionPackageId::from_bytes([8; 32]),
-        );
+        let identity = TextArtifact::identity(output_id::<BoundTerm>(7));
         let prompt_tokens = TokenIds::from([1]).output_id();
         let policy = TextPolicy::from_u32_stop_tokens(4, []).output_id();
         let first = TextExecution::new(
@@ -1190,13 +1234,7 @@ mod tests {
     #[test]
     fn output_artifact_id_changes_when_generated_tokens_change() {
         let execution = TextExecution::new(
-            SourceRef::output(
-                TextArtifact::identity(
-                    output_id::<BoundTerm>(7),
-                    ExecutionPackageId::from_bytes([8; 32]),
-                )
-                .output_id(),
-            ),
+            SourceRef::output(TextArtifact::identity(output_id::<BoundTerm>(7)).output_id()),
             TokenIds::from([1]).output_id(),
             TextPolicy::from_u32_stop_tokens(4, []).output_id(),
         )
@@ -1237,10 +1275,7 @@ mod tests {
             state
         );
 
-        let identity = TextArtifact::identity(
-            output_id::<BoundTerm>(7),
-            ExecutionPackageId::from_bytes([8; 32]),
-        );
+        let identity = TextArtifact::identity(output_id::<BoundTerm>(7));
         assert_eq!(
             TextArtifact::from_canonical_bytes(&identity.canonical_bytes()).unwrap(),
             identity

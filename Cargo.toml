@@ -29,7 +29,7 @@ documentation = "https://docs.rs"
 axum = "0.8"
 base64 = "0.22"
 bytes = "1"
-catena-runner = { path = "../catena-runner", default-features = false }
+catena-lang = { path = "../catena-lang/catena-lang", default-features = false }
 cc = "1"
 ciborium = "0.2"
 commonware-actor = { git = "https://github.com/commonwarexyz/monorepo", rev = "4c3ebe4274d908557d91b637240e8b93609fb32f" }
@@ -102,6 +102,3 @@ tracing-opentelemetry = "0.32"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 webpki = { package = "rustls-webpki", version = "0.103.9", default-features = false }
 x509-cert = { version = "0.2", default-features = false }
-
-[patch."https://github.com/hellas-ai/exploratory-catena.git"]
-catena-lang = { path = "../exploratory-catena/catena-lang" }

@@ -50,8 +50,8 @@ use hellas_rpc::work_store::{
     TerminalOutcome,
 };
 use hellas_rpc::{
-    Assurance, Evaluate, EvaluateProgramManifest, EvaluateRequest, ExecutionPackageId,
-    ProgramManifest, PublicKey,
+    Application, Assurance, CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR, ContentId, Evaluate,
+    EvaluateRequest, ProgramManifest, PublicKey,
 };
 use hellas_wire::mux::{MessagePipe, MuxConfig, MuxTransport, Role as MuxRole};
 use hellas_wire::{DefaultClock, Dispatcher, ServiceMarker, StreamTransport};
@@ -313,9 +313,10 @@ fn provider_endpoint(root: &std::path::Path) -> ProviderEndpoint {
 // ── The prepared inputs a job executes from ───────────────────────────
 
 fn manifest() -> ProgramManifest {
-    ProgramManifest::Evaluate(EvaluateProgramManifest {
-        execution_package: ExecutionPackageId::from_bytes([0x16; 32]),
-    })
+    ProgramManifest::new(
+        Application::new(CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR).unwrap(),
+        ContentId::from_bytes([0x16; 32]),
+    )
 }
 
 fn prompt_tokens() -> TokenIds {
@@ -327,10 +328,7 @@ fn text_policy() -> TextPolicy {
 }
 
 fn identity_artifact() -> TextArtifact {
-    TextArtifact::identity(
-        BoundTermId::from_digest(manifest().content_id().digest()),
-        ExecutionPackageId::from_bytes([0x16; 32]),
-    )
+    TextArtifact::identity(BoundTermId::from_digest(manifest().content_id().digest()))
 }
 
 fn text_execution() -> TextExecution {

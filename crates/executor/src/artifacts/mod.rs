@@ -2,25 +2,30 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::ExecutorError;
-use hellas_rpc::{ContentId, Digest, EvaluateRequest, ExecutionPackageId};
+use hellas_rpc::{ContentId, Digest, EvaluateRequest, ProgramManifest};
 
 use crate::artifact_store::{ArtifactStorage, ArtifactStoreConfig};
-use crate::state::{Invocation, QuotePlan};
+use crate::state::{Invocation, QuotePlan, validate_invocation};
 
 use hellas_rpc::protocol::artifacts::{
-    BoundTermId, Canonical, CanonicalDecode, InputAddressed, OutputAddressed, SourceRef,
-    TextArtifact, TextArtifactId, TextExecution, TextExecutionId, TextPolicy, TextPolicyId,
-    TextSource, TextState, TextStateId, TokenIds, TokenIdsId, completed_text,
+    BoundTermId, Canonical, CanonicalDecode, InputAddressed, OutputAddressed,
+    PreparedPaidInputParts, SourceRef, TextArtifact, TextArtifactId, TextExecution,
+    TextExecutionId, TextPolicy, TextPolicyId, TextSource, TextState, TextStateId, TokenIds,
+    TokenIdsId, completed_text,
 };
 
 const CANONICAL_PARTITION: &str = "evaluate_canonical";
 const EXECUTION_OUTPUT_PARTITION: &str = "evaluate_execution_outputs";
+const RETAINED_EXECUTION_PARTITION: &str = "evaluate_retained_executions";
+/// An execution publishes at most four input and four output canonical
+/// objects. A durable reservation comes first, so this also bounds crash
+/// orphans without having to inspect any canonical body at startup.
+const MAX_CANONICAL_OBJECTS_PER_RETAINED_EXECUTION: usize = 8;
 const MAX_TEXT_ARTIFACT_CHAIN_DEPTH: usize = 1024;
 
 #[derive(Clone, Debug)]
 pub(crate) struct ResolvedEvaluateExecution {
     pub evaluate_request: EvaluateRequest,
-    pub execution_package: ExecutionPackageId,
     pub invocation: Invocation,
     pub prepared_artifacts: Option<PreparedTextArtifacts>,
 }
@@ -33,21 +38,101 @@ pub(crate) struct PreparedTextArtifacts {
     execution: TextExecution,
 }
 
+impl PreparedTextArtifacts {
+    pub(crate) fn retained_heap_bytes(&self) -> Option<usize> {
+        self.prompt_tokens
+            .retained_heap_bytes()?
+            .checked_add(self.policy.retained_heap_bytes()?)
+    }
+}
+
+/// Reconstructs the exact invocation carried by one accepted paid job.
+///
+/// Unlike [`EvaluateArtifactStore::resolve_evaluate_request`], this path reads
+/// no Courtesy artifact state: all graph bodies came from the durable bundle
+/// the parties signed. It validates their links again before anything reaches
+/// the worker and returns them unpublished; retention is decided only after a
+/// successful execution.
+pub(crate) fn resolve_prepared_paid_input(
+    parts: PreparedPaidInputParts,
+) -> Result<(ProgramManifest, ResolvedEvaluateExecution), ExecutorError> {
+    let PreparedPaidInputParts {
+        evaluate_request,
+        manifest,
+        text_execution,
+        prompt_tokens,
+        text_policy,
+        identity_artifact,
+    } = parts;
+
+    if manifest.content_id() != evaluate_request.execution_environment {
+        return Err(invalid_prepared_graph("manifest content id"));
+    }
+    let TextArtifact::Identity { bound_term } = &identity_artifact else {
+        return Err(invalid_prepared_graph("identity artifact kind"));
+    };
+    if bound_term.as_bytes() != evaluate_request.execution_environment.as_bytes() {
+        return Err(invalid_prepared_graph("identity artifact bound term"));
+    }
+    if text_execution.from() != &SourceRef::output(identity_artifact.output_id()) {
+        return Err(invalid_prepared_graph("text execution source"));
+    }
+    if text_execution.input_id().digest() != evaluate_request.text_execution {
+        return Err(invalid_prepared_graph("text execution id"));
+    }
+    if text_execution.prompt_tokens() != prompt_tokens.output_id() {
+        return Err(invalid_prepared_graph("prompt tokens id"));
+    }
+    if text_execution.policy() != text_policy.output_id() {
+        return Err(invalid_prepared_graph("text policy id"));
+    }
+
+    let invocation = Invocation {
+        input_ids: token_ids_to_u32(&prompt_tokens),
+        max_new_tokens: text_policy.max_new_tokens(),
+        stop_token_ids: text_policy
+            .stop_token_ids()
+            .iter()
+            .map(|token| token.as_u32())
+            .collect(),
+    };
+    Ok((
+        manifest,
+        ResolvedEvaluateExecution {
+            evaluate_request,
+            invocation,
+            prepared_artifacts: Some(PreparedTextArtifacts {
+                identity: Some(identity_artifact),
+                prompt_tokens,
+                policy: text_policy,
+                execution: text_execution,
+            }),
+        },
+    ))
+}
+
+fn invalid_prepared_graph(field: &'static str) -> ExecutorError {
+    ExecutorError::InvalidQuoteRequest(format!("journaled paid input has mismatched {field}"))
+}
+
 pub(crate) struct EvaluateArtifactStore {
     storage: Option<Arc<dyn ArtifactStorage>>,
+    // The root handle owns the advisory lock for exactly this store's
+    // lifetime. It is deliberately otherwise unused.
+    _root: Option<Arc<crate::artifact_store::ArtifactStoreRoot>>,
+    retained_execution_capacity: usize,
     canonical_keys: HashSet<Digest>,
     execution_output_keys: HashSet<TextExecutionId>,
-    canonical_blobs: HashMap<Digest, Vec<u8>>,
-    token_ids: HashMap<TokenIdsId, TokenIds>,
-    policies: HashMap<TextPolicyId, TextPolicy>,
-    text_executions: HashMap<TextExecutionId, TextExecution>,
-    text_states: HashMap<TextStateId, TextState>,
-    text_artifacts: HashMap<TextArtifactId, TextArtifact>,
+    retained_executions: HashSet<TextExecutionId>,
+    /// The in-process backend has no filesystem to re-read. It is still
+    /// bounded by the same reservation/object accounting as disk storage.
+    memory_blobs: HashMap<Digest, Vec<u8>>,
+    /// Memory stores have no output partition. Persistent stores use this as
+    /// a bounded lazy decode cache, never as canonical-body retention.
     outputs_by_execution: HashMap<TextExecutionId, TextArtifactId>,
 }
 
 struct MaterializedTextSource {
-    execution_package: ExecutionPackageId,
     execution_environment: hellas_rpc::ContentId,
     tokens: Vec<u32>,
 }
@@ -69,23 +154,18 @@ macro_rules! typed_canonical_artifacts {
     )+) => {
         $(
             async fn $load(&mut self, id: $id) -> Result<$value, ExecutorError> {
-                if let Some(value) = self.$cache.get(&id).cloned() {
-                    return Ok(value);
-                }
                 let value = self
                     .decode_canonical::<$value>(id.digest(), stringify!($value))
                     .await?;
                 if value.$identity() != id {
                     return Err(canonical_type_mismatch(stringify!($value), id.digest()));
                 }
-                self.$cache.insert(id, value.clone());
                 Ok(value)
             }
 
             async fn $insert(&mut self, value: $value) -> Result<$id, ExecutorError> {
                 let id = value.$identity();
                 self.insert_canonical(id.digest(), &value).await?;
-                self.$cache.entry(id).or_insert(value);
                 Ok(id)
             }
         )+
@@ -94,44 +174,102 @@ macro_rules! typed_canonical_artifacts {
 
 impl EvaluateArtifactStore {
     pub(crate) fn memory() -> Self {
-        Self::new(None)
+        Self::new(
+            None,
+            None,
+            crate::artifact_store::DEFAULT_EVALUATE_RETAINED_EXECUTION_CAPACITY,
+        )
     }
 
     pub(crate) async fn open(config: ArtifactStoreConfig) -> Result<Self, ExecutorError> {
+        let retained_execution_capacity = config.retained_execution_capacity();
         let Some(storage) = config.storage() else {
-            return Ok(Self::memory());
+            return Ok(Self::new(None, config.root(), retained_execution_capacity));
         };
         let canonical_keys = scan_digests(&storage, CANONICAL_PARTITION).await?;
-        let execution_output_keys = scan_digests(&storage, EXECUTION_OUTPUT_PARTITION)
+        let execution_output_keys: HashSet<TextExecutionId> =
+            scan_digests(&storage, EXECUTION_OUTPUT_PARTITION)
+                .await?
+                .into_iter()
+                .map(TextExecutionId::from_digest)
+                .collect();
+        let retained_executions = scan_digests(&storage, RETAINED_EXECUTION_PARTITION)
             .await?
             .into_iter()
             .map(TextExecutionId::from_digest)
-            .collect();
+            .collect::<HashSet<_>>();
+        let maximum_canonical_objects = retained_execution_capacity
+            .checked_mul(MAX_CANONICAL_OBJECTS_PER_RETAINED_EXECUTION)
+            .ok_or_else(|| {
+                ExecutorError::ArtifactStore(
+                    "retained Evaluate capacity overflows canonical object bound".to_string(),
+                )
+            })?;
+        if retained_executions.len() > retained_execution_capacity
+            || execution_output_keys.len() > retained_execution_capacity
+            || canonical_keys.len() > maximum_canonical_objects
+            || !execution_output_keys.is_subset(&retained_executions)
+        {
+            return Err(ExecutorError::ArtifactStore(format!(
+                "retained Evaluate artifact store exceeds or contradicts its {retained_execution_capacity}-execution bound"
+            )));
+        }
+        for execution in &retained_executions {
+            let bytes = storage
+                .read(RETAINED_EXECUTION_PARTITION, execution.as_bytes().to_vec())
+                .await
+                .map_err(storage_error)?;
+            decode_execution_reservation(&bytes, *execution)?;
+        }
         Ok(Self {
             storage: Some(storage),
+            _root: config.root(),
+            retained_execution_capacity,
             canonical_keys,
             execution_output_keys,
-            canonical_blobs: HashMap::new(),
-            token_ids: HashMap::new(),
-            policies: HashMap::new(),
-            text_executions: HashMap::new(),
-            text_states: HashMap::new(),
-            text_artifacts: HashMap::new(),
+            retained_executions,
+            memory_blobs: HashMap::new(),
             outputs_by_execution: HashMap::new(),
         })
     }
 
-    fn new(storage: Option<Arc<dyn ArtifactStorage>>) -> Self {
+    /// Fail before GPU admission when a successful retained execution could
+    /// not be published. The Evaluate actor runs at most one GPU job at a
+    /// time, and calls this again when dispatching queued work, so a job that
+    /// fills the final slot cannot make the next queued job waste GPU work.
+    pub(crate) fn ensure_retention_available(
+        &self,
+        evaluate_request: &EvaluateRequest,
+    ) -> Result<(), ExecutorError> {
+        if !evaluate_request.retention().should_retain() {
+            return Ok(());
+        }
+        let execution = TextExecutionId::from_digest(evaluate_request.text_execution);
+        if self.retained_executions.contains(&execution) {
+            return Ok(());
+        }
+        if self.retained_executions.len() >= self.retained_execution_capacity {
+            return Err(ExecutorError::ResourceExhausted(format!(
+                "retained Evaluate execution capacity of {} is exhausted",
+                self.retained_execution_capacity
+            )));
+        }
+        Ok(())
+    }
+
+    fn new(
+        storage: Option<Arc<dyn ArtifactStorage>>,
+        root: Option<Arc<crate::artifact_store::ArtifactStoreRoot>>,
+        retained_execution_capacity: usize,
+    ) -> Self {
         Self {
             storage,
+            _root: root,
+            retained_execution_capacity,
             canonical_keys: HashSet::new(),
             execution_output_keys: HashSet::new(),
-            canonical_blobs: HashMap::new(),
-            token_ids: HashMap::new(),
-            policies: HashMap::new(),
-            text_executions: HashMap::new(),
-            text_states: HashMap::new(),
-            text_artifacts: HashMap::new(),
+            retained_executions: HashSet::new(),
+            memory_blobs: HashMap::new(),
             outputs_by_execution: HashMap::new(),
         }
     }
@@ -142,7 +280,27 @@ impl EvaluateArtifactStore {
                 "canonical bytes do not match digest {digest}"
             )));
         }
+        if !self.canonical_keys.contains(&digest)
+            && self.canonical_keys.len()
+                >= self
+                    .retained_execution_capacity
+                    .checked_mul(MAX_CANONICAL_OBJECTS_PER_RETAINED_EXECUTION)
+                    .ok_or_else(|| {
+                        ExecutorError::ArtifactStore(
+                            "retained Evaluate canonical object bound overflows".to_string(),
+                        )
+                    })?
+        {
+            return Err(ExecutorError::ResourceExhausted(format!(
+                "retained Evaluate canonical object capacity of {} is exhausted",
+                self.retained_execution_capacity * MAX_CANONICAL_OBJECTS_PER_RETAINED_EXECUTION
+            )));
+        }
         let Some(storage) = &self.storage else {
+            self.canonical_keys.insert(digest);
+            self.memory_blobs
+                .entry(digest)
+                .or_insert_with(|| bytes.to_vec());
             return Ok(());
         };
         let existing = storage
@@ -178,6 +336,18 @@ impl EvaluateArtifactStore {
         if !self.canonical_keys.contains(&digest) {
             return Ok(None);
         }
+        if self.storage.is_none() {
+            return self
+                .memory_blobs
+                .get(&digest)
+                .cloned()
+                .map(Some)
+                .ok_or_else(|| {
+                    ExecutorError::ArtifactStore(format!(
+                        "in-memory canonical index is missing bytes for {digest}"
+                    ))
+                });
+        }
         let storage = self.storage.as_ref().ok_or_else(|| {
             ExecutorError::ArtifactStore("canonical artifact storage is unavailable".to_string())
         })?;
@@ -207,17 +377,15 @@ impl EvaluateArtifactStore {
             Some(artifact_id) => {
                 let artifact_id = TextArtifactId::from_digest(artifact_id);
                 let source = self.materialize_artifact(artifact_id).await?;
-                if source.execution_package != plan.execution_package
-                    || source.execution_environment != execution_environment
-                {
+                if source.execution_environment != execution_environment {
                     return Err(ExecutorError::InvalidQuoteRequest(
-                        "initial artifact belongs to a different Catena package".to_string(),
+                        "initial artifact belongs to a different execution environment".to_string(),
                     ));
                 }
                 (SourceRef::output(artifact_id), source.tokens, None)
             }
             None => {
-                let identity = TextArtifact::identity(bound_term_id, plan.execution_package);
+                let identity = TextArtifact::identity(bound_term_id);
                 let identity_id = identity.output_id();
                 (SourceRef::output(identity_id), Vec::new(), Some(identity))
             }
@@ -229,7 +397,7 @@ impl EvaluateArtifactStore {
             full_input.extend(invocation.input_ids);
             invocation.input_ids = full_input;
         }
-        plan.validate_invocation(&invocation)?;
+        validate_invocation(&invocation, plan.vocabulary_size, plan.maximum_capacity)?;
 
         let prompt_tokens = TokenIds::from(plan.invocation.input_ids.clone());
         let prompt_tokens_id = prompt_tokens.output_id();
@@ -251,7 +419,6 @@ impl EvaluateArtifactStore {
 
         Ok(ResolvedEvaluateExecution {
             evaluate_request,
-            execution_package: plan.execution_package,
             invocation,
             prepared_artifacts: Some(PreparedTextArtifacts {
                 identity: identity_to_insert,
@@ -283,6 +450,10 @@ impl EvaluateArtifactStore {
         plan: &QuotePlan,
     ) -> Result<ResolvedEvaluateExecution, ExecutorError> {
         let resolved = self.prepare_text(plan).await?;
+        self.reserve_retained_execution(TextExecutionId::from_digest(
+            resolved.evaluate_request.text_execution,
+        ))
+        .await?;
         self.publish_prepared_text(
             resolved
                 .prepared_artifacts
@@ -317,7 +488,6 @@ impl EvaluateArtifactStore {
 
         Ok(ResolvedEvaluateExecution {
             evaluate_request,
-            execution_package: source.execution_package,
             invocation: Invocation {
                 input_ids,
                 max_new_tokens: policy.max_new_tokens(),
@@ -327,28 +497,10 @@ impl EvaluateArtifactStore {
         })
     }
 
-    pub async fn publish_canonical_bytes(
-        &mut self,
-        bytes: Vec<u8>,
-    ) -> Result<Digest, ExecutorError> {
-        let digest = Digest::hash(&bytes);
-        if !self.canonical_blobs.contains_key(&digest) {
-            self.persist_blob(digest, &bytes).await?;
-            self.canonical_blobs.insert(digest, bytes);
-        }
-        Ok(digest)
-    }
-
     pub async fn get_canonical_bytes(&mut self, digest: Digest) -> Result<Vec<u8>, ExecutorError> {
-        if let Some(bytes) = self.canonical_blobs.get(&digest) {
-            return Ok(bytes.clone());
-        }
-        let bytes = self
-            .read_blob(digest)
+        self.read_blob(digest)
             .await?
-            .ok_or_else(|| ExecutorError::ArtifactNotFound(digest.to_string()))?;
-        self.canonical_blobs.insert(digest, bytes.clone());
-        Ok(bytes)
+            .ok_or_else(|| ExecutorError::ArtifactNotFound(digest.to_string()))
     }
 
     /// Records what one finished execution produced, and returns the id
@@ -368,13 +520,19 @@ impl EvaluateArtifactStore {
     ) -> Result<Digest, ExecutorError> {
         let execution_id = TextExecutionId::from_digest(evaluate_request.text_execution);
         if let Some(prepared) = prepared {
-            self.publish_prepared_text(prepared).await?;
             let prepared_id = prepared.execution.input_id();
             if prepared_id != execution_id {
                 return Err(ExecutorError::ArtifactStore(
                     "prepared execution does not match evaluate request".to_string(),
                 ));
             }
+        }
+        // The marker is durable before the first graph object. A crash at any
+        // later point loses capacity rather than permitting a new execution to
+        // grow the root past its configured bound.
+        self.reserve_retained_execution(execution_id).await?;
+        if let Some(prepared) = prepared {
+            self.publish_prepared_text(prepared).await?;
         }
         let _ = self.text_execution(execution_id).await?;
 
@@ -383,12 +541,24 @@ impl EvaluateArtifactStore {
         self.insert_token_ids(completed.state_tokens).await?;
         self.insert_text_state(completed.state).await?;
         let artifact_id = self.insert_text_artifact(completed.artifact).await?;
-        if !self.outputs_by_execution.contains_key(&execution_id) {
+        if self.execution_output_keys.contains(&execution_id) {
+            let stored = self.output_artifact_for_execution(execution_id).await?;
+            if stored != artifact_id {
+                return Err(ExecutorError::ArtifactStore(format!(
+                    "retained execution {execution_id} already names a different output artifact"
+                )));
+            }
+        } else {
             let stored = self
                 .persist_execution_output(execution_id, artifact_id)
                 .await?;
-            self.outputs_by_execution.insert(execution_id, stored);
+            if stored != artifact_id {
+                return Err(ExecutorError::ArtifactStore(format!(
+                    "retained execution {execution_id} already names a different output artifact"
+                )));
+            }
         }
+        self.outputs_by_execution.insert(execution_id, artifact_id);
         Ok(artifact_id.digest())
     }
 
@@ -434,7 +604,7 @@ impl EvaluateArtifactStore {
         let mut visited_artifacts = HashSet::new();
         let mut visited_executions = HashSet::new();
         let mut steps = Vec::new();
-        let (execution_package, execution_environment) = loop {
+        let execution_environment = loop {
             if !visited_artifacts.insert(current) {
                 return Err(ExecutorError::InvalidQuoteRequest(format!(
                     "evaluate artifact graph contains a cycle at {current}"
@@ -442,19 +612,8 @@ impl EvaluateArtifactStore {
             }
             let artifact = self.text_artifact(current).await?;
             match artifact {
-                TextArtifact::Identity {
-                    bound_term,
-                    execution_package,
-                } => {
-                    let execution_environment = ContentId::from_bytes(*bound_term.as_bytes());
-                    if execution_environment != QuotePlan::execution_environment(execution_package)
-                    {
-                        return Err(ExecutorError::InvalidQuoteRequest(
-                            "identity artifact bound term does not match its Catena package"
-                                .to_string(),
-                        ));
-                    }
-                    break (execution_package, execution_environment);
+                TextArtifact::Identity { bound_term } => {
+                    break ContentId::from_bytes(*bound_term.as_bytes());
                 }
                 TextArtifact::Output(output) => {
                     if steps.len() >= MAX_TEXT_ARTIFACT_CHAIN_DEPTH {
@@ -515,7 +674,6 @@ impl EvaluateArtifactStore {
         }
 
         Ok(MaterializedTextSource {
-            execution_package,
             execution_environment,
             tokens,
         })
@@ -569,14 +727,9 @@ impl EvaluateArtifactStore {
         digest: Digest,
         kind: &str,
     ) -> Result<Vec<u8>, ExecutorError> {
-        if let Some(bytes) = self.canonical_blobs.get(&digest) {
-            return Ok(bytes.clone());
-        }
-        let bytes = self.read_blob(digest).await?.ok_or_else(|| {
+        self.read_blob(digest).await?.ok_or_else(|| {
             ExecutorError::InvalidQuoteRequest(format!("missing {kind} artifact {digest}"))
-        })?;
-        self.canonical_blobs.insert(digest, bytes.clone());
-        Ok(bytes)
+        })
     }
 
     async fn insert_canonical(
@@ -584,13 +737,44 @@ impl EvaluateArtifactStore {
         digest: Digest,
         value: &impl Canonical,
     ) -> Result<(), ExecutorError> {
-        if self.canonical_blobs.contains_key(&digest) {
+        if self.canonical_keys.contains(&digest) {
             return Ok(());
         }
 
         let bytes = value.canonical_bytes();
         self.persist_blob(digest, &bytes).await?;
-        self.canonical_blobs.insert(digest, bytes);
+        Ok(())
+    }
+
+    async fn reserve_retained_execution(
+        &mut self,
+        execution: TextExecutionId,
+    ) -> Result<(), ExecutorError> {
+        if self.retained_executions.contains(&execution) {
+            return Ok(());
+        }
+        if self.retained_executions.len() >= self.retained_execution_capacity {
+            return Err(ExecutorError::ResourceExhausted(format!(
+                "retained Evaluate execution capacity of {} is exhausted",
+                self.retained_execution_capacity
+            )));
+        }
+        let Some(storage) = &self.storage else {
+            self.retained_executions.insert(execution);
+            return Ok(());
+        };
+        let existing = storage
+            .write_once(
+                RETAINED_EXECUTION_PARTITION,
+                execution.as_bytes().to_vec(),
+                encode_execution_reservation(execution),
+            )
+            .await
+            .map_err(storage_error)?;
+        if let Some(bytes) = existing {
+            decode_execution_reservation(&bytes, execution)?;
+        }
+        self.retained_executions.insert(execution);
         Ok(())
     }
 
@@ -600,6 +784,7 @@ impl EvaluateArtifactStore {
         artifact: TextArtifactId,
     ) -> Result<TextArtifactId, ExecutorError> {
         let Some(storage) = &self.storage else {
+            self.execution_output_keys.insert(execution);
             return Ok(artifact);
         };
         let existing = storage
@@ -702,6 +887,33 @@ fn encode_artifact_id(artifact: TextArtifactId) -> Vec<u8> {
     bytes
 }
 
+fn decode_execution_reservation(
+    bytes: &[u8],
+    execution: TextExecutionId,
+) -> Result<(), ExecutorError> {
+    let record: &[u8; 64] = bytes.try_into().map_err(|_| {
+        ExecutorError::ArtifactStore(format!(
+            "invalid retained execution reservation for {execution}: expected 64 bytes, got {}",
+            bytes.len()
+        ))
+    })?;
+    let named: [u8; 32] = record[..32].try_into().expect("fixed record prefix");
+    let checksum: [u8; 32] = record[32..].try_into().expect("fixed record suffix");
+    if named != *execution.as_bytes() || Digest::hash(&named) != Digest::from_bytes(checksum) {
+        return Err(ExecutorError::ArtifactStore(format!(
+            "invalid retained execution reservation for {execution}"
+        )));
+    }
+    Ok(())
+}
+
+fn encode_execution_reservation(execution: TextExecutionId) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(64);
+    bytes.extend_from_slice(execution.as_bytes());
+    bytes.extend_from_slice(Digest::hash(execution.as_bytes()).as_bytes());
+    bytes
+}
+
 fn storage_error(message: String) -> ExecutorError {
     ExecutorError::ArtifactStore(message)
 }
@@ -720,8 +932,6 @@ mod tests {
     use commonware_runtime::{
         Blob as _, Runner as _, Storage as _, Supervisor as _, deterministic,
     };
-    use hellas_rpc::ExecutionPackageId;
-
     fn runner_public_key() -> hellas_rpc::PublicKey {
         hellas_rpc::ProducerSigningKey::from_secret_bytes([8; 32])
             .expect("valid test key")
@@ -740,12 +950,10 @@ mod tests {
     }
 
     fn plan() -> QuotePlan {
-        let execution_package = ExecutionPackageId::from_bytes([8; 32]);
         QuotePlan {
-            execution_package,
             vocabulary_size: u64::from(u32::MAX) + 1,
             maximum_capacity: u64::MAX,
-            execution_environment: QuotePlan::execution_environment(execution_package),
+            execution_environment: ContentId::from_bytes([8; 32]),
             invocation: Invocation {
                 input_ids: vec![1, 2, 3],
                 max_new_tokens: 8,
@@ -758,6 +966,96 @@ mod tests {
         }
     }
 
+    fn paid_parts() -> PreparedPaidInputParts {
+        let manifest = ProgramManifest::new(
+            hellas_rpc::Application::new("hellas/catena-gpu-0.0.1", "causal-lm-0.0.1").unwrap(),
+            ContentId::from_bytes([0x42; 32]),
+        );
+        let execution_environment = manifest.content_id();
+        let identity_artifact =
+            TextArtifact::identity(BoundTermId::from_digest(execution_environment.digest()));
+        let prompt_tokens = TokenIds::from([1, 2, 3]);
+        let text_policy = TextPolicy::from_u32_stop_tokens(8, [4, 5]);
+        let text_execution = TextExecution::new(
+            SourceRef::output(identity_artifact.output_id()),
+            prompt_tokens.output_id(),
+            text_policy.output_id(),
+        );
+        let evaluate_request = EvaluateRequest {
+            text_execution: text_execution.input_id().digest(),
+            runner_public_key: runner_public_key(),
+            execution_environment,
+            nonce: [7; 32],
+            assurance: hellas_rpc::Assurance::ProducerSigned,
+            retain: true,
+        };
+        PreparedPaidInputParts {
+            evaluate_request,
+            manifest,
+            text_execution,
+            prompt_tokens,
+            text_policy,
+            identity_artifact,
+        }
+    }
+
+    #[test]
+    fn journaled_paid_input_resolves_without_courtesy_state() {
+        let parts = paid_parts();
+        let expected_request = parts.evaluate_request.clone();
+        let expected_manifest = parts.manifest.clone();
+
+        let (manifest, resolved) = resolve_prepared_paid_input(parts).unwrap();
+
+        assert_eq!(manifest, expected_manifest);
+        assert_eq!(resolved.evaluate_request, expected_request);
+        assert_eq!(resolved.invocation.input_ids, [1, 2, 3]);
+        assert_eq!(resolved.invocation.max_new_tokens, 8);
+        assert_eq!(resolved.invocation.stop_token_ids, [4, 5]);
+        assert!(resolved.prepared_artifacts.is_some());
+    }
+
+    #[test]
+    fn journaled_paid_input_rechecks_its_graph() {
+        let mut parts = paid_parts();
+        parts.prompt_tokens = TokenIds::from([99]);
+
+        let error = resolve_prepared_paid_input(parts).unwrap_err();
+
+        assert!(error.to_string().contains("prompt tokens id"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn retained_paid_input_publishes_only_after_success() {
+        let (_, resolved) = resolve_prepared_paid_input(paid_parts()).unwrap();
+        let mut store = EvaluateArtifactStore::default();
+        assert!(
+            store
+                .resolve_evaluate_request(resolved.evaluate_request.clone())
+                .await
+                .is_err(),
+            "preparing paid work must not populate Courtesy artifacts"
+        );
+
+        store
+            .record_completed_text_with_prepared(
+                &resolved.evaluate_request,
+                &resolved.invocation,
+                &[10, 11],
+                resolved.prepared_artifacts.as_ref(),
+            )
+            .await
+            .unwrap();
+
+        let published = store
+            .resolve_evaluate_request(resolved.evaluate_request.clone())
+            .await
+            .unwrap();
+        assert_eq!(published.invocation.input_ids, [1, 2, 3]);
+        assert_eq!(published.invocation.max_new_tokens, 8);
+        assert_eq!(published.invocation.stop_token_ids, [4, 5]);
+    }
+
     #[tokio::test]
     async fn prepared_text_round_trips_through_store() {
         let mut store = EvaluateArtifactStore::default();
@@ -768,7 +1066,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(resolved.evaluate_request, recorded.evaluate_request);
-        assert_eq!(resolved.execution_package, recorded.execution_package);
         assert_eq!(resolved.invocation.input_ids, recorded.invocation.input_ids);
         assert_eq!(
             resolved.invocation.max_new_tokens,
@@ -840,15 +1137,14 @@ mod tests {
         next_plan.initial_artifact_id = Some(first_artifact);
 
         let error = store.record_prepared_text(&next_plan).await.unwrap_err();
-        assert!(error.to_string().contains("package capacity is 13"));
+        assert!(error.to_string().contains("environment capacity is 13"));
     }
 
     #[tokio::test]
-    async fn followup_rejects_an_artifact_from_another_package() {
+    async fn followup_rejects_an_artifact_from_another_environment() {
         let mut store = EvaluateArtifactStore::default();
         let mut other = plan();
-        other.execution_package = ExecutionPackageId::from_bytes([9; 32]);
-        other.execution_environment = QuotePlan::execution_environment(other.execution_package);
+        other.execution_environment = ContentId::from_bytes([9; 32]);
         let first = store.record_prepared_text(&other).await.unwrap();
         let first_artifact = store
             .record_completed_text(&first.evaluate_request, &first.invocation, &[10, 11])
@@ -858,7 +1154,11 @@ mod tests {
         next_plan.initial_artifact_id = Some(first_artifact);
 
         let error = store.record_prepared_text(&next_plan).await.unwrap_err();
-        assert!(error.to_string().contains("different Catena package"));
+        assert!(
+            error
+                .to_string()
+                .contains("different execution environment")
+        );
     }
 
     #[tokio::test]
@@ -925,14 +1225,75 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn canonical_artifact_bytes_can_be_published_and_fetched() {
-        let mut store = EvaluateArtifactStore::default();
-        let tokens = TokenIds::from([1, 2, 3]);
-        let bytes = tokens.canonical_bytes();
-        let digest = store.publish_canonical_bytes(bytes.clone()).await.unwrap();
+    async fn memory_capacity_reserves_before_publishing_a_second_graph() {
+        let mut store = EvaluateArtifactStore::new(None, None, 1);
+        let first = store.prepare_text(&plan()).await.unwrap();
+        store
+            .ensure_retention_available(&first.evaluate_request)
+            .unwrap();
+        store
+            .record_completed_text_with_prepared(
+                &first.evaluate_request,
+                &first.invocation,
+                &[10, 11],
+                first.prepared_artifacts.as_ref(),
+            )
+            .await
+            .unwrap();
+        store
+            .ensure_retention_available(&first.evaluate_request)
+            .expect("replaying an already-retained execution needs no new slot");
+        assert_eq!(
+            store.canonical_keys.len(),
+            MAX_CANONICAL_OBJECTS_PER_RETAINED_EXECUTION
+        );
 
-        assert_eq!(digest, tokens.output_id().digest());
-        assert_eq!(store.get_canonical_bytes(digest).await.unwrap(), bytes);
+        let mut second_plan = plan();
+        second_plan.invocation.input_ids = vec![99];
+        let second = store.prepare_text(&second_plan).await.unwrap();
+        let admission_error = store
+            .ensure_retention_available(&second.evaluate_request)
+            .unwrap_err();
+        assert!(matches!(
+            admission_error,
+            ExecutorError::ResourceExhausted(_)
+        ));
+
+        let mut ephemeral = second.evaluate_request.clone();
+        ephemeral.retain = false;
+        store
+            .ensure_retention_available(&ephemeral)
+            .expect("ephemeral execution does not consume retained capacity");
+
+        let error = store
+            .record_completed_text_with_prepared(
+                &second.evaluate_request,
+                &second.invocation,
+                &[12],
+                second.prepared_artifacts.as_ref(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ExecutorError::ResourceExhausted(_)));
+        assert_eq!(store.retained_executions.len(), 1);
+        assert_eq!(
+            store.canonical_keys.len(),
+            MAX_CANONICAL_OBJECTS_PER_RETAINED_EXECUTION
+        );
+    }
+
+    #[test]
+    fn zero_retained_capacity_rejects_before_execution_but_allows_ephemeral_work() {
+        let store = EvaluateArtifactStore::new(None, None, 0);
+        let mut request = evaluate_request(Digest::from_bytes([42; 32]));
+        assert!(matches!(
+            store.ensure_retention_available(&request),
+            Err(ExecutorError::ResourceExhausted(_))
+        ));
+
+        request.retain = false;
+        store.ensure_retention_available(&request).unwrap();
     }
 
     #[test]
@@ -989,10 +1350,17 @@ mod tests {
             let config = ArtifactStoreConfig::new(context.child("artifacts"));
             let digest = {
                 let mut store = EvaluateArtifactStore::open(config.clone()).await.unwrap();
+                let prepared = store.prepare_text(&plan()).await.unwrap();
                 store
-                    .publish_canonical_bytes(b"valid".to_vec())
+                    .record_completed_text_with_prepared(
+                        &prepared.evaluate_request,
+                        &prepared.invocation,
+                        &[10, 11],
+                        prepared.prepared_artifacts.as_ref(),
+                    )
                     .await
-                    .unwrap()
+                    .unwrap();
+                prepared.evaluate_request.text_execution
             };
             let (blob, _) = context
                 .open(CANONICAL_PARTITION, digest.as_bytes())
@@ -1069,6 +1437,78 @@ mod tests {
                 .unwrap();
 
             assert_eq!(resolved.invocation.input_ids, vec![1, 2, 3, 10, 11, 20]);
+        });
+    }
+
+    #[test]
+    fn commonware_capacity_and_reservations_survive_restart() {
+        deterministic::Runner::default().start(|context| async move {
+            let config = ArtifactStoreConfig::new(context).with_retained_execution_capacity(1);
+            {
+                let mut store = EvaluateArtifactStore::open(config.clone()).await.unwrap();
+                let first = store.prepare_text(&plan()).await.unwrap();
+                store
+                    .record_completed_text_with_prepared(
+                        &first.evaluate_request,
+                        &first.invocation,
+                        &[10, 11],
+                        first.prepared_artifacts.as_ref(),
+                    )
+                    .await
+                    .unwrap();
+            }
+
+            let mut reopened = EvaluateArtifactStore::open(config).await.unwrap();
+            let mut second_plan = plan();
+            second_plan.invocation.input_ids = vec![99];
+            let second = reopened.prepare_text(&second_plan).await.unwrap();
+            let error = reopened
+                .record_completed_text_with_prepared(
+                    &second.evaluate_request,
+                    &second.invocation,
+                    &[12],
+                    second.prepared_artifacts.as_ref(),
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(error, ExecutorError::ResourceExhausted(_)));
+        });
+    }
+
+    #[test]
+    fn commonware_rejects_a_corrupt_reservation_at_restart() {
+        deterministic::Runner::default().start(|context| async move {
+            let config = ArtifactStoreConfig::new(context.child("corrupt_reservation"));
+            let execution = {
+                let mut store = EvaluateArtifactStore::open(config.clone()).await.unwrap();
+                let first = store.prepare_text(&plan()).await.unwrap();
+                store
+                    .record_completed_text_with_prepared(
+                        &first.evaluate_request,
+                        &first.invocation,
+                        &[10, 11],
+                        first.prepared_artifacts.as_ref(),
+                    )
+                    .await
+                    .unwrap();
+                TextExecutionId::from_digest(first.evaluate_request.text_execution)
+            };
+            let (blob, _) = context
+                .open(RETAINED_EXECUTION_PARTITION, execution.as_bytes())
+                .await
+                .unwrap();
+            blob.resize(0).await.unwrap();
+            blob.write_at_sync(0, b"corrupt".to_vec()).await.unwrap();
+
+            let error = match EvaluateArtifactStore::open(config).await {
+                Ok(_) => panic!("a corrupt reservation must fail closed"),
+                Err(error) => error,
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("invalid retained execution reservation")
+            );
         });
     }
 }

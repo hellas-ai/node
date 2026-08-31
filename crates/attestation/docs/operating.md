@@ -50,7 +50,7 @@ hellas-cli \
 | `--provider-genesis <content-id>` | The out-of-band pin. The provider's returned bundle must hash to this. |
 | `--apple-app-attest-app-id <teamID.bundleID>` | The app identity. The RP-ID is `SHA256` of this; the assertion must match. |
 | `--apple-app-attest-cdhashes <...>` | Allowlist of build CDhashes you trust not to leak. A build outside it is rejected. |
-| `--retain=false` | Ask the provider not to persist prompt/token/transcript bytes (`llm`/`fetch`; default `true`). Also expressible as OpenAI `store:false` in the body for `fetch`. |
+| `--retain` | Explicitly allow the provider to persist and publish prompt/token/transcript bytes (`llm`/`fetch`; default is ephemeral). Also expressible as OpenAI `store:true` in the body for `fetch`. |
 
 Before any prompt byte leaves the requester, the client verifies, in order:
 pin match → decode bundle → live peer == genesis transport key →
@@ -66,7 +66,7 @@ Any failure aborts before send.
    open gate blocks any prompt before verification completes.
 4. Run one `llm` (Evaluate) and one `fetch`; confirm the returned result
    verifies.
-5. With `--retain=false`, confirm zero prompt-bearing files under the provider's
+5. Without `--retain`, confirm zero prompt-bearing files under the provider's
    data dir.
 6. Restart the provider; confirm resume requires a fresh open verification.
 7. Confirm a CDhash outside the allowlist is rejected at open.

@@ -1,28 +1,21 @@
 {
   "nodes": {
-    "catena-runner": {
+    "catena-lang": {
       "flake": false,
       "locked": {
-        "path": "../catena-runner",
-        "type": "path"
+        "lastModified": 1788196629,
+        "narHash": "sha256-kB9Xj8JItEd3mGuVK7MNIfzxoApKb/6FV4TUeSNdpaI=",
+        "ref": "grw/hellas-safe-runtime",
+        "rev": "be373057d9e974c1cae0c5b8cc93238ae79104ef",
+        "revCount": 271,
+        "type": "git",
+        "url": "file:../catena-lang"
       },
       "original": {
-        "path": "../catena-runner",
-        "type": "path"
-      },
-      "parent": []
-    },
-    "exploratory-catena": {
-      "flake": false,
-      "locked": {
-        "path": "../exploratory-catena",
-        "type": "path"
-      },
-      "original": {
-        "path": "../exploratory-catena",
-        "type": "path"
-      },
-      "parent": []
+        "ref": "grw/hellas-safe-runtime",
+        "type": "git",
+        "url": "file:../catena-lang"
+      }
     },
     "nixpkgs": {
       "locked": {
@@ -58,8 +51,7 @@
     },
     "root": {
       "inputs": {
-        "catena-runner": "catena-runner",
-        "exploratory-catena": "exploratory-catena",
+        "catena-lang": "catena-lang",
         "nixpkgs": "nixpkgs",
         "rust-overlay": "rust-overlay"
       }

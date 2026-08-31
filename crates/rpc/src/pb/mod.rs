@@ -132,8 +132,8 @@ mod id_pins {
         use super::services::execute::{Execute, RunTicket};
         assert_eq!(super::execute::Assurance::ProducerSigned as i32, 0);
         assert_eq!(super::execute::Assurance::AppleAppAttest as i32, 1);
-        assert_eq!(<Execute as ServiceMarker>::SERVICE_ID, 0xf339_ae99);
-        assert_eq!(<RunTicket as MethodMarker>::METHOD_ID, 0x713f_0226);
+        assert_eq!(<Execute as ServiceMarker>::SERVICE_ID, 0x2a0f_bee1);
+        assert_eq!(<RunTicket as MethodMarker>::METHOD_ID, 0xc808_8d01);
     }
 
     #[cfg(feature = "evaluate")]
@@ -157,9 +157,9 @@ mod id_pins {
     #[test]
     fn courtesy_ids_are_stable() {
         use super::services::courtesy::{Courtesy, Open, QuoteTokens};
-        assert_eq!(<Courtesy as ServiceMarker>::SERVICE_ID, 0x5b6d_ffce);
+        assert_eq!(<Courtesy as ServiceMarker>::SERVICE_ID, 0xa842_0437);
         assert_eq!(<Open as MethodMarker>::METHOD_ID, 0x18351e7d);
-        assert_eq!(<QuoteTokens as MethodMarker>::METHOD_ID, 0xc521_cef4);
+        assert_eq!(<QuoteTokens as MethodMarker>::METHOD_ID, 0x4186_3eda);
     }
 
     #[cfg(feature = "work")]

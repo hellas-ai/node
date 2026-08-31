@@ -30,8 +30,8 @@ use hellas_rpc::protocol::work::{
     propose_authorization, terminal_result, work_id,
 };
 use hellas_rpc::{
-    Assurance, Digest, EvaluateProgramManifest, EvaluateRequest, ExecutionPackageId,
-    OutputEventEnvelope, ProducerSigningKey, ProgramManifest, PublicKey,
+    Application, Assurance, CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR, ContentId, Digest,
+    EvaluateRequest, OutputEventEnvelope, ProducerSigningKey, ProgramManifest, PublicKey,
 };
 
 // ── Fixture ───────────────────────────────────────────────────────────
@@ -43,7 +43,6 @@ const HORIZON: u64 = 500;
 const PROMPT: [u32; 4] = [9, 8, 7, 6];
 /// The answer an honest provider returns for it.
 const ANSWER: [u32; 3] = [101, 102, 103];
-const EXECUTION_PACKAGE: ExecutionPackageId = ExecutionPackageId::from_bytes([0x16; 32]);
 const MAX_NEW_TOKENS: u32 = 64;
 const STOP_TOKENS: [u32; 2] = [1, 2];
 
@@ -116,16 +115,15 @@ fn channel() -> PaidChannel {
 }
 
 fn manifest() -> ProgramManifest {
-    ProgramManifest::Evaluate(EvaluateProgramManifest {
-        execution_package: EXECUTION_PACKAGE,
-    })
+    ProgramManifest::new(
+        Application::new(CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR)
+            .expect("the causal-LM application identity is valid"),
+        ContentId::from_bytes([0x16; 32]),
+    )
 }
 
 fn identity_artifact() -> TextArtifact {
-    TextArtifact::identity(
-        BoundTermId::from_digest(manifest().content_id().digest()),
-        EXECUTION_PACKAGE,
-    )
+    TextArtifact::identity(BoundTermId::from_digest(manifest().content_id().digest()))
 }
 
 fn text_policy() -> TextPolicy {
@@ -243,6 +241,7 @@ fn honest_result(answer: &[u32]) -> PaidJobResultV1 {
     let transcript: Vec<OutputEventEnvelope> = match builder.finish(EvaluateTerminal {
         final_position: answer.len() as u64,
         stop_reason: EvaluateStopReason::STOP_TOKEN,
+        matched_stop_token_id: Some(1),
         text_artifact,
         usage,
         billable_units,
@@ -271,6 +270,7 @@ impl FixedEngine {
             answer: Ok(Reproduced {
                 output_token_ids: tokens.to_vec(),
                 stop_reason,
+                matched_stop_token_id: (stop_reason == EvaluateStopReason::STOP_TOKEN).then_some(1),
             }),
             asked: std::sync::Mutex::new(Vec::new()),
         }
@@ -334,13 +334,51 @@ fn the_question_comes_from_the_accepted_bundle() {
     let Ok(plan) = plan(&bundle()) else {
         panic!("the fixture bundle plans");
     };
-    assert_eq!(plan.execution_package, EXECUTION_PACKAGE);
-    assert_eq!(plan.environment, manifest().content_id());
+    assert_eq!(plan.execution_environment, manifest().content_id());
     assert_eq!(plan.prompt_token_ids, PROMPT);
     assert_eq!(plan.max_new_tokens, MAX_NEW_TOKENS);
     // The policy sorts and dedups its stop tokens, so this is the set
     // the execution names rather than the order it was written in.
     assert_eq!(plan.stop_token_ids, [1, 2]);
+}
+
+#[test]
+fn the_question_refuses_a_manifest_outside_the_evaluate_request() {
+    let mut request = evaluate_request();
+    request.execution_environment = ContentId::from_bytes([0x99; 32]);
+    let bundle = PreparedPaidInputV1::new(
+        &request,
+        &manifest(),
+        &text_execution(),
+        &TokenIds::from(PROMPT.to_vec()),
+        &text_policy(),
+        &identity_artifact(),
+    );
+    assert!(matches!(
+        plan(&bundle),
+        Err(ReproduceFault::Body(message))
+            if message.contains("does not name the carried program manifest")
+    ));
+}
+
+#[test]
+fn the_question_refuses_an_identity_outside_the_manifest() {
+    let identity = TextArtifact::identity(BoundTermId::from_digest(
+        ContentId::from_bytes([0x99; 32]).digest(),
+    ));
+    let bundle = PreparedPaidInputV1::new(
+        &evaluate_request(),
+        &manifest(),
+        &text_execution(),
+        &TokenIds::from(PROMPT.to_vec()),
+        &text_policy(),
+        &identity,
+    );
+    assert!(matches!(
+        plan(&bundle),
+        Err(ReproduceFault::Body(message))
+            if message.contains("identity artifact is not bound")
+    ));
 }
 
 /// A job that resumes a previous output is not one this profile can
@@ -473,6 +511,26 @@ async fn the_stop_reason_is_part_of_the_answer() {
         check(&FixedEngine::honest(), &honest).await,
         Ok(Reproduction::Matched)
     );
+}
+
+/// The exact stop token is signed result data, not a cosmetic explanation for
+/// the same token stream.
+#[tokio::test]
+async fn the_matched_stop_token_is_part_of_the_answer() {
+    let honest = honest_result(&ANSWER);
+    let other_witness = FixedEngine {
+        answer: Ok(Reproduced {
+            output_token_ids: ANSWER.to_vec(),
+            stop_reason: EvaluateStopReason::STOP_TOKEN,
+            matched_stop_token_id: Some(2),
+        }),
+        asked: std::sync::Mutex::new(Vec::new()),
+    };
+
+    assert!(matches!(
+        check(&other_witness, &honest).await,
+        Ok(Reproduction::Refuted { .. })
+    ));
 }
 
 /// An engine that fails says the re-execution did not happen, and does

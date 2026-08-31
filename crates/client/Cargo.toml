@@ -15,6 +15,7 @@ iroh = [
     "dep:iroh",
     "dep:iroh-mdns-address-lookup",
     "dep:hellas-attestation",
+    "dep:tokio",
     "hellas-rpc/courtesy",
     "hellas-wire/iroh",
     "hellas-wire/discovery-dht",
@@ -43,6 +44,7 @@ iroh = { workspace = true, features = ["tls-ring"], optional = true }
 iroh-mdns-address-lookup = { version = "0.4", optional = true }
 rand.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, optional = true }
 
 [dev-dependencies]
 base64.workspace = true

@@ -92,20 +92,24 @@ pub use tokens::{
 };
 
 pub use protocol::{
-    APPLE_APP_ATTEST, AppleAppAttestEnrollment, Assurance, CATENA_TOKEN_AUTOREGRESSIVE_PROFILE,
-    CanonicalizationId, ContentId, DagCborDecodeError, DagCborDecoder, DagCborEncodeError,
-    DagCborEncoder, Digest, Evaluate, EvaluateProgramManifest, EvaluateRequest, EventCommitment,
-    ExecutionPackageId, FetchProgramManifest, InputCommitment, InputEventBody, InputEventBodyParts,
-    InputEventEnvelope, InputTranscriptBuilder, JobTerms, JsonBytes, OPEN_EXPORTER_LEN,
-    OPEN_NONCE_LEN, OPEN_PROOF_DOMAIN, OPEN_PROVIDER_ROLE, Operation, OutputEventBody,
-    OutputEventBodyParts, OutputEventEnvelope, OutputTranscriptBuilder, PlatformCredential,
-    PlatformEnrollment, ProducerId, ProducerSigningKey, ProgramManifest, ProviderEnrollmentBundle,
-    ProviderGenesisDecodeError, ProviderGenesisStatement, ProviderIdentityV1, PublicKey,
-    RequestCommitment, Retention, RootKind, RootProof, SchemeId, Signature, SignatureError,
-    SignatureKind, SignedInputEvent, SignedOutputEvent, SignedProviderGenesis, StreamId,
-    StreamVerifyError, canonical_dag_cbor, decode_dag_cbor, hash_tuple, input_genesis,
-    open_proof_binding, output_genesis, scheme_id, verify_input_event_envelopes,
-    verify_input_transcript, verify_output_event_envelopes, verify_output_transcript,
+    APPLE_APP_ATTEST, AppleAppAttestEnrollment, Application, ApplicationError, Assurance,
+    CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR, CODEX_RESPONSES_ADAPTOR, CODEX_RESPONSES_ENDPOINT,
+    CanonicalizationId, CausalLmEnvironment, CausalLmEnvironmentError, ContentId, ContentRef,
+    DagCborDecodeError, DagCborDecoder, DagCborEncodeError, DagCborEncoder, Digest, Evaluate,
+    EvaluateRequest, EventCommitment, FETCH_EVALUATOR, FetchEnvironment, InputCommitment,
+    InputEventBody, InputEventBodyParts, InputEventEnvelope, InputTranscriptBuilder, JobTerms,
+    JsonBytes, MAX_APPLICATION_ID_BYTES, MAX_CAUSAL_LM_ENVIRONMENT_BYTES,
+    MAX_CAUSAL_LM_STATIC_BYTES, OPEN_EXPORTER_LEN, OPEN_NONCE_LEN, OPEN_PROOF_DOMAIN,
+    OPEN_PROVIDER_ROLE, OPENAI_RESPONSES_ADAPTOR, OPENAI_RESPONSES_ENDPOINT, Operation,
+    OutputEventBody, OutputEventBodyParts, OutputEventEnvelope, OutputTranscriptBuilder,
+    PlatformCredential, PlatformEnrollment, ProducerId, ProducerSigningKey, ProgramManifest,
+    ProviderEnrollmentBundle, ProviderGenesisDecodeError, ProviderGenesisStatement,
+    ProviderIdentityV1, PublicKey, RequestCommitment, Retention, RootKind, RootProof, SchemeId,
+    Signature, SignatureError, SignatureKind, SignedInputEvent, SignedOutputEvent,
+    SignedProviderGenesis, StaticSlice, StreamId, StreamVerifyError, canonical_dag_cbor,
+    decode_dag_cbor, hash_tuple, input_genesis, open_proof_binding, output_genesis, scheme_id,
+    verify_input_event_envelopes, verify_input_transcript, verify_output_event_continuation,
+    verify_output_event_envelopes, verify_output_transcript,
 };
 pub use protocol::{commitment, digest, retention, signature, tags, value};
 
@@ -155,3 +159,13 @@ pub const DEFAULT_FETCH_MAX_IN_FLIGHT: usize = 16;
 /// Default bound on Fetch executions waiting behind active provider streams.
 #[cfg(feature = "execute")]
 pub const DEFAULT_FETCH_QUEUE_CAPACITY: usize = 64;
+
+/// Default maximum number of distinct retained Fetch transcripts, including
+/// both completed transcripts and indeterminate running markers.
+#[cfg(feature = "execute")]
+pub const DEFAULT_FETCH_RETAINED_TRANSCRIPT_CAPACITY: usize = 1024;
+
+/// Default maximum number of retained Fetch transcripts being replayed to
+/// consumers at once.
+#[cfg(feature = "execute")]
+pub const DEFAULT_FETCH_REPLAY_MAX_IN_FLIGHT: usize = 16;

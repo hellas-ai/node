@@ -22,9 +22,12 @@ use hellas_chain::{
 };
 #[cfg(feature = "evaluate")]
 use hellas_executor::ArtifactStoreConfig;
+#[cfg(feature = "evaluate")]
+use hellas_executor::GpuConfig;
 use hellas_executor::{
     CourtesyServer, ExecuteServer, Executor, ExecutorMetrics, ExecutorSpawnConfig,
-    FetchAccessPolicy, FetchQuotaStoreBackend, FetchRouteRegistry, FetchTranscriptStoreBackend,
+    FetchAccessPolicy, FetchQuotaStoreBackend, FetchRouteRegistry, FetchServer,
+    FetchTranscriptStoreBackend,
 };
 use hellas_kernel::{EdgeId, NetworkId, Secp256k1Signer, Secp256k1Verifier};
 use hellas_rpc::open::OpenDispatcher;
@@ -46,6 +49,7 @@ use hellas_rpc::protocol::work_setup::{
 use hellas_rpc::serve::{AccountingDispatcher, MethodDispatcher};
 use hellas_rpc::services::courtesy::{Courtesy, Open as CourtesyOpen};
 use hellas_rpc::services::execute::RunTicket;
+use hellas_rpc::services::fetch::{Fetch, Open as FetchOpen};
 use hellas_rpc::services::node::{Node, NodeServer};
 use hellas_rpc::services::work::{Work, WorkHandler, WorkServer};
 use hellas_rpc::services::work_setup::{WorkSetup, WorkSetupHandler, WorkSetupServer};
@@ -57,13 +61,13 @@ use hellas_rpc::work_handshake::{PaymentAdmission, SetupEndpoint, SetupService};
 use hellas_rpc::work_open::{
     SetupAdvance, SetupDriveError, SetupProgress, SetupView, advance_setup,
 };
-use hellas_rpc::work_store::{ChannelStore, Role, SetupStore, discover_setups};
+use hellas_rpc::work_store::{ChannelStore, JobPhase, Role, SetupStore, discover_setups};
 use hellas_rpc::{Assurance, ProducerSigningKey};
 use hellas_wire::iroh::{IrohTransport, IrohTransportError};
 use hellas_wire::{Dispatcher, ServiceMarker, StreamTransport, TransportContext, WireStatus};
 use iroh::{Endpoint, EndpointId, SecretKey, endpoint::Connection, endpoint::presets};
-use tokio::sync::{Mutex as AsyncMutex, oneshot};
-use tokio::task::JoinHandle;
+use tokio::sync::{Mutex as AsyncMutex, Semaphore, mpsc, oneshot};
+use tokio::task::{JoinHandle, JoinSet};
 use tracing::{debug, info, warn};
 
 use super::node_handler::NodeHandlerImpl;
@@ -72,6 +76,14 @@ use crate::commands::discovery::{DiscoveryAdvertiser, served_alpns, start_server
 use crate::identity::OpenIdentity;
 
 type ProductionWorkSource = WorkBlocks<VerifiedRemoteLightClient>;
+
+/// Keep peer-controlled transport state finite. A connection can multiplex
+/// several RPCs, so these are deliberately transport limits rather than job
+/// scheduler limits.
+const MAX_ACTIVE_RPC_CONNECTIONS: usize = 128;
+const MAX_RPC_IN_FLIGHT_PER_CONNECTION: usize = 16;
+const RPC_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+const RPC_CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub(super) struct NodeHandle {
     node_id: EndpointId,
@@ -132,7 +144,7 @@ pub(super) struct NodeConfig {
     pub(super) execute_policy: ExecutePolicy,
     pub(super) queue_size: usize,
     #[cfg(feature = "evaluate")]
-    pub(super) packages: Vec<hellas_executor::PackageSource>,
+    pub(super) content_store: hellas_store::ContentStore,
     pub(super) build: String,
     pub(super) graffiti: Vec<u8>,
     pub(super) fetch_access_policy: FetchAccessPolicy,
@@ -140,6 +152,8 @@ pub(super) struct NodeConfig {
     pub(super) fetch_routes: FetchRouteRegistry,
     pub(super) fetch_max_in_flight: usize,
     pub(super) fetch_queue_size: usize,
+    pub(super) fetch_retained_transcript_capacity: usize,
+    pub(super) fetch_replay_max_in_flight: usize,
     /// What the clock over this node's paid-work journals is built
     /// from, or `None` when no work configuration was loaded. Its
     /// presence is still what advertises the two work ALPNs.
@@ -152,6 +166,8 @@ pub(super) struct NodeConfig {
     pub(super) metrics: Arc<ExecutorMetrics>,
     #[cfg(feature = "evaluate")]
     pub(super) artifact_store: ArtifactStoreConfig,
+    #[cfg(feature = "evaluate")]
+    pub(super) gpu_config: GpuConfig,
 }
 
 #[derive(Clone)]
@@ -161,8 +177,10 @@ struct RemoteExecutionServices {
 }
 
 pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle> {
-    let fetch_store =
-        FetchTranscriptStoreBackend::fs(config.artifact_store_path.join("fetch-transcripts"));
+    let fetch_store = FetchTranscriptStoreBackend::fs_with_capacity(
+        config.artifact_store_path.join("fetch-transcripts"),
+        config.fetch_retained_transcript_capacity,
+    );
     let fetch_access_policy = config
         .fetch_access_policy
         .with_store(FetchQuotaStoreBackend::fs(
@@ -179,21 +197,17 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
         fetch_routes: config.fetch_routes,
         fetch_max_in_flight: config.fetch_max_in_flight,
         fetch_queue_capacity: config.fetch_queue_size,
+        fetch_replay_max_in_flight: config.fetch_replay_max_in_flight,
         fetch_store,
         #[cfg(feature = "evaluate")]
         artifact_store: config.artifact_store,
+        #[cfg(feature = "evaluate")]
+        content_store: config.content_store,
+        #[cfg(feature = "evaluate")]
+        gpu_config: config.gpu_config,
     })
     .await
     .context("failed to spawn executor")?;
-    #[cfg(feature = "evaluate")]
-    for package in config.packages {
-        let name = package.name().to_string();
-        handle
-            .materialize_package(package)
-            .await
-            .with_context(|| format!("failed to load Catena package {name}"))?;
-    }
-
     let alpns = served_alpns(config.work.is_some());
     let mut builder = Endpoint::builder(presets::N0)
         .secret_key(config.secret_key)
@@ -239,9 +253,9 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
     //    and given the same mount slot the accept loop reads: the runner
     //    publishes the channel it is handed, and `Work` is answered from
     //    it from that moment on.
-    // Owner-selected package loading is complete before bind. Clones of the
-    // executor handle live in every remote-execution handler and, when paid
-    // work is configured, in its mount as well.
+    // Local content indexing is complete before bind. Clones of the executor
+    // handle live in every remote-execution handler and, when paid work is
+    // configured, in its mount as well.
     let remote_execution = RemoteExecutionServices {
         executor: handle.clone(),
         open_identity: config.open_identity,
@@ -272,10 +286,18 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
     //    dispatch routed by ALPN to the matching service handler.
     let accept_endpoint = endpoint.clone();
     let accept_task = tokio::spawn(async move {
+        let connection_slots = Arc::new(Semaphore::new(MAX_ACTIVE_RPC_CONNECTIONS));
         loop {
             let incoming = match accept_endpoint.accept().await {
                 Some(inc) => inc,
                 None => break, // endpoint closed
+            };
+            // Stop accepting before peer-controlled connection tasks can grow
+            // without bound. The endpoint's own finite backlog applies
+            // backpressure while every slot is occupied.
+            let connection_slot = match connection_slots.clone().acquire_owned().await {
+                Ok(slot) => slot,
+                Err(_) => break,
             };
             let accepting = match incoming.accept() {
                 Ok(a) => a,
@@ -290,10 +312,15 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
             let work_for_conn = serves_work.clone();
             let setup_for_conn = serves_setup.clone();
             tokio::spawn(async move {
-                let conn = match accepting.await {
-                    Ok(c) => c,
-                    Err(e) => {
+                let _connection_slot = connection_slot;
+                let conn = match tokio::time::timeout(RPC_HANDSHAKE_TIMEOUT, accepting).await {
+                    Ok(Ok(c)) => c,
+                    Ok(Err(e)) => {
                         warn!("connection handshake failed: {e}");
+                        return;
+                    }
+                    Err(_) => {
+                        warn!("connection handshake timed out");
                         return;
                     }
                 };
@@ -342,7 +369,7 @@ async fn serve_connection<S>(
 where
     S: FinalizedBlocks + FinalizedWorkView + Sync,
 {
-    let transport = IrohTransport::new(conn);
+    let transport = Arc::new(IrohTransport::new(conn));
     let context = transport.context();
 
     // Every generated `XServer` is wrapped in `AccountingDispatcher`
@@ -362,21 +389,33 @@ where
             ),
             manager,
         );
-        serve_loop(&transport, &server).await
+        serve_loop(transport, server).await
+    } else if alpn == <Fetch as ServiceMarker>::ALPN.as_bytes() {
+        let server = AccountingDispatcher::new(
+            OpenDispatcher::<_, _, FetchOpen>::new(
+                MethodDispatcher::<_, _, RunTicket>::new(
+                    ExecuteServer(remote_execution.executor.clone()),
+                    FetchServer(remote_execution.executor.clone()),
+                ),
+                remote_execution.open_identity.clone(),
+            ),
+            manager,
+        );
+        serve_loop(transport, server).await
     } else if alpn == <Node as ServiceMarker>::ALPN.as_bytes() {
         let server = AccountingDispatcher::new(NodeServer(node_handler), manager);
-        serve_loop(&transport, &server).await
+        serve_loop(transport, server).await
     } else if let Some(setup) =
         setup.filter(|_| alpn == <WorkSetup as ServiceMarker>::ALPN.as_bytes())
     {
         match setup.service(&context) {
             Some(mounted) => {
                 let server = AccountingDispatcher::new(WorkSetupServer(mounted), manager);
-                serve_loop(&transport, &server).await
+                serve_loop(transport, server).await
             }
             None => {
                 let server = AccountingDispatcher::new(WorkSetupServer(UnmountedWork), manager);
-                serve_loop(&transport, &server).await
+                serve_loop(transport, server).await
             }
         }
     } else if let Some(work) = work.filter(|_| alpn == <Work as ServiceMarker>::ALPN.as_bytes()) {
@@ -386,11 +425,11 @@ where
         match work.handler(&context) {
             Some(mounted) => {
                 let server = AccountingDispatcher::new(WorkServer(mounted), manager);
-                serve_loop(&transport, &server).await
+                serve_loop(transport, server).await
             }
             None => {
                 let server = AccountingDispatcher::new(WorkServer(UnmountedWork), manager);
-                serve_loop(&transport, &server).await
+                serve_loop(transport, server).await
             }
         }
     } else {
@@ -641,14 +680,6 @@ where
     /// failed read, failed predicate, lagging cursor, or endpoint failure
     /// therefore leaves the request on the retryable `NotReady` side.
     async fn refresh_admission(&self) -> anyhow::Result<ReadyChannel> {
-        let Some(descriptor) = self.descriptor.as_ref() else {
-            anyhow::bail!("this channel has no measured admission policy");
-        };
-        let query = WorkChannelQuery {
-            bond_edge: descriptor.bond_edge(),
-            payment_edge: descriptor.channel().payment_edge(),
-            funding: Default::default(),
-        };
         // A `std::sync::MutexGuard` is deliberately confined to this
         // block. Holding the source-slot guard across the read would make
         // this handler's future non-`Send` and is not a valid dispatch.
@@ -659,31 +690,55 @@ where
                 .map_err(|_| anyhow::anyhow!("the finalized source lock is poisoned"))?;
             held.clone()
         };
-        let Some(snapshot) = source
-            .work_channel_snapshot(query.clone())
-            .await
-            .context("the fresh coherent channel read failed")?
-        else {
-            anyhow::bail!("no finalized channel snapshot is available");
-        };
-        if snapshot.query() != &query {
-            anyhow::bail!("the finalized source answered for another channel");
-        }
-        let ready = descriptor
-            .check_ready(&snapshot.observed_channel())
-            .context("the fresh channel snapshot is not ready")?;
-        let cursor = self
-            .service
-            .with_state(|state| state.cursor().0)
-            .context("the mounted channel cursor is unavailable")?;
-        ready
-            .check_caught_up(cursor)
-            .context("the mounted channel has not caught up to the fresh snapshot")?;
-        self.service
-            .admit_new_work(ready.clone())
-            .context("the driven work service refused its fresh readiness")?;
-        Ok(ready)
+        refresh_work_admission(&self.service, self.descriptor.as_ref(), &source).await
     }
+}
+
+/// Re-establishes admission for the exact driven channel from one coherent
+/// finalized read.
+///
+/// Both the wire handler and restart recovery call this function. A recovered
+/// job therefore gets no weaker interpretation of readiness than a new job,
+/// and neither path can accidentally trust the readiness cached at mount.
+async fn refresh_work_admission<S>(
+    service: &WorkService,
+    descriptor: Option<&WorkChannelDescriptor>,
+    source: &S,
+) -> anyhow::Result<ReadyChannel>
+where
+    S: FinalizedBlocks + FinalizedWorkView + Sync,
+{
+    let Some(descriptor) = descriptor else {
+        anyhow::bail!("this channel has no measured admission policy");
+    };
+    let query = WorkChannelQuery {
+        bond_edge: descriptor.bond_edge(),
+        payment_edge: descriptor.channel().payment_edge(),
+        funding: Default::default(),
+    };
+    let Some(snapshot) = source
+        .work_channel_snapshot(query.clone())
+        .await
+        .context("the fresh coherent channel read failed")?
+    else {
+        anyhow::bail!("no finalized channel snapshot is available");
+    };
+    if snapshot.query() != &query {
+        anyhow::bail!("the finalized source answered for another channel");
+    }
+    let ready = descriptor
+        .check_ready(&snapshot.observed_channel())
+        .context("the fresh channel snapshot is not ready")?;
+    let cursor = service
+        .with_state(|state| state.cursor().0)
+        .context("the mounted channel cursor is unavailable")?;
+    ready
+        .check_caught_up(cursor)
+        .context("the mounted channel has not caught up to the fresh snapshot")?;
+    service
+        .admit_new_work(ready.clone())
+        .context("the driven work service refused its fresh readiness")?;
+    Ok(ready)
 }
 
 impl<S> WorkHandler for MountedWorkService<S>
@@ -790,6 +845,7 @@ impl<S: Clone> MountedWork<S> {
         bond_edge: EdgeId,
         service: &WorkService,
         descriptor: Option<WorkChannelDescriptor>,
+        accepting: Arc<AsyncMutex<()>>,
         source: &S,
     ) -> bool {
         match self.mounted.lock() {
@@ -800,7 +856,7 @@ impl<S: Clone> MountedWork<S> {
                     service: service.clone(),
                     descriptor,
                     source: Arc::new(Mutex::new(source.clone())),
-                    accepting: Arc::new(AsyncMutex::new(())),
+                    accepting,
                     driver: self.driver.clone(),
                 });
                 mounted.len() == 1
@@ -967,12 +1023,64 @@ enum Driven {
     /// history, mount and close duty are the driver's, and none of them
     /// countersigns anything.
     Recovery(Box<SetupStore>),
-    /// The channel this setup mounted, close-only until a readiness
-    /// decision is made for it.
-    Channel(WorkService),
+    /// The channel this setup mounted, including the recovery authority
+    /// needed to finish a job accepted before a process restart.
+    Channel(Box<DrivenChannel>),
     /// The setup ended, or its mount was refused. Nothing left to
     /// drive.
     Done,
+}
+
+/// One mounted channel as driven by the paid-work clock.
+///
+/// Recovery lives here rather than in the served route: an accepted job is an
+/// obligation recorded by this journal even if peer routing changes while the
+/// process is down. `accepting` is also lent to the route when one is mounted,
+/// so live acceptance and restart recovery serialize their readiness checks.
+struct DrivenChannel {
+    service: WorkService,
+    descriptor: Option<WorkChannelDescriptor>,
+    accepting: Arc<AsyncMutex<()>>,
+    driver: Option<AcceptedWorkDriver>,
+}
+
+impl DrivenChannel {
+    fn accepted_work_id(&self) -> anyhow::Result<Option<Digest>> {
+        self.service
+            .with_state(|state| {
+                state
+                    .job()
+                    .filter(|job| job.phase() == JobPhase::Accepted)
+                    .map(|job| job.work_id())
+            })
+            .context("the driven channel state is unavailable")
+    }
+
+    /// Starts a journaled Accepted job after proving current readiness.
+    ///
+    /// No in-memory `attempted` marker is needed. A racing live request or
+    /// clock tick reaches the same endpoint; its durable `JobRunning` record
+    /// lets exactly one caller receive `Invoke` and every other caller receive
+    /// `Running`.
+    async fn resume_accepted<S>(&self, source: &S) -> anyhow::Result<bool>
+    where
+        S: FinalizedBlocks + FinalizedWorkView + Sync,
+    {
+        if self.accepted_work_id()?.is_none() {
+            return Ok(false);
+        }
+        let _accepting = self.accepting.lock().await;
+        let Some(work_id) = self.accepted_work_id()? else {
+            return Ok(false);
+        };
+        let driver = self
+            .driver
+            .as_ref()
+            .context("the accepted paid job has no execution backend")?;
+        let ready = refresh_work_admission(&self.service, self.descriptor.as_ref(), source).await?;
+        driver.spawn(self.service.clone(), ready, work_id);
+        Ok(true)
+    }
 }
 
 impl Driven {
@@ -1062,11 +1170,14 @@ impl SetupClock {
                 }
             }
         }
-        if let Driven::Channel(service) = &self.driven {
+        if let Driven::Channel(channel) = &self.driven {
             if let Some(peer) = self.route_peer {
                 work_mount.refresh_source(peer, self.bond_edge, source);
             }
-            match advance_paid_work_clock(service, source).await {
+            if let Err(error) = channel.resume_accepted(source).await {
+                warn!(bond, %error, "an accepted paid job did not resume");
+            }
+            match advance_paid_work_clock(&channel.service, source).await {
                 Ok(progress) => debug!(bond, ?progress, "the channel advanced"),
                 Err(error) => {
                     answered &= !error.source_failed();
@@ -1112,8 +1223,16 @@ impl SetupClock {
         match CloseEndpoint::new(store, signer.clone()) {
             Ok(close) => {
                 let service = WorkService::close_only(close);
+                let accepting = Arc::new(AsyncMutex::new(()));
                 if self.route_peer.is_some_and(|peer| {
-                    mount.mount(peer, self.bond_edge, &service, descriptor, source)
+                    mount.mount(
+                        peer,
+                        self.bond_edge,
+                        &service,
+                        descriptor.clone(),
+                        Arc::clone(&accepting),
+                        source,
+                    )
                 }) {
                     info!(
                         bond,
@@ -1125,7 +1244,12 @@ impl SetupClock {
                         "this channel has no unique peer route; it is driven and not served",
                     );
                 }
-                self.driven = Driven::Channel(service);
+                self.driven = Driven::Channel(Box::new(DrivenChannel {
+                    service,
+                    descriptor,
+                    accepting,
+                    driver: mount.driver.clone(),
+                }));
             }
             // The journal and the key are not both the provider's view
             // of one channel. Nothing this runner can do about it, and
@@ -1357,29 +1481,95 @@ async fn connect_chain(
     None
 }
 
-async fn serve_loop<S>(transport: &IrohTransport, server: &S) -> anyhow::Result<()>
+async fn serve_loop<S>(transport: Arc<IrohTransport>, server: S) -> anyhow::Result<()>
 where
-    S: Dispatcher<IrohTransport> + Send + Sync,
+    S: Dispatcher<IrohTransport> + Send + Sync + 'static,
     S::Error: Send + Sync + 'static,
 {
-    loop {
-        let inbound = match transport.accept().await {
-            Ok(Some(inbound)) => inbound,
-            Ok(None) => break,
-            Err(IrohTransportError::Connection(_)) => break,
-            Err(error) => return Err(anyhow::anyhow!("transport accept failed: {error}")),
+    let server = Arc::new(server);
+    let (inbound_tx, mut inbound_rx) = mpsc::channel(MAX_RPC_IN_FLIGHT_PER_CONNECTION);
+    let accept_transport = transport.clone();
+    // One task owns `accept`: dispatch completion can therefore never cancel
+    // a partially read Open frame. The bounded channel is the only hand-off.
+    let accept_task = tokio::spawn(async move {
+        loop {
+            match accept_transport.accept().await {
+                Ok(Some(inbound)) => {
+                    if inbound_tx.send(Ok(inbound)).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(IrohTransportError::Connection(_)) => break,
+                Err(error) => {
+                    let _ = inbound_tx.send(Err(error)).await;
+                    break;
+                }
+            }
+        }
+    });
+
+    let mut dispatches = JoinSet::new();
+    let result = loop {
+        if dispatches.len() >= MAX_RPC_IN_FLIGHT_PER_CONNECTION {
+            log_dispatch_result(dispatches.join_next().await);
+            continue;
+        }
+
+        let next = if dispatches.is_empty() {
+            match tokio::time::timeout(RPC_CONNECTION_IDLE_TIMEOUT, inbound_rx.recv()).await {
+                Ok(next) => next,
+                Err(_) => break Ok(()),
+            }
+        } else {
+            tokio::select! {
+                next = inbound_rx.recv() => next,
+                completed = dispatches.join_next() => {
+                    log_dispatch_result(completed);
+                    continue;
+                }
+            }
         };
-        if server.dispatch(inbound).await.is_err() {
+
+        match next {
+            Some(Ok(inbound)) => {
+                let server = server.clone();
+                dispatches.spawn(async move { server.dispatch(inbound).await });
+            }
+            Some(Err(error)) => {
+                break Err(anyhow::anyhow!("transport accept failed: {error}"));
+            }
+            None => break Ok(()),
+        }
+    };
+
+    accept_task.abort();
+    let _ = accept_task.await;
+    dispatches.abort_all();
+    while dispatches.join_next().await.is_some() {}
+    result
+}
+
+fn log_dispatch_result<E>(result: Option<Result<Result<(), E>, tokio::task::JoinError>>)
+where
+    E: std::error::Error,
+{
+    match result {
+        Some(Ok(Err(_))) => {
             // RPC errors can be derived from request content. Keep the trace
             // useful without copying prompt or token material into logs.
             warn!("dispatch error; request details suppressed");
         }
+        Some(Err(error)) if !error.is_cancelled() => {
+            warn!("RPC dispatch task failed; request details suppressed");
+        }
+        Some(Ok(Ok(())) | Err(_)) | None => {}
     }
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use futures::StreamExt;
     use std::collections::BTreeSet;
     use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1414,9 +1604,10 @@ mod tests {
     };
     use hellas_rpc::protocol::work_bundle::WorkChannelSetupBundleV1;
     use hellas_rpc::protocol::work_setup::{OmissionMeasurements, ProviderChannelPolicy};
+    use hellas_rpc::services::execute::ExecuteClientImpl;
     use hellas_rpc::services::work::WorkClientImpl;
     use hellas_rpc::services::work_setup::WorkSetupClientImpl;
-    use hellas_rpc::work::{BackendFault, WorkRefusal};
+    use hellas_rpc::work::{BackendFault, PreparedEvaluateInput, WorkRefusal};
     use hellas_rpc::work_close::{BlockSourceError, FinalizedWork};
     use hellas_rpc::work_handshake::{apply_setup_exchange, prepare_setup_exchange};
     use hellas_rpc::work_open::{FinalizedSetup, SetupQuery};
@@ -1424,12 +1615,13 @@ mod tests {
         ChannelRecord, SetupEnd, SetupOrigin, SetupRecord, SetupScan, TerminalOutcome,
     };
     use hellas_rpc::{
-        Assurance, EvaluateProgramManifest, EvaluateRequest, ExecutionPackageId,
-        OutputEventEnvelope, ProducerSigningKey, ProgramManifest, PublicKey, SubmitTxOutcome,
+        Application, Assurance, CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR, ContentId,
+        EvaluateRequest, OutputEventEnvelope, ProducerSigningKey, ProgramManifest, PublicKey,
+        SubmitTxOutcome,
     };
     use hellas_wire::{AuthLevel, PeerIdentity};
     use iroh::{EndpointAddr, TransportAddr};
-    use tokio::sync::Semaphore;
+    use tokio::sync::{Notify, Semaphore};
 
     use super::*;
     use crate::commands::serve::work_config::{
@@ -1461,6 +1653,41 @@ mod tests {
                 *observed = Some(context);
             }
             core::future::ready(Ok(ExchangeSetupResponse::default()))
+        }
+    }
+
+    #[derive(Clone)]
+    struct ConcurrentDispatchWitness {
+        calls: Arc<AtomicUsize>,
+        first_entered: Arc<Notify>,
+        second_entered: Arc<Notify>,
+        release_first: Arc<Notify>,
+    }
+
+    impl WorkSetupHandler for ConcurrentDispatchWitness {
+        fn exchange_setup(
+            &self,
+            _request: ExchangeSetupRequest,
+            _context: TransportContext,
+        ) -> impl core::future::Future<
+            Output = Result<
+                impl Into<hellas_rpc::call::WithTrailer<ExchangeSetupResponse>> + Send,
+                WireStatus,
+            >,
+        > + Send {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let first_entered = self.first_entered.clone();
+            let second_entered = self.second_entered.clone();
+            let release_first = self.release_first.clone();
+            async move {
+                if call == 0 {
+                    first_entered.notify_one();
+                    release_first.notified().await;
+                } else {
+                    second_entered.notify_one();
+                }
+                Ok(ExchangeSetupResponse::default())
+            }
         }
     }
 
@@ -1564,6 +1791,207 @@ mod tests {
         );
         client.close().await;
         server.close().await;
+    }
+
+    #[tokio::test]
+    async fn one_slow_rpc_does_not_serialize_its_connection() {
+        let alpn = <WorkSetup as ServiceMarker>::ALPN.as_bytes();
+        let server = Endpoint::builder(presets::Minimal)
+            .secret_key(SecretKey::from_bytes(&[0x67; 32]))
+            .alpns(vec![alpn.to_vec()])
+            .bind_addr(
+                "127.0.0.1:0"
+                    .parse::<std::net::SocketAddr>()
+                    .expect("a loopback socket"),
+            )
+            .expect("the server has a valid bind address")
+            .bind()
+            .await
+            .expect("the server binds");
+        let target = EndpointAddr::from_parts(
+            server.id(),
+            server.bound_sockets().into_iter().map(TransportAddr::Ip),
+        );
+        let client = Endpoint::builder(presets::Minimal)
+            .secret_key(SecretKey::from_bytes(&[0x68; 32]))
+            .bind_addr(
+                "127.0.0.1:0"
+                    .parse::<std::net::SocketAddr>()
+                    .expect("a loopback socket"),
+            )
+            .expect("the client has a valid bind address")
+            .bind()
+            .await
+            .expect("the client binds");
+
+        let first_entered = Arc::new(Notify::new());
+        let second_entered = Arc::new(Notify::new());
+        let release_first = Arc::new(Notify::new());
+        let witness = ConcurrentDispatchWitness {
+            calls: Arc::new(AtomicUsize::new(0)),
+            first_entered: first_entered.clone(),
+            second_entered: second_entered.clone(),
+            release_first: release_first.clone(),
+        };
+        let accepting = server.clone();
+        let serving = tokio::spawn(async move {
+            let incoming = accepting
+                .accept()
+                .await
+                .expect("the server receives a dial");
+            let connection = incoming
+                .accept()
+                .expect("the server accepts the dial")
+                .await
+                .expect("the handshake completes");
+            serve_loop(
+                Arc::new(IrohTransport::new(connection)),
+                WorkSetupServer(witness),
+            )
+            .await
+        });
+
+        let connection = client
+            .connect(target, alpn)
+            .await
+            .expect("the client dials WorkSetup");
+        let first_transport = IrohTransport::new(connection.clone());
+        let first = tokio::spawn(async move {
+            WorkSetupClientImpl::new(first_transport)
+                .exchange_setup(ExchangeSetupRequest::default())
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), first_entered.notified())
+            .await
+            .expect("the first handler starts");
+
+        let second_transport = IrohTransport::new(connection.clone());
+        let second = tokio::spawn(async move {
+            WorkSetupClientImpl::new(second_transport)
+                .exchange_setup(ExchangeSetupRequest::default())
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), second_entered.notified())
+            .await
+            .expect("the second handler starts while the first is blocked");
+        release_first.notify_one();
+        first
+            .await
+            .expect("the first client task completes")
+            .expect("the first RPC succeeds");
+        second
+            .await
+            .expect("the second client task completes")
+            .expect("the second RPC succeeds");
+
+        connection.close(0_u32.into(), b"concurrency test complete");
+        tokio::time::timeout(Duration::from_secs(5), serving)
+            .await
+            .expect("the server observes connection close")
+            .expect("the server task does not panic")
+            .expect("the serve loop exits cleanly");
+        client.close().await;
+        server.close().await;
+    }
+
+    #[tokio::test]
+    async fn production_fetch_alpn_dispatches_run_ticket_on_its_connection() {
+        let alpn = <Fetch as ServiceMarker>::ALPN.as_bytes();
+        assert!(served_alpns(false).contains(&alpn.to_vec()));
+        let server = Endpoint::builder(presets::Minimal)
+            .secret_key(SecretKey::from_bytes(&[0x65; 32]))
+            .alpns(vec![alpn.to_vec()])
+            .bind_addr(
+                "127.0.0.1:0"
+                    .parse::<std::net::SocketAddr>()
+                    .expect("a loopback socket"),
+            )
+            .expect("the server has a valid bind address")
+            .bind()
+            .await
+            .expect("the server binds");
+        let target = EndpointAddr::from_parts(
+            server.id(),
+            server.bound_sockets().into_iter().map(TransportAddr::Ip),
+        );
+        let client = Endpoint::builder(presets::Minimal)
+            .secret_key(SecretKey::from_bytes(&[0x66; 32]))
+            .bind_addr(
+                "127.0.0.1:0"
+                    .parse::<std::net::SocketAddr>()
+                    .expect("a loopback socket"),
+            )
+            .expect("the client has a valid bind address")
+            .bind()
+            .await
+            .expect("the client binds");
+
+        let local_peer = PeerId::from_bytes(*server.id().as_bytes());
+        let directory = Arc::new(PeerDirectory::with_config(
+            local_peer,
+            hellas_rpc::peer_directory_config(),
+        ));
+        let node_handler = NodeHandlerImpl::new(
+            server.id(),
+            "fetch-dispatch-test".to_string(),
+            Vec::new(),
+            directory.clone(),
+        );
+        let accepting_server = server.clone();
+        let serving = tokio::spawn(async move {
+            let incoming = accepting_server
+                .accept()
+                .await
+                .expect("the server receives the Fetch dial");
+            let connection = incoming
+                .accept()
+                .expect("the server accepts the Fetch dial")
+                .await
+                .expect("the Fetch handshake completes");
+            serve_connection::<NodeChain>(
+                connection.alpn().to_vec(),
+                connection,
+                test_remote_execution(),
+                node_handler,
+                directory.manager(),
+                None,
+                None,
+            )
+            .await
+        });
+
+        let connection = client
+            .connect(target, alpn)
+            .await
+            .expect("the client dials the advertised Fetch ALPN");
+        let closing = connection.clone();
+        let mut response = match ExecuteClientImpl::new(IrohTransport::new(connection))
+            .run_ticket(hellas_rpc::pb::execute::RunTicketRequest::default())
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => panic!("RunTicket method did not reach its server stream: {error}"),
+        };
+        let error = match response.next().await {
+            Some(Err(error)) => error,
+            Some(Ok(_)) => panic!("an empty ticket cannot produce work events"),
+            None => match response.finish() {
+                Ok(_) => panic!("an empty ticket must end with an error trailer"),
+                Err(error) => error,
+            },
+        };
+        assert_ne!(
+            error.code(),
+            hellas_wire::WireCode::Unimplemented,
+            "Fetch ALPN must route RunTicket to Execute, not its Fetch fallback",
+        );
+        closing.close(0_u32.into(), b"test complete");
+        let _ = tokio::time::timeout(Duration::from_secs(5), serving)
+            .await
+            .expect("the Fetch serve loop observes connection close")
+            .expect("the Fetch server task does not panic");
+        server.close().await;
+        client.close().await;
     }
 
     async fn exchange_routed_setup(
@@ -2168,7 +2596,7 @@ mod tests {
         let identity = crate::identity::load_or_create(Some(&identity_path), true)
             .expect("the test remote-execution identity is created");
         let executor = Executor::spawn_with_producer_key(
-            ExecutePolicy::Skip,
+            ExecutePolicy::Deny,
             hellas_rpc::DEFAULT_EXECUTION_QUEUE_CAPACITY,
             identity.producer_key.clone(),
             identity.enrollment.canonical_bytes(),
@@ -2683,9 +3111,11 @@ mod tests {
     // ── One job, paid for, and then contested ─────────────────────────
 
     fn manifest() -> ProgramManifest {
-        ProgramManifest::Evaluate(EvaluateProgramManifest {
-            execution_package: ExecutionPackageId::from_bytes([0x16; 32]),
-        })
+        ProgramManifest::new(
+            Application::new(CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR)
+                .expect("the causal-LM application identity is valid"),
+            ContentId::from_bytes([0x16; 32]),
+        )
     }
 
     fn prompt_tokens() -> TokenIds {
@@ -2697,10 +3127,7 @@ mod tests {
     }
 
     fn identity_artifact() -> TextArtifact {
-        TextArtifact::identity(
-            BoundTermId::from_digest(manifest().content_id().digest()),
-            ExecutionPackageId::from_bytes([0x16; 32]),
-        )
+        TextArtifact::identity(BoundTermId::from_digest(manifest().content_id().digest()))
     }
 
     fn text_execution() -> TextExecution {
@@ -2778,6 +3205,7 @@ mod tests {
         match builder.finish(EvaluateTerminal {
             final_position: answer.len() as u64,
             stop_reason: EvaluateStopReason::STOP_TOKEN,
+            matched_stop_token_id: Some(1),
             text_artifact: Digest::from_bytes([0x77; 32]),
             usage,
             billable_units,
@@ -2798,10 +3226,10 @@ mod tests {
     impl PaidEvaluateBackend for AnsweringPaidBackend {
         async fn evaluate(
             &self,
-            request: EvaluateRequest,
+            input: PreparedEvaluateInput,
         ) -> Result<Vec<OutputEventEnvelope>, BackendFault> {
             assert_eq!(
-                request.text_execution,
+                input.evaluate_request().text_execution,
                 evaluate_request().text_execution,
                 "the paid gate dispatches the request retained in the accepted bundle",
             );
@@ -2840,7 +3268,7 @@ mod tests {
     impl PaidEvaluateBackend for BlockingPaidBackend {
         async fn evaluate(
             &self,
-            _request: EvaluateRequest,
+            _input: PreparedEvaluateInput,
         ) -> Result<Vec<OutputEventEnvelope>, BackendFault> {
             self.entered.add_permits(1);
             match self.release.acquire().await {
@@ -2855,6 +3283,33 @@ mod tests {
         if let Err(error) = store.commit(record, &Secp256k1Verifier::new()) {
             panic!("the fixture channel record commits: {error}");
         }
+    }
+
+    /// The provider journal a process can find after crashing between its
+    /// durable acceptance and the detached backend task's first poll.
+    fn write_accepted_channel(root: &Path) -> Digest {
+        let channel = descriptor().channel().clone();
+        let mut store = open_channel(root);
+        let job = authorization();
+        let id = work_id(&channel, &job);
+        commit(
+            &mut store,
+            ChannelRecord::JobProposed {
+                authorization: job,
+                client_signature: client().sign(signing_hash(id)),
+                prepared_input: match bundle().encode() {
+                    Ok(bytes) => bytes,
+                    Err(error) => panic!("the fixture bundle encodes: {error}"),
+                },
+            },
+        );
+        commit(
+            &mut store,
+            ChannelRecord::JobAccepted {
+                provider_signature: provider().sign(signing_hash(id)),
+            },
+        );
+        id
     }
 
     /// The channel journal a restarted provider finds: one job it
@@ -4751,6 +5206,60 @@ mod tests {
             "a second tick drives the channel"
         );
         assert!(chain.submitted().is_empty(), "and it has nothing to submit");
+    }
+
+    /// Discovery must resume the obligation already recorded by an Accepted
+    /// journal; no client retries a request and no transient Courtesy state is
+    /// present after this simulated process restart.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_clock_resumes_an_accepted_job_after_restart() {
+        let dir = temp();
+        write_setup_journal(dir.path());
+        let work_id = write_accepted_channel(dir.path());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mount = MountedWork::with_backend(AnsweringPaidBackend {
+            calls: Arc::clone(&calls),
+        });
+        let mut runner = runner(dir.path(), Some(admits()), &mount);
+        let chain = TestChain::new();
+        chain.set_snapshot(ready_channel_snapshot(ORIGIN, None));
+
+        assert!(runner.tick(&chain).await, "the recovery read answers");
+
+        let finished = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let phase = mount
+                    .service(&vouched_context(default_route_peer()))
+                    .and_then(|service| {
+                        service
+                            .with_state(|state| {
+                                state
+                                    .job()
+                                    .filter(|job| job.work_id() == work_id)
+                                    .map(|job| job.phase())
+                            })
+                            .ok()
+                            .flatten()
+                    });
+                if calls.load(Ordering::SeqCst) == 1 && phase == Some(JobPhase::Ready) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(
+            finished.is_ok(),
+            "the recovered accepted job reaches one durable result"
+        );
+
+        assert!(runner.tick(&chain).await, "the next recovery read answers");
+        tokio::task::yield_now().await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a ready journal is never invoked again"
+        );
     }
 
     /// A request is answered while the clock waits on a slow chain.

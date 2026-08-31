@@ -37,8 +37,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use self::state::GatewayState;
 
 pub use execution::{
-    CliRuntime, ExecutionEvent, ExecutionRequest, ExecutionRequestOptions, ExecutionStrategy,
-    Outcome, PreparedExecution, StopReason,
+    CausalLmExecutionEnvironment, CliRuntime, ExecutionEvent, ExecutionRequest,
+    ExecutionRequestOptions, ExecutionStrategy, Outcome, PreparedExecution, StopReason,
 };
 
 const DEFAULT_HTTP_PORT: u16 = 8080;
@@ -59,17 +59,19 @@ pub struct GatewayOptions {
     pub queue_size: usize,
     pub retries: usize,
     pub default_max_tokens: u32,
-    /// Fixed local alias sent to Hellas executors. Request-body `model`
-    /// fields are presentation labels and cannot select package paths.
-    pub package_name: String,
-    /// Exact Catena identity pinned by a remote-only caller. Local and
-    /// verify-local gateways derive it from the verified package instead.
-    pub execution_package: Option<hellas_rpc::ExecutionPackageId>,
-    /// Owner-selected Catena package source for a local execution leg.
+    /// Fixed presentation label returned to API clients. It is not sent to an
+    /// executor and cannot select trusted execution content.
+    pub model_name: String,
+    /// Strict canonical Catena causal-LM manifest and locally checked root
+    /// metadata, bound to an independent caller pin.
+    pub causal_lm: CausalLmExecutionEnvironment,
+    /// Locally available Xet content used by a local execution leg. The
+    /// executor may only reopen the objects named below the manifest root; it
+    /// does not fetch or compile while admitting the environment.
     #[cfg(feature = "evaluate")]
-    pub local_package: Option<hellas_executor::PackageSource>,
+    pub local_content_store: Option<hellas_store::ContentStore>,
     /// Application-selected tokenizer used only before and after execution.
-    /// It is not part of the Catena package or Hellas execution claim.
+    /// It is not part of the Catena environment or Hellas execution claim.
     pub tokenizer: PathBuf,
     /// Application-selected stop IDs sent explicitly with every request.
     pub stop_token_ids: Vec<u32>,
@@ -79,9 +81,12 @@ pub struct GatewayOptions {
     pub responses_proxy_api_key_env: String,
     pub responses_fetch_route_service: String,
     pub responses_fetch_route_method: String,
+    /// Exact manifest ID for the attested Fetch route. Fetch owns its request
+    /// structuring and response destructuring as trusted computation, unlike
+    /// the causal-LM path whose tokenizer and decoding remain local
+    /// presentation policy.
     pub responses_fetch_execution_environment: Option<hellas_rpc::ContentId>,
     pub responses_fetch_request_overrides: JsonMap<String, JsonValue>,
-    pub trusted_producer_public_keys: Vec<hellas_rpc::PublicKey>,
     /// The out-of-band anchor every remote route is verified against.
     /// `None` is the absence of a *route*, never a route dialled without
     /// an anchor: each remote constructor takes an anchor by value, so a
@@ -155,9 +160,9 @@ pub async fn run(options: GatewayOptions) -> anyhow::Result<()> {
 
     info!("timeout: {}s", state.inference_timeout.as_secs());
     info!(
-        package = %state.package_name,
-        execution_package = %state.execution_package,
-        "using configured Hellas package"
+        model = %state.model_name,
+        program_manifest = %state.causal_lm.manifest_id(),
+        "using configured causal-LM environment"
     );
 
     let wrap_child = if let Some(cmd) = options.wrap.as_deref() {

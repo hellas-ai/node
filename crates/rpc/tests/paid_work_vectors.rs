@@ -31,8 +31,8 @@ use hellas_rpc::protocol::work::{
     private_policy_commitment, result_digest, work_id,
 };
 use hellas_rpc::{
-    Assurance, ContentId, Digest, Evaluate, EvaluateProgramManifest, EvaluateRequest,
-    EventCommitment, ExecutionPackageId, ProgramManifest, PublicKey, RequestCommitment,
+    Application, Assurance, CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR, ContentId, Digest, Evaluate,
+    EvaluateRequest, EventCommitment, ProgramManifest, PublicKey, RequestCommitment,
 };
 
 // ── Fixtures ──────────────────────────────────────────────────────────
@@ -161,9 +161,10 @@ fn channel_policy() -> PaidChannelPolicyV1 {
 }
 
 fn manifest() -> ProgramManifest {
-    ProgramManifest::Evaluate(EvaluateProgramManifest {
-        execution_package: ExecutionPackageId::from_bytes([0x16; 32]),
-    })
+    ProgramManifest::new(
+        Application::new(CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR).unwrap(),
+        ContentId::from_bytes([0x16; 32]),
+    )
 }
 
 fn prompt_tokens() -> TokenIds {
@@ -175,10 +176,7 @@ fn text_policy() -> TextPolicy {
 }
 
 fn identity_artifact() -> TextArtifact {
-    TextArtifact::identity(
-        BoundTermId::from_digest(manifest().content_id().digest()),
-        ExecutionPackageId::from_bytes([0x16; 32]),
-    )
+    TextArtifact::identity(BoundTermId::from_digest(manifest().content_id().digest()))
 }
 
 fn text_execution() -> TextExecution {
@@ -569,7 +567,7 @@ fn golden_digests_bind_the_encoded_network() {
     );
     assert_eq!(
         hex(&work_id(&channel, &authorization()).into_bytes()),
-        "d4bdc659d47820c35f494066192e2e688897ca8595373dcf4baa7607505cb453"
+        "7ebf09a0d7c77b8747d53b56cbd981b7cad754ec3c4a913f16cfe8f6545c0ee4"
     );
 
     let other = channel_on(
@@ -670,6 +668,14 @@ fn prepared_input_is_reproducible_from_its_components() {
     let decoded = PreparedPaidInputV1::decode(&encoded, 1_048_576).expect("legal bundle");
     assert_eq!(decoded, bundle);
     assert_eq!(
+        decoded
+            .parts()
+            .expect("the canonical bodies parse")
+            .manifest
+            .canonical_bytes(),
+        manifest().canonical_bytes(),
+    );
+    assert_eq!(
         input_digest(&channel(), &decoded),
         input_digest(&channel(), &bundle)
     );
@@ -769,6 +775,24 @@ fn prepared_input_mutations_reject() {
         .parts()
         .expect_err("a noncanonical token body must not parse");
     assert!(err.to_string().contains("non-canonical"), "{err}");
+
+    // MUTATION: the carried manifest must be parsed too; hashing arbitrary
+    // bytes would let a paid-input graph commit to an invalid application.
+    let mut noncanonical_manifest = manifest().canonical_bytes();
+    noncanonical_manifest.push(0);
+    let noncanonical = assemble(&[
+        &evaluate_request_bytes_of(),
+        &noncanonical_manifest,
+        &text_execution().canonical_bytes(),
+        &prompt_tokens().canonical_bytes(),
+        &text_policy().canonical_bytes(),
+        &identity_artifact().canonical_bytes(),
+    ]);
+    let err = PreparedPaidInputV1::decode(&noncanonical, budget)
+        .expect("lengths are still well formed")
+        .parts()
+        .expect_err("a noncanonical manifest body must not parse");
+    assert!(err.to_string().contains("trailing bytes"), "{err}");
 }
 
 /// A declared length is never trusted: not against the input, not
@@ -896,7 +920,7 @@ fn widest_fixed_preimage_is_measured() {
         "hellas.work.paid-job-authorize.v1",
         "hellas.work.paid-job-result.v1",
         "hellas.work.payment-binding.v1",
-        "hellas.work.evaluate-output.v1",
+        "hellas.work.evaluate-output.v2",
     ] {
         assert!(
             domain.len() <= "hellas.work.paid-channel-policy.v1".len(),
@@ -1631,9 +1655,10 @@ fn each_graph_binding_is_checked_on_its_own() {
     );
 
     // A manifest that is not the environment the request commits to.
-    let other_manifest = ProgramManifest::Evaluate(EvaluateProgramManifest {
-        execution_package: ExecutionPackageId::from_bytes([0x99; 32]),
-    });
+    let other_manifest = ProgramManifest::new(
+        Application::new(CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR).unwrap(),
+        ContentId::from_bytes([0x99; 32]),
+    );
     assert_ne!(other_manifest.content_id(), manifest().content_id());
     let mismatched_manifest = PreparedPaidInputV1::new(
         &evaluate_request(),
@@ -1697,10 +1722,7 @@ fn each_graph_binding_is_checked_on_its_own() {
     // the request runs in. It is a legal artifact and a legal request;
     // what is wrong is the edge between them, and the provider reads
     // the model out of this end of it.
-    let elsewhere = TextArtifact::identity(
-        BoundTermId::from_bytes([0x83; 32]),
-        ExecutionPackageId::from_bytes([0x16; 32]),
-    );
+    let elsewhere = TextArtifact::identity(BoundTermId::from_bytes([0x83; 32]));
     let mut rebound_policy = policy;
     rebound_policy.identity_source_digest =
         match identity_source_digest(&elsewhere.canonical_bytes()) {
@@ -2344,6 +2366,7 @@ fn canonical_output_digest_normalizes_chunking() {
     let terminal = EvaluateTerminal {
         final_position: 4,
         stop_reason: EvaluateStopReason::STOP_TOKEN,
+        matched_stop_token_id: Some(1),
         text_artifact: Digest::from_bytes([0x60; 32]),
         usage: EvaluateUsage {
             input_units: 4,
@@ -2363,8 +2386,17 @@ fn canonical_output_digest_normalizes_chunking() {
     // MUTATION: another stop reason.
     let mut stopped = terminal.clone();
     stopped.stop_reason = EvaluateStopReason::MAX_OUTPUT;
+    stopped.matched_stop_token_id = None;
     assert_ne!(
         canonical_output_digest(network, id, &tokens, &stopped).expect("legal"),
+        digest
+    );
+
+    // MUTATION: another selected stop token.
+    let mut witness = terminal.clone();
+    witness.matched_stop_token_id = Some(2);
+    assert_ne!(
+        canonical_output_digest(network, id, &tokens, &witness).expect("legal"),
         digest
     );
 
@@ -2447,7 +2479,7 @@ fn digest_preimages_are_reproducible_by_hand() {
     assert_eq!(preimage.len(), 30 + 16 + 32 + 98);
     assert_eq!(
         hex(&Digest::hash(&preimage).into_bytes()),
-        "6682628fc23bc3b1b19fee524dfc9cd32ebf2d7d59f66bef5004d2f225ac2c70"
+        "7af77e5376b3f26a934861afd93c3a4bfe1cdcffd4a642d9bc2f22a55823f196"
     );
 
     // The payment binding, whose three fields are all 32 bytes: a round
@@ -2494,6 +2526,7 @@ fn the_canonical_output_preimage_is_reproducible_by_hand() {
     let terminal = EvaluateTerminal {
         final_position: 3,
         stop_reason: EvaluateStopReason::MAX_OUTPUT,
+        matched_stop_token_id: None,
         text_artifact: Digest::from_bytes([0x60; 32]),
         usage: EvaluateUsage {
             input_units: 5,
@@ -2502,7 +2535,7 @@ fn the_canonical_output_preimage_is_reproducible_by_hand() {
         billable_units: 8,
     };
 
-    let mut preimage = b"hellas.work.evaluate-output.v1".to_vec();
+    let mut preimage = b"hellas.work.evaluate-output.v2".to_vec();
     preimage.push(NETWORK.len() as u8);
     preimage.extend_from_slice(NETWORK.as_bytes());
     preimage.extend_from_slice(id.as_bytes());
@@ -2512,13 +2545,14 @@ fn the_canonical_output_preimage_is_reproducible_by_hand() {
     preimage.extend_from_slice(&[0x00, 0x01, 0x02, 0x03]);
     preimage.extend_from_slice(&3_u64.to_be_bytes());
     preimage.push(2);
+    preimage.push(0);
     preimage.extend_from_slice(&[0x60; 32]);
     preimage.extend_from_slice(&5_u64.to_be_bytes());
     preimage.extend_from_slice(&3_u64.to_be_bytes());
     preimage.extend_from_slice(&8_u64.to_be_bytes());
     // 30 domain, 16 network, 32 work id, 8 count, 12 tokens, 8 position,
-    // 1 stop reason, 32 artifact, 24 usage.
-    assert_eq!(preimage.len(), 30 + 16 + 32 + 8 + 12 + 8 + 1 + 32 + 24);
+    // 1 stop reason, 1 absent-witness marker, 32 artifact, 24 usage.
+    assert_eq!(preimage.len(), 30 + 16 + 32 + 8 + 12 + 8 + 1 + 1 + 32 + 24);
 
     assert_eq!(
         Digest::hash(&preimage),
@@ -2526,7 +2560,7 @@ fn the_canonical_output_preimage_is_reproducible_by_hand() {
     );
     assert_eq!(
         hex(&Digest::hash(&preimage).into_bytes()),
-        "aa27535cce25ae5c1169e6306804d6e784298319a6a0ed8ac30ad50c2fedca7c"
+        "83aa7b2b6e7f992893b308cf934e258540f9443dca657cd41102249870f7e027"
     );
 }
 
@@ -2553,6 +2587,7 @@ fn spool_transcript() -> Vec<hellas_rpc::OutputEventEnvelope> {
     match builder.finish(EvaluateTerminal {
         final_position: 3,
         stop_reason: EvaluateStopReason::STOP_TOKEN,
+        matched_stop_token_id: Some(1),
         text_artifact: Digest::from_bytes([0x77; 32]),
         usage,
         billable_units: 7,

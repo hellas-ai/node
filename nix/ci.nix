@@ -20,6 +20,10 @@ let
     toolchain:
     [
       toolchain
+      # Unix FIFO-adversary regressions create their fixtures with `mkfifo`.
+      # Keep that test dependency explicit: writeShellApplication otherwise
+      # gives Cargo a deliberately minimal PATH.
+      pkgs.coreutils
       pkgs.stdenv.cc
     ]
     ++ workspaceNativeBuildInputs;

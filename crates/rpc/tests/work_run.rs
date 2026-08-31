@@ -37,8 +37,8 @@ use hellas_rpc::protocol::work_setup::{
     WorkSetupError, payment_terms_hash,
 };
 use hellas_rpc::work::{
-    BackendFault, PaidEvaluateBackend, ProviderEndpoint, RunAdmission, RunError, RunOutcome,
-    WorkService, run_accepted_work,
+    BackendFault, PaidEvaluateBackend, PreparedEvaluateInput, ProviderEndpoint, RunAdmission,
+    RunError, RunOutcome, WorkService, run_accepted_work,
 };
 use hellas_rpc::work_close::{FinalizedWork, observe};
 use hellas_rpc::work_store::{
@@ -46,8 +46,8 @@ use hellas_rpc::work_store::{
     TerminalOutcome, WorkStoreError,
 };
 use hellas_rpc::{
-    Assurance, EvaluateProgramManifest, EvaluateRequest, ExecutionPackageId, OutputEventEnvelope,
-    ProducerSigningKey, ProgramManifest, PublicKey,
+    Application, Assurance, CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR, ContentId, EvaluateRequest,
+    OutputEventEnvelope, ProducerSigningKey, ProgramManifest, PublicKey,
 };
 
 // ── Fixture ───────────────────────────────────────────────────────────
@@ -339,9 +339,10 @@ fn serving(store: ChannelStore) -> WorkService {
 // ── The prepared inputs a job executes from ───────────────────────────
 
 fn manifest() -> ProgramManifest {
-    ProgramManifest::Evaluate(EvaluateProgramManifest {
-        execution_package: ExecutionPackageId::from_bytes([0x16; 32]),
-    })
+    ProgramManifest::new(
+        Application::new(CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR).unwrap(),
+        ContentId::from_bytes([0x16; 32]),
+    )
 }
 
 fn prompt_tokens() -> TokenIds {
@@ -353,10 +354,7 @@ fn text_policy() -> TextPolicy {
 }
 
 fn identity_artifact() -> TextArtifact {
-    TextArtifact::identity(
-        BoundTermId::from_digest(manifest().content_id().digest()),
-        ExecutionPackageId::from_bytes([0x16; 32]),
-    )
+    TextArtifact::identity(BoundTermId::from_digest(manifest().content_id().digest()))
 }
 
 fn text_execution() -> TextExecution {
@@ -472,6 +470,7 @@ fn transcript_for(
     let terminal = EvaluateTerminal {
         final_position: generated.len() as u64,
         stop_reason: EvaluateStopReason::STOP_TOKEN,
+        matched_stop_token_id: Some(1),
         text_artifact: Digest::from_bytes([0x77; 32]),
         usage,
         billable_units,
@@ -528,16 +527,18 @@ impl CountingBackend {
 impl PaidEvaluateBackend for CountingBackend {
     fn evaluate(
         &self,
-        request: EvaluateRequest,
+        input: PreparedEvaluateInput,
     ) -> impl core::future::Future<Output = Result<Vec<OutputEventEnvelope>, BackendFault>> + Send
     {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(input.program_manifest(), manifest().canonical_bytes());
+        let request = input.evaluate_request();
         let answer = self.answer.clone();
         let produced = match answer {
-            Answer::Transcript => Ok(answer_transcript(&request)),
+            Answer::Transcript => Ok(answer_transcript(request)),
             Answer::ForAnotherRequest(nonce) => Ok(answer_transcript(&evaluate_request(nonce))),
             Answer::UnderAnotherKey(byte) => Ok(transcript_for(
-                &request,
+                request,
                 &[&ANSWER[..2], &ANSWER[2..]],
                 &producer(byte),
             )),
@@ -616,6 +617,7 @@ fn a_result_is_derived_from_the_transcript_that_produced_it() {
     let terminal = EvaluateTerminal {
         final_position: ANSWER.len() as u64,
         stop_reason: EvaluateStopReason::STOP_TOKEN,
+        matched_stop_token_id: Some(1),
         text_artifact: Digest::from_bytes([0x77; 32]),
         usage: EvaluateUsage {
             input_units: PROMPT_TOKENS,
@@ -882,12 +884,13 @@ fn a_job_this_process_is_running_is_not_started_again() {
     let id = accept(&mut store, 1);
     let mut endpoint = endpoint(store);
 
-    let RunAdmission::Invoke(request) = expect_admission(endpoint.begin_run(id, &ready())) else {
+    let RunAdmission::Invoke(input) = expect_admission(endpoint.begin_run(id, &ready())) else {
         panic!("the first call may invoke");
     };
-    // The request comes out of the journal, not out of a quote: this is
-    // the one both parties signed the digest of.
-    assert_eq!(request, evaluate_request(1));
+    // Both bodies come out of the journal, not out of a quote: these are
+    // the exact canonical values both parties signed the digest of.
+    assert_eq!(input.evaluate_request(), &evaluate_request(1));
+    assert_eq!(input.program_manifest(), manifest().canonical_bytes());
 
     assert_eq!(
         expect_admission(endpoint.begin_run(id, &ready())),

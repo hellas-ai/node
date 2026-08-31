@@ -22,3 +22,6 @@ ureq = { version = "3", default-features = false, features = [
     "rustls",
     "rustls-webpki-roots",
 ] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

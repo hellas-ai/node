@@ -124,8 +124,9 @@ impl WireAdaptor for OpenAiCompletionsAdaptor {
             }
             OutputEvent::ToolCallStart(_)
             | OutputEvent::ToolCallArgumentsDelta(_)
-            | OutputEvent::ToolCallEnd(_) => Err(AdaptorError::unsupported(
-                "text completions cannot render tool-call deltas",
+            | OutputEvent::ToolCallEnd(_)
+            | OutputEvent::Adaptor(_) => Err(AdaptorError::unsupported(
+                "text completions cannot render tool or adaptor-specific events",
             )),
             OutputEvent::Usage(_) => Ok(Vec::new()),
             OutputEvent::Provenance(provenance) => {

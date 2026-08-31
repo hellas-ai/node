@@ -5,8 +5,8 @@ package hellas.evaluate.v1;
 import "hellas/v1/hellas.proto";
 
 // Binding/verifiable token evaluation. The execution environment commits to
-// an exact Catena executable package; tokenization and text decoding are
-// convenience layers outside this protocol.
+// one canonical Catena causal-LM program, ABI, and content-addressed runtime
+// inputs. Tokenization and text decoding remain outside this protocol.
 
 service Evaluate {
   rpc CreateTicket(EvaluateRequest) returns (.hellas.v1.Ticket);
@@ -19,7 +19,7 @@ message EvaluateRequest {
   bytes execution_environment = 3; // ProgramManifest ContentId
   bytes nonce = 4; // exactly 32 bytes
   .hellas.v1.Assurance assurance = 5;
-  // Whether the provider may persist prompt- or token-bearing artifacts.
-  // Absence preserves the historical default: retain.
+  // Whether the provider may persist and publish prompt- or token-bearing
+  // artifacts through Courtesy. Absence means false.
   optional bool retain = 6;
 }

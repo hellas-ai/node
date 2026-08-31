@@ -35,8 +35,8 @@ use hellas_rpc::work_store::{
     TerminalOutcome, WorkStoreError,
 };
 use hellas_rpc::{
-    Assurance, Evaluate, EvaluateProgramManifest, EvaluateRequest, ExecutionPackageId,
-    OutputEventEnvelope, ProducerSigningKey, ProgramManifest, PublicKey,
+    Application, Assurance, CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR, ContentId, Evaluate,
+    EvaluateRequest, OutputEventEnvelope, ProducerSigningKey, ProgramManifest, PublicKey,
 };
 
 // ── Fixture ───────────────────────────────────────────────────────────
@@ -177,9 +177,10 @@ fn payload(digest: Digest) -> PayloadHash {
 // ── The prepared inputs a job executes from ───────────────────────────
 
 fn manifest() -> ProgramManifest {
-    ProgramManifest::Evaluate(EvaluateProgramManifest {
-        execution_package: ExecutionPackageId::from_bytes([0x16; 32]),
-    })
+    ProgramManifest::new(
+        Application::new(CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR).unwrap(),
+        ContentId::from_bytes([0x16; 32]),
+    )
 }
 
 fn prompt_tokens() -> TokenIds {
@@ -191,10 +192,7 @@ fn text_policy() -> TextPolicy {
 }
 
 fn identity_artifact() -> TextArtifact {
-    TextArtifact::identity(
-        BoundTermId::from_digest(manifest().content_id().digest()),
-        ExecutionPackageId::from_bytes([0x16; 32]),
-    )
+    TextArtifact::identity(BoundTermId::from_digest(manifest().content_id().digest()))
 }
 
 fn text_execution(nonce: u64) -> TextExecution {
@@ -267,6 +265,7 @@ fn transcript_of(request: &EvaluateRequest, answer: &[u32]) -> Vec<OutputEventEn
     match builder.finish(EvaluateTerminal {
         final_position: answer.len() as u64,
         stop_reason: EvaluateStopReason::STOP_TOKEN,
+        matched_stop_token_id: Some(1),
         text_artifact: Digest::from_bytes([0x77; 32]),
         usage,
         billable_units,

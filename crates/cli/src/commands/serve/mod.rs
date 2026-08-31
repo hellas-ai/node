@@ -4,17 +4,18 @@ use anyhow::{Context, bail};
 use commonware_runtime::Runner as _;
 #[cfg(feature = "evaluate")]
 use hellas_executor::ArtifactStoreConfig;
+#[cfg(feature = "evaluate")]
+use hellas_executor::GpuConfig;
 use hellas_executor::{
-    CallerAccess, ExecutorMetrics, FetchAccessPolicy, FetchProjectorFactory, FetchProvider,
-    FetchRoute, FetchRouteEntry, FetchRouteGrant, FetchRoutePolicy, FetchRouteRegistry,
-    RequestRateLimit, SpendLimit,
+    CallerAccess, ExecutorMetrics, FetchAccessPolicy, FetchRoute, FetchRouteEntry, FetchRouteGrant,
+    FetchRoutePolicy, FetchRouteRegistry, RequestRateLimit, SpendLimit,
 };
 use hellas_kernel::Secp256k1Signer;
 use hellas_rpc::policy::ExecutePolicy;
-use hellas_rpc::{Assurance, ContentId, FetchProgramManifest, ProducerSigningKey, ProgramManifest};
+use hellas_rpc::{Assurance, FetchEnvironment, ProducerId, ProducerSigningKey};
 use iroh::SecretKey;
 use serde::Deserialize;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -23,6 +24,7 @@ use tokio::time::{Duration, timeout};
 use tracing::warn;
 
 mod codex_provider;
+mod codex_responses;
 mod node;
 mod node_handler;
 mod openai_provider;
@@ -36,16 +38,20 @@ pub use probe::{ProbeOptions, run_probe};
 pub use provision::{ProvisionOptions, run_provision};
 pub use work_config::{WorkConfig, load_work_config};
 
-pub(crate) const DEFAULT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
-
 pub struct ServeOptions {
     pub port: Option<u16>,
     pub execute_policy: ExecutePolicy,
     pub queue_size: usize,
     #[cfg(feature = "evaluate")]
-    pub packages: Vec<crate::commands::package::PackageArg>,
+    pub content_paths: Vec<PathBuf>,
     #[cfg(feature = "evaluate")]
-    pub package_cache: Option<PathBuf>,
+    pub content_roots: Vec<PathBuf>,
+    #[cfg(feature = "evaluate")]
+    pub content_index: Option<PathBuf>,
+    #[cfg(feature = "evaluate")]
+    pub gpu_config: GpuConfig,
+    #[cfg(feature = "evaluate")]
+    pub evaluate_retained_execution_capacity: usize,
     pub artifact_store_path: Option<PathBuf>,
     /// The loaded paid-work configuration, not the path it came from.
     /// Its presence is still what serves the two work ALPNs; what is new
@@ -58,6 +64,8 @@ pub struct ServeOptions {
     pub fetch_config_file: Option<PathBuf>,
     pub fetch_max_in_flight: usize,
     pub fetch_queue_size: usize,
+    pub fetch_retained_transcript_capacity: usize,
+    pub fetch_replay_max_in_flight: usize,
     pub secret_key: SecretKey,
     pub producer_key: ProducerSigningKey,
     /// The settlement key both paid endpoints are built over, read from
@@ -83,6 +91,15 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
     #[cfg(feature = "evaluate")]
     {
         let storage_path = artifact_store_path.join("evaluate");
+        // Claim and narrow the configured root before either the content index
+        // or Commonware's Evaluate child is opened. The retained descriptor
+        // coordinates cooperating runtimes that resolve the same stable path;
+        // its ancestors remain an operator-trusted boundary.
+        let artifact_store_root = ArtifactStoreConfig::lock_root(
+            &artifact_store_path,
+            options.evaluate_retained_execution_capacity,
+        )
+        .map_err(anyhow::Error::msg)?;
         // Not needless, whatever clippy sees: the `#[cfg(not(evaluate))]`
         // call below is the other arm, and without this `return` the
         // block's value becomes the function's under one cfg and not the
@@ -99,7 +116,7 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
                 run_with_store(
                     options,
                     artifact_store_path,
-                    ArtifactStoreConfig::new(context),
+                    ArtifactStoreConfig::new(context).with_locked_root(artifact_store_root),
                 )
             })
         })
@@ -116,13 +133,16 @@ async fn run_with_store(
     #[cfg(feature = "evaluate")] artifact_store: ArtifactStoreConfig,
 ) -> CliResult<()> {
     #[cfg(feature = "evaluate")]
-    let package_cache = options
-        .package_cache
+    let content_index = options
+        .content_index
         .clone()
-        .map(Ok)
-        .unwrap_or_else(crate::identity::default_package_cache_path)?;
+        .unwrap_or_else(|| artifact_store_path.join("content-index.bin"));
     #[cfg(feature = "evaluate")]
-    let packages = crate::commands::package::package_sources(options.packages, package_cache)?;
+    let content_store = crate::commands::environment::index_content(
+        &options.content_paths,
+        &options.content_roots,
+        &content_index,
+    )?;
 
     // What the operator configured, said back once, and then which of
     // §4's four evidence cases this node started in, in words. The
@@ -197,7 +217,9 @@ async fn run_with_store(
         execute_policy: options.execute_policy.clone(),
         queue_size: options.queue_size,
         #[cfg(feature = "evaluate")]
-        packages,
+        content_store,
+        #[cfg(feature = "evaluate")]
+        gpu_config: options.gpu_config,
         build,
         graffiti,
         fetch_access_policy,
@@ -205,6 +227,8 @@ async fn run_with_store(
         fetch_routes,
         fetch_max_in_flight: options.fetch_max_in_flight,
         fetch_queue_size: options.fetch_queue_size,
+        fetch_retained_transcript_capacity: options.fetch_retained_transcript_capacity,
+        fetch_replay_max_in_flight: options.fetch_replay_max_in_flight,
         work: work_runner,
         secret_key: options.secret_key,
         producer_key: options.producer_key,
@@ -252,8 +276,8 @@ async fn run_with_store(
     Ok(())
 }
 
-/// Load the unified fetch configuration: the route table (providers,
-/// protocols, capabilities) and the caller access policy, cross-validated so
+/// Load the unified fetch configuration: the route table (sealed destinations,
+/// credentials, capabilities) and the caller access policy, cross-validated so
 /// a caller grant naming an undefined route is a load error rather than a
 /// silent dead entry.
 fn load_fetch_config(path: &std::path::Path) -> CliResult<(FetchRouteRegistry, FetchAccessPolicy)> {
@@ -262,42 +286,38 @@ fn load_fetch_config(path: &std::path::Path) -> CliResult<(FetchRouteRegistry, F
         .with_context(|| format!("failed to parse {}", path.display()))?;
 
     let mut registry = FetchRouteRegistry::new();
-    let responses_projector: Arc<dyn FetchProjectorFactory> =
-        Arc::new(responses_projector::ResponsesFetchProjectorFactory);
     for route in file.routes {
         if route.service.trim().is_empty() || route.method.trim().is_empty() {
             bail!("fetch config route service and method must be non-empty");
         }
-        let projector_factory = match route.protocol {
-            FetchRouteProtocol::OpenaiResponses => responses_projector.clone(),
-        };
+        let entry = route
+            .destination
+            .into_entry(route.capabilities.into_policy()?)?;
+        info!(
+            service = %route.service,
+            method = %route.method,
+            execution_environment = %entry.execution_environment(),
+            "loaded sealed Fetch route",
+        );
         registry
-            .register(
-                FetchRoute::new(route.service, route.method),
-                FetchRouteEntry {
-                    execution_environment: ProgramManifest::Fetch(FetchProgramManifest {
-                        program: parse_content_id(&route.manifest.program)?,
-                        config: parse_content_id(&route.manifest.config)?,
-                        build: parse_content_id(&route.manifest.build)?,
-                    })
-                    .content_id(),
-                    provider: route.upstream.into_provider()?,
-                    projector_factory,
-                    capabilities: route.capabilities.into_policy()?,
-                },
-            )
+            .register(FetchRoute::new(route.service, route.method), entry)
             .map_err(|err| anyhow::anyhow!("invalid fetch config: {err}"))?;
     }
 
-    let callers = file
-        .callers
-        .into_iter()
-        .map(FetchPolicyCaller::into_access)
-        .collect::<CliResult<Vec<_>>>()?;
+    let mut caller_ids = HashSet::new();
+    let mut callers = Vec::with_capacity(file.callers.len());
+    for caller in file.callers {
+        let caller = caller.into_access()?;
+        let caller_id = ProducerId::from_public_key(&caller.public_key);
+        if !caller_ids.insert(caller_id) {
+            bail!("fetch config defines the same caller public_key more than once");
+        }
+        callers.push(caller);
+    }
     for caller in &callers {
         if let hellas_executor::RouteSet::Explicit(routes) = &caller.routes {
             for route in routes.keys() {
-                if !registry.contains(route) {
+                if registry.entry(route).is_none() {
                     bail!(
                         "fetch config grants caller access to undefined route {}/{}",
                         route.service,
@@ -311,6 +331,7 @@ fn load_fetch_config(path: &std::path::Path) -> CliResult<(FetchRouteRegistry, F
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FetchConfigFile {
     #[serde(default)]
     routes: Vec<FetchConfigRoute>,
@@ -319,51 +340,31 @@ struct FetchConfigFile {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FetchConfigRoute {
     service: String,
     method: String,
-    /// The wire contract this route speaks; selects the output projector and
-    /// event canonicalizer. Explicit because it is consensus-relevant.
-    protocol: FetchRouteProtocol,
-    manifest: FetchManifest,
-    upstream: FetchUpstream,
+    /// One sealed, compiled destination plus provider-local credentials. This
+    /// one selection constructs both the HTTP driver and the projector whose
+    /// manifest is quoted; a URL or separate identity cannot be supplied.
+    destination: FetchDestination,
     #[serde(default)]
     capabilities: FetchPolicyLimits,
 }
 
 #[derive(Debug, Deserialize)]
-struct FetchManifest {
-    program: String,
-    config: String,
-    build: String,
-}
-
-fn parse_content_id(raw: &str) -> CliResult<ContentId> {
-    raw.parse()
-        .with_context(|| format!("invalid ContentId {raw:?}"))
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-enum FetchRouteProtocol {
-    OpenaiResponses,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "kebab-case")]
-enum FetchUpstream {
-    /// Any OpenAI-Responses-compatible HTTP endpoint with bearer auth from
-    /// an environment variable.
-    OpenaiCompatible {
-        url: String,
-        #[serde(default = "default_openai_api_key_env")]
-        api_key_env: String,
-    },
-    CodexOauth {
-        #[serde(default)]
-        base_url: Option<String>,
+#[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
+enum FetchDestination {
+    /// Official Codex Responses, authenticated by the local Codex OAuth store.
+    CodexResponses {
         #[serde(default)]
         auth_path: Option<PathBuf>,
+    },
+    /// Official OpenAI Responses, authenticated by an API key held in a local
+    /// environment variable.
+    OpenaiResponses {
+        #[serde(default = "default_openai_api_key_env")]
+        api_key_env: String,
     },
 }
 
@@ -371,24 +372,36 @@ fn default_openai_api_key_env() -> String {
     "OPENAI_API_KEY".to_string()
 }
 
-impl FetchUpstream {
-    fn into_provider(self) -> CliResult<Arc<dyn FetchProvider>> {
-        Ok(match self {
-            Self::OpenaiCompatible { url, api_key_env } => Arc::new(
-                openai_provider::OpenAiResponsesFetchProvider::new(&url, &api_key_env)?,
-            ),
-            Self::CodexOauth {
-                base_url,
-                auth_path,
-            } => Arc::new(codex_provider::CodexResponsesFetchProvider::new(
-                base_url.as_deref().unwrap_or(DEFAULT_CODEX_BASE_URL),
-                auth_path.as_deref(),
-            )?),
-        })
+impl FetchDestination {
+    fn into_entry(self, capabilities: FetchRoutePolicy) -> CliResult<FetchRouteEntry> {
+        let (environment, provider): (FetchEnvironment, Arc<dyn hellas_executor::FetchProvider>) =
+            match self {
+                Self::CodexResponses { auth_path } => (
+                    FetchEnvironment::CodexResponses,
+                    Arc::new(codex_provider::CodexResponsesFetchProvider::new(
+                        auth_path.as_deref(),
+                    )?),
+                ),
+                Self::OpenaiResponses { api_key_env } => (
+                    FetchEnvironment::OpenAiResponses,
+                    Arc::new(openai_provider::OpenAiResponsesFetchProvider::new(
+                        &api_key_env,
+                    )?),
+                ),
+            };
+        let adaptor_factory = Arc::new(responses_projector::ResponsesFetchAdaptorFactory::new(
+            environment,
+        ));
+        Ok(FetchRouteEntry::new(
+            provider,
+            adaptor_factory,
+            capabilities,
+        )?)
     }
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FetchPolicyCaller {
     public_key: String,
     routes: Vec<FetchPolicyRoute>,
@@ -402,11 +415,19 @@ impl FetchPolicyCaller {
     fn into_access(self) -> CliResult<CallerAccess> {
         let public_key = crate::parse_public_key_hex(&self.public_key)
             .map_err(|err| anyhow::anyhow!("invalid fetch policy public_key: {err}"))?;
-        let routes = self
-            .routes
-            .into_iter()
-            .map(FetchPolicyRoute::into_grant)
-            .collect::<CliResult<Vec<_>>>()?;
+        let mut seen_routes = HashSet::new();
+        let mut routes = Vec::with_capacity(self.routes.len());
+        for route in self.routes {
+            let grant = route.into_grant()?;
+            if !seen_routes.insert(grant.route.clone()) {
+                bail!(
+                    "fetch config grants caller duplicate route {}/{}",
+                    grant.route.service,
+                    grant.route.method
+                );
+            }
+            routes.push(grant);
+        }
         let mut access = CallerAccess::explicit(public_key, routes);
         access.request_rate = self
             .request_rate
@@ -421,6 +442,7 @@ impl FetchPolicyCaller {
 /// (on `routes`) and as a per-caller grant (on `callers`); admission
 /// validates against their intersection.
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FetchPolicyLimits {
     #[serde(default)]
     models: Vec<String>,
@@ -451,11 +473,14 @@ impl FetchPolicyLimits {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FetchPolicyRoute {
     service: String,
     method: String,
-    #[serde(flatten)]
-    limits: FetchPolicyLimits,
+    #[serde(default)]
+    models: Vec<String>,
+    #[serde(default, alias = "max_output_units")]
+    max_output_tokens: Option<u64>,
 }
 
 impl FetchPolicyRoute {
@@ -465,12 +490,17 @@ impl FetchPolicyRoute {
         }
         Ok(FetchRouteGrant {
             route: FetchRoute::new(self.service, self.method),
-            policy: self.limits.into_policy()?,
+            policy: FetchPolicyLimits {
+                models: self.models,
+                max_output_tokens: self.max_output_tokens,
+            }
+            .into_policy()?,
         })
     }
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FetchPolicyRate {
     capacity: f64,
     refill_per_sec: f64,
@@ -492,6 +522,7 @@ impl FetchPolicyRate {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FetchPolicySpend {
     max_units: u64,
     window_seconds: u64,
@@ -549,7 +580,7 @@ fn print_qr(data: &str) {
 mod tests {
     use super::*;
     use hellas_executor::{FetchAccessError, FetchRequestView};
-    use hellas_rpc::ProducerSigningKey;
+    use hellas_rpc::{Digest, FetchEnvironment, InputCommitment, ProducerSigningKey};
 
     fn public_key_hex(byte: u8) -> String {
         let key = ProducerSigningKey::from_secret_bytes([byte; 32])
@@ -571,16 +602,33 @@ mod tests {
         serde_json::json!({
             "service": "codex",
             "method": "responses",
-            "protocol": "openai-responses",
-            "manifest": {
-                "program": "0101010101010101010101010101010101010101010101010101010101010101",
-                "config": "0202020202020202020202020202020202020202020202020202020202020202",
-                "build": "0303030303030303030303030303030303030303030303030303030303030303"
-            },
             // Keep this fixture independent of the process-global HOME.
-            "upstream": { "type": "codex-oauth", "auth_path": "/tmp/hellas-test-codex-auth.json" },
+            "destination": {
+                "type": "codex-responses",
+                "auth_path": "target/hellas-test-codex-auth.json"
+            },
             "capabilities": capabilities,
         })
+    }
+
+    fn authenticated_codex_route(
+        dir: &tempfile::TempDir,
+        capabilities: serde_json::Value,
+    ) -> serde_json::Value {
+        let auth_path = dir.path().join("codex-auth.json");
+        let auth = crate::commands::codex_auth::CodexAuthStore::new(Some(&auth_path)).unwrap();
+        auth.save(&crate::commands::codex_auth::CodexAuthState::new(
+            crate::commands::codex_auth::test_tokens_with_account_id(
+                "test-access",
+                "test-refresh",
+                "test-account",
+            ),
+            None,
+        ))
+        .unwrap();
+        let mut route = codex_route(capabilities);
+        route["destination"]["auth_path"] = serde_json::json!(auth_path);
+        route
     }
 
     #[test]
@@ -590,7 +638,7 @@ mod tests {
         let path = write_config(
             &dir,
             serde_json::json!({
-                "routes": [codex_route(serde_json::json!({}))],
+                "routes": [authenticated_codex_route(&dir, serde_json::json!({}))],
                 "callers": [{
                     "public_key": public_key,
                     "routes": [{
@@ -610,7 +658,12 @@ mod tests {
         let (registry, mut policy) = load_fetch_config(&path).unwrap();
 
         let route = FetchRoute::new("codex", "responses");
-        let capabilities = registry.entry(&route).unwrap().capabilities.clone();
+        let entry = registry.entry(&route).unwrap();
+        assert_eq!(
+            entry.execution_environment(),
+            FetchEnvironment::CodexResponses.manifest_id()
+        );
+        let capabilities = entry.capabilities.clone();
         policy
             .authorize_admission(
                 &caller,
@@ -622,6 +675,7 @@ mod tests {
                 },
                 1_000,
                 "r1".to_string(),
+                InputCommitment::from_digest(Digest::from_bytes([1; 32])),
                 &capabilities,
             )
             .unwrap();
@@ -636,6 +690,7 @@ mod tests {
                 },
                 1_000,
                 "r2".to_string(),
+                InputCommitment::from_digest(Digest::from_bytes([2; 32])),
                 &capabilities,
             )
             .unwrap_err();
@@ -648,7 +703,7 @@ mod tests {
         let path = write_config(
             &dir,
             serde_json::json!({
-                "routes": [codex_route(serde_json::json!({
+                "routes": [authenticated_codex_route(&dir, serde_json::json!({
                     "models": ["gpt-5.5-codex"],
                     "max_output_tokens": 4096
                 }))],
@@ -677,7 +732,7 @@ mod tests {
         let path = write_config(
             &dir,
             serde_json::json!({
-                "routes": [codex_route(serde_json::json!({}))],
+                "routes": [authenticated_codex_route(&dir, serde_json::json!({}))],
                 "callers": [{
                     "public_key": public_key_hex(1),
                     "routes": [{ "service": "openai", "method": "responses" }]
@@ -697,8 +752,8 @@ mod tests {
             &dir,
             serde_json::json!({
                 "routes": [
-                    codex_route(serde_json::json!({})),
-                    codex_route(serde_json::json!({})),
+                    authenticated_codex_route(&dir, serde_json::json!({})),
+                    authenticated_codex_route(&dir, serde_json::json!({})),
                 ],
             }),
         );
@@ -706,5 +761,142 @@ mod tests {
         let err = load_fetch_config(&path).unwrap_err();
 
         assert!(err.to_string().contains("registered twice"));
+    }
+
+    #[test]
+    fn load_fetch_config_rejects_duplicate_callers_and_caller_routes() {
+        let dir = tempfile::tempdir().unwrap();
+        let caller = serde_json::json!({
+            "public_key": public_key_hex(1),
+            "routes": [{ "service": "codex", "method": "responses" }]
+        });
+        let duplicate_callers = write_config(
+            &dir,
+            serde_json::json!({
+                "routes": [authenticated_codex_route(&dir, serde_json::json!({}))],
+                "callers": [caller.clone(), caller]
+            }),
+        );
+        let error = load_fetch_config(&duplicate_callers).unwrap_err();
+        assert!(error.to_string().contains("more than once"), "{error:#}");
+
+        let duplicate_routes = write_config(
+            &dir,
+            serde_json::json!({
+                "routes": [authenticated_codex_route(&dir, serde_json::json!({}))],
+                "callers": [{
+                    "public_key": public_key_hex(1),
+                    "routes": [
+                        { "service": "codex", "method": "responses" },
+                        { "service": "codex", "method": "responses" }
+                    ]
+                }]
+            }),
+        );
+        let error = load_fetch_config(&duplicate_routes).unwrap_err();
+        assert!(error.to_string().contains("duplicate route"), "{error:#}");
+    }
+
+    #[test]
+    fn load_fetch_config_rejects_operator_claimed_trusted_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut route = codex_route(serde_json::json!({}));
+        route["adaptor"] = serde_json::json!("codex-0.0.1");
+        let path = write_config(&dir, serde_json::json!({ "routes": [route] }));
+        let err = load_fetch_config(&path).unwrap_err();
+        assert!(format!("{err:#}").contains("unknown field `adaptor`"));
+
+        let mut route = codex_route(serde_json::json!({}));
+        route["environment"] = serde_json::json!({
+            "program": "01",
+            "config": "02",
+            "build": "03"
+        });
+        let path = write_config(&dir, serde_json::json!({ "routes": [route] }));
+        let err = load_fetch_config(&path).unwrap_err();
+        assert!(format!("{err:#}").contains("unknown field `environment`"));
+    }
+
+    #[test]
+    fn load_fetch_config_rejects_operator_selected_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut route = codex_route(serde_json::json!({}));
+        route["destination"]["base_url"] = serde_json::json!("https://example.invalid/codex");
+        let path = write_config(&dir, serde_json::json!({ "routes": [route] }));
+        let error = load_fetch_config(&path).unwrap_err();
+
+        assert!(format!("{error:#}").contains("unknown field `base_url`"));
+    }
+
+    #[test]
+    fn config_has_two_sealed_destination_variants_and_no_url_field() {
+        let codex: FetchDestination = serde_json::from_value(serde_json::json!({
+            "type": "codex-responses",
+            "auth_path": "target/codex-auth.json"
+        }))
+        .unwrap();
+        assert!(matches!(codex, FetchDestination::CodexResponses { .. }));
+
+        let openai: FetchDestination = serde_json::from_value(serde_json::json!({
+            "type": "openai-responses",
+            "api_key_env": "HELLAS_TEST_OPENAI_KEY"
+        }))
+        .unwrap();
+        assert!(matches!(
+            openai,
+            FetchDestination::OpenaiResponses { ref api_key_env }
+                if api_key_env == "HELLAS_TEST_OPENAI_KEY"
+        ));
+
+        let error = serde_json::from_value::<FetchDestination>(serde_json::json!({
+            "type": "openai-responses",
+            "url": "https://example.invalid/v1/responses"
+        }))
+        .unwrap_err();
+        assert!(error.to_string().contains("unknown field `url`"));
+    }
+
+    #[test]
+    fn fetch_config_rejects_unknown_policy_fields_at_every_level() {
+        type Mutation = (&'static str, fn(&mut serde_json::Value));
+
+        let base = serde_json::json!({
+            "routes": [codex_route(serde_json::json!({}))],
+            "callers": [{
+                "public_key": public_key_hex(1),
+                "routes": [{ "service": "codex", "method": "responses" }],
+                "request_rate": { "capacity": 2.0, "refill_per_sec": 1.0 },
+                "spend": { "max_units": 64, "window_seconds": 60 }
+            }]
+        });
+        let mutations: &[Mutation] = &[
+            ("modles", |value| {
+                value["routes"][0]["capabilities"]["modles"] = serde_json::json!(["gpt"]);
+            }),
+            ("route_typo", |value| {
+                value["callers"][0]["routes"][0]["route_typo"] = serde_json::json!(true);
+            }),
+            ("caller_typo", |value| {
+                value["callers"][0]["caller_typo"] = serde_json::json!(true);
+            }),
+            ("rate_typo", |value| {
+                value["callers"][0]["request_rate"]["rate_typo"] = serde_json::json!(1);
+            }),
+            ("spend_typo", |value| {
+                value["callers"][0]["spend"]["spend_typo"] = serde_json::json!(1);
+            }),
+        ];
+
+        for (field, mutate) in mutations {
+            let mut value = base.clone();
+            mutate(&mut value);
+            let error = serde_json::from_value::<FetchConfigFile>(value).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("unknown field `{field}`")),
+                "unexpected error for {field}: {error}"
+            );
+        }
     }
 }

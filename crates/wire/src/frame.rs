@@ -94,8 +94,12 @@ pub enum FrameError {
     BadKeyUtf8,
     #[error("metadata value not utf-8")]
     BadValueUtf8,
-    #[error("varint too long")]
+    #[error("unknown metadata value tag: {0}")]
+    UnknownMetadataTag(u8),
+    #[error("invalid varint encoding")]
     BadVarint,
+    #[error("frame has {remaining} trailing bytes")]
+    TrailingBytes { remaining: usize },
     #[error("frame length {len} exceeds wire cap {cap}")]
     OversizedFrame { len: usize, cap: usize },
 }
@@ -155,6 +159,86 @@ pub fn encode_frame(frame: &Frame, out: &mut bytes::BytesMut) {
     }
 }
 
+/// Compute and validate the exact encoded size before an iroh sender allocates
+/// its framing buffer. This mirrors [`encode_frame`] and applies the same
+/// metadata and whole-frame bounds the decoder enforces.
+#[cfg(any(feature = "iroh", test))]
+pub(crate) fn encoded_frame_len(frame: &Frame) -> Result<usize, FrameError> {
+    let body_len = match frame {
+        Frame::Open(open) => checked_encoded_add(4, encoded_metadata_len(&open.headers)?)?,
+        Frame::Body(payload) => payload.len(),
+        Frame::End(end) => {
+            let message_len = end.trailer.message.len();
+            let len = checked_encoded_add(1, encoded_varint_len(message_len))?;
+            let len = checked_encoded_add(len, message_len)?;
+            checked_encoded_add(len, encoded_metadata_len(&end.trailer.metadata)?)?
+        }
+        Frame::Reset(_) => 1,
+        Frame::Credit(_) => 4,
+    };
+    let len = checked_encoded_add(1, body_len)?;
+    if len > MAX_FRAME_BYTES {
+        return Err(FrameError::OversizedFrame {
+            len,
+            cap: MAX_FRAME_BYTES,
+        });
+    }
+    Ok(len)
+}
+
+#[cfg(any(feature = "iroh", test))]
+fn encoded_metadata_len(metadata: &Metadata) -> Result<usize, FrameError> {
+    if metadata.len() > METADATA_MAX_ENTRIES as usize {
+        return Err(FrameError::BodyTooLarge {
+            len: metadata.len(),
+            limit: METADATA_MAX_ENTRIES as usize,
+        });
+    }
+    let mut len = encoded_varint_len(metadata.len());
+    for (key, value) in metadata.iter() {
+        if key.len() > METADATA_MAX_FIELD_LEN {
+            return Err(FrameError::BodyTooLarge {
+                len: key.len(),
+                limit: METADATA_MAX_FIELD_LEN,
+            });
+        }
+        let value_len = match value {
+            crate::metadata::MetadataValue::Text(value) => value.len(),
+            crate::metadata::MetadataValue::Bytes(value) => value.len(),
+        };
+        if value_len > METADATA_MAX_FIELD_LEN {
+            return Err(FrameError::BodyTooLarge {
+                len: value_len,
+                limit: METADATA_MAX_FIELD_LEN,
+            });
+        }
+        len = checked_encoded_add(len, encoded_varint_len(key.len()))?;
+        len = checked_encoded_add(len, key.len())?;
+        len = checked_encoded_add(len, 1)?;
+        len = checked_encoded_add(len, encoded_varint_len(value_len))?;
+        len = checked_encoded_add(len, value_len)?;
+    }
+    Ok(len)
+}
+
+#[cfg(any(feature = "iroh", test))]
+fn encoded_varint_len(mut value: usize) -> usize {
+    let mut len = 1;
+    while value >= 0x80 {
+        value >>= 7;
+        len += 1;
+    }
+    len
+}
+
+#[cfg(any(feature = "iroh", test))]
+fn checked_encoded_add(left: usize, right: usize) -> Result<usize, FrameError> {
+    left.checked_add(right).ok_or(FrameError::OversizedFrame {
+        len: usize::MAX,
+        cap: MAX_FRAME_BYTES,
+    })
+}
+
 pub fn decode_frame(buf: &[u8]) -> Result<Frame, FrameError> {
     if buf.is_empty() {
         return Err(FrameError::Short { needed: 1, got: 0 });
@@ -170,7 +254,13 @@ pub fn decode_frame(buf: &[u8]) -> Result<Frame, FrameError> {
                 });
             }
             let method_id = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
-            let headers = decode_metadata(&body[4..])?.0;
+            let metadata_bytes = &body[4..];
+            let (headers, consumed) = decode_metadata(metadata_bytes)?;
+            if consumed != metadata_bytes.len() {
+                return Err(FrameError::TrailingBytes {
+                    remaining: metadata_bytes.len() - consumed,
+                });
+            }
             Ok(Frame::Open(OpenFrame { method_id, headers }))
         }
         FrameKind::Body => Ok(Frame::Body(Bytes::copy_from_slice(body))),
@@ -180,18 +270,30 @@ pub fn decode_frame(buf: &[u8]) -> Result<Frame, FrameError> {
             }
             let status = WireCode::from_u8(body[0]).ok_or(FrameError::UnknownCode(body[0]))?;
             let (msg_len, msg_consumed) = read_varint(&body[1..])?;
-            let msg_len = msg_len as usize;
+            let msg_len = bounded_len(msg_len, MAX_FRAME_BYTES)?;
             let msg_start = 1 + msg_consumed;
-            if body.len() < msg_start + msg_len {
+            let msg_end = msg_start
+                .checked_add(msg_len)
+                .ok_or(FrameError::BodyTooLarge {
+                    len: usize::MAX,
+                    limit: MAX_FRAME_BYTES,
+                })?;
+            if body.len() < msg_end {
                 return Err(FrameError::Short {
-                    needed: msg_start + msg_len,
+                    needed: msg_end,
                     got: body.len(),
                 });
             }
-            let message = std::str::from_utf8(&body[msg_start..msg_start + msg_len])
+            let message = std::str::from_utf8(&body[msg_start..msg_end])
                 .map_err(|_| FrameError::BadValueUtf8)?
                 .into();
-            let metadata = decode_metadata(&body[msg_start + msg_len..])?.0;
+            let metadata_bytes = &body[msg_end..];
+            let (metadata, consumed) = decode_metadata(metadata_bytes)?;
+            if consumed != metadata_bytes.len() {
+                return Err(FrameError::TrailingBytes {
+                    remaining: metadata_bytes.len() - consumed,
+                });
+            }
             Ok(Frame::End(EndFrame {
                 status,
                 trailer: Trailer {
@@ -205,6 +307,11 @@ pub fn decode_frame(buf: &[u8]) -> Result<Frame, FrameError> {
             if body.is_empty() {
                 return Err(FrameError::Short { needed: 1, got: 0 });
             }
+            if body.len() > 1 {
+                return Err(FrameError::TrailingBytes {
+                    remaining: body.len() - 1,
+                });
+            }
             let code = WireCode::from_u8(body[0]).ok_or(FrameError::UnknownCode(body[0]))?;
             Ok(Frame::Reset(ResetFrame { code }))
         }
@@ -213,6 +320,11 @@ pub fn decode_frame(buf: &[u8]) -> Result<Frame, FrameError> {
                 return Err(FrameError::Short {
                     needed: 4,
                     got: body.len(),
+                });
+            }
+            if body.len() > 4 {
+                return Err(FrameError::TrailingBytes {
+                    remaining: body.len() - 4,
                 });
             }
             let additional_bytes = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
@@ -255,7 +367,7 @@ fn decode_metadata(buf: &[u8]) -> Result<(Metadata, usize), FrameError> {
     let (count, consumed) = read_varint(buf)?;
     if count > METADATA_MAX_ENTRIES {
         return Err(FrameError::BodyTooLarge {
-            len: count as usize,
+            len: usize::try_from(count).unwrap_or(usize::MAX),
             limit: METADATA_MAX_ENTRIES as usize,
         });
     }
@@ -264,58 +376,58 @@ fn decode_metadata(buf: &[u8]) -> Result<(Metadata, usize), FrameError> {
     for _ in 0..count {
         let (key_len, c) = read_varint(&buf[pos..])?;
         pos += c;
-        let key_len = key_len as usize;
-        if key_len > METADATA_MAX_FIELD_LEN {
-            return Err(FrameError::BodyTooLarge {
-                len: key_len,
-                limit: METADATA_MAX_FIELD_LEN,
-            });
-        }
-        if buf.len() < pos + key_len {
+        let key_len = bounded_len(key_len, METADATA_MAX_FIELD_LEN)?;
+        let key_end = pos.checked_add(key_len).ok_or(FrameError::BodyTooLarge {
+            len: usize::MAX,
+            limit: METADATA_MAX_FIELD_LEN,
+        })?;
+        if buf.len() < key_end {
             return Err(FrameError::Short {
-                needed: pos + key_len,
+                needed: key_end,
                 got: buf.len(),
             });
         }
-        let key = std::str::from_utf8(&buf[pos..pos + key_len])
+        let key = std::str::from_utf8(&buf[pos..key_end])
             .map_err(|_| FrameError::BadKeyUtf8)?
             .to_string();
-        pos += key_len;
-        if buf.len() < pos + 1 {
+        pos = key_end;
+        let tag_end = pos.checked_add(1).ok_or(FrameError::BodyTooLarge {
+            len: usize::MAX,
+            limit: MAX_FRAME_BYTES,
+        })?;
+        if buf.len() < tag_end {
             return Err(FrameError::Short {
-                needed: pos + 1,
+                needed: tag_end,
                 got: buf.len(),
             });
         }
         let tag = buf[pos];
-        pos += 1;
+        pos = tag_end;
         let (val_len, c) = read_varint(&buf[pos..])?;
         pos += c;
-        let val_len = val_len as usize;
-        if val_len > METADATA_MAX_FIELD_LEN {
-            return Err(FrameError::BodyTooLarge {
-                len: val_len,
-                limit: METADATA_MAX_FIELD_LEN,
-            });
-        }
-        if buf.len() < pos + val_len {
+        let val_len = bounded_len(val_len, METADATA_MAX_FIELD_LEN)?;
+        let value_end = pos.checked_add(val_len).ok_or(FrameError::BodyTooLarge {
+            len: usize::MAX,
+            limit: METADATA_MAX_FIELD_LEN,
+        })?;
+        if buf.len() < value_end {
             return Err(FrameError::Short {
-                needed: pos + val_len,
+                needed: value_end,
                 got: buf.len(),
             });
         }
         let value = match tag {
             0 => {
-                let s = std::str::from_utf8(&buf[pos..pos + val_len])
+                let s = std::str::from_utf8(&buf[pos..value_end])
                     .map_err(|_| FrameError::BadValueUtf8)?;
                 crate::metadata::MetadataValue::Text(s.into())
             }
-            1 => crate::metadata::MetadataValue::Bytes(Bytes::copy_from_slice(
-                &buf[pos..pos + val_len],
-            )),
-            other => return Err(FrameError::UnknownKind(other)),
+            1 => {
+                crate::metadata::MetadataValue::Bytes(Bytes::copy_from_slice(&buf[pos..value_end]))
+            }
+            other => return Err(FrameError::UnknownMetadataTag(other)),
         };
-        pos += val_len;
+        pos = value_end;
         meta.insert(key, value);
     }
     Ok((meta, pos))
@@ -348,13 +460,26 @@ pub(crate) fn read_varint(buf: &[u8]) -> Result<(u64, usize), FrameError> {
 /// Returns:
 /// - `Ok(Some((value, consumed)))` — complete varint decoded
 /// - `Ok(None)` — buffer ends mid-varint (≤ 9 continuation bytes seen)
-/// - `Err(BadVarint)` — 10 continuation bytes seen, malformed
+/// - `Err(BadVarint)` — non-minimal, overflowing, or overlong encoding
 pub(crate) fn read_varint_partial(buf: &[u8]) -> Result<Option<(u64, usize)>, FrameError> {
     let mut result: u64 = 0;
     let mut shift = 0;
     for (i, byte) in buf.iter().take(10).enumerate() {
+        // A u64 LEB128 has only one payload bit in its tenth byte. Accepting
+        // anything larger silently discards high bits in the shift below and
+        // lets multiple hostile encodings alias the same length.
+        if i == 9 && byte & 0x7f > 1 {
+            return Err(FrameError::BadVarint);
+        }
         result |= u64::from(byte & 0x7f) << shift;
         if byte & 0x80 == 0 {
+            // Unsigned LEB128 is canonical only when a multi-byte encoding's
+            // terminal group is non-zero. For example, 0x80 0x00 aliases the
+            // one-byte encoding 0x00 and must not be another accepted wire
+            // spelling.
+            if i > 0 && byte & 0x7f == 0 {
+                return Err(FrameError::BadVarint);
+            }
             return Ok(Some((result, i + 1)));
         }
         shift += 7;
@@ -377,6 +502,36 @@ pub(crate) fn read_varint_partial(buf: &[u8]) -> Result<Option<(u64, usize)>, Fr
 /// The mux's body-frame cap is a flow-control knob; this cap is the
 /// parser's escape hatch. They differ in concern and lifecycle.
 pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
+
+/// Validate an untrusted wire length before narrowing it to the host pointer
+/// width. Comparing in `u64` first is essential on 32-bit targets: a direct
+/// `as usize` cast can wrap a huge announced length below the frame cap.
+#[cfg(any(feature = "iroh", test))]
+pub(crate) fn bounded_frame_len(len: u64) -> Result<usize, FrameError> {
+    if len > MAX_FRAME_BYTES as u64 {
+        return Err(FrameError::OversizedFrame {
+            len: usize::try_from(len).unwrap_or(usize::MAX),
+            cap: MAX_FRAME_BYTES,
+        });
+    }
+    usize::try_from(len).map_err(|_| FrameError::OversizedFrame {
+        len: usize::MAX,
+        cap: MAX_FRAME_BYTES,
+    })
+}
+
+fn bounded_len(len: u64, limit: usize) -> Result<usize, FrameError> {
+    if len > limit as u64 {
+        return Err(FrameError::BodyTooLarge {
+            len: usize::try_from(len).unwrap_or(usize::MAX),
+            limit,
+        });
+    }
+    usize::try_from(len).map_err(|_| FrameError::BodyTooLarge {
+        len: usize::MAX,
+        limit,
+    })
+}
 
 #[cfg(test)]
 mod tests {
@@ -419,6 +574,20 @@ mod tests {
         let (val, consumed) = read_varint_partial(&buf).unwrap().unwrap();
         assert_eq!(consumed, 10);
         assert_eq!(val, u64::MAX);
+
+        // The tenth byte has only one payload bit. Without this check, the
+        // shift discarded high bits and hostile overlong lengths aliased a
+        // smaller u64 value.
+        buf[9] = 0x02;
+        assert!(matches!(
+            read_varint_partial(&buf),
+            Err(FrameError::BadVarint)
+        ));
+
+        assert!(matches!(
+            read_varint_partial(&[0x80, 0x00]),
+            Err(FrameError::BadVarint)
+        ));
     }
 
     #[test]
@@ -437,6 +606,17 @@ mod tests {
             assert!(MAX_FRAME_BYTES >= 1 << 20);
             assert!(MAX_FRAME_BYTES <= 16 * 1024 * 1024);
         }
+        assert_eq!(
+            bounded_frame_len(MAX_FRAME_BYTES as u64).unwrap(),
+            MAX_FRAME_BYTES
+        );
+        assert!(matches!(
+            bounded_frame_len(u64::MAX),
+            Err(FrameError::OversizedFrame {
+                len: usize::MAX,
+                cap: _
+            })
+        ));
     }
 
     #[test]
@@ -462,6 +642,60 @@ mod tests {
             }
             _ => panic!("expected Open"),
         }
+    }
+
+    #[test]
+    fn structured_frames_reject_trailing_bytes() {
+        for frame in [
+            Frame::Open(OpenFrame {
+                method_id: 7,
+                headers: Metadata::new(),
+            }),
+            Frame::End(EndFrame {
+                status: WireCode::Ok,
+                trailer: Trailer::ok(),
+            }),
+            Frame::Reset(ResetFrame {
+                code: WireCode::Cancelled,
+            }),
+            Frame::Credit(CreditFrame {
+                additional_bytes: 1,
+            }),
+        ] {
+            let mut encoded = bytes::BytesMut::new();
+            encode_frame(&frame, &mut encoded);
+            encoded.extend_from_slice(&[0]);
+            assert!(matches!(
+                decode_frame(&encoded),
+                Err(FrameError::TrailingBytes { remaining: 1 })
+            ));
+        }
+    }
+
+    #[test]
+    fn outbound_size_is_rejected_before_encoding() {
+        let oversized = Frame::Body(Bytes::from(vec![0; MAX_FRAME_BYTES]));
+        assert!(matches!(
+            encoded_frame_len(&oversized),
+            Err(FrameError::OversizedFrame {
+                len,
+                cap: MAX_FRAME_BYTES,
+            }) if len == MAX_FRAME_BYTES + 1
+        ));
+
+        let mut metadata = Metadata::new();
+        metadata.insert_bytes("large", Bytes::from(vec![0; METADATA_MAX_FIELD_LEN + 1]));
+        let open = Frame::Open(OpenFrame {
+            method_id: 8,
+            headers: metadata,
+        });
+        assert!(matches!(
+            encoded_frame_len(&open),
+            Err(FrameError::BodyTooLarge {
+                len,
+                limit: METADATA_MAX_FIELD_LEN,
+            }) if len == METADATA_MAX_FIELD_LEN + 1
+        ));
     }
 
     #[test]

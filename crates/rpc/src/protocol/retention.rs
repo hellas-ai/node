@@ -4,8 +4,8 @@
 /// OpenAI's `store` for Fetch), but execution code only carries this type.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Retention {
-    Ephemeral,
     #[default]
+    Ephemeral,
     Retain,
 }
 
@@ -32,5 +32,16 @@ impl From<bool> for Retention {
 impl From<Retention> for bool {
     fn from(retention: Retention) -> Self {
         retention.should_retain()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Retention;
+
+    #[test]
+    fn retention_defaults_to_ephemeral() {
+        assert_eq!(Retention::default(), Retention::Ephemeral);
+        assert!(!Retention::default().should_retain());
     }
 }

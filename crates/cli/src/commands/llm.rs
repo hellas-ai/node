@@ -1,28 +1,139 @@
 use crate::commands::CliResult;
+#[cfg(feature = "evaluate")]
 use anyhow::Context;
 use futures::StreamExt;
 use hellas_client::ExecutionRoute;
 #[cfg(feature = "evaluate")]
-use hellas_executor::{Executor, PackageSource};
+use hellas_executor::{
+    ArtifactStoreConfig, CausalLmEnvironmentSource, Executor, ExecutorMetrics, ExecutorSpawnConfig,
+    FetchAccessPolicy, FetchRouteRegistry, FetchTranscriptStoreBackend, GpuConfig,
+};
 use hellas_gateway::{
-    CliRuntime, ExecutionEvent, ExecutionRequest, ExecutionRequestOptions, ExecutionStrategy,
-    Outcome,
+    CausalLmExecutionEnvironment, CliRuntime, ExecutionEvent, ExecutionRequest,
+    ExecutionRequestOptions, ExecutionStrategy, Outcome,
 };
 use hellas_presentation::{TextOutputDecoder, TextPresentation};
-use hellas_rpc::{Assurance, ContentId, ExecutionPackageId, ProducerSigningKey, Retention};
+use hellas_rpc::{Assurance, ContentId, ProducerSigningKey, Retention};
+#[cfg(feature = "evaluate")]
+use hellas_store::ContentStore;
 use iroh::{EndpointId, SecretKey};
 use std::io::{self, Write};
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+/// Canonical evaluator metadata loaded from an operator-selected root file.
+///
+/// The caller-selected or locally derived manifest is the only evaluator
+/// identity sent in a remote quote. The environment body stays local and
+/// supplies the bounded causal-LM metadata used to validate the token request.
+pub(crate) struct LoadedCausalLmEnvironment {
+    execution: CausalLmExecutionEnvironment,
+    #[cfg(feature = "evaluate")]
+    manifest_bytes: Vec<u8>,
+}
+
+impl LoadedCausalLmEnvironment {
+    pub(crate) fn execution(&self) -> &CausalLmExecutionEnvironment {
+        &self.execution
+    }
+
+    pub(crate) fn into_execution(self) -> CausalLmExecutionEnvironment {
+        self.execution
+    }
+}
+
+/// Strictly load one canonical causal-LM root and enforce any caller-selected
+/// manifest identity before constructing a local or remote route.
+pub(crate) fn load_environment(
+    path: &Path,
+    manifest_id: Option<ContentId>,
+) -> CliResult<LoadedCausalLmEnvironment> {
+    let bytes = super::read_bounded_regular_file(
+        path,
+        "environment",
+        hellas_rpc::MAX_CAUSAL_LM_ENVIRONMENT_BYTES,
+    )?;
+    let environment =
+        hellas_rpc::CausalLmEnvironment::from_canonical_bytes(&bytes).map_err(|error| {
+            anyhow::anyhow!("invalid canonical environment {}: {error}", path.display())
+        })?;
+    let manifest = environment.manifest();
+    let manifest_bytes = manifest.canonical_bytes();
+    let derived_manifest_id = manifest.content_id();
+    let expected_manifest_id = manifest_id.unwrap_or(derived_manifest_id);
+    anyhow::ensure!(
+        derived_manifest_id == expected_manifest_id,
+        "environment {} derives manifest {derived_manifest_id}, not caller-pinned {expected_manifest_id}",
+        path.display()
+    );
+    let execution = CausalLmExecutionEnvironment::from_canonical_bytes(
+        expected_manifest_id,
+        manifest_bytes.clone(),
+        bytes,
+    )
+    .map_err(|error| anyhow::anyhow!("invalid causal-LM execution environment: {error}"))?;
+    Ok(LoadedCausalLmEnvironment {
+        execution,
+        #[cfg(feature = "evaluate")]
+        manifest_bytes,
+    })
+}
+
+/// Build the local, verified content view required by a local execution leg.
+///
+/// No acquisition occurs here. The environment root is indexed alongside the
+/// operator-named program/static files, then the executor seam proves that all
+/// exact content references are present before a route is started.
+#[cfg(feature = "evaluate")]
+pub(crate) fn local_content_store(
+    enabled: bool,
+    environment_path: &Path,
+    environment: &LoadedCausalLmEnvironment,
+    mut content_paths: Vec<PathBuf>,
+    content_roots: Vec<PathBuf>,
+    content_index: Option<PathBuf>,
+) -> CliResult<Option<ContentStore>> {
+    if !enabled {
+        anyhow::ensure!(
+            content_paths.is_empty() && content_roots.is_empty() && content_index.is_none(),
+            "--content, --content-root, and --content-index require --local or --verify-local"
+        );
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        !content_paths.is_empty() || !content_roots.is_empty(),
+        "--local and --verify-local require at least one --content or --content-root"
+    );
+    if !content_paths.iter().any(|path| path == environment_path) {
+        content_paths.push(environment_path.to_owned());
+    }
+    let content_index = content_index
+        .or_else(hellas_store::state::records_path)
+        .context("no content-store state directory; pass --content-index FILE")?;
+    let store = crate::commands::environment::index_content(
+        &content_paths,
+        &content_roots,
+        &content_index,
+    )?;
+    let source =
+        CausalLmEnvironmentSource::from_manifest_bytes(&store, &environment.manifest_bytes)
+            .context("local content does not satisfy the causal-LM environment")?;
+    anyhow::ensure!(
+        source.manifest_id() == environment.execution.manifest_id(),
+        "local content resolved a different program manifest"
+    );
+    Ok(Some(store))
+}
 
 pub struct ExecuteOptions {
     pub node_id: Option<EndpointId>,
     pub node_addrs: Vec<SocketAddr>,
-    pub package_name: String,
-    pub execution_package: Option<ExecutionPackageId>,
+    /// Presentation label. It never enters a quote or manifest.
+    pub model_name: String,
+    pub causal_lm: CausalLmExecutionEnvironment,
     #[cfg(feature = "evaluate")]
-    pub local_package: Option<PackageSource>,
+    pub local_content_store: Option<ContentStore>,
     pub tokenizer: PathBuf,
     pub stop_token_ids: Vec<u32>,
     pub prompt: String,
@@ -59,67 +170,53 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
     };
 
     // Presentation is an explicitly separate local input. Hellas commits the
-    // resulting token IDs, not this tokenizer or the decoded text it produces.
+    // resulting token IDs, not this tokenizer, label, or decoded text.
     let presentation = Arc::new(TextPresentation::load(&options.tokenizer)?);
     let input_ids = presentation.encode(&options.prompt)?;
     let mut decoder = TextOutputDecoder::new(presentation);
-    let package_name = options.package_name;
+    let manifest_id = options.causal_lm.manifest_id();
+    info!(program_manifest = %manifest_id, "using canonical causal-LM environment");
     let runner_key = options.producer_key.clone();
 
     #[cfg(feature = "evaluate")]
-    let (runtime, execution_package) = if options.local || options.verify_local {
-        let executor = Executor::spawn_with_producer_key(
-            hellas_rpc::policy::ExecutePolicy::Eager,
-            hellas_rpc::DEFAULT_EXECUTION_QUEUE_CAPACITY,
-            runner_key.clone(),
-            options.provider_genesis,
-            options.assurance,
-        )
+    let runtime = if options.local || options.verify_local {
+        let content_store = options
+            .local_content_store
+            .context("local Catena execution requires a verified local content store")?;
+        let executor = Executor::spawn_configured(ExecutorSpawnConfig {
+            execute_policy: hellas_rpc::policy::ExecutePolicy::Any,
+            queue_capacity: hellas_rpc::DEFAULT_EXECUTION_QUEUE_CAPACITY,
+            metrics: Arc::new(ExecutorMetrics::default()),
+            producer_key: Arc::new(runner_key.clone()),
+            provider_genesis: Arc::new(options.provider_genesis),
+            assurance: options.assurance,
+            fetch_access_policy: FetchAccessPolicy::trusted_callers([runner_key.public_key()]),
+            fetch_routes: FetchRouteRegistry::default(),
+            fetch_max_in_flight: hellas_rpc::DEFAULT_FETCH_MAX_IN_FLIGHT,
+            fetch_queue_capacity: hellas_rpc::DEFAULT_FETCH_QUEUE_CAPACITY,
+            fetch_replay_max_in_flight: hellas_rpc::DEFAULT_FETCH_REPLAY_MAX_IN_FLIGHT,
+            fetch_store: FetchTranscriptStoreBackend::memory(),
+            artifact_store: ArtifactStoreConfig::memory(),
+            content_store,
+            gpu_config: GpuConfig::default(),
+        })
+        .await
         .context("failed to initialize local Catena executor")?;
-        let local_package = options.local_package.context(
-            "local Catena execution needs a package manifest path; pass --package NAME=PATH",
-        )?;
-        let execution_package = executor
-            .materialize_package(local_package)
-            .await
-            .with_context(|| format!("failed to load Catena package {package_name}"))?;
-        info!(
-            package = %package_name,
-            execution_package = %execution_package,
-            "verified local Catena package"
-        );
         let runtime = CliRuntime::local(executor);
         if options.verify_local {
-            (
-                runtime.with_remote(secret_key.clone()).await?,
-                execution_package,
-            )
+            runtime.with_remote(secret_key.clone()).await?
         } else {
-            (runtime, execution_package)
+            runtime
         }
     } else {
-        let execution_package = options
-            .execution_package
-            .context("remote Catena execution requires --package-id <64-hex Catena package ID>")?;
-        (
-            CliRuntime::remote(secret_key.clone()).await?,
-            execution_package,
-        )
+        CliRuntime::remote(secret_key.clone()).await?
     };
     #[cfg(not(feature = "evaluate"))]
-    let (runtime, execution_package) = {
-        let execution_package = options
-            .execution_package
-            .context("remote Catena execution requires --package-id <64-hex Catena package ID>")?;
-        (
-            CliRuntime::remote(secret_key.clone()).await?,
-            execution_package,
-        )
-    };
+    let runtime = CliRuntime::remote(secret_key.clone()).await?;
 
     #[cfg(feature = "evaluate")]
     let strategy = if options.verify_local {
-        info!(package = %package_name, "executing remotely and verifying against local Catena");
+        info!(program_manifest = %manifest_id, "executing remotely and verifying against local Catena");
         ExecutionStrategy::Verify {
             primary: ExecutionRoute::remote(
                 options.node_id,
@@ -130,10 +227,10 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
             shadow: ExecutionRoute::Local,
         }
     } else if options.local {
-        info!(package = %package_name, "executing locally with Catena");
+        info!(program_manifest = %manifest_id, "executing locally with Catena");
         ExecutionStrategy::Run(ExecutionRoute::Local)
     } else {
-        info!(package = %package_name, "executing remotely with Catena");
+        info!(program_manifest = %manifest_id, "executing remotely with Catena");
         ExecutionStrategy::Run(ExecutionRoute::remote(
             options.node_id,
             options.node_addrs,
@@ -149,15 +246,15 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
         provider_trust.expect("remote route requires provider trust"),
     ));
 
+    info!(model = %options.model_name, "using presentation label");
     let remote_runtime = uses_remote.then(|| runtime.clone());
     let request = ExecutionRequest::new(
         runtime,
-        package_name,
+        options.causal_lm,
         input_ids,
         options.stop_token_ids,
         ExecutionRequestOptions {
             max_new_tokens: options.max_new_tokens,
-            execution_package,
             assurance: options.assurance,
             retention: Retention::from_retain(options.retain),
         },
@@ -201,4 +298,146 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
         runtime.close_remote().await;
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hellas_rpc::{CausalLmEnvironment, ContentId, ContentRef, StaticSlice};
+
+    fn fixture_environment(program: &[u8], weights: &[u8]) -> CausalLmEnvironment {
+        CausalLmEnvironment::new(
+            ContentRef::new(ContentId::hash(program), program.len() as u64),
+            "model",
+            vec![ContentRef::new(
+                ContentId::hash(weights),
+                weights.len() as u64,
+            )],
+            vec![StaticSlice::new(0, 0, weights.len() as u64)],
+            Vec::new(),
+            256,
+            1_024,
+        )
+        .expect("fixture environment is valid")
+    }
+
+    #[test]
+    fn loading_an_environment_derives_its_exact_manifest() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("model.environment");
+        let environment = fixture_environment(b"program", b"weights");
+        std::fs::write(&path, environment.canonical_bytes()).unwrap();
+
+        let loaded = load_environment(&path, None).unwrap();
+        assert_eq!(
+            loaded.into_execution().manifest_id(),
+            environment.manifest().content_id()
+        );
+    }
+
+    #[test]
+    fn loading_an_environment_accepts_its_explicit_manifest_pin() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("model.environment");
+        let environment = fixture_environment(b"program", b"weights");
+        let manifest_id = environment.manifest().content_id();
+        std::fs::write(&path, environment.canonical_bytes()).unwrap();
+
+        let loaded = load_environment(&path, Some(manifest_id)).unwrap();
+        assert_eq!(loaded.into_execution().manifest_id(), manifest_id);
+    }
+
+    #[test]
+    fn loading_an_environment_rejects_a_mismatched_manifest_pin() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("model.environment");
+        let environment = fixture_environment(b"program", b"weights");
+        std::fs::write(&path, environment.canonical_bytes()).unwrap();
+
+        let expected = ContentId::from_bytes([0x55; 32]);
+        let error = load_environment(&path, Some(expected))
+            .err()
+            .expect("a mismatched caller pin must be refused");
+        let message = error.to_string();
+        assert!(message.contains("not caller-pinned"), "{message}");
+        assert!(message.contains(&expected.to_string()), "{message}");
+    }
+
+    #[test]
+    fn loading_an_environment_reads_only_the_protocol_bound() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("oversized.environment");
+        std::fs::write(
+            &path,
+            vec![0; hellas_rpc::MAX_CAUSAL_LM_ENVIRONMENT_BYTES + 1],
+        )
+        .unwrap();
+
+        let error = load_environment(&path, None)
+            .err()
+            .expect("oversize is refused");
+        assert!(error.to_string().contains("over the"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn loading_an_environment_rejects_a_fifo_without_waiting_for_a_writer() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("model.environment.fifo");
+        let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c_path` is a live, NUL-terminated path for this call.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let thread_path = path.clone();
+        let thread = std::thread::spawn(move || {
+            sender.send(load_environment(&thread_path, None)).unwrap();
+        });
+        let result = receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("environment loading blocked while opening a FIFO");
+        let error = result.err().expect("a FIFO must be refused");
+        assert!(format!("{error:#}").contains("not a regular file"));
+        thread.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn loading_an_environment_rejects_a_device_before_reading_from_it() {
+        let error = load_environment(Path::new("/dev/zero"), None)
+            .err()
+            .expect("a device must not be accepted as an environment");
+        assert!(format!("{error:#}").contains("not a regular file"));
+    }
+
+    #[cfg(feature = "evaluate")]
+    #[test]
+    fn local_content_is_bound_before_executor_startup() {
+        let directory = tempfile::tempdir().unwrap();
+        let program_path = directory.path().join("model.hex");
+        let weights_path = directory.path().join("weights.bin");
+        let environment_path = directory.path().join("model.environment");
+        let index_path = directory.path().join("fastresume.bin");
+        let program = b"program";
+        let weights = b"weights";
+        std::fs::write(&program_path, program).unwrap();
+        std::fs::write(&weights_path, weights).unwrap();
+        let environment = fixture_environment(program, weights);
+        std::fs::write(&environment_path, environment.canonical_bytes()).unwrap();
+        let loaded = load_environment(&environment_path, None).unwrap();
+
+        let store = local_content_store(
+            true,
+            &environment_path,
+            &loaded,
+            vec![program_path, weights_path],
+            Vec::new(),
+            Some(index_path),
+        )
+        .unwrap();
+        assert!(store.is_some());
+    }
 }

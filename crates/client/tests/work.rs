@@ -45,16 +45,16 @@ use hellas_rpc::protocol::work_setup::{
 };
 use hellas_rpc::services::work::WorkServer;
 use hellas_rpc::work::{
-    BackendFault, ClientEndpoint, PaidEvaluateBackend, ProviderEndpoint, RunOutcome, WorkService,
-    run_accepted_work,
+    BackendFault, ClientEndpoint, PaidEvaluateBackend, PreparedEvaluateInput, ProviderEndpoint,
+    RunOutcome, WorkService, run_accepted_work,
 };
 use hellas_rpc::work_close::{BlockSourceError, FinalizedBlocks, FinalizedWork, observe};
 use hellas_rpc::work_store::{
     ChannelRecord, ChannelStore, JobPhase, JobState, Role, SetupOrigin, TerminalOutcome,
 };
 use hellas_rpc::{
-    Assurance, EvaluateProgramManifest, EvaluateRequest, ExecutionPackageId, OutputEventEnvelope,
-    ProducerSigningKey, ProgramManifest, PublicKey,
+    Application, Assurance, CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR, ContentId, EvaluateRequest,
+    OutputEventEnvelope, ProducerSigningKey, ProgramManifest, PublicKey,
 };
 use hellas_wire::mux::{MessagePipe, MuxConfig, MuxTransport, Role as MuxRole};
 use hellas_wire::{DefaultClock, Dispatcher, StreamTransport};
@@ -307,9 +307,11 @@ fn commit(store: &mut ChannelStore, record: ChannelRecord) {
 // ── The prepared inputs a job executes from ───────────────────────────
 
 fn manifest() -> ProgramManifest {
-    ProgramManifest::Evaluate(EvaluateProgramManifest {
-        execution_package: ExecutionPackageId::from_bytes([0x16; 32]),
-    })
+    ProgramManifest::new(
+        Application::new(CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR)
+            .expect("the causal-LM application identity is valid"),
+        ContentId::from_bytes([0x16; 32]),
+    )
 }
 
 /// The prompt every job here runs on. It is the whole input, because
@@ -325,10 +327,7 @@ fn text_policy() -> TextPolicy {
 }
 
 fn identity_artifact() -> TextArtifact {
-    TextArtifact::identity(
-        BoundTermId::from_digest(manifest().content_id().digest()),
-        ExecutionPackageId::from_bytes([0x16; 32]),
-    )
+    TextArtifact::identity(BoundTermId::from_digest(manifest().content_id().digest()))
 }
 
 fn text_execution() -> TextExecution {
@@ -442,6 +441,7 @@ fn transcript_for(request: &EvaluateRequest, answer: &[u32]) -> Vec<OutputEventE
     match builder.finish(EvaluateTerminal {
         final_position: answer.len() as u64,
         stop_reason: EvaluateStopReason::STOP_TOKEN,
+        matched_stop_token_id: Some(1),
         text_artifact,
         usage,
         billable_units,
@@ -467,11 +467,11 @@ impl AnsweringBackend {
 impl PaidEvaluateBackend for AnsweringBackend {
     fn evaluate(
         &self,
-        request: EvaluateRequest,
+        input: PreparedEvaluateInput,
     ) -> impl core::future::Future<Output = Result<Vec<OutputEventEnvelope>, BackendFault>> + Send
     {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        let produced = transcript_for(&request, &ANSWER);
+        let produced = transcript_for(input.evaluate_request(), &ANSWER);
         async move { Ok(produced) }
     }
 }
@@ -574,6 +574,7 @@ impl FixedEngine {
             answer: Ok(Reproduced {
                 output_token_ids: tokens.to_vec(),
                 stop_reason: EvaluateStopReason::STOP_TOKEN,
+                matched_stop_token_id: Some(1),
             }),
         }
     }
@@ -674,6 +675,7 @@ impl Reproducer for LatchedEngine {
         Ok(Reproduced {
             output_token_ids: ANSWER.to_vec(),
             stop_reason: EvaluateStopReason::STOP_TOKEN,
+            matched_stop_token_id: Some(1),
         })
     }
 }

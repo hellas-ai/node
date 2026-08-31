@@ -78,7 +78,7 @@ use hellas_kernel::{
 };
 use hellas_xet::{MIN_CHUNK_SIZE, SingleChunkHasher, XetFileHasher};
 
-use crate::evaluate::{EvaluateTerminal, verify_output_events};
+use crate::evaluate::{EvaluateTerminal, validate_terminal_stop_witness, verify_output_events};
 use crate::protocol::artifacts::{
     Canonical, InputAddressed, OutputAddressed, PreparedPaidInputV1, SourceRef, TextArtifact,
 };
@@ -118,7 +118,7 @@ const PAYMENT_BINDING: &[u8] = b"hellas.work.payment-binding.v1";
 /// one connection.
 const DELIVERY_REQUEST: &[u8] = b"hellas.work.delivery-request.v1";
 /// The normalized Evaluate answer the client's re-execution compares.
-const EVALUATE_OUTPUT: &[u8] = b"hellas.work.evaluate-output.v1";
+const EVALUATE_OUTPUT: &[u8] = b"hellas.work.evaluate-output.v2";
 
 // ── Envelope ──────────────────────────────────────────────────────────
 
@@ -1092,6 +1092,9 @@ pub fn canonical_output_digest(
     output_token_ids: &[u32],
     terminal: &EvaluateTerminal,
 ) -> Result<Digest, PaidWorkError> {
+    validate_terminal_stop_witness(terminal).map_err(|_| PaidWorkError::Mismatch {
+        field: "matched stop token id",
+    })?;
     let output_count =
         u64::try_from(output_token_ids.len()).map_err(|_| PaidWorkError::Overflow {
             field: "output token count",
@@ -1125,6 +1128,13 @@ pub fn canonical_output_digest(
     }
     hasher.update(&terminal.final_position.to_be_bytes());
     hasher.update(&[terminal.stop_reason.as_u8()]);
+    match terminal.matched_stop_token_id {
+        Some(token_id) => {
+            hasher.update(&[1]);
+            hasher.update(&token_id.to_be_bytes());
+        }
+        None => hasher.update(&[0]),
+    }
     hasher.update(terminal.text_artifact.as_bytes());
     hasher.update(&terminal.usage.input_units.to_be_bytes());
     hasher.update(&terminal.usage.output_units.to_be_bytes());
@@ -1423,11 +1433,10 @@ pub fn check_prepared_input(
     // job that resumed a previous output would be paid for work whose
     // input this bundle does not carry.
     //
-    // Its bound term is the environment the execution actually resolves
-    // in — a party materializing this source reads the execution package from
-    // here, not from the request — so an identity naming another
-    // environment is a job that would fault at dispatch after both
-    // parties had signed for it.
+    // Its bound term is the manifest identity the execution resolves in. A
+    // party reconstructing this source reads that exact manifest from the
+    // prepared bundle, so an identity naming another environment is a job
+    // that would fault at dispatch after both parties had signed for it.
     let TextArtifact::Identity { bound_term, .. } = &parts.identity_artifact else {
         return Err(PaidWorkError::Mismatch {
             field: "identity_artifact kind",
@@ -1448,7 +1457,7 @@ pub fn check_prepared_input(
     let graph = [
         (
             "manifest content id",
-            parts.manifest.as_bytes() == request.execution_environment.as_bytes(),
+            parts.manifest.content_id().as_bytes() == request.execution_environment.as_bytes(),
         ),
         (
             "environment_commitment",

@@ -106,9 +106,10 @@ message OutputEventEnvelope {
 
 // Wire protocol: zero or more WorkChunk events, terminated by exactly one
 // WorkFinished or WorkFailed, after which the stream ends. WorkChunk events
-// carry signed output events as they become available. Successful result
-// commitment lives in the terminal signed output event; WorkFinished is stream
-// framing, not a scheme result carrier.
+// carry the signed non-terminal prefix as it becomes available; WorkFinished
+// carries exactly the next signed terminal event. Successful result commitment
+// lives in that terminal event; WorkFinished is stream framing, not a second
+// copy of the transcript or a scheme result carrier.
 message WorkEvent {
   oneof kind {
     WorkChunk chunk = 1;
@@ -123,7 +124,7 @@ message WorkChunk {
 
 message WorkFinished {
   reserved 1, 2;
-  repeated OutputEventEnvelope output_events = 3;
+  OutputEventEnvelope terminal_output_event = 3;
   repeated AssuranceEvidence assurance_evidence = 4;
 }
 

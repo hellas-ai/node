@@ -9,14 +9,11 @@ documentation.workspace = true
 
 [features]
 default = ["evaluate"]
-evaluate = ["dep:catena-runner", "dep:commonware-runtime"]
+evaluate = ["dep:catena-lang", "dep:commonware-runtime", "dep:hellas-store"]
 
 [dependencies]
 async-trait = "0.1"
-catena-runner = { workspace = true, default-features = false, features = [
-    "fetch",
-    "runtime",
-], optional = true }
+catena-lang = { workspace = true, optional = true }
 commonware-runtime = { workspace = true, optional = true }
 futures-core = "0.3"
 futures-util = "0.3"
@@ -29,6 +26,7 @@ hellas-rpc = { workspace = true, features = [
     "courtesy",
     "work",
 ] }
+hellas-store = { workspace = true, optional = true }
 hellas-wire = { workspace = true }
 prometheus-client = { workspace = true }
 rand = { workspace = true }
@@ -40,3 +38,6 @@ tokio-stream = { workspace = true }
 tracing = { workspace = true }
 uuid = { version = "1", features = ["v4"] }
 zeroize = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

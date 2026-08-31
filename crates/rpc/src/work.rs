@@ -137,7 +137,7 @@ use crate::pb::work::{
     deliver_result_response::Outcome as DeliverOutcome,
 };
 use crate::protocol::Digest;
-use crate::protocol::artifacts::PreparedPaidInputV1;
+use crate::protocol::artifacts::{PreparedPaidInputParts, PreparedPaidInputV1};
 use crate::protocol::work::{
     JobDeadlines, PaidJobAuthorizationV1, PaidJobResultV1, PaidWorkError, PaymentBindingV1,
     PrivateRecord as _, check_authorization, check_prepared_input, delivery_request_digest,
@@ -762,13 +762,12 @@ impl ProviderEndpoint {
     /// finalized blocks through, not at the height the readiness was
     /// decided at.
     ///
-    /// The request it hands back is rebuilt from the bundle the journal
-    /// holds, never from a quote. That bundle is the one the
-    /// authorization both parties signed commits to: its digest is
-    /// checked before it is stored and again on every replay
-    /// (`ChannelState::apply_proposed`), so a bundle altered on disk
-    /// fails when the journal is opened rather than producing a job
-    /// nobody agreed to.
+    /// The request and canonical manifest it hands back are rebuilt from the
+    /// bundle the journal holds, never from a quote. That bundle is the one the
+    /// authorization both parties signed commits to: its digest is checked
+    /// before it is stored and again on every replay
+    /// (`ChannelState::apply_proposed`), so a bundle altered on disk fails when
+    /// the journal is opened rather than producing a job nobody agreed to.
     ///
     /// # Errors
     ///
@@ -825,15 +824,13 @@ impl ProviderEndpoint {
 
         let bundle = PreparedPaidInputV1::decode(job.prepared_input(), MAX_RECORD_BYTES)
             .map_err(PaidWorkError::from)?;
-        let request = bundle
-            .parts()
-            .map_err(PaidWorkError::from)?
-            .evaluate_request;
+        let parts = bundle.parts().map_err(PaidWorkError::from)?;
+        let input = PreparedEvaluateInput { parts };
 
         self.close
             .store
             .commit(ChannelRecord::JobRunning, &Secp256k1Verifier::new())?;
-        Ok(RunAdmission::Invoke(request))
+        Ok(RunAdmission::Invoke(Box::new(input)))
     }
 
     /// Signs the result of the transcript this job's invocation
@@ -1591,22 +1588,54 @@ impl BackendFault {
     }
 }
 
+/// The complete journaled input handed to a paid Evaluate backend.
+///
+/// All six bodies come from the same strictly decoded [`PreparedPaidInputV1`]
+/// whose digest the parties signed. Keeping the execution, tokens, policy, and
+/// identity here is what lets a backend run after restart without depending on
+/// transient Courtesy state. Environment bytes remain content-store data below
+/// the manifest root and do not cross this seam.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedEvaluateInput {
+    parts: PreparedPaidInputParts,
+}
+
+impl PreparedEvaluateInput {
+    /// Returns the Evaluate request rebuilt from the journal.
+    #[must_use]
+    pub const fn evaluate_request(&self) -> &EvaluateRequest {
+        &self.parts.evaluate_request
+    }
+
+    /// Returns the exact canonical ProgramManifest bytes from the journal.
+    #[must_use]
+    pub fn program_manifest(&self) -> Vec<u8> {
+        self.parts.manifest.canonical_bytes()
+    }
+
+    /// Transfers all six strictly decoded bodies to the backend implementation.
+    #[must_use]
+    pub fn into_parts(self) -> PreparedPaidInputParts {
+        self.parts
+    }
+}
+
 /// The one seam a paid job crosses on its way to real execution.
 ///
-/// One method, and it takes the request this endpoint rebuilt from its
-/// own journal rather than anything a peer sent. What comes back is the
-/// complete signed transcript of that invocation — not a digest of one,
-/// because a digest is exactly what a backend that ran nothing could
-/// also return.
+/// One method, and it takes the complete prepared graph this endpoint rebuilt
+/// from its own journal rather than anything transient or supplied at dispatch.
+/// What comes back is the complete signed transcript of that invocation — not
+/// a digest of one, because a digest is exactly what a backend that ran nothing
+/// could also return.
 ///
 /// Implementors must invoke once per call. That is not a property this
 /// trait can check, and it is not the one the gate rests on: the gate
 /// calls this at most once per `work_id` whatever the implementor does.
 pub trait PaidEvaluateBackend {
-    /// Runs one prepared Evaluate request to its terminal.
+    /// Runs one journaled Evaluate input to its terminal.
     fn evaluate(
         &self,
-        request: EvaluateRequest,
+        input: PreparedEvaluateInput,
     ) -> impl core::future::Future<Output = Result<Vec<OutputEventEnvelope>, BackendFault>> + Send;
 }
 
@@ -1614,8 +1643,8 @@ pub trait PaidEvaluateBackend {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RunAdmission {
     /// The marker is durable and the backend has not been called.
-    /// Invoke exactly once, with this request.
-    Invoke(EvaluateRequest),
+    /// Invoke exactly once, with this journaled input.
+    Invoke(Box<PreparedEvaluateInput>),
     /// This process marked the job and has not recorded its result.
     Running,
     /// A signed result already exists.
@@ -1741,8 +1770,8 @@ where
     B: PaidEvaluateBackend + Sync,
 {
     let admission = service.begin_run(work_id, ready)?;
-    let request = match admission {
-        RunAdmission::Invoke(request) => request,
+    let input = match admission {
+        RunAdmission::Invoke(input) => *input,
         RunAdmission::Running => return Ok(RunOutcome::Running),
         RunAdmission::Indeterminate => return Ok(RunOutcome::Indeterminate),
         RunAdmission::Ready { result, signature } => {
@@ -1750,7 +1779,7 @@ where
         }
     };
 
-    let transcript = match backend.evaluate(request).await {
+    let transcript = match backend.evaluate(input).await {
         Ok(transcript) => transcript,
         Err(fault) => return Err(end_failed(service, work_id, RunError::Backend(fault))),
     };

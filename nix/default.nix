@@ -3,8 +3,7 @@
   system,
   nixpkgs,
   rust-overlay,
-  catena-runner,
-  exploratory-catena,
+  catena-lang,
 }:
 let
   nativePkg = import ./package.nix {
@@ -13,8 +12,7 @@ let
       system
       nixpkgs
       rust-overlay
-      catena-runner
-      exploratory-catena
+      catena-lang
       ;
   };
   inherit (nativePkg)
@@ -121,8 +119,7 @@ let
           system
           nixpkgs
           rust-overlay
-          catena-runner
-          exploratory-catena
+          catena-lang
           crossSystem
           ;
       };
@@ -145,8 +142,8 @@ let
         buildFeatures = [ "validator" ];
       };
     }
-    # The current runner is HIP-only. Do not advertise a local Catena runtime
-    # on platforms where its execution backend cannot work.
+    # Do not advertise the safe local GPU runtime on platforms where the
+    # packaged provider toolchain is not yet supported.
     //
       lib.optionalAttrs (crossSystem == null && pkgSpec.pkgs.stdenv.hostPlatform.system == "x86_64-linux")
         {
@@ -175,20 +172,6 @@ let
 
   nativePackages = packagesFor null;
   isX86_64Linux = pkgs.stdenv.hostPlatform.system == "x86_64-linux";
-  rocmPath = lib.optionalAttrs isX86_64Linux {
-    path = pkgs.symlinkJoin {
-      name = "hellas-rocm-path";
-      paths = [
-        pkgs.rocmPackages.clang
-        pkgs.rocmPackages.clr
-        pkgs.rocmPackages.hip-common
-        pkgs.rocmPackages.hipcc
-        pkgs.rocmPackages.rocm-core
-        pkgs.rocmPackages.rocm-device-libs
-        pkgs.rocmPackages.rocm-runtime
-      ];
-    };
-  };
   # Flat `cross-<target>-<name>` packages. Nested `packages.<sys>.cross.<target>.<name>`
   # violates the flake schema (each entry must be a derivation), which `nix flake check`
   # rightly flags.
@@ -261,12 +244,19 @@ let
             pkgs.rocmPackages.hipcc
           ];
           shellHook = envShellHook + ''
-            export ROCM_PATH=${rocmPath.path}
-            export HIP_PATH=${rocmPath.path}
+            # hipcc's setup selects its clang as the host C compiler. That
+            # compiler emits LLVM 22 LTO objects which this Rust toolchain's
+            # lld cannot consume (notably while building alloca's C shim).
+            # Keep ordinary build scripts on nixpkgs' wrapped host compiler;
+            # Catena still reaches ROCm through hipcc and HIP_CLANG_PATH.
+            export CC=${pkgs.stdenv.cc}/bin/cc
+            export CXX=${pkgs.stdenv.cc}/bin/c++
+            export ROCM_PATH=${pkgs.hellasLib.rocmToolkit}
+            export HIP_PATH=${pkgs.hellasLib.rocmToolkit}
             export HIP_CLANG_PATH=${pkgs.rocmPackages.clang}/bin
             export DEVICE_LIB_PATH=${pkgs.rocmPackages.rocm-device-libs}/amdgcn/bitcode
-            export HIP_FLAGS="--rocm-path=${rocmPath.path} --rocm-device-lib-path=${pkgs.rocmPackages.rocm-device-libs}/amdgcn/bitcode"
-            export LD_LIBRARY_PATH=${rocmPath.path}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+            export HIP_FLAGS="--rocm-path=${pkgs.hellasLib.rocmToolkit} --rocm-device-lib-path=${pkgs.rocmPackages.rocm-device-libs}/amdgcn/bitcode"
+            export LD_LIBRARY_PATH=${pkgs.hellasLib.rocmToolkit}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
           '';
         };
       };
@@ -275,7 +265,19 @@ let
     }
   );
 
+  noCatgradLock =
+    pkgs.runCommand "hellas-no-catgrad-lock" { nativeBuildInputs = [ pkgs.gnugrep ]; }
+      ''
+        if grep -Eqi 'catgrad' ${../flake.lock}; then
+          echo "flake.lock still contains Catgrad after the Catena cutover" >&2
+          exit 1
+        fi
+        touch "$out"
+      '';
+
   hydraLints = {
+    "no-catgrad-lock" = noCatgradLock;
+
     sort = mkHydraSourceCheck {
       name = "check-sort";
       inputs = [ pkgs.cargo-sort ];
@@ -413,7 +415,9 @@ in
   ci = { inherit (ci) checks builds; };
 
   # nixosTests are also surfaced under `checks` so `nix flake check` runs them.
-  checks = linuxOutputs.nixosTests or { };
+  checks = (linuxOutputs.nixosTests or { }) // {
+    "no-catgrad-lock" = noCatgradLock;
+  };
   nixosTests = linuxOutputs.nixosTests or { };
 
   hydraJobs = {

@@ -1,138 +1,328 @@
-use core::{fmt, str::FromStr};
-
 use crate::{ContentId, DagCborEncoder};
 
-/// The exact executable Catena package a text evaluation runs.
+use super::value::{CanonicalDecodeError, CanonicalDecoder};
+
+const PROGRAM_MANIFEST_DOMAIN: &str = "hellas.program.manifest.v4";
+const MAX_PROGRAM_MANIFEST_BYTES: usize = 4 * 1024;
+/// Maximum UTF-8 byte length of each opaque application identity component.
+pub const MAX_APPLICATION_ID_BYTES: usize = 1024;
+
+/// The exact evaluator and adaptor that interpret a program root.
 ///
-/// This is an opaque digest produced by the Catena package verifier. Hellas
-/// deliberately does not reinterpret it as one of its own content IDs: the
-/// producer and hash domain belong to Catena, while the surrounding
-/// [`ProgramManifest`] is content-addressed by Hellas.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ExecutionPackageId([u8; 32]);
-
-impl ExecutionPackageId {
-    pub const LEN: usize = 32;
-
-    pub const fn from_bytes(bytes: [u8; Self::LEN]) -> Self {
-        Self(bytes)
-    }
-
-    pub const fn as_bytes(&self) -> &[u8; Self::LEN] {
-        &self.0
-    }
+/// Both identifiers are opaque. Identity compares the complete pair exactly as
+/// supplied: this layer performs no parsing, normalization, version
+/// negotiation, or compatibility inference.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Application {
+    evaluator: String,
+    adaptor: String,
 }
 
-impl fmt::Display for ExecutionPackageId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for byte in self.0 {
-            write!(formatter, "{byte:02x}")?;
+impl Application {
+    /// Builds one exact application identity without parsing or normalization.
+    pub fn new(
+        evaluator: impl Into<String>,
+        adaptor: impl Into<String>,
+    ) -> Result<Self, ApplicationError> {
+        let evaluator = evaluator.into();
+        let adaptor = adaptor.into();
+        if evaluator.is_empty() {
+            return Err(ApplicationError::EmptyEvaluator);
         }
-        Ok(())
-    }
-}
-
-impl FromStr for ExecutionPackageId {
-    type Err = ExecutionPackageIdParseError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        if value.len() != Self::LEN * 2 {
-            return Err(ExecutionPackageIdParseError::Length(value.len()));
+        if evaluator.len() > MAX_APPLICATION_ID_BYTES {
+            return Err(ApplicationError::EvaluatorTooLong {
+                bytes: evaluator.len(),
+                limit: MAX_APPLICATION_ID_BYTES,
+            });
         }
-        let mut bytes = [0_u8; Self::LEN];
-        for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
-            let high = hex_nibble(pair[0])
-                .ok_or(ExecutionPackageIdParseError::Hex(index.saturating_mul(2)))?;
-            let low = hex_nibble(pair[1]).ok_or(ExecutionPackageIdParseError::Hex(
-                index.saturating_mul(2).saturating_add(1),
-            ))?;
-            bytes[index] = (high << 4) | low;
+        if adaptor.is_empty() {
+            return Err(ApplicationError::EmptyAdaptor);
         }
-        Ok(Self::from_bytes(bytes))
-    }
-}
-
-const fn hex_nibble(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ExecutionPackageIdParseError {
-    Length(usize),
-    Hex(usize),
-}
-
-impl fmt::Display for ExecutionPackageIdParseError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Length(length) => write!(
-                formatter,
-                "Catena execution package ID must be exactly 64 hexadecimal characters (got {length})"
-            ),
-            Self::Hex(index) => write!(
-                formatter,
-                "Catena execution package ID contains a non-hexadecimal character at byte {index}"
-            ),
+        if adaptor.len() > MAX_APPLICATION_ID_BYTES {
+            return Err(ApplicationError::AdaptorTooLong {
+                bytes: adaptor.len(),
+                limit: MAX_APPLICATION_ID_BYTES,
+            });
         }
+        Ok(Self { evaluator, adaptor })
+    }
+
+    /// Returns the exact opaque evaluator identity.
+    #[must_use]
+    pub fn evaluator(&self) -> &str {
+        &self.evaluator
+    }
+
+    /// Returns the exact opaque adaptor identity.
+    #[must_use]
+    pub fn adaptor(&self) -> &str {
+        &self.adaptor
     }
 }
 
-impl core::error::Error for ExecutionPackageIdParseError {}
+/// A malformed opaque component of an [`Application`] identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ApplicationError {
+    /// The evaluator identity was empty.
+    #[error("application evaluator must not be empty")]
+    EmptyEvaluator,
+    /// The adaptor identity was empty.
+    #[error("application adaptor must not be empty")]
+    EmptyAdaptor,
+    /// The evaluator identity exceeded [`MAX_APPLICATION_ID_BYTES`].
+    #[error("application evaluator is {bytes} UTF-8 bytes, over the {limit}-byte limit")]
+    EvaluatorTooLong {
+        /// Observed UTF-8 byte length.
+        bytes: usize,
+        /// Maximum accepted UTF-8 byte length.
+        limit: usize,
+    },
+    /// The adaptor identity exceeded [`MAX_APPLICATION_ID_BYTES`].
+    #[error("application adaptor is {bytes} UTF-8 bytes, over the {limit}-byte limit")]
+    AdaptorTooLong {
+        /// Observed UTF-8 byte length.
+        bytes: usize,
+        /// Maximum accepted UTF-8 byte length.
+        limit: usize,
+    },
+}
 
-/// The token-level execution contract implemented by this manifest schema.
+/// One application-owned, content-addressed execution environment.
 ///
-/// Tokenization, chat templating, and text decoding are outside this profile:
-/// the committed inputs and outputs are token IDs.
-pub const CATENA_TOKEN_AUTOREGRESSIVE_PROFILE: &str =
-    "hellas.evaluate.catena.token-autoregressive.greedy.v1";
-
+/// The application defines the meaning of `root`. For example, Catena causal
+/// LM roots exclude tokenizers, chat templates, decoding, and other
+/// presentation policy. An attested Fetch application instead includes its
+/// exact request structuring and response destructuring because those steps are
+/// trusted computation.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct EvaluateProgramManifest {
-    pub execution_package: ExecutionPackageId,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FetchProgramManifest {
-    pub program: ContentId,
-    pub config: ContentId,
-    pub build: ContentId,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ProgramManifest {
-    Evaluate(EvaluateProgramManifest),
-    Fetch(FetchProgramManifest),
+pub struct ProgramManifest {
+    application: Application,
+    root: ContentId,
 }
 
 impl ProgramManifest {
-    pub fn canonical_bytes(&self) -> Vec<u8> {
-        let mut e = DagCborEncoder::new();
-        match self {
-            Self::Evaluate(m) => {
-                e.array(4);
-                e.str("hellas.program.manifest.v3");
-                e.u64(0);
-                e.str(CATENA_TOKEN_AUTOREGRESSIVE_PROFILE);
-                e.bytes(m.execution_package.as_bytes());
-            }
-            Self::Fetch(m) => {
-                e.array(5);
-                e.str("hellas.program.manifest.v2");
-                e.u64(1);
-                e.bytes(m.program.as_bytes());
-                e.bytes(m.config.as_bytes());
-                e.bytes(m.build.as_bytes());
-            }
-        }
-        e.into_bytes()
+    /// Binds an exact application identity to its application-owned root.
+    #[must_use]
+    pub const fn new(application: Application, root: ContentId) -> Self {
+        Self { application, root }
     }
 
+    /// Returns the complete, exact interpreter identity.
+    #[must_use]
+    pub const fn application(&self) -> &Application {
+        &self.application
+    }
+
+    /// Returns the content identifier whose structure the application owns.
+    #[must_use]
+    pub const fn root(&self) -> ContentId {
+        self.root
+    }
+
+    /// Strict DAG-CBOR `[domain, [evaluator, adaptor], root]` encoding.
+    ///
+    /// Definite arrays and the minimal encoder give every manifest exactly one
+    /// wire representation, independent of which application interprets it.
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let mut encoder = DagCborEncoder::new();
+        encoder.array(3);
+        encoder.str(PROGRAM_MANIFEST_DOMAIN);
+        encoder.array(2);
+        encoder.str(&self.application.evaluator);
+        encoder.str(&self.application.adaptor);
+        encoder.bytes(self.root.as_bytes());
+        encoder.into_bytes()
+    }
+
+    /// Decodes the single strict, bounded DAG-CBOR manifest representation.
+    ///
+    /// Evaluator and adaptor identifiers remain exact opaque strings; decoding
+    /// does not normalize, parse, or negotiate either one.
+    pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, CanonicalDecodeError> {
+        if bytes.len() > MAX_PROGRAM_MANIFEST_BYTES {
+            return Err(CanonicalDecodeError::new(format!(
+                "program manifest is {} bytes, over the {MAX_PROGRAM_MANIFEST_BYTES}-byte limit",
+                bytes.len()
+            )));
+        }
+
+        let mut decoder = CanonicalDecoder::new(bytes);
+        decoder.array_exact(3)?;
+        decoder.expect_str(PROGRAM_MANIFEST_DOMAIN)?;
+        decoder.array_exact(2)?;
+        let evaluator = decoder.str()?.to_string();
+        let adaptor = decoder.str()?.to_string();
+        let root = ContentId::from_bytes(decoder.bytes_32()?);
+        decoder.finish()?;
+
+        let application = Application::new(evaluator, adaptor)
+            .map_err(|error| CanonicalDecodeError::new(error.to_string()))?;
+        let manifest = Self::new(application, root);
+        if manifest.canonical_bytes() != bytes {
+            return Err(CanonicalDecodeError::new(
+                "program manifest is not in canonical DAG-CBOR form",
+            ));
+        }
+        Ok(manifest)
+    }
+
+    /// Returns the Xet content identifier of the canonical manifest bytes.
     pub fn content_id(&self) -> ContentId {
         ContentId::hash(&self.canonical_bytes())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn manifest(evaluator: &str, adaptor: &str, root: u8) -> ProgramManifest {
+        ProgramManifest::new(
+            Application::new(evaluator, adaptor).unwrap(),
+            ContentId::from_bytes([root; 32]),
+        )
+    }
+
+    fn raw_manifest(evaluator: &str, adaptor: &str) -> Vec<u8> {
+        let mut encoder = DagCborEncoder::new();
+        encoder.array(3);
+        encoder.str(PROGRAM_MANIFEST_DOMAIN);
+        encoder.array(2);
+        encoder.str(evaluator);
+        encoder.str(adaptor);
+        encoder.bytes(&[0; 32]);
+        encoder.into_bytes()
+    }
+
+    #[test]
+    fn application_validates_each_exact_utf8_component() {
+        assert_eq!(
+            Application::new("", "a"),
+            Err(ApplicationError::EmptyEvaluator)
+        );
+        assert_eq!(
+            Application::new("e", ""),
+            Err(ApplicationError::EmptyAdaptor)
+        );
+
+        let boundary = "é".repeat(MAX_APPLICATION_ID_BYTES / 2);
+        let application = Application::new(boundary.clone(), boundary.clone()).unwrap();
+        assert_eq!(application.evaluator(), boundary);
+        assert_eq!(application.adaptor(), boundary);
+        let manifest = ProgramManifest::new(application, ContentId::from_bytes([0; 32]));
+        assert!(manifest.canonical_bytes().len() <= MAX_PROGRAM_MANIFEST_BYTES);
+
+        let unnormalized = Application::new(" evaluator ", "Adaptor+Build").unwrap();
+        assert_eq!(unnormalized.evaluator(), " evaluator ");
+        assert_eq!(unnormalized.adaptor(), "Adaptor+Build");
+
+        assert_eq!(
+            Application::new("e".repeat(MAX_APPLICATION_ID_BYTES + 1), "a"),
+            Err(ApplicationError::EvaluatorTooLong {
+                bytes: MAX_APPLICATION_ID_BYTES + 1,
+                limit: MAX_APPLICATION_ID_BYTES,
+            })
+        );
+        assert_eq!(
+            Application::new("e", "é".repeat(MAX_APPLICATION_ID_BYTES / 2 + 1)),
+            Err(ApplicationError::AdaptorTooLong {
+                bytes: MAX_APPLICATION_ID_BYTES + 2,
+                limit: MAX_APPLICATION_ID_BYTES,
+            })
+        );
+    }
+
+    #[test]
+    fn decoder_applies_the_same_application_validation() {
+        for (bytes, expected) in [
+            (raw_manifest("", "a"), ApplicationError::EmptyEvaluator),
+            (raw_manifest("e", ""), ApplicationError::EmptyAdaptor),
+            (
+                raw_manifest(&"e".repeat(MAX_APPLICATION_ID_BYTES + 1), "a"),
+                ApplicationError::EvaluatorTooLong {
+                    bytes: MAX_APPLICATION_ID_BYTES + 1,
+                    limit: MAX_APPLICATION_ID_BYTES,
+                },
+            ),
+            (
+                raw_manifest("e", &"a".repeat(MAX_APPLICATION_ID_BYTES + 1)),
+                ApplicationError::AdaptorTooLong {
+                    bytes: MAX_APPLICATION_ID_BYTES + 1,
+                    limit: MAX_APPLICATION_ID_BYTES,
+                },
+            ),
+        ] {
+            assert_eq!(
+                ProgramManifest::from_canonical_bytes(&bytes)
+                    .unwrap_err()
+                    .to_string(),
+                expected.to_string()
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_bytes_are_one_domain_tagged_shape() {
+        let manifest = manifest("e", "a", 0x11);
+        let mut expected = vec![0x83, 0x78, 0x1a];
+        expected.extend_from_slice(b"hellas.program.manifest.v4");
+        expected.extend_from_slice(&[0x82, 0x61, b'e', 0x61, b'a', 0x58, 0x20]);
+        expected.extend_from_slice(&[0x11; 32]);
+
+        assert_eq!(manifest.canonical_bytes(), expected);
+        assert_eq!(
+            ProgramManifest::from_canonical_bytes(&expected),
+            Ok(manifest.clone())
+        );
+        assert_eq!(manifest.content_id(), ContentId::hash(&expected));
+        assert_eq!(
+            manifest.content_id().to_string(),
+            "a0e154011f3dc2fdbcf69fafedca1d4aaf6bfc6e8fff625052c9a6f2b9169186"
+        );
+    }
+
+    #[test]
+    fn identity_binds_the_whole_opaque_application_pair_and_root() {
+        let joined_left = manifest("ab", "c", 7);
+        let joined_right = manifest("a", "bc", 7);
+        let other_evaluator = manifest("AB", "c", 7);
+        let other_adaptor = manifest("ab", "C", 7);
+        let other_root = manifest("ab", "c", 8);
+
+        for other in [&joined_right, &other_evaluator, &other_adaptor, &other_root] {
+            assert_ne!(&joined_left, other);
+            assert_ne!(joined_left.content_id(), other.content_id());
+        }
+    }
+
+    #[test]
+    fn decoder_rejects_noncanonical_trailing_and_oversized_inputs() {
+        let canonical = manifest("e", "a", 0x11).canonical_bytes();
+
+        let mut noncanonical = vec![0x98, 0x03];
+        noncanonical.extend_from_slice(&canonical[1..]);
+        assert!(
+            ProgramManifest::from_canonical_bytes(&noncanonical)
+                .unwrap_err()
+                .to_string()
+                .contains("non-canonical")
+        );
+
+        let mut trailing = canonical;
+        trailing.push(0);
+        assert!(
+            ProgramManifest::from_canonical_bytes(&trailing)
+                .unwrap_err()
+                .to_string()
+                .contains("trailing bytes")
+        );
+
+        let oversized = vec![0; MAX_PROGRAM_MANIFEST_BYTES + 1];
+        assert!(
+            ProgramManifest::from_canonical_bytes(&oversized)
+                .unwrap_err()
+                .to_string()
+                .contains("over")
+        );
     }
 }

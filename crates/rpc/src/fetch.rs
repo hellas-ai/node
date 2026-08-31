@@ -1,5 +1,6 @@
 use std::str;
 
+use crate::pb::execute::InputEventEnvelope as PbInputEventEnvelope;
 use crate::{
     Assurance, CanonicalizationId, ContentId, InputCommitment, InputEventEnvelope,
     InputTranscriptBuilder, JsonBytes, Operation, OutputEventEnvelope, OutputTranscriptBuilder,
@@ -12,6 +13,38 @@ const INPUT_CANONICALIZATION: &[u8] = b"hellas.fetch.input.v3";
 const OUTPUT_CANONICALIZATION: &[u8] = b"hellas.fetch.output.v2";
 const OUTPUT_EVENT_KIND: &str = "response.event";
 const OUTPUT_TERMINAL_KIND: &str = "response.terminal";
+const INPUT_EVENT_KINDS: [&str; 8] = [
+    "assurance",
+    "execution.environment",
+    "request.nonce",
+    "service",
+    "method",
+    "request.retain",
+    "request.body",
+    "input.end",
+];
+
+/// Maximum signed envelopes in one successful Fetch output transcript,
+/// including its terminal envelope.
+///
+/// Each envelope has its own wire frame; this bound limits retained state and
+/// transcript verification work rather than the size of a terminal frame.
+pub const MAX_FETCH_OUTPUT_EVENTS: usize = 4_096;
+
+/// Maximum cumulative payload bytes across all signed Fetch output envelopes,
+/// including the terminal payload.
+pub const MAX_FETCH_OUTPUT_PAYLOAD_BYTES: usize = 2 * 1024 * 1024;
+
+/// Maximum UTF-8 JSON bytes in the signed Fetch `request.body` event.
+///
+/// This is checked before callers allocate/sign a transcript and again after
+/// verifiers authenticate it, so every Fetch implementation shares the same
+/// v0.0.1 admission bound.
+pub const MAX_FETCH_REQUEST_BODY_BYTES: usize = 1024 * 1024;
+
+/// Maximum UTF-8 bytes in each signed Fetch route component (`service` and
+/// `method`).
+pub const MAX_FETCH_ROUTE_COMPONENT_BYTES: usize = 256;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FetchInput {
@@ -74,7 +107,8 @@ pub fn build_input_events_with_retention(
     key: &ProducerSigningKey,
     retention: Retention,
 ) -> Result<Vec<InputEventEnvelope>, FetchProtocolError> {
-    validate_non_empty_service_method(service, method)?;
+    validate_service_method(service.as_bytes(), method.as_bytes())?;
+    validate_request_body_limit(payload)?;
     validate_json("request.body", payload)?;
     let mut builder = InputTranscriptBuilder::new(
         scheme_id(Operation::Fetch, assurance),
@@ -151,27 +185,52 @@ impl<'a> FetchOutputTranscriptBuilder<'a> {
 pub fn verify_input_events(
     events: &[InputEventEnvelope],
 ) -> Result<FetchInput, FetchProtocolError> {
-    let caller_key = *events
-        .first()
-        .ok_or(FetchProtocolError::EmptyInputTranscript)?
-        .event()
-        .public_key();
-    let assurance = input_assurance(events)?;
+    // Shape and byte bounds are deliberately checked before signature
+    // verification. The Fetch input language has exactly eight events, so an
+    // adversarial peer must never be able to buy an unbounded signature loop
+    // by appending otherwise well-formed envelopes.
+    let parts = input_parts(events)?;
+    let caller_key = *events[0].event().public_key();
+    let assurance = parts.assurance;
     let input_commitment =
         verify_input_event_envelopes(scheme_id(Operation::Fetch, assurance), &caller_key, events)?;
-    let (execution_environment, service, method, body, retention) = input_parts(events)?;
-    validate_non_empty_service_method(&service, &method)?;
-    validate_json("request.body", body.as_bytes())?;
+    validate_json("request.body", parts.body)?;
     Ok(FetchInput {
         input_commitment,
         assurance,
         caller_key,
-        execution_environment,
-        service,
-        method,
-        body,
-        retention,
+        execution_environment: parts.execution_environment,
+        service: parts.service.to_string(),
+        method: parts.method.to_string(),
+        body: JsonBytes::new(parts.body.to_vec()),
+        retention: parts.retention,
     })
+}
+
+/// Rejects oversized or invalid fixed Fetch payload shapes directly on the
+/// decoded protobuf request, before envelope conversion hashes payloads or
+/// allocates the signed domain objects.
+pub fn validate_input_event_pb_shape(
+    events: &[PbInputEventEnvelope],
+) -> Result<(), FetchProtocolError> {
+    input_payload_parts(events)?;
+    for (index, (event, expected)) in events.iter().zip(INPUT_EVENT_KINDS).enumerate() {
+        let Some(body) = &event.body else {
+            // Domain conversion reports the more precise missing-body error.
+            continue;
+        };
+        if body.kind != expected {
+            return Err(FetchProtocolError::UnexpectedInputEvent {
+                index,
+                expected,
+                actual: bounded_kind(&body.kind),
+            });
+        }
+        if body.canonicalization_id != input_canonicalization().as_bytes() {
+            return Err(FetchProtocolError::InputCanonicalizationMismatch { index });
+        }
+    }
+    Ok(())
 }
 
 pub fn verify_output_events(
@@ -179,6 +238,7 @@ pub fn verify_output_events(
     assurance: Assurance,
     events: &[OutputEventEnvelope],
 ) -> Result<FetchOutput, FetchProtocolError> {
+    validate_output_limits(events)?;
     let producer_key = *events
         .first()
         .ok_or(FetchProtocolError::EmptyOutputTranscript)?
@@ -198,41 +258,21 @@ pub fn verify_output_events(
     })
 }
 
-pub fn verify_terminal_continuation(
-    assurance: Assurance,
-    streamed_prefix: &[OutputEventEnvelope],
-    finished: &[OutputEventEnvelope],
-) -> Result<(), FetchProtocolError> {
-    if finished.is_empty() {
-        return Err(FetchProtocolError::EmptyOutputTranscript);
-    }
-    if finished.len() < streamed_prefix.len() {
-        return Err(FetchProtocolError::WrongOutputEventCount {
-            actual: finished.len(),
+fn validate_output_limits(events: &[OutputEventEnvelope]) -> Result<(), FetchProtocolError> {
+    if events.len() > MAX_FETCH_OUTPUT_EVENTS {
+        return Err(FetchProtocolError::OutputEventLimit {
+            actual: events.len(),
         });
     }
-    let first = finished
-        .first()
-        .ok_or(FetchProtocolError::EmptyOutputTranscript)?;
-    let input = first.event().body().input();
-    let producer_key = *first.event().public_key();
-    verify_output_event_envelopes(
-        scheme_id(Operation::Fetch, assurance),
-        input,
-        &producer_key,
-        finished,
-    )?;
-    output_payloads(finished)?;
-    for (index, streamed) in streamed_prefix.iter().enumerate() {
-        expect_output_event(streamed, index, OUTPUT_EVENT_KIND)?;
-        let Some(finished_event) = finished.get(index) else {
-            return Err(FetchProtocolError::WrongOutputEventCount {
-                actual: finished.len(),
-            });
-        };
-        if finished_event != streamed {
-            return Err(FetchProtocolError::OutputPrefixMismatch { index });
-        }
+    let payload_bytes = events.iter().try_fold(0_usize, |total, event| {
+        total
+            .checked_add(event.payload().len())
+            .ok_or(FetchProtocolError::OutputPayloadLengthOverflow)
+    })?;
+    if payload_bytes > MAX_FETCH_OUTPUT_PAYLOAD_BYTES {
+        return Err(FetchProtocolError::OutputPayloadLimit {
+            actual: payload_bytes,
+        });
     }
     Ok(())
 }
@@ -257,87 +297,124 @@ fn output_payloads(
     Ok((payloads, events[terminal_index].payload().to_vec()))
 }
 
-fn input_parts(
-    events: &[InputEventEnvelope],
-) -> Result<(ContentId, String, String, JsonBytes, Retention), FetchProtocolError> {
+struct FetchInputParts<'a> {
+    assurance: Assurance,
+    execution_environment: ContentId,
+    service: &'a str,
+    method: &'a str,
+    body: &'a [u8],
+    retention: Retention,
+}
+
+trait FetchInputPayload {
+    fn fetch_payload(&self) -> &[u8];
+}
+
+impl FetchInputPayload for InputEventEnvelope {
+    fn fetch_payload(&self) -> &[u8] {
+        self.payload()
+    }
+}
+
+impl FetchInputPayload for PbInputEventEnvelope {
+    fn fetch_payload(&self) -> &[u8] {
+        &self.payload
+    }
+}
+
+fn input_parts(events: &[InputEventEnvelope]) -> Result<FetchInputParts<'_>, FetchProtocolError> {
     if events.len() != 8 {
         return Err(FetchProtocolError::WrongInputEventCount {
             actual: events.len(),
         });
     }
-    expect_input_event(&events[0], 0, "assurance")?;
-    expect_input_event(&events[1], 1, "execution.environment")?;
-    expect_input_event(&events[2], 2, "request.nonce")?;
-    expect_input_event(&events[3], 3, "service")?;
-    expect_input_event(&events[4], 4, "method")?;
-    expect_input_event(&events[5], 5, "request.retain")?;
-    expect_input_event(&events[6], 6, "request.body")?;
-    expect_input_event(&events[7], 7, "input.end")?;
-    if !events[7].payload().is_empty() {
+    for (index, (event, expected)) in events.iter().zip(INPUT_EVENT_KINDS).enumerate() {
+        expect_input_event(event, index, expected)?;
+    }
+    input_payload_parts(events)
+}
+
+fn input_payload_parts<T: FetchInputPayload>(
+    events: &[T],
+) -> Result<FetchInputParts<'_>, FetchProtocolError> {
+    if events.len() != 8 {
+        return Err(FetchProtocolError::WrongInputEventCount {
+            actual: events.len(),
+        });
+    }
+    let payload = |index: usize| events[index].fetch_payload();
+    if !payload(7).is_empty() {
         return Err(FetchProtocolError::NonEmptyInputEnd);
     }
-    let execution_environment = ContentId::from_slice(events[1].payload()).map_err(|_| {
-        FetchProtocolError::WrongInputLength {
+    let execution_environment =
+        ContentId::from_slice(payload(1)).map_err(|_| FetchProtocolError::WrongInputLength {
             field: "execution.environment",
-            actual: events[1].payload().len(),
-        }
-    })?;
-    if events[2].payload().len() != 32 {
+            actual: payload(1).len(),
+        })?;
+    if payload(2).len() != 32 {
         return Err(FetchProtocolError::WrongInputLength {
             field: "request.nonce",
-            actual: events[2].payload().len(),
+            actual: payload(2).len(),
         });
     }
-    let service =
-        str::from_utf8(events[3].payload()).map_err(|source| FetchProtocolError::Utf8 {
-            field: "service",
-            source,
-        })?;
-    let method =
-        str::from_utf8(events[4].payload()).map_err(|source| FetchProtocolError::Utf8 {
-            field: "method",
-            source,
-        })?;
-    let retention = match events[5].payload() {
-        [0] => Retention::Ephemeral,
-        [1] => Retention::Retain,
-        payload => {
-            return Err(FetchProtocolError::InvalidRetention {
-                actual: payload.to_vec(),
-            });
-        }
-    };
-    Ok((
-        execution_environment,
-        service.to_string(),
-        method.to_string(),
-        JsonBytes::new(events[6].payload().to_vec()),
-        retention,
-    ))
-}
-
-fn input_assurance(events: &[InputEventEnvelope]) -> Result<Assurance, FetchProtocolError> {
-    let event = events
-        .first()
-        .ok_or(FetchProtocolError::EmptyInputTranscript)?;
-    expect_input_event(event, 0, "assurance")?;
-    let [tag] = event.payload() else {
-        return Err(FetchProtocolError::WrongAssuranceLength {
-            actual: event.payload().len(),
+    validate_service_method(payload(3), payload(4))?;
+    let service = str::from_utf8(payload(3)).map_err(|source| FetchProtocolError::Utf8 {
+        field: "service",
+        source,
+    })?;
+    let method = str::from_utf8(payload(4)).map_err(|source| FetchProtocolError::Utf8 {
+        field: "method",
+        source,
+    })?;
+    let [retention] = payload(5) else {
+        return Err(FetchProtocolError::WrongInputLength {
+            field: "request.retain",
+            actual: payload(5).len(),
         });
     };
-    Assurance::from_byte(*tag).map_err(|_| FetchProtocolError::UnknownAssurance(*tag))
+    let retention = match retention {
+        0 => Retention::Ephemeral,
+        1 => Retention::Retain,
+        tag => {
+            return Err(FetchProtocolError::InvalidRetention { actual: vec![*tag] });
+        }
+    };
+    let [assurance] = payload(0) else {
+        return Err(FetchProtocolError::WrongAssuranceLength {
+            actual: payload(0).len(),
+        });
+    };
+    let assurance = Assurance::from_byte(*assurance)
+        .map_err(|_| FetchProtocolError::UnknownAssurance(*assurance))?;
+    validate_request_body_limit(payload(6))?;
+    Ok(FetchInputParts {
+        assurance,
+        execution_environment,
+        service,
+        method,
+        body: payload(6),
+        retention,
+    })
 }
 
-fn validate_non_empty_service_method(
-    service: &str,
-    method: &str,
-) -> Result<(), FetchProtocolError> {
+fn validate_service_method(service: &[u8], method: &[u8]) -> Result<(), FetchProtocolError> {
     if service.is_empty() {
         return Err(FetchProtocolError::EmptyService);
     }
     if method.is_empty() {
         return Err(FetchProtocolError::EmptyMethod);
+    }
+    if service.len() > MAX_FETCH_ROUTE_COMPONENT_BYTES {
+        return Err(FetchProtocolError::RouteComponentLimit {
+            field: "service",
+            actual: service.len(),
+        });
+    }
+    if method.len() > MAX_FETCH_ROUTE_COMPONENT_BYTES {
+        return Err(FetchProtocolError::RouteComponentLimit {
+            field: "method",
+            actual: method.len(),
+        });
     }
     Ok(())
 }
@@ -363,7 +440,7 @@ fn expect_input_event(
         Err(FetchProtocolError::UnexpectedInputEvent {
             index,
             expected,
-            actual: event.event().body().kind().to_string(),
+            actual: bounded_kind(event.event().body().kind()),
         })
     }
 }
@@ -383,8 +460,27 @@ fn expect_output_event(
         Err(FetchProtocolError::UnexpectedOutputEvent {
             index,
             expected,
-            actual: event.event().body().kind().to_string(),
+            actual: bounded_kind(event.event().body().kind()),
         })
+    }
+}
+
+fn bounded_kind(kind: &str) -> String {
+    const MAX_DISPLAY_BYTES: usize = 64;
+    if kind.len() <= MAX_DISPLAY_BYTES {
+        kind.to_string()
+    } else {
+        format!("<{} UTF-8 bytes>", kind.len())
+    }
+}
+
+fn validate_request_body_limit(payload: &[u8]) -> Result<(), FetchProtocolError> {
+    if payload.len() > MAX_FETCH_REQUEST_BODY_BYTES {
+        Err(FetchProtocolError::RequestBodyLimit {
+            actual: payload.len(),
+        })
+    } else {
+        Ok(())
     }
 }
 
@@ -394,8 +490,10 @@ pub enum FetchProtocolError {
     EmptyService,
     #[error("fetch method must not be empty")]
     EmptyMethod,
-    #[error("fetch input transcript is empty")]
-    EmptyInputTranscript,
+    #[error(
+        "fetch {field} contains {actual} bytes, over the {MAX_FETCH_ROUTE_COMPONENT_BYTES}-byte limit"
+    )]
+    RouteComponentLimit { field: &'static str, actual: usize },
     #[error("fetch output transcript is empty")]
     EmptyOutputTranscript,
     #[error("fetch input transcript must contain exactly 8 events, got {actual}")]
@@ -408,8 +506,20 @@ pub enum FetchProtocolError {
     InvalidRetention { actual: Vec<u8> },
     #[error("fetch {field} must be 32 bytes, got {actual}")]
     WrongInputLength { field: &'static str, actual: usize },
-    #[error("fetch output transcript must contain exactly one terminal event, got {actual} events")]
-    WrongOutputEventCount { actual: usize },
+    #[error(
+        "fetch output transcript contains {actual} events, over the {MAX_FETCH_OUTPUT_EVENTS}-event limit"
+    )]
+    OutputEventLimit { actual: usize },
+    #[error(
+        "fetch output transcript contains {actual} payload bytes, over the {MAX_FETCH_OUTPUT_PAYLOAD_BYTES}-byte limit"
+    )]
+    OutputPayloadLimit { actual: usize },
+    #[error("fetch output transcript payload length exceeds usize range")]
+    OutputPayloadLengthOverflow,
+    #[error(
+        "fetch request body contains {actual} bytes, over the {MAX_FETCH_REQUEST_BODY_BYTES}-byte limit"
+    )]
+    RequestBodyLimit { actual: usize },
     #[error("fetch input event {index} must be {expected}, got {actual}")]
     UnexpectedInputEvent {
         index: usize,
@@ -428,8 +538,6 @@ pub enum FetchProtocolError {
     OutputCanonicalizationMismatch { index: usize },
     #[error("fetch input.end payload must be empty")]
     NonEmptyInputEnd,
-    #[error("fetch streamed output event {index} does not match finished transcript")]
-    OutputPrefixMismatch { index: usize },
     #[error("fetch {field} event is not UTF-8: {source}")]
     Utf8 {
         field: &'static str,
@@ -460,6 +568,59 @@ mod tests {
         ContentId::from_bytes([9; 32])
     }
 
+    fn json_string_of_size(size: usize) -> Vec<u8> {
+        assert!(size >= 2);
+        let mut body = Vec::with_capacity(size);
+        body.push(b'\"');
+        body.resize(size - 1, b'a');
+        body.push(b'\"');
+        body
+    }
+
+    fn unchecked_input_events(body: Vec<u8>) -> Vec<InputEventEnvelope> {
+        let caller = key(1);
+        let mut builder = InputTranscriptBuilder::new(
+            scheme_id(Operation::Fetch, TEST_ASSURANCE),
+            &caller,
+            input_canonicalization(),
+        );
+        builder
+            .push("assurance", vec![TEST_ASSURANCE.to_byte()])
+            .unwrap();
+        builder
+            .push("execution.environment", environment().as_bytes().to_vec())
+            .unwrap();
+        builder.push("request.nonce", vec![7; 32]).unwrap();
+        builder.push("service", b"openai".to_vec()).unwrap();
+        builder.push("method", b"responses".to_vec()).unwrap();
+        builder.push("request.retain", vec![1]).unwrap();
+        builder.push("request.body", body).unwrap();
+        builder.push("input.end", Vec::new()).unwrap();
+        builder.finish().unwrap().0
+    }
+
+    fn raw_input_events(service: Vec<u8>, method: Vec<u8>) -> Vec<InputEventEnvelope> {
+        let caller = key(1);
+        let mut builder = InputTranscriptBuilder::new(
+            scheme_id(Operation::Fetch, TEST_ASSURANCE),
+            &caller,
+            input_canonicalization(),
+        );
+        builder
+            .push("assurance", vec![TEST_ASSURANCE.to_byte()])
+            .unwrap();
+        builder
+            .push("execution.environment", environment().as_bytes().to_vec())
+            .unwrap();
+        builder.push("request.nonce", vec![0; 32]).unwrap();
+        builder.push("service", service).unwrap();
+        builder.push("method", method).unwrap();
+        builder.push("request.retain", vec![1]).unwrap();
+        builder.push("request.body", br#"{}"#.to_vec()).unwrap();
+        builder.push("input.end", Vec::new()).unwrap();
+        builder.finish().unwrap().0
+    }
+
     #[test]
     fn input_events_round_trip_through_shape_verifier() {
         let caller = key(1);
@@ -481,6 +642,95 @@ mod tests {
         assert_eq!(input.method, "responses");
         assert_eq!(input.body.as_bytes(), br#"{"model":"gpt"}"#);
         assert_eq!(input.retention, Retention::Retain);
+    }
+
+    #[test]
+    fn input_count_is_rejected_before_chain_verification() {
+        let mut events = build_input_events(
+            "openai",
+            "responses",
+            br#"{}"#,
+            environment(),
+            TEST_ASSURANCE,
+            &key(1),
+        )
+        .unwrap();
+        // The appended envelope has a valid signature in isolation but cannot
+        // be a valid continuation of the finished eight-event transcript.
+        events.push(events[0].clone());
+
+        assert!(matches!(
+            verify_input_events(&events),
+            Err(FetchProtocolError::WrongInputEventCount { actual: 9 })
+        ));
+    }
+
+    #[test]
+    fn protobuf_shape_is_bounded_before_domain_conversion() {
+        let events = build_input_events(
+            "openai",
+            "responses",
+            br#"{}"#,
+            environment(),
+            TEST_ASSURANCE,
+            &key(1),
+        )
+        .unwrap();
+        let mut protobuf = events
+            .iter()
+            .map(crate::stream::input_event_to_pb)
+            .collect::<Vec<_>>();
+        protobuf[3].payload = vec![b'x'; MAX_FETCH_ROUTE_COMPONENT_BYTES + 1];
+
+        assert!(matches!(
+            validate_input_event_pb_shape(&protobuf),
+            Err(FetchProtocolError::RouteComponentLimit {
+                field: "service",
+                actual,
+            }) if actual == MAX_FETCH_ROUTE_COMPONENT_BYTES + 1
+        ));
+    }
+
+    #[test]
+    fn request_body_limit_accepts_the_exact_boundary() {
+        let caller = key(1);
+        let body = json_string_of_size(MAX_FETCH_REQUEST_BODY_BYTES);
+        let events = build_input_events(
+            "openai",
+            "responses",
+            &body,
+            environment(),
+            TEST_ASSURANCE,
+            &caller,
+        )
+        .unwrap();
+
+        assert_eq!(verify_input_events(&events).unwrap().body.as_bytes(), body);
+    }
+
+    #[test]
+    fn request_body_limit_rejects_build_and_authenticated_verify_oversize() {
+        let caller = key(1);
+        let body = json_string_of_size(MAX_FETCH_REQUEST_BODY_BYTES + 1);
+        assert!(matches!(
+            build_input_events(
+                "openai",
+                "responses",
+                &body,
+                environment(),
+                TEST_ASSURANCE,
+                &caller,
+            ),
+            Err(FetchProtocolError::RequestBodyLimit { actual })
+                if actual == MAX_FETCH_REQUEST_BODY_BYTES + 1
+        ));
+
+        let events = unchecked_input_events(body);
+        assert!(matches!(
+            verify_input_events(&events),
+            Err(FetchProtocolError::RequestBodyLimit { actual })
+                if actual == MAX_FETCH_REQUEST_BODY_BYTES + 1
+        ));
     }
 
     #[test]
@@ -653,69 +903,78 @@ mod tests {
             ]
         );
         assert_eq!(terminal, b"semantic-terminal");
-        verify_terminal_continuation(TEST_ASSURANCE, &events[..2], &events).unwrap();
-    }
-
-    #[test]
-    fn terminal_continuation_rejects_divergent_valid_chain() {
-        let caller = key(1);
-        let producer = key(2);
-        let input = verify_input_events(
-            &build_input_events(
-                "openai",
-                "responses",
-                br#"{"model":"gpt"}"#,
-                environment(),
-                TEST_ASSURANCE,
-                &caller,
-            )
-            .unwrap(),
-        )
-        .unwrap()
-        .input_commitment;
-
-        let mut streamed = FetchOutputTranscriptBuilder::new(input, TEST_ASSURANCE, &producer);
-        let first_streamed = streamed.push_event(b"live-event".to_vec()).unwrap();
-        let _streamed_finished = streamed.finish(b"terminal".to_vec()).unwrap();
-
-        let mut divergent = FetchOutputTranscriptBuilder::new(input, TEST_ASSURANCE, &producer);
-        divergent
-            .push_event(b"different-live-event".to_vec())
-            .unwrap();
-        let divergent_finished = divergent.finish(b"terminal".to_vec()).unwrap();
-
-        assert!(matches!(
-            verify_terminal_continuation(TEST_ASSURANCE, &[first_streamed], &divergent_finished,)
-                .unwrap_err(),
-            FetchProtocolError::OutputPrefixMismatch { index: 0 }
-        ));
     }
 
     #[test]
     fn input_rejects_empty_service() {
-        let caller = key(1);
-        let mut builder = InputTranscriptBuilder::new(
-            scheme_id(Operation::Fetch, TEST_ASSURANCE),
-            &caller,
-            input_canonicalization(),
-        );
-        builder
-            .push("assurance", vec![TEST_ASSURANCE.to_byte()])
-            .unwrap();
-        builder
-            .push("execution.environment", environment().as_bytes().to_vec())
-            .unwrap();
-        builder.push("request.nonce", vec![0; 32]).unwrap();
-        builder.push("service", Vec::new()).unwrap();
-        builder.push("method", b"responses".to_vec()).unwrap();
-        builder.push("request.retain", vec![1]).unwrap();
-        builder.push("request.body", br#"{}"#.to_vec()).unwrap();
-        builder.push("input.end", Vec::new()).unwrap();
-        let (events, _) = builder.finish().unwrap();
+        let events = raw_input_events(Vec::new(), b"responses".to_vec());
 
         assert!(matches!(
             verify_input_events(&events).unwrap_err(),
             FetchProtocolError::EmptyService
+        ));
+    }
+
+    #[test]
+    fn input_builder_bounds_each_route_component() {
+        let caller = key(1);
+        let maximum = "x".repeat(MAX_FETCH_ROUTE_COMPONENT_BYTES);
+        build_input_events(
+            &maximum,
+            &maximum,
+            br#"{}"#,
+            environment(),
+            TEST_ASSURANCE,
+            &caller,
+        )
+        .unwrap();
+        let overlong = "x".repeat(MAX_FETCH_ROUTE_COMPONENT_BYTES + 1);
+
+        assert!(matches!(
+            build_input_events(
+                &overlong,
+                "responses",
+                br#"{}"#,
+                environment(),
+                TEST_ASSURANCE,
+                &caller,
+            )
+            .unwrap_err(),
+            FetchProtocolError::RouteComponentLimit {
+                field: "service",
+                actual,
+            } if actual == MAX_FETCH_ROUTE_COMPONENT_BYTES + 1
+        ));
+        assert!(matches!(
+            build_input_events(
+                "openai",
+                &overlong,
+                br#"{}"#,
+                environment(),
+                TEST_ASSURANCE,
+                &caller,
+            )
+            .unwrap_err(),
+            FetchProtocolError::RouteComponentLimit {
+                field: "method",
+                actual,
+            } if actual == MAX_FETCH_ROUTE_COMPONENT_BYTES + 1
+        ));
+    }
+
+    #[test]
+    fn input_verifier_bounds_signed_route_components() {
+        let events = raw_input_events(
+            b"openai".to_vec(),
+            vec![b'x'; MAX_FETCH_ROUTE_COMPONENT_BYTES + 1],
+        );
+
+        assert!(matches!(
+            verify_input_events(&events).unwrap_err(),
+            FetchProtocolError::RouteComponentLimit {
+                field: "method",
+                actual,
+            } if actual == MAX_FETCH_ROUTE_COMPONENT_BYTES + 1
         ));
     }
 
@@ -839,7 +1098,7 @@ use crate::output::{
 type PayloadEncodeError = serde_ipld_dagcbor::EncodeError<TryReserveError>;
 type PayloadDecodeError = serde_ipld_dagcbor::DecodeError<Infallible>;
 
-const EVENT_CODEC: &str = "hellas.fetch.output.event.v2";
+const EVENT_CODEC: &str = "hellas.fetch.output.event.v3";
 const TERMINAL_CODEC: &str = "hellas.fetch.output.terminal.v2";
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -863,6 +1122,7 @@ pub enum FetchEventPayload {
         arguments: JsonValue,
     },
     StructuredOutputDelta(StructuredDelta),
+    Adaptor(crate::output::AdaptorEvent),
     Usage(Usage),
     Provenance(Provenance),
 }
@@ -922,10 +1182,13 @@ pub fn decode_fetch_terminal_payload(
         });
     }
     let FetchTerminalPayload::Finished {
+        stop_reason,
         usage,
         billable_units,
-        ..
     } = &payload;
+    if *stop_reason == StopReason::Cancelled {
+        return Err(FetchPayloadError::CancelledTerminal);
+    }
     let expected = fetch_billable_units(*usage);
     if *billable_units != expected {
         return Err(FetchPayloadError::BillableUnitsMismatch {
@@ -1008,6 +1271,7 @@ impl TryFrom<&OutputEvent> for FetchEventPayload {
             OutputEvent::StructuredOutputDelta(delta) => {
                 Ok(Self::StructuredOutputDelta(delta.clone()))
             }
+            OutputEvent::Adaptor(event) => Ok(Self::Adaptor(event.clone())),
             OutputEvent::Usage(usage) => Ok(Self::Usage(*usage)),
             OutputEvent::Provenance(provenance) => Ok(Self::Provenance(provenance.clone())),
             OutputEvent::Finished { .. } | OutputEvent::Error { .. } => {
@@ -1056,6 +1320,7 @@ impl TryFrom<FetchEventPayload> for OutputEvent {
             FetchEventPayload::StructuredOutputDelta(delta) => {
                 Ok(Self::StructuredOutputDelta(delta))
             }
+            FetchEventPayload::Adaptor(event) => Ok(Self::Adaptor(event)),
             FetchEventPayload::Usage(usage) => Ok(Self::Usage(usage)),
             FetchEventPayload::Provenance(provenance) => Ok(Self::Provenance(provenance)),
         }
@@ -1128,6 +1393,32 @@ mod payload_tests {
     }
 
     #[test]
+    fn cancelled_terminal_is_rejected_by_both_codec_directions() {
+        let event = OutputEvent::Finished {
+            stop_reason: StopReason::Cancelled,
+            usage: None,
+        };
+        assert!(matches!(
+            encode_fetch_terminal_payload(&event),
+            Err(FetchPayloadError::CancelledTerminal)
+        ));
+
+        let bytes = serde_ipld_dagcbor::to_vec(&(
+            TERMINAL_CODEC,
+            FetchTerminalPayload::Finished {
+                stop_reason: StopReason::Cancelled,
+                usage: None,
+                billable_units: 0,
+            },
+        ))
+        .unwrap();
+        assert!(matches!(
+            decode_fetch_terminal_payload(&bytes),
+            Err(FetchPayloadError::CancelledTerminal)
+        ));
+    }
+
+    #[test]
     fn terminal_payload_is_not_event_payload() {
         let event = OutputEvent::Finished {
             stop_reason: StopReason::EndOfText,
@@ -1148,7 +1439,7 @@ mod payload_tests {
             channel: TextChannel::Output,
         };
         let actual = hex(&encode_fetch_event_payload(&event).unwrap());
-        let expected = "82781c68656c6c61732e66657463682e6f75747075742e6576656e742e7632a1695465787444656c7461a36564656c746162686965696e64657800676368616e6e656c664f7574707574";
+        let expected = "82781c68656c6c61732e66657463682e6f75747075742e6576656e742e7633a1695465787444656c7461a36564656c746162686965696e64657800676368616e6e656c664f7574707574";
         assert_eq!(actual, expected);
     }
 }

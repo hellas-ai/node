@@ -51,14 +51,15 @@ use hellas_rpc::protocol::work_setup::{
 };
 use hellas_rpc::services::work::{WorkClientImpl, WorkServer};
 use hellas_rpc::work::{
-    BackendFault, ClientEndpoint, PaidEvaluateBackend, PaymentError, ProviderEndpoint, RunError,
-    RunOutcome, WorkRefusal, WorkService, admit_payment, fetch_result, run_accepted_work,
+    BackendFault, ClientEndpoint, PaidEvaluateBackend, PaymentError, PreparedEvaluateInput,
+    ProviderEndpoint, RunError, RunOutcome, WorkRefusal, WorkService, admit_payment, fetch_result,
+    run_accepted_work,
 };
 use hellas_rpc::work_close::{FinalizedWork, observe};
 use hellas_rpc::work_store::{ChannelRecord, ChannelStore, JobPhase, JobState, Role, SetupOrigin};
 use hellas_rpc::{
-    Assurance, EvaluateProgramManifest, EvaluateRequest, ExecutionPackageId, OutputEventEnvelope,
-    ProducerSigningKey, ProgramManifest, PublicKey,
+    Application, Assurance, CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR, ContentId, EvaluateRequest,
+    OutputEventEnvelope, ProducerSigningKey, ProgramManifest, PublicKey,
 };
 use hellas_wire::mux::{MessagePipe, MuxConfig, MuxTransport, Role as MuxRole};
 use hellas_wire::{DefaultClock, Dispatcher, StreamTransport};
@@ -315,9 +316,10 @@ fn commit(store: &mut ChannelStore, record: ChannelRecord) {
 // ── The prepared inputs a job executes from ───────────────────────────
 
 fn manifest() -> ProgramManifest {
-    ProgramManifest::Evaluate(EvaluateProgramManifest {
-        execution_package: ExecutionPackageId::from_bytes([0x16; 32]),
-    })
+    ProgramManifest::new(
+        Application::new(CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR).unwrap(),
+        ContentId::from_bytes([0x16; 32]),
+    )
 }
 
 fn prompt_tokens() -> TokenIds {
@@ -329,10 +331,7 @@ fn text_policy() -> TextPolicy {
 }
 
 fn identity_artifact() -> TextArtifact {
-    TextArtifact::identity(
-        BoundTermId::from_digest(manifest().content_id().digest()),
-        ExecutionPackageId::from_bytes([0x16; 32]),
-    )
+    TextArtifact::identity(BoundTermId::from_digest(manifest().content_id().digest()))
 }
 
 fn text_execution() -> TextExecution {
@@ -430,6 +429,7 @@ fn transcript_for(request: &EvaluateRequest, answer: &[u32]) -> Vec<OutputEventE
     match builder.finish(EvaluateTerminal {
         final_position: answer.len() as u64,
         stop_reason: EvaluateStopReason::STOP_TOKEN,
+        matched_stop_token_id: Some(1),
         text_artifact: Digest::from_bytes([0x77; 32]),
         usage,
         billable_units,
@@ -455,11 +455,11 @@ impl AnsweringBackend {
 impl PaidEvaluateBackend for AnsweringBackend {
     fn evaluate(
         &self,
-        request: EvaluateRequest,
+        input: PreparedEvaluateInput,
     ) -> impl core::future::Future<Output = Result<Vec<OutputEventEnvelope>, BackendFault>> + Send
     {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        let produced = transcript_for(&request, &ANSWER);
+        let produced = transcript_for(input.evaluate_request(), &ANSWER);
         async move { Ok(produced) }
     }
 }

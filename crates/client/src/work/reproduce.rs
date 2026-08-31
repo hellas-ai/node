@@ -18,10 +18,10 @@
 //! [`reproduce`] rebuilds `PaidJobResultV1::canonical_output_digest` from
 //! scratch and returns it. That digest binds the whole answer — the
 //! output token ids in position order, the final position, the stop
-//! reason, the output text artifact, and the usage counts
+//! reason and matched stop-token witness, the output text artifact, and the usage counts
 //! (`hellas_rpc::protocol::work::canonical_output_digest`) — so
 //! reproducing it reproduces all of them. Every part of it except the
-//! tokens and the stop reason is *derived* here from the job's own
+//! tokens, stop reason, and matched stop-token witness is *derived* here from the job's own
 //! inputs, through the same [`completed_text`] the provider's artifact
 //! store uses; the tokens and the stop reason come from re-running the
 //! model.
@@ -56,7 +56,7 @@ use hellas_rpc::protocol::artifacts::{
     OutputAddressed as _, PreparedPaidInputV1, TextArtifact, TextExecutionId, completed_text,
 };
 use hellas_rpc::protocol::work::{PaidJobResultV1, canonical_output_digest};
-use hellas_rpc::{ContentId, Digest, ExecutionPackageId};
+use hellas_rpc::{ContentId, Digest};
 
 /// Why a result could not be reproduced at all.
 ///
@@ -92,10 +92,13 @@ pub enum ReproduceFault {
 /// clients holding the same authorization ask the same question.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReproductionRequest {
-    /// The exact verified Catena execution package the identity artifact names.
-    pub execution_package: ExecutionPackageId,
-    /// The environment manifest the execution is bound to.
-    pub environment: ContentId,
+    /// Content ID of the exact program manifest the execution is bound to.
+    ///
+    /// The identity artifact's bound term and the evaluate request are both
+    /// checked against this ID before an engine receives the request. The
+    /// manifest already commits to its complete application pair and root, so
+    /// no evaluator-specific identity is repeated here.
+    pub execution_environment: ContentId,
     /// The whole prompt, in token ids.
     ///
     /// For this profile it is the execution's prompt tokens: the only
@@ -115,6 +118,9 @@ pub struct Reproduced {
     pub output_token_ids: Vec<u32>,
     /// Why generation stopped.
     pub stop_reason: EvaluateStopReason,
+    /// The selected stop token returned by the runtime, present exactly when
+    /// `stop_reason` is [`EvaluateStopReason::STOP_TOKEN`].
+    pub matched_stop_token_id: Option<u32>,
 }
 
 /// Whether a reproduction reproduced the signed answer.
@@ -168,17 +174,24 @@ pub fn plan(bundle: &PreparedPaidInputV1) -> Result<ReproductionRequest, Reprodu
     let parts = bundle
         .parts()
         .map_err(|error| ReproduceFault::Body(error.to_string()))?;
-    let TextArtifact::Identity {
-        execution_package, ..
-    } = &parts.identity_artifact
-    else {
+    let TextArtifact::Identity { bound_term } = &parts.identity_artifact else {
         return Err(ReproduceFault::Unsupported {
             what: "input is a previous output rather than an identity",
         });
     };
+    let manifest_id = parts.manifest.content_id();
+    if parts.evaluate_request.execution_environment != manifest_id {
+        return Err(ReproduceFault::Body(
+            "evaluate request does not name the carried program manifest".to_string(),
+        ));
+    }
+    if bound_term.as_bytes() != manifest_id.as_bytes() {
+        return Err(ReproduceFault::Body(
+            "identity artifact is not bound to the carried program manifest".to_string(),
+        ));
+    }
     Ok(ReproductionRequest {
-        execution_package: *execution_package,
-        environment: parts.evaluate_request.execution_environment,
+        execution_environment: manifest_id,
         prompt_token_ids: parts
             .prompt_tokens
             .as_slice()
@@ -234,7 +247,7 @@ pub async fn reproduce<E: Reproducer + ?Sized>(
 /// Rebuilds the canonical answer digest a correct provider would have
 /// signed for this reproduction.
 ///
-/// Everything but the tokens and the stop reason is derived: the output
+/// Everything but the tokens, stop reason, and matched stop-token witness is derived: the output
 /// artifact through [`completed_text`], the usage from the two token
 /// counts, and the billable total from those. A provider that generated
 /// these tokens has no freedom left in any of it.
@@ -275,6 +288,7 @@ fn reproduced_output_digest(
     let terminal = EvaluateTerminal {
         final_position: output_units,
         stop_reason: produced.stop_reason,
+        matched_stop_token_id: produced.matched_stop_token_id,
         text_artifact: completed.artifact.output_id().digest(),
         usage,
         billable_units,

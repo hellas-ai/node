@@ -23,7 +23,7 @@ allow = [
 ]
 
 [licenses.private]
-# catena-runner is an unpublished sibling interface proposal. Its owners must
+# catena-lang is an unpublished sibling interface proposal. Its owners must
 # add the intended licence and licence texts before public distribution.
 ignore = true
 

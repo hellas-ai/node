@@ -228,6 +228,9 @@ impl WireAdaptor for OpenAiResponsesAdaptor {
             }
             OutputEvent::ToolCallEnd(end) => render_tool_call_end(state, end),
             OutputEvent::StructuredOutputDelta(delta) => render_structured_delta(state, delta),
+            OutputEvent::Adaptor(_) => Err(AdaptorError::unsupported(
+                "OpenAI Responses cannot render another adaptor's signed events",
+            )),
             OutputEvent::Usage(usage) => {
                 state.usage = Some(usage);
                 Ok(Vec::new())
