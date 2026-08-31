@@ -36,6 +36,30 @@ pub fn decode_dag_cbor<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, DagCborDe
     serde_ipld_dagcbor::from_slice(bytes)
 }
 
+/// Decode a value only when `bytes` are its one canonical DAG-CBOR spelling.
+///
+/// `serde_ipld_dagcbor` accepts some semantically equivalent CBOR encodings on
+/// input. That is useful at an ordinary serialization boundary, but not for a
+/// signed protocol body whose canonicalization identifier promises exact
+/// bytes. Decode and re-encode before exposing the value so a verifier cannot
+/// accept a spelling that another implementation rejects.
+pub(crate) fn decode_canonical_dag_cbor<T>(bytes: &[u8]) -> Result<T, CanonicalDecodeError>
+where
+    T: DeserializeOwned + Serialize,
+{
+    let value = serde_ipld_dagcbor::from_slice(bytes)
+        .map_err(|error| CanonicalDecodeError::new(format!("invalid DAG-CBOR: {error}")))?;
+    let canonical = canonical_dag_cbor(&value).map_err(|error| {
+        CanonicalDecodeError::new(format!("could not canonicalize decoded DAG-CBOR: {error}"))
+    })?;
+    if canonical != bytes {
+        return Err(CanonicalDecodeError::new(
+            "DAG-CBOR body is not canonically encoded",
+        ));
+    }
+    Ok(value)
+}
+
 /// Minimal strict DAG-CBOR encoder for commitment blobs whose byte layout is
 /// part of the protocol. Use this when serde's struct/enum representation would
 /// obscure the exact canonical preimage.

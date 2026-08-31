@@ -1083,9 +1083,6 @@ mod tests {
 // vendor-HTTP bytes → adaptors.
 // ---------------------------------------------------------------------
 
-use std::collections::TryReserveError;
-use std::convert::Infallible;
-
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use thiserror::Error;
@@ -1094,9 +1091,8 @@ use crate::output::{
     OutputEvent, Provenance, StopReason, StructuredDelta, TextChannel, ToolCallArgumentsDelta,
     ToolCallEnd, ToolCallStart, Usage,
 };
-
-type PayloadEncodeError = serde_ipld_dagcbor::EncodeError<TryReserveError>;
-type PayloadDecodeError = serde_ipld_dagcbor::DecodeError<Infallible>;
+use crate::protocol::value::{CanonicalDecodeError, decode_canonical_dag_cbor};
+use crate::{DagCborEncodeError, canonical_dag_cbor};
 
 const EVENT_CODEC: &str = "hellas.fetch.output.event.v3";
 const TERMINAL_CODEC: &str = "hellas.fetch.output.terminal.v2";
@@ -1138,12 +1134,11 @@ pub enum FetchTerminalPayload {
 
 pub fn encode_fetch_event_payload(event: &OutputEvent) -> Result<Vec<u8>, FetchPayloadError> {
     let payload = FetchEventPayload::try_from(event)?;
-    serde_ipld_dagcbor::to_vec(&(EVENT_CODEC, payload)).map_err(FetchPayloadError::Encode)
+    canonical_dag_cbor(&(EVENT_CODEC, payload)).map_err(FetchPayloadError::Encode)
 }
 
 pub fn decode_fetch_event_payload(bytes: &[u8]) -> Result<OutputEvent, FetchPayloadError> {
-    let (codec, payload): (String, FetchEventPayload) =
-        serde_ipld_dagcbor::from_slice(bytes).map_err(FetchPayloadError::Decode)?;
+    let (codec, payload): (String, FetchEventPayload) = decode_canonical_dag_cbor(bytes)?;
     if codec != EVENT_CODEC {
         return Err(FetchPayloadError::CodecMismatch {
             expected: EVENT_CODEC,
@@ -1167,14 +1162,13 @@ pub fn encode_fetch_terminal_payload(event: &OutputEvent) -> Result<Vec<u8>, Fet
         OutputEvent::Error { .. } => return Err(FetchPayloadError::FailureAsTerminal),
         _ => return Err(FetchPayloadError::NonTerminalAsTerminal),
     };
-    serde_ipld_dagcbor::to_vec(&(TERMINAL_CODEC, payload)).map_err(FetchPayloadError::Encode)
+    canonical_dag_cbor(&(TERMINAL_CODEC, payload)).map_err(FetchPayloadError::Encode)
 }
 
 pub fn decode_fetch_terminal_payload(
     bytes: &[u8],
 ) -> Result<FetchTerminalPayload, FetchPayloadError> {
-    let (codec, payload): (String, FetchTerminalPayload) =
-        serde_ipld_dagcbor::from_slice(bytes).map_err(FetchPayloadError::Decode)?;
+    let (codec, payload): (String, FetchTerminalPayload) = decode_canonical_dag_cbor(bytes)?;
     if codec != TERMINAL_CODEC {
         return Err(FetchPayloadError::CodecMismatch {
             expected: TERMINAL_CODEC,
@@ -1330,9 +1324,9 @@ impl TryFrom<FetchEventPayload> for OutputEvent {
 #[derive(Debug, Error)]
 pub enum FetchPayloadError {
     #[error("fetch payload encode failed: {0}")]
-    Encode(#[from] PayloadEncodeError),
+    Encode(#[from] DagCborEncodeError),
     #[error("fetch payload decode failed: {0}")]
-    Decode(#[from] PayloadDecodeError),
+    Decode(#[from] CanonicalDecodeError),
     #[error("fetch payload codec mismatch: expected {expected}, got {actual}")]
     CodecMismatch {
         expected: &'static str,
@@ -1360,6 +1354,13 @@ mod payload_tests {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()
     }
 
+    fn overlong_tuple_header(canonical: &[u8]) -> Vec<u8> {
+        assert_eq!(canonical[0], 0x82);
+        let mut noncanonical = vec![0x98, 0x02];
+        noncanonical.extend_from_slice(&canonical[1..]);
+        noncanonical
+    }
+
     #[test]
     fn event_payload_round_trip() {
         let event = OutputEvent::TextDelta {
@@ -1372,6 +1373,41 @@ mod payload_tests {
         let decoded = decode_fetch_event_payload(&encoded).unwrap();
 
         assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn event_payload_must_be_canonical_dag_cbor() {
+        let canonical = encode_fetch_event_payload(&OutputEvent::TextDelta {
+            index: 0,
+            delta: "hello".to_string(),
+            channel: TextChannel::Output,
+        })
+        .unwrap();
+        let noncanonical = overlong_tuple_header(&canonical);
+        let _: (String, FetchEventPayload) = serde_ipld_dagcbor::from_slice(&noncanonical)
+            .expect("the permissive decoder accepts the equivalent tuple header");
+
+        assert!(matches!(
+            decode_fetch_event_payload(&noncanonical),
+            Err(FetchPayloadError::Decode(_))
+        ));
+    }
+
+    #[test]
+    fn terminal_payload_must_be_canonical_dag_cbor() {
+        let canonical = encode_fetch_terminal_payload(&OutputEvent::Finished {
+            stop_reason: StopReason::EndOfText,
+            usage: None,
+        })
+        .unwrap();
+        let noncanonical = overlong_tuple_header(&canonical);
+        let _: (String, FetchTerminalPayload) = serde_ipld_dagcbor::from_slice(&noncanonical)
+            .expect("the permissive decoder accepts the equivalent tuple header");
+
+        assert!(matches!(
+            decode_fetch_terminal_payload(&noncanonical),
+            Err(FetchPayloadError::Decode(_))
+        ));
     }
 
     #[test]

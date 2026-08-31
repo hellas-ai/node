@@ -1,12 +1,13 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::protocol::value::{CanonicalDecodeError, decode_canonical_dag_cbor};
 use crate::{
     Assurance, CanonicalizationId, Digest, Evaluate, EvaluateRequest, InputCommitment, Operation,
     OutputEventEnvelope, OutputTranscriptBuilder, ProducerSigningKey, PublicKey, StreamVerifyError,
-    decode_dag_cbor, encode_token_ids, scheme_id, verify_output_event_envelopes,
+    encode_token_ids, scheme_id, verify_output_event_envelopes,
 };
-use crate::{DagCborDecodeError, DagCborEncodeError, canonical_dag_cbor};
+use crate::{DagCborEncodeError, canonical_dag_cbor};
 
 const OUTPUT_CANONICALIZATION: &[u8] = b"hellas.evaluate.output.v4";
 pub const TOKEN_DELTA_EVENT_KIND: &str = "evaluate.token_delta.v4";
@@ -106,7 +107,7 @@ pub fn encode_token_delta_payload(
 pub fn decode_token_delta_payload(
     bytes: &[u8],
 ) -> Result<EvaluateTokenDelta, EvaluateProtocolError> {
-    let (codec, payload): (String, EvaluateTokenDelta) = decode_dag_cbor(bytes)?;
+    let (codec, payload): (String, EvaluateTokenDelta) = decode_canonical_dag_cbor(bytes)?;
     if codec != TOKEN_DELTA_CODEC {
         return Err(EvaluateProtocolError::CodecMismatch {
             expected: TOKEN_DELTA_CODEC,
@@ -126,7 +127,7 @@ pub fn encode_terminal_payload(
 }
 
 pub fn decode_terminal_payload(bytes: &[u8]) -> Result<EvaluateTerminal, EvaluateProtocolError> {
-    let (codec, payload): (String, EvaluateTerminal) = decode_dag_cbor(bytes)?;
+    let (codec, payload): (String, EvaluateTerminal) = decode_canonical_dag_cbor(bytes)?;
     if codec != TERMINAL_CODEC {
         return Err(EvaluateProtocolError::CodecMismatch {
             expected: TERMINAL_CODEC,
@@ -347,7 +348,7 @@ pub enum EvaluateProtocolError {
     #[error("evaluate payload encode failed: {0}")]
     Encode(#[from] DagCborEncodeError),
     #[error("evaluate payload decode failed: {0}")]
-    Decode(#[from] DagCborDecodeError),
+    Decode(#[from] CanonicalDecodeError),
     #[error("evaluate payload codec mismatch: expected {expected}, got {actual}")]
     CodecMismatch {
         expected: &'static str,
@@ -404,6 +405,13 @@ mod tests {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()
     }
 
+    fn overlong_tuple_header(canonical: &[u8]) -> Vec<u8> {
+        assert_eq!(canonical[0], 0x82);
+        let mut noncanonical = vec![0x98, 0x02];
+        noncanonical.extend_from_slice(&canonical[1..]);
+        noncanonical
+    }
+
     #[test]
     fn evaluate_v4_domains_and_first_event_commitment_are_pinned() {
         assert_eq!(OUTPUT_CANONICALIZATION, b"hellas.evaluate.output.v4");
@@ -438,6 +446,47 @@ mod tests {
         assert!(matches!(
             decode_token_delta_payload(&bytes),
             Err(EvaluateProtocolError::EmptyTokenDelta)
+        ));
+    }
+
+    #[test]
+    fn decoded_token_delta_must_be_canonical_dag_cbor() {
+        let canonical = encode_token_delta_payload(&EvaluateTokenDelta {
+            start_position: 0,
+            token_ids: vec![7],
+        })
+        .unwrap();
+        let noncanonical = overlong_tuple_header(&canonical);
+        let _: (String, EvaluateTokenDelta) = serde_ipld_dagcbor::from_slice(&noncanonical)
+            .expect("the permissive decoder accepts the equivalent tuple header");
+
+        assert!(matches!(
+            decode_token_delta_payload(&noncanonical),
+            Err(EvaluateProtocolError::Decode(_))
+        ));
+    }
+
+    #[test]
+    fn decoded_terminal_must_be_canonical_dag_cbor() {
+        let canonical = encode_terminal_payload(&EvaluateTerminal {
+            final_position: 0,
+            stop_reason: EvaluateStopReason::MAX_OUTPUT,
+            matched_stop_token_id: None,
+            text_artifact: Digest::from_bytes([4; 32]),
+            usage: EvaluateUsage {
+                input_units: 3,
+                output_units: 0,
+            },
+            billable_units: 3,
+        })
+        .unwrap();
+        let noncanonical = overlong_tuple_header(&canonical);
+        let _: (String, EvaluateTerminal) = serde_ipld_dagcbor::from_slice(&noncanonical)
+            .expect("the permissive decoder accepts the equivalent tuple header");
+
+        assert!(matches!(
+            decode_terminal_payload(&noncanonical),
+            Err(EvaluateProtocolError::Decode(_))
         ));
     }
 

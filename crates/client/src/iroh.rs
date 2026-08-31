@@ -1118,24 +1118,22 @@ async fn discover_and_prepare_fetch(
                         status,
                     )
                 })?;
-                Ok((transport, producer_key, ticket))
-            },
-        )
-        .await
-        {
-            Ok((transport, producer_key, ticket)) => {
                 let ticket = validate_fetch_ticket(
                     ticket,
                     input_commitment,
                     assurance,
                     provider_trust.expected_genesis,
                 )?;
-                return Ok(PreparedFetch {
+                Ok(PreparedFetch {
                     transport,
                     ticket,
                     producer_key,
-                });
-            }
+                })
+            },
+        )
+        .await
+        {
+            Ok(prepared) => return Ok(prepared),
             Err(error) => {
                 last_error = Some(error);
                 if attempts >= max_attempts {
