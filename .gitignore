@@ -4,6 +4,7 @@
 .envrc
 .claude
 .env
+prompts/
 crates/kernel/node_modules/
 crates/kernel/target/
 crates/kernel/ref/
