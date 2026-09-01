@@ -580,8 +580,10 @@ in
   provider-content-index-eval =
     assert service.environment ? ROCM_PATH;
     assert service.environment ? HIP_PATH;
-    assert service.environment.TMPDIR == "/var/cache/hellas";
+    assert service.environment.TMPDIR == "/run/hellas";
     assert service.path != [ ];
+    assert service.serviceConfig.RuntimeDirectory == "hellas";
+    assert service.serviceConfig.RuntimeDirectoryMode == "0700";
     assert service.serviceConfig.CacheDirectory == "hellas";
     # The logical resident-asset cap must never lower the driver's memlock
     # permission. The cgroup ceiling is the whole-unit containment boundary.
@@ -657,6 +659,9 @@ in
       ];
     assert verifyLocalGatewayService.serviceConfig.ReadOnlyPaths == [ "/srv/hellas/content" ];
     assert !(lib.elem "/srv/hellas/content" verifyLocalGatewayService.serviceConfig.ReadWritePaths);
+    assert verifyLocalGatewayService.environment.TMPDIR == "/run/hellas-gateway";
+    assert verifyLocalGatewayService.serviceConfig.RuntimeDirectory == "hellas-gateway";
+    assert verifyLocalGatewayService.serviceConfig.RuntimeDirectoryMode == "0700";
     assert
       managedContentProviderService.serviceConfig.ReadOnlyPaths == [
         "/var/lib/hellas/content"

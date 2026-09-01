@@ -372,10 +372,11 @@ in
         // cfg.environment
         // {
           HOME = hellasLib.defaultStateDir;
-          # Catena's generated source and shared objects are runtime cache
-          # data. Keep them writable and persistent across daemon restarts,
-          # never in /tmp and never in the immutable Nix store.
-          TMPDIR = "/var/cache/hellas";
+          # Catena compiles generated shared objects below TMPDIR and dlopens
+          # them. CacheDirectory is deliberately mounted noexec for a
+          # DynamicUser, so use the private, ephemeral RuntimeDirectory for
+          # executable compiler scratch instead.
+          TMPDIR = "/run/hellas";
           XDG_CACHE_HOME = "/var/cache/hellas";
         }
         // lib.optionalAttrs providerGpuConfigured rocmEnvironment
@@ -390,6 +391,8 @@ in
         );
         Restart = "on-failure";
         DynamicUser = true;
+        RuntimeDirectory = "hellas";
+        RuntimeDirectoryMode = "0700";
         StateDirectory = "hellas";
         StateDirectoryMode = "0700";
         CacheDirectory = "hellas";
@@ -460,7 +463,9 @@ in
         }
         // lib.optionalAttrs (gateway.local || gateway.verifyLocal) (
           {
-            TMPDIR = "/var/cache/hellas-gateway";
+            # Local Catena execution dlopens generated shared objects, which
+            # cannot live below DynamicUser's noexec CacheDirectory.
+            TMPDIR = "/run/hellas-gateway";
             XDG_CACHE_HOME = "/var/cache/hellas-gateway";
           }
           // rocmEnvironment
@@ -496,6 +501,8 @@ in
       }
       // lib.optionalAttrs (gateway.local || gateway.verifyLocal) (
         {
+          RuntimeDirectory = "hellas-gateway";
+          RuntimeDirectoryMode = "0700";
           CacheDirectory = "hellas-gateway";
           CacheDirectoryMode = "0700";
         }

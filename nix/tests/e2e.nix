@@ -427,7 +427,7 @@ in
       assert "--gpu-max-generation-device-bytes 536870912" in unit
       assert "--gpu-compile-timeout-secs 600" in unit
       assert "--gpu-execution-timeout-secs 900" in unit
-      assert "TMPDIR=/var/cache/hellas" in unit
+      assert "TMPDIR=/run/hellas" in unit
       machine.succeed(
           "test \"$(cat /sys/fs/cgroup/system.slice/hellas.service/memory.oom.group)\" = 1"
       )
