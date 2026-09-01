@@ -43,6 +43,7 @@ pub fn decode_dag_cbor<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, DagCborDe
 /// signed protocol body whose canonicalization identifier promises exact
 /// bytes. Decode and re-encode before exposing the value so a verifier cannot
 /// accept a spelling that another implementation rejects.
+#[cfg(any(feature = "evaluate", feature = "fetch"))]
 pub(crate) fn decode_canonical_dag_cbor<T>(bytes: &[u8]) -> Result<T, CanonicalDecodeError>
 where
     T: DeserializeOwned + Serialize,
