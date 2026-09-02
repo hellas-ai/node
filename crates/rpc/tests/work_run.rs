@@ -428,6 +428,7 @@ fn accept(store: &mut ChannelStore, nonce: u8) -> Digest {
     commit(
         store,
         ChannelRecord::JobAccepted {
+            work_id: id,
             provider_signature: provider().sign(signing_hash(id)),
         },
     );
@@ -835,7 +836,7 @@ async fn a_marker_a_process_did_not_come_back_from_is_indeterminate() {
         let mut store = store_at(dir.path(), CURSOR);
         let id = accept(&mut store, 1);
         // Exactly the state `begin_run` leaves before it returns.
-        commit(&mut store, ChannelRecord::JobRunning);
+        commit(&mut store, ChannelRecord::JobRunning { work_id: id });
         id
     };
 
@@ -1004,6 +1005,7 @@ async fn a_job_that_was_never_co_signed_does_not_run() {
     commit(
         &mut store,
         ChannelRecord::JobAccepted {
+            work_id: id,
             provider_signature: provider().sign(signing_hash(id)),
         },
     );

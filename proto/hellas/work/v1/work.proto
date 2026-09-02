@@ -131,12 +131,15 @@ message WorkAccepted {
   // The provider's compact secp256k1 signature over the same work id:
   // exactly 64 bytes.
   bytes provider_signature = 1;
+  // The job this answer co-signs. Required when several acceptance
+  // exchanges share one channel and responses arrive out of order.
+  bytes work_id = 2;
 }
 
 message DeliverResultRequest {
   // The accepted job's `work_id`: the authorization's own digest,
-  // exactly 32 bytes. There is one job in flight per channel, so this
-  // names it rather than selecting among many.
+  // exactly 32 bytes. Several jobs may be in flight per channel, so
+  // every follow-on message selects one explicitly.
   //
   // It is an identifier and not an authority. What authorises the
   // release is the signature below.

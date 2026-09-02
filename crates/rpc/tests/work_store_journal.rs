@@ -110,11 +110,8 @@ fn a_v2_channel_journal_is_refused_not_misread() {
     // tell the two apart, which is what makes the refusal the journal
     // header's job.
     assert!(
-        matches!(
-            ChannelRecord::decode(&[0x06]),
-            Ok(ChannelRecord::ResultMatched)
-        ),
-        "an old v2 record body still decodes under the new tags",
+        ChannelRecord::decode(&[0x06]).is_err(),
+        "a v4 job marker requires its work id",
     );
 
     // A genuine v2 file, written byte by byte: the v2 header, then one

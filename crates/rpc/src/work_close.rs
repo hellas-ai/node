@@ -592,8 +592,8 @@ pub fn observe<V: SigVerifier>(
     {
         return Ok(());
     }
-    if let Some(outcome) = expiry_at(store.state(), block.height, block.payload) {
-        store.commit(ChannelRecord::JobTerminated { outcome }, verifier)?;
+    for (work_id, outcome) in expiry_at(store.state(), block.height, block.payload) {
+        store.commit(ChannelRecord::JobTerminated { work_id, outcome }, verifier)?;
     }
 
     apply_finalized_txs(store, block.height, block.payload, &block.txs, verifier)?;
@@ -640,13 +640,15 @@ pub(crate) fn apply_finalized_txs<V: SigVerifier>(
                 // no longer be paid for. It rests at an expired terminal,
                 // and the provider bears whatever compute or delivery it
                 // already spent on it.
-                if let Some(deadline) = store
+                let open: Vec<_> = store
                     .state()
-                    .job()
-                    .map(|job| job.authorization().payment_deadline)
-                {
+                    .jobs()
+                    .map(|job| (job.work_id(), job.authorization().payment_deadline))
+                    .collect();
+                for (work_id, deadline) in open {
                     store.commit(
                         ChannelRecord::JobTerminated {
+                            work_id,
                             outcome: TerminalOutcome::Expired {
                                 deadline,
                                 height,
@@ -688,13 +690,15 @@ pub(crate) fn apply_finalized_txs<V: SigVerifier>(
                     .iter()
                     .find(|payout| payout.owner() == channel.provider_key())
                     .map_or(0, |payout| payout.value());
-                if let Some(deadline) = store
+                let open: Vec<_> = store
                     .state()
-                    .job()
-                    .map(|job| job.authorization().payment_deadline)
-                {
+                    .jobs()
+                    .map(|job| (job.work_id(), job.authorization().payment_deadline))
+                    .collect();
+                for (work_id, deadline) in open {
                     store.commit(
                         ChannelRecord::JobTerminated {
+                            work_id,
                             outcome: TerminalOutcome::Expired {
                                 deadline,
                                 height,
@@ -743,26 +747,35 @@ fn expiry_at(
     state: &crate::work_store::ChannelState,
     height: u64,
     payload: [u8; 32],
-) -> Option<TerminalOutcome> {
+) -> Vec<(crate::protocol::Digest, TerminalOutcome)> {
     if state.role() != Role::Provider {
-        return None;
+        return Vec::new();
     }
-    let job = state.job()?;
-    let authorization = job.authorization();
-    let deadline = if height > authorization.payment_deadline {
-        authorization.payment_deadline
-    } else if height > authorization.terminal_deadline && job.result().is_none() {
-        authorization.terminal_deadline
-    } else if height > authorization.acceptance_deadline && job.phase() == JobPhase::HalfSigned {
-        authorization.acceptance_deadline
-    } else {
-        return None;
-    };
-    Some(TerminalOutcome::Expired {
-        deadline,
-        height,
-        payload,
-    })
+    state
+        .jobs()
+        .filter_map(|job| {
+            let authorization = job.authorization();
+            let deadline = if height > authorization.payment_deadline {
+                authorization.payment_deadline
+            } else if height > authorization.terminal_deadline && job.result().is_none() {
+                authorization.terminal_deadline
+            } else if height > authorization.acceptance_deadline
+                && job.phase() == JobPhase::HalfSigned
+            {
+                authorization.acceptance_deadline
+            } else {
+                return None;
+            };
+            Some((
+                job.work_id(),
+                TerminalOutcome::Expired {
+                    deadline,
+                    height,
+                    payload,
+                },
+            ))
+        })
+        .collect()
 }
 
 /// Reads every finalized block this journal has not seen, in order.

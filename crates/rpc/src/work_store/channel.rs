@@ -80,6 +80,7 @@
 //! settles exactly the open job. A concurrent profile needs a job
 //! identifier in every record; it is not this one.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use hellas_kernel::{
@@ -100,8 +101,8 @@ use crate::work_store::journal::{
 };
 use crate::work_store::setup::SetupOrigin;
 use crate::work_store::{
-    Applied, WorkStoreError, cursor::Cursor, hex, put_bytes, put_option, put_u64, take_bool,
-    take_bytes, take_option,
+    Applied, WorkStoreError, cursor::Cursor, hex, put_bytes, put_option, put_u64, take_bytes,
+    take_option,
 };
 
 /// Domain of a channel journal's key.
@@ -481,11 +482,16 @@ pub enum ChannelRecord {
     },
     /// The provider's co-signature over the same `work_id`.
     JobAccepted {
+        /// Job whose authorization is being co-signed.
+        work_id: Digest,
         /// The provider's signature.
         provider_signature: Sig,
     },
     /// The provider is about to invoke the backend.
-    JobRunning,
+    JobRunning {
+        /// Job whose invocation is beginning.
+        work_id: Digest,
+    },
     /// The provider's signed terminal result, and the signed events it
     /// summarises.
     ///
@@ -495,6 +501,8 @@ pub enum ChannelRecord {
     /// kept only the digests could not run its own re-execution without
     /// asking the provider for the bytes again.
     JobResult {
+        /// Job the result belongs to.
+        work_id: Digest,
         /// The result body.
         result: PaidJobResultV1,
         /// The provider's signature over its digest.
@@ -503,7 +511,10 @@ pub enum ChannelRecord {
         transcript: Vec<u8>,
     },
     /// The provider is about to release the plaintext.
-    PlaintextReleased,
+    PlaintextReleased {
+        /// Job whose plaintext is being released.
+        work_id: Digest,
+    },
     /// The client's own re-execution reproduced this job's answer and it
     /// matched.
     ///
@@ -515,7 +526,10 @@ pub enum ChannelRecord {
     /// at exactly one place — immediately after the reproduction matched
     /// — and the payment rule below is what makes that one place the only
     /// way to reach a payment.
-    ResultMatched,
+    ResultMatched {
+        /// Job whose result the client reproduced.
+        work_id: Digest,
+    },
     /// This channel's one job reaches its permanent terminal.
     ///
     /// It replaces both the old payment record and the old ending: a
@@ -527,6 +541,8 @@ pub enum ChannelRecord {
     /// had reached are read off the open job this record ends, not
     /// carried here: there is exactly one job they could be about.
     JobTerminated {
+        /// Job reaching this terminal.
+        work_id: Digest,
         /// How the job ended.
         outcome: TerminalOutcome,
     },
@@ -708,17 +724,26 @@ impl ChannelRecord {
                 // second length here could disagree with it.
                 out.extend_from_slice(prepared_input);
             }
-            Self::JobAccepted { provider_signature } => {
+            Self::JobAccepted {
+                work_id,
+                provider_signature,
+            } => {
                 out.push(tag::ACCEPTED);
+                out.extend_from_slice(work_id.as_bytes());
                 out.extend_from_slice(provider_signature.as_bytes());
             }
-            Self::JobRunning => out.push(tag::RUNNING),
+            Self::JobRunning { work_id } => {
+                out.push(tag::RUNNING);
+                out.extend_from_slice(work_id.as_bytes());
+            }
             Self::JobResult {
+                work_id,
                 result,
                 provider_signature,
                 transcript,
             } => {
                 out.push(tag::RESULT);
+                out.extend_from_slice(work_id.as_bytes());
                 out.extend_from_slice(&result.encode());
                 out.extend_from_slice(provider_signature.as_bytes());
                 // Last field, and the whole of the rest, for the reason
@@ -726,10 +751,17 @@ impl ChannelRecord {
                 // carries this record's length.
                 out.extend_from_slice(transcript);
             }
-            Self::PlaintextReleased => out.push(tag::PLAINTEXT),
-            Self::ResultMatched => out.push(tag::MATCHED),
-            Self::JobTerminated { outcome } => {
+            Self::PlaintextReleased { work_id } => {
+                out.push(tag::PLAINTEXT);
+                out.extend_from_slice(work_id.as_bytes());
+            }
+            Self::ResultMatched { work_id } => {
+                out.push(tag::MATCHED);
+                out.extend_from_slice(work_id.as_bytes());
+            }
+            Self::JobTerminated { work_id, outcome } => {
                 out.push(tag::TERMINATED);
+                out.extend_from_slice(work_id.as_bytes());
                 put_outcome(&mut out, outcome);
             }
             Self::ClosePrepared { start } => {
@@ -795,17 +827,26 @@ impl ChannelRecord {
                 prepared_input: cursor.rest().to_vec(),
             },
             tag::ACCEPTED => Self::JobAccepted {
+                work_id: digest(&mut cursor)?,
                 provider_signature: signature(&mut cursor)?,
             },
-            tag::RUNNING => Self::JobRunning,
+            tag::RUNNING => Self::JobRunning {
+                work_id: digest(&mut cursor)?,
+            },
             tag::RESULT => Self::JobResult {
+                work_id: digest(&mut cursor)?,
                 result: private_record(&mut cursor)?,
                 provider_signature: signature(&mut cursor)?,
                 transcript: cursor.rest().to_vec(),
             },
-            tag::PLAINTEXT => Self::PlaintextReleased,
-            tag::MATCHED => Self::ResultMatched,
+            tag::PLAINTEXT => Self::PlaintextReleased {
+                work_id: digest(&mut cursor)?,
+            },
+            tag::MATCHED => Self::ResultMatched {
+                work_id: digest(&mut cursor)?,
+            },
             tag::TERMINATED => Self::JobTerminated {
+                work_id: digest(&mut cursor)?,
                 outcome: take_outcome(&mut cursor)?,
             },
             tag::CLOSE_PREPARED => Self::ClosePrepared {
@@ -1106,10 +1147,11 @@ pub struct ChannelState {
     settlement: WorkPaymentSettlement,
     role: Role,
     ledger: CreditLedger,
-    job: Option<JobState>,
-    terminal: Option<JobTerminal>,
+    jobs: BTreeMap<Digest, JobState>,
+    terminals: BTreeMap<Digest, JobTerminal>,
+    proposal_nonce_high_water: u64,
     cursor: (u64, [u8; 32]),
-    indeterminate: bool,
+    indeterminate: BTreeMap<Digest, ()>,
     close_prepared: Option<PaymentCloseStart>,
     close_opened: Option<OpenContest>,
     close_responded: Option<RespondedContest>,
@@ -1187,10 +1229,11 @@ impl ChannelState {
             settlement,
             role,
             ledger: CreditLedger::new(),
-            job: None,
-            terminal: None,
+            jobs: BTreeMap::new(),
+            terminals: BTreeMap::new(),
+            proposal_nonce_high_water: 0,
             cursor: (origin.height, origin.payload),
-            indeterminate: false,
+            indeterminate: BTreeMap::new(),
             close_prepared: None,
             close_opened: None,
             close_responded: None,
@@ -1222,8 +1265,9 @@ impl ChannelState {
             settlement,
             role,
             ledger,
-            job,
-            terminal,
+            jobs,
+            terminals,
+            proposal_nonce_high_water,
             cursor,
             indeterminate,
             close_prepared,
@@ -1240,7 +1284,8 @@ impl ChannelState {
         put_u64(&mut out, settlement.omission_bond());
         out.push(role_code(*role));
         put_u64(&mut out, ledger.credited_cumulative());
-        put_option(&mut out, job.as_ref(), |out, job| {
+        put_u64(&mut out, jobs.len() as u64);
+        for job in jobs.values() {
             let JobState {
                 authorization,
                 work_id,
@@ -1254,18 +1299,19 @@ impl ChannelState {
             out.extend_from_slice(&authorization.encode());
             out.extend_from_slice(work_id.as_bytes());
             out.extend_from_slice(client_signature.as_bytes());
-            put_option(out, provider_signature.as_ref(), |out, signature| {
+            put_option(&mut out, provider_signature.as_ref(), |out, signature| {
                 out.extend_from_slice(signature.as_bytes());
             });
             out.push(phase.code());
-            put_option(out, result.as_ref(), |out, (result, signature)| {
+            put_option(&mut out, result.as_ref(), |out, (result, signature)| {
                 out.extend_from_slice(&result.encode());
                 out.extend_from_slice(signature.as_bytes());
             });
-            put_bytes(out, prepared_input);
-            put_bytes(out, transcript);
-        });
-        put_option(&mut out, terminal.as_ref(), |out, terminal| {
+            put_bytes(&mut out, prepared_input);
+            put_bytes(&mut out, transcript);
+        }
+        put_u64(&mut out, terminals.len() as u64);
+        for terminal in terminals.values() {
             let JobTerminal {
                 work_id,
                 phase,
@@ -1273,11 +1319,15 @@ impl ChannelState {
             } = terminal;
             out.extend_from_slice(work_id.as_bytes());
             out.push(phase.code());
-            put_outcome(out, outcome);
-        });
+            put_outcome(&mut out, outcome);
+        }
+        put_u64(&mut out, *proposal_nonce_high_water);
         put_u64(&mut out, cursor.0);
         out.extend_from_slice(&cursor.1);
-        out.push(u8::from(*indeterminate));
+        put_u64(&mut out, indeterminate.len() as u64);
+        for work_id in indeterminate.keys() {
+            out.extend_from_slice(work_id.as_bytes());
+        }
         put_option(&mut out, close_prepared.as_ref(), |out, start| {
             put_bytes(out, &encode_kernel(start));
         });
@@ -1337,45 +1387,68 @@ impl ChannelState {
             });
         }
         let credited = cursor.u64().ok_or(ChannelStateError::Malformed)?;
+        let jobs_len = cursor.u64().ok_or(ChannelStateError::Malformed)?;
+        let mut jobs = BTreeMap::new();
+        for _ in 0..jobs_len {
+            let authorization = private_record(&mut cursor)?;
+            let work_id = digest(&mut cursor)?;
+            let client_signature = signature(&mut cursor)?;
+            let provider_signature =
+                take_option(&mut cursor, ChannelStateError::Malformed, signature)?;
+            let phase = JobPhase::from_code(cursor.byte().ok_or(ChannelStateError::Malformed)?)?;
+            let result = take_option(&mut cursor, ChannelStateError::Malformed, |cursor| {
+                Ok((private_record(cursor)?, signature(cursor)?))
+            })?;
+            let job = JobState {
+                authorization,
+                work_id,
+                client_signature,
+                provider_signature,
+                phase,
+                result,
+                prepared_input: take_bytes(&mut cursor, ChannelStateError::Malformed)?.to_vec(),
+                transcript: take_bytes(&mut cursor, ChannelStateError::Malformed)?.to_vec(),
+            };
+            if jobs.insert(work_id, job).is_some() {
+                return Err(ChannelStateError::Malformed);
+            }
+        }
+        let terminals_len = cursor.u64().ok_or(ChannelStateError::Malformed)?;
+        let mut terminals = BTreeMap::new();
+        for _ in 0..terminals_len {
+            let terminal = JobTerminal {
+                work_id: digest(&mut cursor)?,
+                phase: JobPhase::from_code(cursor.byte().ok_or(ChannelStateError::Malformed)?)?,
+                outcome: take_outcome(&mut cursor)?,
+            };
+            if terminals.insert(terminal.work_id, terminal).is_some() {
+                return Err(ChannelStateError::Malformed);
+            }
+        }
+        let proposal_nonce_high_water = cursor.u64().ok_or(ChannelStateError::Malformed)?;
         let state = Self {
             channel,
             settlement,
             role,
             ledger: CreditLedger::credited(credited),
-            job: take_option(&mut cursor, ChannelStateError::Malformed, |cursor| {
-                let authorization = private_record(cursor)?;
-                let work_id = digest(cursor)?;
-                let client_signature = signature(cursor)?;
-                let provider_signature =
-                    take_option(cursor, ChannelStateError::Malformed, signature)?;
-                let phase =
-                    JobPhase::from_code(cursor.byte().ok_or(ChannelStateError::Malformed)?)?;
-                let result = take_option(cursor, ChannelStateError::Malformed, |cursor| {
-                    Ok((private_record(cursor)?, signature(cursor)?))
-                })?;
-                Ok(JobState {
-                    authorization,
-                    work_id,
-                    client_signature,
-                    provider_signature,
-                    phase,
-                    result,
-                    prepared_input: take_bytes(cursor, ChannelStateError::Malformed)?.to_vec(),
-                    transcript: take_bytes(cursor, ChannelStateError::Malformed)?.to_vec(),
-                })
-            })?,
-            terminal: take_option(&mut cursor, ChannelStateError::Malformed, |cursor| {
-                Ok(JobTerminal {
-                    work_id: digest(cursor)?,
-                    phase: JobPhase::from_code(cursor.byte().ok_or(ChannelStateError::Malformed)?)?,
-                    outcome: take_outcome(cursor)?,
-                })
-            })?,
+            jobs,
+            terminals,
+            proposal_nonce_high_water,
             cursor: (
                 cursor.u64().ok_or(ChannelStateError::Malformed)?,
                 cursor.array::<32>().ok_or(ChannelStateError::Malformed)?,
             ),
-            indeterminate: take_bool(&mut cursor, ChannelStateError::Malformed)?,
+            indeterminate: {
+                let count = cursor.u64().ok_or(ChannelStateError::Malformed)?;
+                let mut held = BTreeMap::new();
+                for _ in 0..count {
+                    let work_id = digest(&mut cursor)?;
+                    if held.insert(work_id, ()).is_some() {
+                        return Err(ChannelStateError::Malformed);
+                    }
+                }
+                held
+            },
             close_prepared: take_option(&mut cursor, ChannelStateError::Malformed, |cursor| {
                 decode_kernel(take_bytes(cursor, ChannelStateError::Malformed)?)
             })?,
@@ -1469,7 +1542,7 @@ impl ChannelState {
                 field: "credited cumulative against the terminal",
             });
         }
-        if let Some(job) = &self.job {
+        for job in self.jobs.values() {
             if job.work_id != work_id(&self.channel, &job.authorization) {
                 return Err(ChannelStateError::WrongChannel { field: "work_id" });
             }
@@ -1524,8 +1597,8 @@ impl ChannelState {
                 }
             }
         }
-        if let Some(terminal) = &self.terminal {
-            if self.job.is_some() {
+        for terminal in self.terminals.values() {
+            if self.jobs.contains_key(&terminal.work_id) {
                 return Err(ChannelStateError::Terminated {
                     step: "replaying a checkpoint with a job still open",
                     outcome: terminal.outcome.name(),
@@ -1621,10 +1694,28 @@ impl ChannelState {
         self.settlement
     }
 
-    /// Returns the job in flight, if there is one.
+    /// Returns the only job in flight when exactly one exists.
+    ///
+    /// Kept for one-job callers. Concurrent callers should use
+    /// [`Self::job_by_id`] or [`Self::jobs`].
     #[must_use]
-    pub const fn job(&self) -> Option<&JobState> {
-        self.job.as_ref()
+    pub fn job(&self) -> Option<&JobState> {
+        if self.jobs.len() == 1 {
+            self.jobs.values().next()
+        } else {
+            None
+        }
+    }
+
+    /// Returns one active job by its stable identifier.
+    #[must_use]
+    pub fn job_by_id(&self, work_id: Digest) -> Option<&JobState> {
+        self.jobs.get(&work_id)
+    }
+
+    /// Iterates all active jobs in deterministic work-id order.
+    pub fn jobs(&self) -> impl ExactSizeIterator<Item = &JobState> {
+        self.jobs.values()
     }
 
     /// Returns this channel's one permanent terminal, once its job has
@@ -1633,8 +1724,29 @@ impl ChannelState {
     /// Present means the job is over for good: no second proposal opens,
     /// and no late reply to the first is taken.
     #[must_use]
-    pub const fn terminal(&self) -> Option<&JobTerminal> {
-        self.terminal.as_ref()
+    pub fn terminal(&self) -> Option<&JobTerminal> {
+        if self.terminals.len() == 1 {
+            self.terminals.values().next()
+        } else {
+            None
+        }
+    }
+
+    /// Returns an archived terminal by work ID.
+    #[must_use]
+    pub fn terminal_by_id(&self, work_id: Digest) -> Option<&JobTerminal> {
+        self.terminals.get(&work_id)
+    }
+
+    /// Iterates the append-only terminal archive in deterministic order.
+    pub fn terminals(&self) -> impl ExactSizeIterator<Item = &JobTerminal> {
+        self.terminals.values()
+    }
+
+    /// Returns the largest proposal nonce ever admitted.
+    #[must_use]
+    pub const fn proposal_nonce_high_water(&self) -> u64 {
+        self.proposal_nonce_high_water
     }
 
     /// Returns the certificate this channel's job was paid with, if it
@@ -1646,7 +1758,21 @@ impl ChannelState {
     /// a second payment.
     #[must_use]
     pub fn last_payment(&self) -> Option<PaidCertificate> {
-        let terminal = self.terminal.as_ref()?;
+        self.terminals
+            .values()
+            .filter_map(Self::payment_from_terminal)
+            .max_by_key(|payment| payment.certificate.earned_cumulative())
+    }
+
+    /// Returns the retained payment for one work ID.
+    #[must_use]
+    pub fn payment(&self, work_id: Digest) -> Option<PaidCertificate> {
+        self.terminals
+            .get(&work_id)
+            .and_then(Self::payment_from_terminal)
+    }
+
+    fn payment_from_terminal(terminal: &JobTerminal) -> Option<PaidCertificate> {
         let TerminalOutcome::Certified {
             certificate,
             binding,
@@ -1673,8 +1799,14 @@ impl ChannelState {
     /// resolves it, and a [`ChannelRecord::JobResult`] is refused while
     /// it holds.
     #[must_use]
-    pub const fn is_indeterminate(&self) -> bool {
-        self.indeterminate
+    pub fn is_indeterminate(&self) -> bool {
+        !self.indeterminate.is_empty()
+    }
+
+    /// Whether one active invocation was interrupted by a restart.
+    #[must_use]
+    pub fn job_is_indeterminate(&self, work_id: Digest) -> bool {
+        self.indeterminate.contains_key(&work_id)
     }
 
     /// Returns the largest cumulative the paid certificate names.
@@ -1886,14 +2018,14 @@ impl ChannelState {
         }
     }
 
-    fn open_job(&self, step: &'static str) -> Result<JobState, ChannelStateError> {
-        if let Some(job) = &self.job {
+    fn open_job(&self, work_id: Digest, step: &'static str) -> Result<JobState, ChannelStateError> {
+        if let Some(job) = self.jobs.get(&work_id) {
             return Ok(job.clone());
         }
         // A late reply to a finished job is refused as terminated rather
         // than as a phase error: the job is not merely absent, it is over
         // for good, and no step reopens it.
-        if let Some(terminal) = &self.terminal {
+        if let Some(terminal) = self.terminals.get(&work_id) {
             return Err(ChannelStateError::Terminated {
                 step,
                 outcome: terminal.outcome.name(),
@@ -1905,8 +2037,12 @@ impl ChannelState {
         })
     }
 
-    fn refuse_if_terminated(&self, step: &'static str) -> Result<(), ChannelStateError> {
-        match &self.terminal {
+    fn refuse_if_terminated(
+        &self,
+        work_id: Digest,
+        step: &'static str,
+    ) -> Result<(), ChannelStateError> {
+        match self.terminals.get(&work_id) {
             Some(terminal) => Err(ChannelStateError::Terminated {
                 step,
                 outcome: terminal.outcome.name(),
@@ -1936,18 +2072,22 @@ impl ChannelState {
                 client_signature,
                 prepared_input,
             } => self.apply_proposed(authorization, *client_signature, prepared_input, verifier),
-            ChannelRecord::JobAccepted { provider_signature } => {
-                self.apply_accepted(*provider_signature, verifier)
-            }
-            ChannelRecord::JobRunning => self.apply_running(),
+            ChannelRecord::JobAccepted {
+                work_id,
+                provider_signature,
+            } => self.apply_accepted(*work_id, *provider_signature, verifier),
+            ChannelRecord::JobRunning { work_id } => self.apply_running(*work_id),
             ChannelRecord::JobResult {
+                work_id,
                 result,
                 provider_signature,
                 transcript,
-            } => self.apply_result(result, *provider_signature, transcript, verifier),
-            ChannelRecord::PlaintextReleased => self.apply_plaintext(),
-            ChannelRecord::ResultMatched => self.apply_matched(),
-            ChannelRecord::JobTerminated { outcome } => self.apply_terminated(outcome, verifier),
+            } => self.apply_result(*work_id, result, *provider_signature, transcript, verifier),
+            ChannelRecord::PlaintextReleased { work_id } => self.apply_plaintext(*work_id),
+            ChannelRecord::ResultMatched { work_id } => self.apply_matched(*work_id),
+            ChannelRecord::JobTerminated { work_id, outcome } => {
+                self.apply_terminated(*work_id, outcome, verifier)
+            }
             ChannelRecord::ClosePrepared { start } => self.apply_close_prepared(start),
             ChannelRecord::CloseOpened {
                 start_id,
@@ -2067,7 +2207,7 @@ impl ChannelState {
                 step: "signing a close start",
             });
         }
-        if let Some(job) = &self.job {
+        if let Some(job) = self.jobs.values().next() {
             return Err(ChannelStateError::WrongPhase {
                 step: "signing a close start",
                 phase: job.phase.name(),
@@ -2210,7 +2350,7 @@ impl ChannelState {
     }
 
     fn refuse_open_job(&self, step: &'static str) -> Result<(), ChannelStateError> {
-        match &self.job {
+        match self.jobs.values().next() {
             Some(job) => Err(ChannelStateError::WrongPhase {
                 step,
                 phase: job.phase.name(),
@@ -2252,11 +2392,6 @@ impl ChannelState {
                 "bond_terms_hash",
                 authorization.bond_terms_hash == terms.bond_terms_hash(),
             ),
-            // The sole authorization a channel ever admits is its first,
-            // and its nonce is one. There is no sequence to advance: the
-            // permanent terminal above is what stops a second job, so the
-            // nonce is a fixed marker rather than a high-water mark.
-            ("proposal_nonce", authorization.proposal_nonce == 1),
         ] {
             if !holds {
                 return Err(ChannelStateError::WrongChannel { field });
@@ -2324,7 +2459,7 @@ impl ChannelState {
         verifier: &V,
     ) -> Result<Applied, ChannelStateError> {
         let work_id = work_id(&self.channel, authorization);
-        if let Some(job) = &self.job {
+        if let Some(job) = self.jobs.get(&work_id) {
             if job.authorization == *authorization
                 && job.client_signature == client_signature
                 && job.prepared_input == prepared_input
@@ -2336,15 +2471,18 @@ impl ChannelState {
                 phase: job.phase.name(),
             });
         }
-        // This channel admits one job for its whole life. Once that job
-        // has reached its terminal, a fresh proposal has nothing to open.
-        self.refuse_if_terminated("proposing a job")?;
+        self.refuse_if_terminated(work_id, "proposing a job")?;
         // A closing channel takes no new work. The close is built from
         // what is held now, so a job admitted after it would be a job
         // whose payment no close could carry.
         self.refuse_if_closing("proposing a job")?;
 
         self.check_authorization(authorization, prepared_input)?;
+        if authorization.proposal_nonce <= self.proposal_nonce_high_water {
+            return Err(ChannelStateError::WrongChannel {
+                field: "proposal_nonce",
+            });
+        }
         if !verifier.verify_sig(client_signature, self.client_key(), signing_hash(work_id)) {
             return Err(ChannelStateError::BadSignature {
                 slot: "authorization",
@@ -2361,25 +2499,30 @@ impl ChannelState {
             self.check_compute_limit(authorization.price)?;
         }
 
-        self.job = Some(JobState {
-            authorization: *authorization,
+        self.jobs.insert(
             work_id,
-            prepared_input: prepared_input.to_vec(),
-            client_signature,
-            provider_signature: None,
-            phase: JobPhase::HalfSigned,
-            result: None,
-            transcript: Vec::new(),
-        });
+            JobState {
+                authorization: *authorization,
+                work_id,
+                prepared_input: prepared_input.to_vec(),
+                client_signature,
+                provider_signature: None,
+                phase: JobPhase::HalfSigned,
+                result: None,
+                transcript: Vec::new(),
+            },
+        );
+        self.proposal_nonce_high_water = authorization.proposal_nonce;
         Ok(Applied::Changed)
     }
 
     fn apply_accepted<V: SigVerifier>(
         &mut self,
+        work_id: Digest,
         provider_signature: Sig,
         verifier: &V,
     ) -> Result<Applied, ChannelStateError> {
-        let mut job = self.open_job("co-signing a job")?;
+        let mut job = self.open_job(work_id, "co-signing a job")?;
         if job.provider_signature == Some(provider_signature) {
             return Ok(Applied::Redundant);
         }
@@ -2408,13 +2551,13 @@ impl ChannelState {
         }
         job.provider_signature = Some(provider_signature);
         job.phase = JobPhase::Accepted;
-        self.job = Some(job);
+        self.jobs.insert(work_id, job);
         Ok(Applied::Changed)
     }
 
-    fn apply_running(&mut self) -> Result<Applied, ChannelStateError> {
+    fn apply_running(&mut self, work_id: Digest) -> Result<Applied, ChannelStateError> {
         self.require_role("a running marker", Role::Provider)?;
-        let mut job = self.open_job("a running marker")?;
+        let mut job = self.open_job(work_id, "a running marker")?;
         match job.phase {
             JobPhase::Running => return Ok(Applied::Redundant),
             JobPhase::Accepted => {}
@@ -2433,7 +2576,7 @@ impl ChannelState {
             });
         }
         job.phase = JobPhase::Running;
-        self.job = Some(job);
+        self.jobs.insert(work_id, job);
         Ok(Applied::Changed)
     }
 
@@ -2454,12 +2597,13 @@ impl ChannelState {
     /// rebuilt, so a result naming another job cannot equal it.
     fn apply_result<V: SigVerifier>(
         &mut self,
+        work_id: Digest,
         result: &PaidJobResultV1,
         provider_signature: Sig,
         transcript: &[u8],
         verifier: &V,
     ) -> Result<Applied, ChannelStateError> {
-        let mut job = self.open_job("recording a result")?;
+        let mut job = self.open_job(work_id, "recording a result")?;
         if let Some((held, signature)) = &job.result {
             if held == result && *signature == provider_signature && job.transcript == transcript {
                 return Ok(Applied::Redundant);
@@ -2471,7 +2615,7 @@ impl ChannelState {
         // A running marker proves only that the backend may have been
         // invoked. If this process did not make that invocation, no
         // result it could produce now is evidence about it.
-        if self.indeterminate {
+        if self.indeterminate.contains_key(&work_id) {
             return Err(ChannelStateError::Indeterminate);
         }
         // The provider may only record a result for an invocation it
@@ -2528,7 +2672,7 @@ impl ChannelState {
         job.result = Some((*result, provider_signature));
         job.transcript = transcript.to_vec();
         job.phase = JobPhase::Ready;
-        self.job = Some(job);
+        self.jobs.insert(work_id, job);
         Ok(Applied::Changed)
     }
 
@@ -2542,9 +2686,9 @@ impl ChannelState {
     /// a step of its own rather than a flag on the result — a receipt is
     /// timely or late whatever a re-execution later says, and the two are
     /// decided at different heights.
-    fn apply_matched(&mut self) -> Result<Applied, ChannelStateError> {
+    fn apply_matched(&mut self, work_id: Digest) -> Result<Applied, ChannelStateError> {
         self.require_role("recording a reproduction match", Role::Client)?;
-        let mut job = self.open_job("recording a reproduction match")?;
+        let mut job = self.open_job(work_id, "recording a reproduction match")?;
         match job.phase {
             JobPhase::Matched => return Ok(Applied::Redundant),
             JobPhase::Ready => {}
@@ -2556,13 +2700,13 @@ impl ChannelState {
             }
         }
         job.phase = JobPhase::Matched;
-        self.job = Some(job);
+        self.jobs.insert(work_id, job);
         Ok(Applied::Changed)
     }
 
-    fn apply_plaintext(&mut self) -> Result<Applied, ChannelStateError> {
+    fn apply_plaintext(&mut self, work_id: Digest) -> Result<Applied, ChannelStateError> {
         self.require_role("releasing plaintext", Role::Provider)?;
-        let mut job = self.open_job("releasing plaintext")?;
+        let mut job = self.open_job(work_id, "releasing plaintext")?;
         if job.phase.delivered() {
             return Ok(Applied::Redundant);
         }
@@ -2574,7 +2718,7 @@ impl ChannelState {
         }
         self.check_delivery_limit(job.authorization.price)?;
         job.phase = JobPhase::Delivered;
-        self.job = Some(job);
+        self.jobs.insert(work_id, job);
         Ok(Applied::Changed)
     }
 
@@ -2588,6 +2732,7 @@ impl ChannelState {
     /// stops without one.
     fn apply_terminated<V: SigVerifier>(
         &mut self,
+        work_id: Digest,
         outcome: &TerminalOutcome,
         verifier: &V,
     ) -> Result<Applied, ChannelStateError> {
@@ -2596,7 +2741,7 @@ impl ChannelState {
         // re-committing the same outcome must be the retry it is rather
         // than a second job's terminal or a step a closed job cannot
         // take. Answered before the open-job rule below for that reason.
-        if let Some(held) = &self.terminal {
+        if let Some(held) = self.terminals.get(&work_id) {
             if held.outcome == *outcome {
                 return Ok(Applied::Redundant);
             }
@@ -2605,7 +2750,13 @@ impl ChannelState {
                 outcome: held.outcome.name(),
             });
         }
-        let job = self.open_job("terminating the job")?;
+        if matches!(outcome, TerminalOutcome::Certified { .. }) && !self.jobs.contains_key(&work_id)
+        {
+            return Err(ChannelStateError::WrongChannel {
+                field: "binding work_id",
+            });
+        }
+        let job = self.open_job(work_id, "terminating the job")?;
         match outcome {
             TerminalOutcome::Certified {
                 certificate,
@@ -2766,9 +2917,10 @@ impl ChannelState {
 
     /// Installs this channel's one permanent terminal and closes the job.
     fn rest_at(&mut self, terminal: JobTerminal) {
-        self.terminal = Some(terminal);
-        self.job = None;
-        self.indeterminate = false;
+        let work_id = terminal.work_id;
+        self.jobs.remove(&work_id);
+        self.indeterminate.remove(&work_id);
+        self.terminals.insert(work_id, terminal);
     }
 
     /// Checks the one job's price against the compute limit.
@@ -2777,11 +2929,16 @@ impl ChannelState {
     /// job, so a price that fits the limit is the whole of what fits.
     fn check_compute_limit(&self, price: u64) -> Result<(), ChannelStateError> {
         let limit = self.channel.channel_policy().compute_credit_limit;
-        if price > limit {
+        let reserved = self
+            .jobs
+            .values()
+            .map(|job| job.authorization.price)
+            .fold(0_u64, u64::saturating_add);
+        if reserved.saturating_add(price) > limit {
             return Err(ChannelStateError::OverCredit {
                 ledger: "compute",
                 used: 0,
-                reserved: 0,
+                reserved,
                 price,
                 limit,
             });
@@ -2792,11 +2949,17 @@ impl ChannelState {
     /// Checks the one job's price against the delivery limit.
     fn check_delivery_limit(&self, price: u64) -> Result<(), ChannelStateError> {
         let limit = self.channel.channel_policy().delivery_credit_limit;
-        if price > limit {
+        let reserved = self
+            .jobs
+            .values()
+            .filter(|job| job.phase == JobPhase::Delivered)
+            .map(|job| job.authorization.price)
+            .fold(0_u64, u64::saturating_add);
+        if reserved.saturating_add(price) > limit {
             return Err(ChannelStateError::OverCredit {
                 ledger: "delivery",
                 used: 0,
-                reserved: 0,
+                reserved,
                 price,
                 limit,
             });
@@ -2880,9 +3043,11 @@ impl ChannelStore {
             state.apply(&record, verifier)?;
         }
         state.indeterminate = state
-            .job
-            .as_ref()
-            .is_some_and(|job| job.phase == JobPhase::Running);
+            .jobs
+            .values()
+            .filter(|job| job.phase == JobPhase::Running)
+            .map(|job| (job.work_id, ()))
+            .collect();
         journal.observe_replay(replayed, replay.records.len());
         let store = Self {
             journal,

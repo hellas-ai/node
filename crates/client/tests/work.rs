@@ -403,6 +403,7 @@ fn accept(
         commit(
             store,
             ChannelRecord::JobAccepted {
+                work_id: id,
                 provider_signature: provider().sign(signing_hash(id)),
             },
         );

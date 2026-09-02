@@ -352,12 +352,14 @@ impl Job {
 
     fn accepted(&self) -> ChannelRecord {
         ChannelRecord::JobAccepted {
+            work_id: self.work_id,
             provider_signature: provider().sign(payload(self.work_id)),
         }
     }
 
     fn result_record(&self, channel: &PaidChannel) -> ChannelRecord {
         ChannelRecord::JobResult {
+            work_id: self.work_id,
             result: self.result,
             provider_signature: provider().sign(payload(result_digest(channel, &self.result))),
             transcript: spool(&self.transcript),
@@ -366,6 +368,7 @@ impl Job {
 
     fn paid(&self, channel: &PaidChannel) -> ChannelRecord {
         ChannelRecord::JobTerminated {
+            work_id: self.work_id,
             outcome: TerminalOutcome::Certified {
                 certificate: self.certificate,
                 binding: Box::new(self.binding),
@@ -382,9 +385,13 @@ fn provider_sequence(channel: &PaidChannel, job: &Job) -> Vec<ChannelRecord> {
     vec![
         job.proposed(),
         job.accepted(),
-        ChannelRecord::JobRunning,
+        ChannelRecord::JobRunning {
+            work_id: job.work_id,
+        },
         job.result_record(channel),
-        ChannelRecord::PlaintextReleased,
+        ChannelRecord::PlaintextReleased {
+            work_id: job.work_id,
+        },
         job.paid(channel),
     ]
 }
@@ -400,7 +407,9 @@ fn client_sequence(channel: &PaidChannel, job: &Job) -> Vec<ChannelRecord> {
         job.proposed(),
         job.accepted(),
         job.result_record(channel),
-        ChannelRecord::ResultMatched,
+        ChannelRecord::ResultMatched {
+            work_id: job.work_id,
+        },
         job.paid(channel),
     ]
 }
@@ -505,18 +514,22 @@ fn the_client_credits_the_same_payment_it_signed() {
 /// check two endpoints could open the same channel's one job under two
 /// different `work_id`s and disagree forever about which one it was.
 #[test]
-fn a_first_authorization_with_a_nonce_other_than_one_is_refused() {
+fn proposal_nonces_advance_monotonically() {
     let dir = temp();
     let channel = channel();
     let mut store = open(dir.path(), Role::Provider);
 
-    // MUTATION: everything about this job is the fixture's except the
-    // nonce, and its signature is genuinely the client's over the
-    // work_id the nonce-2 authorization hashes to.
+    // Any positive starting nonce is legal and establishes the high-water
+    // mark.
     let other = job_at(&channel, 2, 0);
+    commit_all(&mut store, &[other.proposed()]);
+    assert_eq!(store.state().proposal_nonce_high_water(), 2);
+
+    // A lower nonce cannot be reused for another job.
+    let job = job_at(&channel, 1, 0);
     let error = store
-        .commit(other.proposed(), &Secp256k1Verifier::new())
-        .expect_err("the sole authorization's nonce is 1");
+        .commit(job.proposed(), &Secp256k1Verifier::new())
+        .expect_err("the proposal nonce does not move backwards");
     assert!(
         matches!(
             error,
@@ -526,12 +539,11 @@ fn a_first_authorization_with_a_nonce_other_than_one_is_refused() {
         ),
         "unexpected error: {error}",
     );
-    assert!(store.state().job().is_none(), "nothing was opened");
-
-    // The control: the same job at nonce 1 opens.
-    let job = job_at(&channel, 1, 0);
-    commit_all(&mut store, &[job.proposed()]);
-    assert!(store.state().job().is_some(), "the nonce-1 proposal opens");
+    assert_eq!(
+        store.state().jobs().len(),
+        1,
+        "the first proposal remains open"
+    );
 }
 
 // ── A result is its transcript's own ──────────────────────────────────
@@ -552,7 +564,13 @@ fn a_result_must_be_the_transcript_it_is_stored_beside() {
     let mut store = open(dir.path(), Role::Provider);
     commit_all(
         &mut store,
-        &[job.proposed(), job.accepted(), ChannelRecord::JobRunning],
+        &[
+            job.proposed(),
+            job.accepted(),
+            ChannelRecord::JobRunning {
+                work_id: job.work_id,
+            },
+        ],
     );
 
     // MUTATION: the same signed result, spooled beside a transcript of
@@ -561,6 +579,7 @@ fn a_result_must_be_the_transcript_it_is_stored_beside() {
     let error = store
         .commit(
             ChannelRecord::JobResult {
+                work_id: job.work_id,
                 result: job.result,
                 provider_signature: provider().sign(payload(result_digest(&channel, &job.result))),
                 transcript: spool(&other_answer),
@@ -587,6 +606,7 @@ fn a_result_must_be_the_transcript_it_is_stored_beside() {
     let error = store
         .commit(
             ChannelRecord::JobResult {
+                work_id: job.work_id,
                 result: altered,
                 provider_signature: provider().sign(payload(result_digest(&channel, &altered))),
                 transcript: spool(&job.transcript),
@@ -740,7 +760,12 @@ fn round3_transition_consumes_post_boundary_cursor() {
         let mut store = open(dir.path(), Role::Provider);
         commit_all(&mut store, &[job.proposed(), job.accepted()]);
         advance(&mut store, height);
-        let running = store.commit(ChannelRecord::JobRunning, &verifier);
+        let running = store.commit(
+            ChannelRecord::JobRunning {
+                work_id: job.work_id,
+            },
+            &verifier,
+        );
         if timely {
             if let Err(error) = running {
                 panic!("dispatch at the terminal deadline is durable: {error}");
@@ -868,7 +893,12 @@ fn a_verdict_belongs_to_a_client_holding_a_result() {
     let mut provider_store = open(dir.path(), Role::Provider);
     commit_all(&mut provider_store, &provider_sequence(&channel, &job)[..4]);
     let error = provider_store
-        .commit(ChannelRecord::ResultMatched, &verifier)
+        .commit(
+            ChannelRecord::ResultMatched {
+                work_id: job.work_id,
+            },
+            &verifier,
+        )
         .expect_err("a provider does not check its own answer");
     assert!(
         matches!(
@@ -891,7 +921,12 @@ fn a_verdict_belongs_to_a_client_holding_a_result() {
         Some(JobPhase::Accepted)
     );
     let error = store
-        .commit(ChannelRecord::ResultMatched, &verifier)
+        .commit(
+            ChannelRecord::ResultMatched {
+                work_id: job.work_id,
+            },
+            &verifier,
+        )
         .expect_err("there is nothing yet to have checked");
     assert!(
         matches!(
@@ -908,7 +943,12 @@ fn a_verdict_belongs_to_a_client_holding_a_result() {
     // and taken again is redundant rather than a second verdict.
     commit_all(&mut store, &sequence[3..5]);
     let before = store.len();
-    if let Err(error) = store.commit(ChannelRecord::ResultMatched, &verifier) {
+    if let Err(error) = store.commit(
+        ChannelRecord::ResultMatched {
+            work_id: job.work_id,
+        },
+        &verifier,
+    ) {
         panic!("a repeated verdict is the same verdict: {error}");
     }
     assert_eq!(store.len(), before, "and it is not written twice");
@@ -942,6 +982,75 @@ fn an_authenticated_result_is_payable_without_reproduction() {
         panic!("an authenticated result is paid for: {error}");
     }
     assert_eq!(store.state().ledger().credited_cumulative(), PRICE);
+}
+
+/// Two jobs share one channel, may advance in a different order than
+/// they were proposed, and retain both terminals across restart.
+#[test]
+fn concurrent_jobs_pay_once_each_and_survive_restart() {
+    let dir = temp();
+    let channel = channel();
+    let first = job_at(&channel, 1, 0);
+    let second = job_at(&channel, 2, PRICE);
+    let verifier = Secp256k1Verifier::new();
+    let mut store = open(dir.path(), Role::Provider);
+
+    // Both reservations exist together. Follow-on records deliberately
+    // arrive in the reverse proposal order.
+    for record in [
+        first.proposed(),
+        second.proposed(),
+        second.accepted(),
+        first.accepted(),
+        ChannelRecord::JobRunning {
+            work_id: second.work_id,
+        },
+        ChannelRecord::JobRunning {
+            work_id: first.work_id,
+        },
+        second.result_record(&channel),
+        first.result_record(&channel),
+        ChannelRecord::PlaintextReleased {
+            work_id: second.work_id,
+        },
+        ChannelRecord::PlaintextReleased {
+            work_id: first.work_id,
+        },
+    ] {
+        store
+            .commit(record, &verifier)
+            .expect("the interleaving is valid");
+    }
+    assert_eq!(store.state().jobs().len(), 2);
+    assert_eq!(store.state().proposal_nonce_high_water(), 2);
+
+    store
+        .commit(first.paid(&channel), &verifier)
+        .expect("the first cumulative pays");
+    store
+        .commit(second.paid(&channel), &verifier)
+        .expect("the next cumulative pays");
+    assert_eq!(store.state().ledger().credited_cumulative(), 2 * PRICE);
+    assert_eq!(store.state().jobs().len(), 0);
+    assert_eq!(store.state().terminals().len(), 2);
+    assert_eq!(
+        store.state().last_payment().map(|payment| payment.work_id),
+        Some(second.work_id),
+    );
+
+    drop(store);
+    let reopened = open(dir.path(), Role::Provider);
+    assert_eq!(reopened.state().ledger().credited_cumulative(), 2 * PRICE);
+    assert_eq!(reopened.state().terminals().len(), 2);
+    assert!(reopened.state().terminal_by_id(first.work_id).is_some());
+    assert!(reopened.state().terminal_by_id(second.work_id).is_some());
+    assert_eq!(
+        reopened
+            .state()
+            .payment(second.work_id)
+            .map(|payment| payment.certificate.earned_cumulative()),
+        Some(2 * PRICE),
+    );
 }
 
 // ── The defect this phase exists to prevent ───────────────────────────
@@ -1072,7 +1181,9 @@ fn a_half_signed_job_keeps_its_bytes() {
     assert!(
         matches!(
             error,
-            WorkStoreError::Channel(ChannelStateError::WrongPhase { .. })
+            WorkStoreError::Channel(ChannelStateError::WrongChannel {
+                field: "proposal_nonce"
+            })
         ),
         "unexpected error: {error}"
     );
@@ -1090,7 +1201,13 @@ fn an_interrupted_invocation_stays_indeterminate() {
         let mut store = open(dir.path(), Role::Provider);
         commit_all(
             &mut store,
-            &[job.proposed(), job.accepted(), ChannelRecord::JobRunning],
+            &[
+                job.proposed(),
+                job.accepted(),
+                ChannelRecord::JobRunning {
+                    work_id: job.work_id,
+                },
+            ],
         );
     }
 
@@ -1112,6 +1229,7 @@ fn an_interrupted_invocation_stays_indeterminate() {
     // may have spent is the provider's own to bear.
     if let Err(error) = recovered.commit(
         ChannelRecord::JobTerminated {
+            work_id: job.work_id,
             outcome: TerminalOutcome::Indeterminate,
         },
         &verifier,
@@ -1186,7 +1304,12 @@ fn delivery_credit_bounds_what_may_be_released() {
     let job = job_at(&channel, 1, 0);
     commit_all(&mut store, &provider_sequence(&channel, &job)[..4]);
     let error = store
-        .commit(ChannelRecord::PlaintextReleased, &verifier)
+        .commit(
+            ChannelRecord::PlaintextReleased {
+                work_id: job.work_id,
+            },
+            &verifier,
+        )
         .expect_err("the one job's price is over the delivery limit");
     assert!(
         matches!(
@@ -1243,13 +1366,21 @@ fn a_signature_from_the_wrong_party_is_not_evidence() {
             "the client signing as the provider",
             vec![job.proposed()],
             ChannelRecord::JobAccepted {
+                work_id: job.work_id,
                 provider_signature: client().sign(payload(job.work_id)),
             },
         ),
         (
             "a result signed over another digest",
-            vec![job.proposed(), job.accepted(), ChannelRecord::JobRunning],
+            vec![
+                job.proposed(),
+                job.accepted(),
+                ChannelRecord::JobRunning {
+                    work_id: job.work_id,
+                },
+            ],
             ChannelRecord::JobResult {
+                work_id: job.work_id,
                 result: job.result,
                 provider_signature: provider().sign(payload(job.work_id)),
                 transcript: spool(&job.transcript),
@@ -1259,6 +1390,7 @@ fn a_signature_from_the_wrong_party_is_not_evidence() {
             "a binding signed over another digest",
             provider_sequence(&channel, &job)[..5].to_vec(),
             ChannelRecord::JobTerminated {
+                work_id: job.work_id,
                 outcome: TerminalOutcome::Certified {
                     certificate: job.certificate,
                     binding: Box::new(job.binding),
@@ -1271,6 +1403,7 @@ fn a_signature_from_the_wrong_party_is_not_evidence() {
             "a certificate the client did not sign",
             provider_sequence(&channel, &job)[..5].to_vec(),
             ChannelRecord::JobTerminated {
+                work_id: job.work_id,
                 outcome: TerminalOutcome::Certified {
                     certificate: job.certificate,
                     binding: Box::new(job.binding),
@@ -1352,6 +1485,7 @@ fn a_payment_must_be_the_one_this_position_admits() {
         let error = store
             .commit(
                 ChannelRecord::JobTerminated {
+                    work_id: job.work_id,
                     outcome: TerminalOutcome::Certified {
                         certificate: job.certificate,
                         binding: Box::new(binding),
@@ -1407,6 +1541,7 @@ fn a_payment_must_be_the_one_this_position_admits() {
         let error = store
             .commit(
                 ChannelRecord::JobTerminated {
+                    work_id: job.work_id,
                     outcome: TerminalOutcome::Certified {
                         certificate,
                         binding: Box::new(job.binding),
@@ -1462,7 +1597,14 @@ fn role_scoped_steps_belong_to_one_role() {
 
     let mut client_store = open(dir.path(), Role::Client);
     commit_all(&mut client_store, &[job.proposed(), job.accepted()]);
-    for record in [ChannelRecord::JobRunning, ChannelRecord::PlaintextReleased] {
+    for record in [
+        ChannelRecord::JobRunning {
+            work_id: job.work_id,
+        },
+        ChannelRecord::PlaintextReleased {
+            work_id: job.work_id,
+        },
+    ] {
         let error = client_store
             .commit(record, &verifier)
             .expect_err("that is a provider's step");
@@ -2079,6 +2221,7 @@ fn the_record_codec_is_exact_and_ordered() {
     let recorded = job.result_record(&channel);
     let bytes = recorded.encode();
     let mut expected = vec![4_u8];
+    expected.extend_from_slice(job.work_id.as_bytes());
     expected.extend_from_slice(&job.result.encode());
     expected.extend_from_slice(
         provider()
@@ -2089,27 +2232,34 @@ fn the_record_codec_is_exact_and_ordered() {
     assert_eq!(bytes, expected);
     assert_eq!(ChannelRecord::decode(&bytes), Ok(recorded));
 
-    // The two records with no body at all are one byte each, and they
-    // are not each other's.
-    assert_eq!(ChannelRecord::JobRunning.encode(), vec![3_u8]);
-    assert_eq!(ChannelRecord::PlaintextReleased.encode(), vec![5_u8]);
-    assert_eq!(ChannelRecord::ResultMatched.encode(), vec![6_u8]);
-    assert_eq!(ChannelRecord::decode(&[3]), Ok(ChannelRecord::JobRunning));
-    assert_eq!(
-        ChannelRecord::decode(&[5]),
-        Ok(ChannelRecord::PlaintextReleased)
-    );
-    assert_eq!(
-        ChannelRecord::decode(&[6]),
-        Ok(ChannelRecord::ResultMatched)
-    );
+    // Marker records carry the work ID, so reordered messages cannot be
+    // applied to whichever job happens to be current.
+    for record in [
+        ChannelRecord::JobRunning {
+            work_id: job.work_id,
+        },
+        ChannelRecord::PlaintextReleased {
+            work_id: job.work_id,
+        },
+        ChannelRecord::ResultMatched {
+            work_id: job.work_id,
+        },
+    ] {
+        let bytes = record.encode();
+        assert_eq!(bytes.len(), 1 + Digest::LEN);
+        assert_eq!(&bytes[1..], job.work_id.as_bytes());
+        assert_eq!(ChannelRecord::decode(&bytes), Ok(record));
+    }
+    assert!(ChannelRecord::decode(&[3]).is_err());
 
     // The terminated record: the terminal tag, then the outcome
     // discriminant, then — for a certified outcome — the certificate,
     // binding, and two client signatures.
     let paid = job.paid(&channel);
     let bytes = paid.encode();
-    let mut expected = vec![7_u8, 0_u8];
+    let mut expected = vec![7_u8];
+    expected.extend_from_slice(job.work_id.as_bytes());
+    expected.push(0_u8);
     let mut certificate = vec![0_u8; job.certificate.encoded_size()];
     let written = job.certificate.write_to(&mut certificate);
     certificate.truncate(written);
@@ -2124,7 +2274,10 @@ fn the_record_codec_is_exact_and_ordered() {
     assert_eq!(bytes, expected);
     assert_eq!(
         bytes.len(),
-        2 + EarnedCertificate::ENCODED_SIZE + PaymentBindingV1::ENCODED_SIZE + 2 * Sig::LENGTH
+        2 + Digest::LEN
+            + EarnedCertificate::ENCODED_SIZE
+            + PaymentBindingV1::ENCODED_SIZE
+            + 2 * Sig::LENGTH
     );
     assert_eq!(ChannelRecord::decode(&bytes), Ok(paid));
 
@@ -2132,6 +2285,7 @@ fn the_record_codec_is_exact_and_ordered() {
     // reader that agreed with the layout only by round-tripping could
     // not see it.
     let swapped = ChannelRecord::JobTerminated {
+        work_id: job.work_id,
         outcome: TerminalOutcome::Certified {
             certificate: job.certificate,
             binding: Box::new(job.binding),
@@ -2163,11 +2317,14 @@ fn the_record_codec_is_exact_and_ordered() {
         (3_u8, TerminalOutcome::Failed { code: 0x2122_2324 }),
         (4_u8, TerminalOutcome::Indeterminate),
     ] {
-        let record = ChannelRecord::JobTerminated { outcome };
+        let record = ChannelRecord::JobTerminated {
+            work_id: job.work_id,
+            outcome,
+        };
         let bytes = record.encode();
         assert_eq!(bytes.first(), Some(&7_u8), "the terminal tag");
         assert_eq!(
-            bytes.get(1),
+            bytes.get(1 + Digest::LEN),
             Some(&discriminant),
             "the outcome discriminant"
         );
@@ -2393,6 +2550,7 @@ fn inputs_swapped_on_the_disk_are_not_a_job_to_execute() {
                     prepared_input: bundle_bytes(bundle_nonce),
                 },
                 ChannelRecord::JobAccepted {
+                    work_id: job.work_id,
                     provider_signature: provider().sign(payload(job.work_id)),
                 },
             ] {
@@ -2495,10 +2653,8 @@ fn a_retained_close_start_admits_no_further_work() {
     );
     assert!(store.state().is_closing());
 
-    // A second job is refused: the channel's one job is certified, and
-    // its permanent terminal admits no other — which the paid channel
-    // reaches before the close cutoff would, since the certificate this
-    // close carries is what that one paid job left.
+    // A later job would otherwise be valid, but the retained close is the
+    // admission cutoff.
     let next = job_at(&channel, 2, PRICE);
     let error = store
         .commit(next.proposed(), &verifier)
@@ -2506,9 +2662,8 @@ fn a_retained_close_start_admits_no_further_work() {
     assert!(
         matches!(
             error,
-            WorkStoreError::Channel(ChannelStateError::Terminated {
-                step: "proposing a job",
-                outcome: "certified",
+            WorkStoreError::Channel(ChannelStateError::Closing {
+                step: "proposing a job"
             })
         ),
         "unexpected error: {error}"
@@ -2551,6 +2706,7 @@ fn each_job_terminal_rejects_a_late_reply_and_a_second_proposal() {
                 job.accepted(),
                 job.result_record(&channel),
                 ChannelRecord::JobTerminated {
+                    work_id: job.work_id,
                     outcome: TerminalOutcome::Refuted {
                         result_digest,
                         reproduction_digest,
@@ -2564,6 +2720,7 @@ fn each_job_terminal_rejects_a_late_reply_and_a_second_proposal() {
             vec![
                 job.proposed(),
                 ChannelRecord::JobTerminated {
+                    work_id: job.work_id,
                     outcome: TerminalOutcome::Expired {
                         deadline: job.authorization.payment_deadline,
                         height: RECEIPT_HEIGHT - 1,
@@ -2578,6 +2735,7 @@ fn each_job_terminal_rejects_a_late_reply_and_a_second_proposal() {
             vec![
                 job.proposed(),
                 ChannelRecord::JobTerminated {
+                    work_id: job.work_id,
                     outcome: TerminalOutcome::Failed { code: 1 },
                 },
             ],
@@ -2588,6 +2746,7 @@ fn each_job_terminal_rejects_a_late_reply_and_a_second_proposal() {
             vec![
                 job.proposed(),
                 ChannelRecord::JobTerminated {
+                    work_id: job.work_id,
                     outcome: TerminalOutcome::Indeterminate,
                 },
             ],
@@ -2886,9 +3045,13 @@ fn delivered_store(root: &std::path::Path) -> ChannelStore {
         &[
             job.proposed(),
             job.accepted(),
-            ChannelRecord::JobRunning,
+            ChannelRecord::JobRunning {
+                work_id: job.work_id,
+            },
             job.result_record(&channel),
-            ChannelRecord::PlaintextReleased,
+            ChannelRecord::PlaintextReleased {
+                work_id: job.work_id,
+            },
         ],
     );
     store

@@ -144,8 +144,12 @@ const MAGIC: &[u8] = b"hellas.work-journal.v1";
 /// sequence it is, so a predecessor's frames verify at the same
 /// sequences in its successor and a stale generation opens as the live
 /// one. The reset is pre-deployment, like the three before it: no
-/// journal written by a deployed node is being retired here.
-const FORMAT_VERSION: u8 = 5;
+/// journal written by a deployed node is being retired here. Version 5
+/// stores a single implicit job: follow-on records have no work ID and
+/// checkpoints have one job/terminal slot. Reading one as the concurrent
+/// format could apply reordered messages to the wrong job, so v6 makes
+/// every job record explicit and stores active/archive collections.
+const FORMAT_VERSION: u8 = 6;
 /// Domain of the header digest every frame is bound to.
 const HEADER_DOMAIN: &[u8] = b"hellas.work.journal-header.v1";
 /// Domain of one frame's digest.

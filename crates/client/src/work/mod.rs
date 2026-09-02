@@ -158,7 +158,7 @@ where
 
     let deadline = endpoint
         .state()
-        .job()
+        .job_by_id(work_id)
         .ok_or(DeliverError::NoSuchJob)?
         .authorization()
         .payment_deadline;
@@ -294,7 +294,7 @@ where
     };
 
     // The bundle the journal holds, not the one any response carried.
-    let Some(job) = endpoint.state().job() else {
+    let Some(job) = endpoint.state().job_by_id(work_id) else {
         return Err(CollectError::Deliver(DeliverError::NoSuchJob));
     };
     let bundle = PreparedPaidInputV1::decode(job.prepared_input(), MAX_RECORD_BYTES)

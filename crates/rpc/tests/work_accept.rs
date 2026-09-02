@@ -1033,7 +1033,10 @@ fn terminated_provider(root: &std::path::Path, outcome: TerminalOutcome) -> (Wor
             client_signature,
             prepared_input: bundle_bytes(1),
         },
-        ChannelRecord::JobTerminated { outcome },
+        ChannelRecord::JobTerminated {
+            work_id: held,
+            outcome,
+        },
     ] {
         if let Err(error) = store.commit(record, &verifier) {
             panic!("the fixture reaches its terminal: {error}");
@@ -1253,17 +1256,19 @@ fn a_repeat_proposal_returns_the_retained_request() {
 }
 
 #[test]
-fn a_different_proposal_while_one_is_outstanding_conflicts() {
+fn a_different_proposal_while_one_is_outstanding_opens_concurrently() {
     let root = temp();
     let mut endpoint = client_endpoint(root.path());
     let Ok(_) = endpoint.propose(&proposal(1)) else {
         panic!("the first proposal is built");
     };
-    let conflict = endpoint.propose(&proposal(2));
+    let second = endpoint.propose(&proposal(2));
     assert!(
-        matches!(conflict, Err(ProposeError::Conflict)),
-        "a second job is a conflict, not a queue, got {conflict:?}",
+        second.is_ok(),
+        "a second job may share the channel, got {second:?}",
     );
+    assert_eq!(endpoint.state().jobs().len(), 2);
+    assert_eq!(endpoint.state().proposal_nonce_high_water(), 2);
 }
 
 #[test]
@@ -1359,6 +1364,7 @@ fn a_response_this_service_does_not_define_is_malformed() {
             AcceptWorkResponse {
                 outcome: Some(Outcome::Accepted(WorkAccepted {
                     provider_signature: vec![0; Sig::LENGTH - 1],
+                    work_id: vec![0; Digest::LEN],
                 })),
             },
         ),
@@ -1372,9 +1378,13 @@ fn a_response_this_service_does_not_define_is_malformed() {
 }
 
 fn accepted_response(signature: Sig) -> AcceptWorkResponse {
+    let authorization = authorization(1, 1);
     AcceptWorkResponse {
         outcome: Some(Outcome::Accepted(WorkAccepted {
             provider_signature: signature.as_bytes().to_vec(),
+            work_id: work_id(ready().channel(), &authorization)
+                .as_bytes()
+                .to_vec(),
         })),
     }
 }
@@ -1784,12 +1794,13 @@ fn bytes_that_are_not_an_authorization_are_invalid() {
 }
 
 #[test]
-fn a_job_already_in_flight_declines_the_next_one() {
+fn a_job_already_in_flight_does_not_block_the_next_one() {
     let root = temp();
     let mut endpoint = provider_endpoint(root.path());
     accepted_signature(&endpoint.accept(&signed_request(1, 1)));
-    let response = endpoint.accept(&signed_request(2, 1));
-    assert_eq!(refusal_code(&response), WorkRefusalCode::Declined);
+    let response = endpoint.accept(&signed_request(2, 2));
+    accepted_signature(&response);
+    assert_eq!(endpoint.state().jobs().len(), 2);
 }
 
 #[test]

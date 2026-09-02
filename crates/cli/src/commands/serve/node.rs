@@ -3306,6 +3306,7 @@ mod tests {
         commit(
             &mut store,
             ChannelRecord::JobAccepted {
+                work_id: id,
                 provider_signature: provider().sign(signing_hash(id)),
             },
         );
@@ -3337,10 +3338,11 @@ mod tests {
         commit(
             &mut store,
             ChannelRecord::JobAccepted {
+                work_id: id,
                 provider_signature: provider().sign(signing_hash(id)),
             },
         );
-        commit(&mut store, ChannelRecord::JobRunning);
+        commit(&mut store, ChannelRecord::JobRunning { work_id: id });
         let transcript = answer_transcript();
         let result = match terminal_result(&channel, &job, &transcript) {
             Ok(result) => result,
@@ -3349,6 +3351,7 @@ mod tests {
         commit(
             &mut store,
             ChannelRecord::JobResult {
+                work_id: id,
                 result,
                 provider_signature: provider().sign(signing_hash(result_digest(&channel, &result))),
                 transcript: match encode_transcript(&transcript) {
@@ -3357,7 +3360,7 @@ mod tests {
                 },
             },
         );
-        commit(&mut store, ChannelRecord::PlaintextReleased);
+        commit(&mut store, ChannelRecord::PlaintextReleased { work_id: id });
         let (certificate, binding) = match next_payment(&channel, &job, &result, 0, settlement()) {
             Ok(paid) => paid,
             Err(error) => panic!("the fixture payment builds: {error}"),
@@ -3365,6 +3368,7 @@ mod tests {
         commit(
             &mut store,
             ChannelRecord::JobTerminated {
+                work_id: id,
                 outcome: TerminalOutcome::Certified {
                     certificate,
                     binding: Box::new(binding),

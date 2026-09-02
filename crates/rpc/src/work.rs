@@ -664,9 +664,10 @@ impl ProviderEndpoint {
     /// the retry returns the retained signature.
     pub fn accept(&mut self, request: &AcceptWorkRequest) -> AcceptWorkResponse {
         match self.decide(request) {
-            Ok(signature) => AcceptWorkResponse {
+            Ok((work_id, signature)) => AcceptWorkResponse {
                 outcome: Some(Outcome::Accepted(WorkAccepted {
                     provider_signature: signature.as_bytes().to_vec(),
+                    work_id: work_id.as_bytes().to_vec(),
                 })),
             },
             Err(refusal) => AcceptWorkResponse {
@@ -678,7 +679,7 @@ impl ProviderEndpoint {
         }
     }
 
-    fn decide(&mut self, request: &AcceptWorkRequest) -> Result<Sig, Refusal> {
+    fn decide(&mut self, request: &AcceptWorkRequest) -> Result<(Digest, Sig), Refusal> {
         let ready = self
             .admitting()
             .map_err(|error| Refusal::new(endpoint_refusal(error), error.to_string()))?
@@ -694,7 +695,7 @@ impl ProviderEndpoint {
         // durable and already the client's, and a height that has passed
         // since cannot unsay it.
         if let Some(retained) = self.retained_signature(work_id) {
-            return Ok(retained);
+            return Ok((work_id, retained));
         }
 
         let (cursor_height, _) = self.state().cursor();
@@ -723,20 +724,20 @@ impl ProviderEndpoint {
         let signature = self.close.signer.sign(signing_hash(work_id));
         self.close.store.commit(
             ChannelRecord::JobAccepted {
+                work_id,
                 provider_signature: signature,
             },
             &Secp256k1Verifier::new(),
         )?;
-        Ok(signature)
+        Ok((work_id, signature))
     }
 
     /// Returns this endpoint's co-signature over `work_id`, if it has
     /// already given one.
     fn retained_signature(&self, work_id: Digest) -> Option<Sig> {
-        let job = self.state().job()?;
-        (job.work_id() == work_id)
-            .then(|| job.provider_signature())
-            .flatten()
+        self.state()
+            .job_by_id(work_id)
+            .and_then(JobState::provider_signature)
     }
 
     /// Decides whether the backend may be invoked for `work_id`, and
@@ -784,10 +785,7 @@ impl ProviderEndpoint {
         work_id: Digest,
         ready: &ReadyChannel,
     ) -> Result<RunAdmission, RunError> {
-        let job = self.state().job().ok_or(RunError::NoSuchJob)?;
-        if job.work_id() != work_id {
-            return Err(RunError::NoSuchJob);
-        }
+        let job = self.state().job_by_id(work_id).ok_or(RunError::NoSuchJob)?;
         // A signed result exists in exactly the three phases past it, so
         // this is the phase test as well as the answer.
         if let Some((result, signature)) = job.result() {
@@ -797,7 +795,7 @@ impl ProviderEndpoint {
             });
         }
         match job.phase() {
-            JobPhase::Running if self.state().is_indeterminate() => {
+            JobPhase::Running if self.state().job_is_indeterminate(work_id) => {
                 return Ok(RunAdmission::Indeterminate);
             }
             JobPhase::Running => return Ok(RunAdmission::Running),
@@ -827,9 +825,10 @@ impl ProviderEndpoint {
         let parts = bundle.parts().map_err(PaidWorkError::from)?;
         let input = PreparedEvaluateInput { parts };
 
-        self.close
-            .store
-            .commit(ChannelRecord::JobRunning, &Secp256k1Verifier::new())?;
+        self.close.store.commit(
+            ChannelRecord::JobRunning { work_id },
+            &Secp256k1Verifier::new(),
+        )?;
         Ok(RunAdmission::Invoke(Box::new(input)))
     }
 
@@ -857,10 +856,7 @@ impl ProviderEndpoint {
         work_id: Digest,
         transcript: &[OutputEventEnvelope],
     ) -> Result<(PaidJobResultV1, Sig), RunError> {
-        let job = self.state().job().ok_or(RunError::NoSuchJob)?;
-        if job.work_id() != work_id {
-            return Err(RunError::NoSuchJob);
-        }
+        let job = self.state().job_by_id(work_id).ok_or(RunError::NoSuchJob)?;
         let authorization = *job.authorization();
         let ready = self.admitting()?.clone();
         let channel = ready.channel();
@@ -907,6 +903,7 @@ impl ProviderEndpoint {
         }
         self.close.store.commit(
             ChannelRecord::JobResult {
+                work_id,
                 result,
                 provider_signature: signature,
                 transcript: spool,
@@ -961,10 +958,10 @@ impl ProviderEndpoint {
         let work_id = work_id_bytes(&request.work_id).ok_or(DeliverError::Malformed("work id"))?;
         let signature = signature(&request.client_signature)
             .ok_or(DeliverError::Malformed("client signature"))?;
-        let job = self.state().job().ok_or(DeliverError::NoSuchJob)?;
-        if job.work_id() != work_id {
-            return Err(DeliverError::NoSuchJob);
-        }
+        let job = self
+            .state()
+            .job_by_id(work_id)
+            .ok_or(DeliverError::NoSuchJob)?;
         let admitted = self.admitting()?.clone();
         // Who is asking, on this connection. A `work_id` says which job;
         // it says nothing about who may be handed it, and it travels —
@@ -995,9 +992,10 @@ impl ProviderEndpoint {
         let (cursor_height, _) = self.state().cursor();
         ready.check_releasable(cursor_height, terminal_deadline)?;
 
-        self.close
-            .store
-            .commit(ChannelRecord::PlaintextReleased, &Secp256k1Verifier::new())?;
+        self.close.store.commit(
+            ChannelRecord::PlaintextReleased { work_id },
+            &Secp256k1Verifier::new(),
+        )?;
         Ok(Delivery {
             result,
             signature,
@@ -1040,6 +1038,7 @@ impl ProviderEndpoint {
         let certificate = earned_certificate(&request.certificate)
             .ok_or(PaymentError::Malformed("certificate"))?;
         let binding = PaymentBindingV1::decode(&request.binding)?;
+        let work_id = binding.work_id;
         let binding_signature = signature(&request.binding_signature)
             .ok_or(PaymentError::Malformed("binding signature"))?;
         let certificate_signature = signature(&request.certificate_signature)
@@ -1047,6 +1046,7 @@ impl ProviderEndpoint {
 
         let state = self.close.store.commit(
             ChannelRecord::JobTerminated {
+                work_id,
                 outcome: TerminalOutcome::Certified {
                     certificate,
                     binding: Box::new(binding),
@@ -1076,12 +1076,10 @@ impl ProviderEndpoint {
     /// [`RunError::NoSuchJob`] when no open job carries this `work_id`,
     /// and [`RunError::Store`] when the ending cannot be made durable.
     pub fn end_run(&mut self, work_id: Digest) -> Result<(), RunError> {
-        let job = self.state().job().ok_or(RunError::NoSuchJob)?;
-        if job.work_id() != work_id {
-            return Err(RunError::NoSuchJob);
-        }
+        self.state().job_by_id(work_id).ok_or(RunError::NoSuchJob)?;
         self.close.store.commit(
             ChannelRecord::JobTerminated {
+                work_id,
                 outcome: TerminalOutcome::Failed {
                     code: PROVIDER_FAULT_CODE,
                 },
@@ -1097,10 +1095,6 @@ impl ProviderEndpoint {
 /// because [`ProviderEndpoint::end_run`] is the one provider-chosen
 /// ending, and it is always the provider's own side going wrong.
 const PROVIDER_FAULT_CODE: u32 = 1;
-
-/// The nonce the one authorization a channel admits carries. A channel
-/// opens one job for its whole life, so there is one nonce and it is one.
-const SOLE_PROPOSAL_NONCE: u64 = 1;
 
 // ── Settling on chain ─────────────────────────────────────────────────
 
@@ -2210,14 +2204,13 @@ impl ChannelDriver<'_> {
     fn for_job(&self, work_id: Digest) -> Result<(), CatchUpError> {
         let endpoint = self.service.endpoint().map_err(|_| CatchUpError::Busy)?;
         let state = endpoint.state();
-        let held = state
-            .job()
-            .map(JobState::work_id)
-            .or_else(|| state.terminal().map(|terminal| terminal.work_id));
-        match held {
-            None => Ok(()),
-            Some(held) if held == work_id => Ok(()),
-            Some(_) => Err(CatchUpError::OtherJob),
+        if state.job_by_id(work_id).is_some() || state.terminal_by_id(work_id).is_some() {
+            return Ok(());
+        }
+        if state.jobs().len() == 0 && state.terminals().len() == 0 {
+            Ok(())
+        } else {
+            Err(CatchUpError::OtherJob)
         }
     }
 }
@@ -2788,10 +2781,11 @@ impl ClientEndpoint {
         let (cursor_height, _) = self.state().cursor();
         let policy = *self.ready.execution_policy();
 
-        if let Some(job) = self.state().job() {
-            if job.phase() != JobPhase::HalfSigned {
-                return Err(ProposeError::JobInFlight { phase: job.phase() });
-            }
+        for job in self
+            .state()
+            .jobs()
+            .filter(|job| job.phase() == JobPhase::HalfSigned)
+        {
             let retained = *job.authorization();
             let rebuilt = propose_authorization(
                 self.ready.channel(),
@@ -2801,7 +2795,7 @@ impl ClientEndpoint {
                 proposal.deadlines,
             )?;
             if rebuilt != retained {
-                return Err(ProposeError::Conflict);
+                continue;
             }
             return Ok(wire_request(
                 &retained,
@@ -2810,14 +2804,15 @@ impl ClientEndpoint {
             ));
         }
 
-        // The sole authorization this channel ever admits, and its nonce
-        // is one. There is no sequence to advance: the channel's permanent
-        // terminal is what stops a second job.
+        // Nonces form a durable high-water mark. A second job does not
+        // wait for the first, but no crash or reordered response can make
+        // the sequence move backwards or reuse a number.
+        let proposal_nonce = self.state().proposal_nonce_high_water().saturating_add(1);
         let authorization = propose_authorization(
             self.ready.channel(),
             &policy,
             &proposal.prepared_input,
-            SOLE_PROPOSAL_NONCE,
+            proposal_nonce,
             proposal.deadlines,
         )?;
         check_authorization(self.ready.channel(), &authorization, &policy, cursor_height)?;
@@ -2866,9 +2861,12 @@ impl ClientEndpoint {
     /// [`ProposeError::Store`] when the signature is not the provider's
     /// or the journal will not take it.
     pub fn accepted(&mut self, response: &AcceptWorkResponse) -> Result<Digest, ProposeError> {
-        let signature = match response.outcome.as_ref() {
-            Some(Outcome::Accepted(accepted)) => signature(&accepted.provider_signature)
-                .ok_or(ProposeError::Malformed("provider signature"))?,
+        let (work_id, signature) = match response.outcome.as_ref() {
+            Some(Outcome::Accepted(accepted)) => (
+                work_id_bytes(&accepted.work_id).ok_or(ProposeError::Malformed("work id"))?,
+                signature(&accepted.provider_signature)
+                    .ok_or(ProposeError::Malformed("provider signature"))?,
+            ),
             Some(Outcome::Refused(refused)) => {
                 return Err(ProposeError::Refused {
                     refusal: WorkRefusal::from_code(refused.code)
@@ -2878,13 +2876,12 @@ impl ClientEndpoint {
             }
             None => return Err(ProposeError::Malformed("outcome")),
         };
-        let work_id = self
-            .state()
-            .job()
-            .map(JobState::work_id)
+        self.state()
+            .job_by_id(work_id)
             .ok_or(ProposeError::NoOpenJob)?;
         self.store.commit(
             ChannelRecord::JobAccepted {
+                work_id,
                 provider_signature: signature,
             },
             &Secp256k1Verifier::new(),
@@ -2988,10 +2985,9 @@ impl ClientEndpoint {
         ready: &ReadyChannel,
         delivered: &WorkDelivered,
     ) -> Result<Delivery, DeliverError> {
-        let job = self.state().job().ok_or(DeliverError::NoSuchJob)?;
-        if job.work_id() != work_id {
-            return Err(DeliverError::NoSuchJob);
-        }
+        self.state()
+            .job_by_id(work_id)
+            .ok_or(DeliverError::NoSuchJob)?;
 
         bind(ready, &self.store, &self.signer, Role::Client)?;
         if ready.execution_policy() != self.ready.execution_policy() {
@@ -3014,6 +3010,7 @@ impl ClientEndpoint {
             .ok_or(DeliverError::Malformed("provider signature"))?;
         self.store.commit(
             ChannelRecord::JobResult {
+                work_id,
                 result,
                 provider_signature: signature,
                 transcript: delivered.transcript.clone(),
@@ -3045,10 +3042,9 @@ impl ClientEndpoint {
         work_id: Digest,
         exporter: &[u8; 32],
     ) -> Result<DeliverResultRequest, DeliverError> {
-        let job = self.state().job().ok_or(DeliverError::NoSuchJob)?;
-        if job.work_id() != work_id {
-            return Err(DeliverError::NoSuchJob);
-        }
+        self.state()
+            .job_by_id(work_id)
+            .ok_or(DeliverError::NoSuchJob)?;
         let signature = self.signer.sign(signing_hash(delivery_request_digest(
             self.ready.channel(),
             work_id,
@@ -3074,12 +3070,13 @@ impl ClientEndpoint {
     /// `work_id`, and [`DeliverError::Store`] when the job has no
     /// recorded result or the match cannot be made durable.
     pub fn matched(&mut self, work_id: Digest) -> Result<(), DeliverError> {
-        let job = self.state().job().ok_or(DeliverError::NoSuchJob)?;
-        if job.work_id() != work_id {
-            return Err(DeliverError::NoSuchJob);
-        }
-        self.store
-            .commit(ChannelRecord::ResultMatched, &Secp256k1Verifier::new())?;
+        self.state()
+            .job_by_id(work_id)
+            .ok_or(DeliverError::NoSuchJob)?;
+        self.store.commit(
+            ChannelRecord::ResultMatched { work_id },
+            &Secp256k1Verifier::new(),
+        )?;
         Ok(())
     }
 
@@ -3102,14 +3099,15 @@ impl ClientEndpoint {
         work_id: Digest,
         reproduction_digest: Digest,
     ) -> Result<(), DeliverError> {
-        let job = self.state().job().ok_or(DeliverError::NoSuchJob)?;
-        if job.work_id() != work_id {
-            return Err(DeliverError::NoSuchJob);
-        }
+        let job = self
+            .state()
+            .job_by_id(work_id)
+            .ok_or(DeliverError::NoSuchJob)?;
         let (result, _) = job.result().ok_or(DeliverError::NoSuchJob)?;
         let result_digest = result_digest(self.ready.channel(), result);
         self.store.commit(
             ChannelRecord::JobTerminated {
+                work_id,
                 outcome: TerminalOutcome::Refuted {
                     result_digest,
                     reproduction_digest,
@@ -3150,17 +3148,13 @@ impl ClientEndpoint {
     /// edge can settle, and [`PaymentError::Store`] for every rule the
     /// journal applies — including a payment signed past its deadline.
     pub fn pay(&mut self, work_id: Digest) -> Result<AdmitCertificateRequest, PaymentError> {
-        if let Some(retained) = self
-            .state()
-            .last_payment()
-            .filter(|payment| payment.work_id == work_id)
-        {
+        if let Some(retained) = self.state().payment(work_id) {
             return Ok(admit_request(&retained));
         }
-        let job = self.state().job().ok_or(PaymentError::NoSuchJob)?;
-        if job.work_id() != work_id {
-            return Err(PaymentError::NoSuchJob);
-        }
+        let job = self
+            .state()
+            .job_by_id(work_id)
+            .ok_or(PaymentError::NoSuchJob)?;
         let Some((result, _)) = job.result() else {
             return Err(PaymentError::NotPayable { phase: job.phase() });
         };
@@ -3183,6 +3177,7 @@ impl ClientEndpoint {
 
         self.store.commit(
             ChannelRecord::JobTerminated {
+                work_id,
                 outcome: TerminalOutcome::Certified {
                     certificate,
                     binding: Box::new(binding),
@@ -3235,8 +3230,7 @@ impl ClientEndpoint {
         };
         let signed = self
             .state()
-            .last_payment()
-            .filter(|payment| payment.work_id == work_id)
+            .payment(work_id)
             .ok_or(PaymentError::NoSuchJob)?
             .certificate
             .earned_cumulative();

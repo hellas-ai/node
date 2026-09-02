@@ -166,8 +166,8 @@ mod id_pins {
     #[test]
     fn work_ids_are_stable() {
         use super::services::work::{AcceptWork, AdmitCertificate, DeliverResult, Work};
-        assert_eq!(<Work as ServiceMarker>::SERVICE_ID, 0x4784_f9a3);
-        assert_eq!(<AcceptWork as MethodMarker>::METHOD_ID, 0xaae4_0060);
+        assert_eq!(<Work as ServiceMarker>::SERVICE_ID, 0xf61c_cea0);
+        assert_eq!(<AcceptWork as MethodMarker>::METHOD_ID, 0xe6a7_13c2);
         assert_eq!(<DeliverResult as MethodMarker>::METHOD_ID, 0xf15a_a80e);
         assert_eq!(<AdmitCertificate as MethodMarker>::METHOD_ID, 0x0ffb_b4f9);
     }
