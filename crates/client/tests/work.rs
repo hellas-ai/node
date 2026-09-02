@@ -16,9 +16,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::Bytes;
-use hellas_client::work::payment::pay_for_checked_result;
+use hellas_client::work::payment::{pay_for_checked_result, pay_for_result};
 use hellas_client::work::reproduce::{ReproduceFault, Reproduced, Reproducer};
-use hellas_client::work::{CheckedResult, CollectError, CollectOutcome, collect_checked_result};
+use hellas_client::work::{
+    CheckedResult, CollectError, CollectOutcome, CollectResultError, CollectResultOutcome,
+    collect_checked_result, collect_result,
+};
 use hellas_kernel::{
     BlockHeight, Decode as _, Edge, EdgeId, EdgeValues, Fees, Key, LeaseSlots, List,
     MAX_EDGE_OUTPUTS, NetworkId, Parties, Payout, PendingSlot, RegistryChunk, RegistryNamespace,
@@ -843,6 +846,84 @@ async fn a_checked_answer_becomes_a_payment_the_provider_admitted() {
     };
     assert_eq!(payment.work_id, id);
     assert_eq!(payment.certificate.earned_cumulative(), PRICE);
+}
+
+/// The normal paid-work path authenticates and pays a provider result
+/// without constructing or invoking a reproduction engine.
+#[tokio::test]
+async fn an_authenticated_answer_is_paid_without_reexecution() {
+    let client_root = temp();
+    let provider_root = temp();
+    let ready = ready();
+    let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR);
+    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
+    let (id, _) = accept(
+        &execution_policy(),
+        &mut [&mut client_store, &mut provider_store],
+        1,
+    );
+    let provider_endpoint = ProviderEndpoint::new(ready.clone(), provider_store, provider())
+        .expect("the provider endpoint binds");
+    let service = WorkService::new(provider_endpoint);
+    let mut endpoint = ClientEndpoint::new(ready.clone(), client_store, client())
+        .expect("the client endpoint binds");
+    run_to_result(&service, &ready, id).await;
+
+    let (transport, server) = transport_pair();
+    let serving = serve(server, service.clone());
+    let collected = collect_result(transport, &mut endpoint, &ready, &still(), id).await;
+    serving.abort();
+    assert!(
+        matches!(collected, Ok(CollectResultOutcome::Collected(_))),
+        "the authenticated answer is collected: {collected:?}",
+    );
+    assert_eq!(
+        endpoint.state().job().map(JobState::phase),
+        Some(JobPhase::Ready),
+        "ordinary collection does not claim an independent match",
+    );
+
+    let (transport, server) = transport_pair();
+    let serving = serve(server, service.clone());
+    let credited = pay_for_result(transport, &mut endpoint, id).await;
+    serving.abort();
+    assert_eq!(credited.ok(), Some(PRICE));
+    assert_eq!(endpoint.state().ledger().credited_cumulative(), PRICE);
+}
+
+/// Ordinary collection uses the same post-delivery finalized-height
+/// barrier as the checked path and will not return a stale payable result.
+#[tokio::test]
+async fn ordinary_collection_refuses_a_stale_payment_boundary() {
+    let client_root = temp();
+    let provider_root = temp();
+    let ready = ready();
+    let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR);
+    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
+    let (id, authorization) = accept(
+        &execution_policy(),
+        &mut [&mut client_store, &mut provider_store],
+        1,
+    );
+    let provider_endpoint = ProviderEndpoint::new(ready.clone(), provider_store, provider())
+        .expect("the provider endpoint binds");
+    let service = WorkService::new(provider_endpoint);
+    let mut endpoint = ClientEndpoint::new(ready.clone(), client_store, client())
+        .expect("the client endpoint binds");
+    run_to_result(&service, &ready, id).await;
+
+    let stale = Blocks {
+        tip: authorization.payment_deadline.saturating_add(1),
+    };
+    let (transport, server) = transport_pair();
+    let serving = serve(server, service);
+    let collected = collect_result(transport, &mut endpoint, &ready, &stale, id).await;
+    serving.abort();
+    assert!(
+        matches!(collected, Err(CollectResultError::Stale { .. })),
+        "the stale result is refused: {collected:?}",
+    );
+    assert!(endpoint.state().last_payment().is_none());
 }
 
 /// A payment signed before a crash is re-sent after it, and credited

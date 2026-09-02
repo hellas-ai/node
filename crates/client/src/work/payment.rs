@@ -72,7 +72,7 @@ use hellas_wire::StreamTransport;
 /// — which is what it does for a job this client has not checked, or a
 /// payment past its deadline — and for an acknowledgement that does not
 /// name the amount this client signed.
-pub async fn pay_for_checked_result<T>(
+pub async fn pay_for_result<T>(
     transport: T,
     endpoint: &mut ClientEndpoint,
     work_id: Digest,
@@ -83,4 +83,23 @@ where
     T::Stream: 'static,
 {
     admit_payment(&WorkClientImpl::new(transport), endpoint, work_id).await
+}
+
+/// Backwards-compatible spelling for callers that independently
+/// reproduced the result before paying.
+///
+/// Payment safety is enforced by the authenticated result and durable
+/// payment deadline. Independent reproduction remains an optional
+/// correctness check rather than a prerequisite for settlement.
+pub async fn pay_for_checked_result<T>(
+    transport: T,
+    endpoint: &mut ClientEndpoint,
+    work_id: Digest,
+) -> Result<u64, PaymentError>
+where
+    T: StreamTransport + Sync,
+    T::Error: std::error::Error + Send + Sync + 'static,
+    T::Stream: 'static,
+{
+    pay_for_result(transport, endpoint, work_id).await
 }

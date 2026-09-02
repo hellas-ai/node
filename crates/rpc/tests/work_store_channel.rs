@@ -918,13 +918,13 @@ fn a_verdict_belongs_to_a_client_holding_a_result() {
     );
 }
 
-/// An unverified result is not paid for, whichever half of the channel
-/// is asked.
+/// An authenticated result is payable without mandatory reproduction.
 ///
-/// The verdict is the only thing varied: the same delivered result, the
-/// same signed payment, refused before it and taken after it.
+/// The optional matched marker remains valid, but does not gate ordinary
+/// settlement: the provider's result signature and transcript binding
+/// are the evidence the payment names.
 #[test]
-fn an_unverified_result_is_not_paid_for() {
+fn an_authenticated_result_is_payable_without_reproduction() {
     let dir = temp();
     let channel = channel();
     let verifier = Secp256k1Verifier::new();
@@ -937,26 +937,9 @@ fn an_unverified_result_is_not_paid_for() {
         Some(JobPhase::Ready)
     );
 
-    // MUTATION: the payment offered with the verdict step skipped.
-    let error = store
-        .commit(job.paid(&channel), &verifier)
-        .expect_err("a result nobody checked is not payable");
-    assert!(
-        matches!(
-            error,
-            WorkStoreError::Channel(ChannelStateError::WrongPhase {
-                step: "crediting a payment",
-                phase: "ready"
-            })
-        ),
-        "unexpected error: {error}"
-    );
-    assert_eq!(store.state().ledger().credited_cumulative(), 0);
-
-    // The control: with the verdict recorded, the same payment is taken.
-    commit_all(&mut store, &[ChannelRecord::ResultMatched]);
+    // The ordinary path pays directly from Ready.
     if let Err(error) = store.commit(job.paid(&channel), &verifier) {
-        panic!("a checked result is paid for: {error}");
+        panic!("an authenticated result is paid for: {error}");
     }
     assert_eq!(store.state().ledger().credited_cumulative(), PRICE);
 }

@@ -2679,15 +2679,14 @@ impl ChannelState {
         certificate_signature: Sig,
         verifier: &V,
     ) -> Result<Applied, ChannelStateError> {
-        // A provider credits what it has delivered. A client has no
-        // delivery marker of its own; what it has is that its own
-        // re-execution matched, and a result that merely arrived is not
-        // one an honest client signs a certificate for.
-        let expected = match self.role {
-            Role::Provider => JobPhase::Delivered,
-            Role::Client => JobPhase::Matched,
+        // A provider credits only plaintext it released. A client may
+        // pay an authenticated result as soon as it is durably Ready;
+        // Matched remains the stronger, opt-in local-reexecution state.
+        let payable = match self.role {
+            Role::Provider => job.phase == JobPhase::Delivered,
+            Role::Client => matches!(job.phase, JobPhase::Ready | JobPhase::Matched),
         };
-        if job.phase != expected {
+        if !payable {
             return Err(ChannelStateError::WrongPhase {
                 step: "crediting a payment",
                 phase: job.phase.name(),
