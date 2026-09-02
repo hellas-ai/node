@@ -41,6 +41,26 @@ let
     taplo
   ];
 
+  # Buf's standard RPC naming rules assume generated gRPC APIs. Hellas uses
+  # service names in transport identities and deliberately shares protocol
+  # objects between methods, so those cosmetic rules would change the wire
+  # protocol or add one-field wrappers. Keep the exceptions with the check
+  # that needs them instead of a repository-root tool configuration file.
+  bufLintConfig = builtins.toJSON {
+    version = "v2";
+    modules = [ { path = "proto"; } ];
+    lint = {
+      use = [ "STANDARD" ];
+      except = [
+        "SERVICE_SUFFIX"
+        "RPC_RESPONSE_STANDARD_NAME"
+        "RPC_REQUEST_STANDARD_NAME"
+        "RPC_REQUEST_RESPONSE_UNIQUE"
+      ];
+    };
+  };
+  bufLintCommand = "buf lint --config ${lib.escapeShellArg bufLintConfig}";
+
   kernel = import ./kernel.nix {
     inherit
       pkgs
@@ -83,6 +103,7 @@ let
 
   ci = import ./ci.nix {
     inherit
+      bufLintCommand
       pkgs
       lib
       rustToolchain
@@ -315,7 +336,7 @@ let
     buf = mkHydraSourceCheck {
       name = "check-buf";
       inputs = [ pkgs.buf ];
-      command = "buf lint";
+      command = bufLintCommand;
     };
 
     deadnix = mkHydraSourceCheck {

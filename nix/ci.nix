@@ -1,4 +1,5 @@
 {
+  bufLintCommand,
   pkgs,
   lib,
   rustToolchain,
@@ -133,7 +134,7 @@ let
         [
           pkgs.taplo
         ];
-    buf = mk "check-buf" "buf lint" [ pkgs.buf ];
+    buf = mk "check-buf" bufLintCommand [ pkgs.buf ];
     deny = mk "check-deny" "cargo deny check" (
       (cargoEnv rustToolchain)
       ++ [
