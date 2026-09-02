@@ -1,4 +1,5 @@
 {
+  bufLintCommand,
   pkgs,
   lib,
   rustToolchain,
@@ -20,6 +21,10 @@ let
     toolchain:
     [
       toolchain
+      # Unix FIFO-adversary regressions create their fixtures with `mkfifo`.
+      # Keep that test dependency explicit: writeShellApplication otherwise
+      # gives Cargo a deliberately minimal PATH.
+      pkgs.coreutils
       pkgs.stdenv.cc
     ]
     ++ workspaceNativeBuildInputs;
@@ -33,9 +38,8 @@ let
     );
     # Default features alone leave most of the CLI unlinted: `evaluate`,
     # `node` and `gateway` are all off by default, which is most of what
-    # the binary actually does. Not `--all-features` — that pulls
-    # candle-cuda and objc2, which cannot build here. So: the buildable
-    # feature sets, named.
+    # the binary actually does. So the buildable feature sets are named and
+    # checked independently.
     clippy-features = mk "check-clippy-features" (builtins.concatStringsSep " && " (
       map
         (f: "cargo clippy -p hellas-cli --no-default-features --features ${f} --all-targets -- -D warnings")
@@ -45,6 +49,7 @@ let
           "validator"
           "evaluate"
           "node"
+          "llm"
           "gateway"
           "otel"
         ]
@@ -57,15 +62,71 @@ let
     # to empty binaries.
     kernel = mk "check-kernel" "cargo test -p hellas-kernel --all-features" (cargoEnv rustToolchain);
     executor = mk "check-executor" "cargo test -p hellas-executor" (cargoEnv rustToolchain);
+    # The paid-work protocol module is behind `work`, which nothing in the
+    # default graph turns on — so without this line its records, digests,
+    # and vector suite would be neither compiled nor linted here. It is
+    # the one RPC feature that pulls the consensus kernel in, which is
+    # exactly why it is checked rather than assumed.
+    #
+    # The whole package runs, not one named test file: `work` pulls
+    # `evaluate` and therefore `execute`, so this line is also what
+    # compiles `pb::id_pins` — the wire-id pins that no other gate here
+    # reaches, the `hellas.work.v1` service and method among them.
+    # Naming a single `--test` target would leave a rotated service id
+    # unnoticed, which is exactly what happened once.
+    rpc-work =
+      mk "check-rpc-work"
+        "cargo test -p hellas-rpc --features work && cargo clippy -p hellas-rpc --features work --all-targets -- -D warnings"
+        (cargoEnv rustToolchain);
+    # The client's paid-work half and the oracle inside it. `work` is off
+    # by default on `hellas-client`, so `check-clippy` compiles none of
+    # it: not the orchestrator, not its end-to-end test, and not the
+    # oracle's own suite — the one that says what a failed independent
+    # check does. All three run only here.
+    client-work =
+      mk "check-client-work"
+        "cargo test -p hellas-client --features work && cargo clippy -p hellas-client --features work --all-targets -- -D warnings"
+        (cargoEnv rustToolchain);
+    # The chain service's wire-id pins compile only under `chain`, which
+    # `work` does not pull in. `check-validator` links hellas-rpc with
+    # that feature but runs hellas-chain's tests, not hellas-rpc's, so
+    # until this line existed the light-client service and method ids
+    # were pinned by a test no gate ran. A rotated chain id would have
+    # reached deployed nodes with every check green.
+    rpc-chain =
+      mk "check-rpc-chain"
+        "cargo test -p hellas-rpc --features chain && cargo clippy -p hellas-rpc --features chain --all-targets -- -D warnings"
+        (cargoEnv rustToolchain);
     validator =
       mk "check-validator" "cargo test -p hellas-chain --no-default-features --features validator"
         (cargoEnv rustToolchain);
-    # The staked fraud-game end-to-end tests (consensus-level slash and
-    # the full two-edge game) live behind `preverified-seals`. It implies
-    # `validator`, not the other way round, so the check above never
-    # reaches them.
-    staked =
-      mk "check-staked" "cargo test -p hellas-chain --no-default-features --features preverified-seals"
+    # The finalized-block codec without a database or a mempool: the
+    # feature an endpoint enables to read the block its channel opened
+    # in. Every other gate reaches this code through `indexer`, which
+    # also enables the execution layer the split was made to avoid — so
+    # only this line fails if the codec grows a dependency back on it.
+    chain-block-view =
+      mk "check-chain-block-view"
+        "cargo clippy -p hellas-chain --no-default-features --features block-view --all-targets -- -D warnings"
+        (cargoEnv rustToolchain);
+    # The settlement watcher's block source: the codec above plus the
+    # paid endpoint's journal. It is the only dimension that compiles
+    # `hellas-chain` and `hellas-rpc/work` together, so it is the only
+    # one that fails when the two disagree about what a finalized block
+    # hands a watcher.
+    chain-work-watcher =
+      mk "check-chain-work-watcher"
+        "cargo clippy -p hellas-chain --no-default-features --features work-watcher --all-targets -- -D warnings"
+        (cargoEnv rustToolchain);
+    # The setup driver end to end. It needs both halves at once —
+    # `validator` for the database, the kernel, and the indexer, and
+    # `work-watcher` for the journal and the driver — and neither of the
+    # two dimensions above runs a test with the other's code compiled
+    # in. This is the only line that runs a paid channel being opened
+    # against real finalized blocks.
+    chain-setup =
+      mk "check-chain-setup"
+        "cargo test -p hellas-chain --no-default-features --features validator,work-watcher"
         (cargoEnv rustToolchain);
     sort = mk "check-sort" "cargo-sort --workspace --check --no-format" [ pkgs.cargo-sort ];
     taplo =
@@ -73,7 +134,7 @@ let
         [
           pkgs.taplo
         ];
-    buf = mk "check-buf" "buf lint" [ pkgs.buf ];
+    buf = mk "check-buf" bufLintCommand [ pkgs.buf ];
     deny = mk "check-deny" "cargo deny check" (
       (cargoEnv rustToolchain)
       ++ [
@@ -101,11 +162,17 @@ let
       export AR_wasm32_unknown_unknown=${lib.getExe' pkgs.llvmPackages.llvm "llvm-ar"}
       cargo check -p hellas-chain --no-default-features --features wasm-client --target wasm32-unknown-unknown
     '' (cargoEnv (rustToolchain.override { targets = [ "wasm32-unknown-unknown" ]; }));
-    wasm-jobs = mk "check-wasm-jobs" "cargo check -p hellas-jobs --target wasm32-unknown-unknown" (
-      cargoEnv (rustToolchain.override { targets = [ "wasm32-unknown-unknown" ]; })
-    );
     wasm-xet = mk "check-wasm-xet" "cargo check -p hellas-xet --target wasm32-unknown-unknown" (
       cargoEnv (rustToolchain.override { targets = [ "wasm32-unknown-unknown" ]; })
+    );
+    # `hellas-xet` sits inside the `#![no_std]` kernel's dependency
+    # closure, which must be allocation-free. With default features off
+    # the crate takes the `alloc` name for an empty module of its own, so
+    # this build is what fails — loudly, at compile time — the moment
+    # someone reaches for a `Vec` there again. It cannot ride along with
+    # `check-clippy`: a workspace build unifies `chunking` back on.
+    xet-no-alloc = mk "check-xet-no-alloc" "cargo build -p hellas-xet --no-default-features" (
+      cargoEnv rustToolchain
     );
   };
 
@@ -134,13 +201,16 @@ let
   # `nix build .#packages.<system>.<attr>`.
   ciBuilds = {
     cli = "cli";
-    cli-candle = "cli-candle";
     cli-validator = "cli-validator";
     static-x86_64 = "cross-x86_64-linux-musl-cli";
     static-aarch64 = "cross-aarch64-linux-musl-cli";
-    static-windows = "cross-x86_64-windows-cli";
-    docker-cuda = "docker-cuda";
     hellas-rpc-wasm = "hellas-rpc-wasm";
+  }
+  // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+    docker = "docker";
+  }
+  // lib.optionalAttrs (pkgs.stdenv.hostPlatform.system == "x86_64-linux") {
+    cli-catena = "cli-catena";
   };
 in
 {

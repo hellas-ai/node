@@ -158,6 +158,16 @@ impl Auth {
     pub const fn webauthn(assertion: WebAuthnAssertion) -> Self {
         Self::WebAuthn(assertion)
     }
+
+    /// Returns true when this witness is a native settlement signature.
+    ///
+    /// Terms shapes whose later transactions need the party's own
+    /// secp256k1 key read this at open: a passkey can authorize the
+    /// open and then be unable to sign anything the channel runs on.
+    #[must_use]
+    pub const fn is_native(&self) -> bool {
+        matches!(self, Self::Native(_))
+    }
 }
 
 impl Encode for Auth {

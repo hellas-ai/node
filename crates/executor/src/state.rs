@@ -1,17 +1,13 @@
 use std::collections::HashMap;
 #[cfg(feature = "evaluate")]
-use std::str::FromStr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-#[cfg(feature = "evaluate")]
-use crate::DEFAULT_MAX_SEQ;
 use crate::ExecutorError;
-use crate::fetch_provider::FetchProviderRequest;
-#[cfg(feature = "evaluate")]
-use hellas_rpc::Dtype;
+use crate::fetch_provider::FetchCall;
 #[cfg(feature = "evaluate")]
 use hellas_rpc::pb::courtesy::{
-    EvaluateStart as PbEvaluateStart, QuotePreparedTextRequest, evaluate_start,
+    EvaluateStart as PbEvaluateStart, QuoteTokensRequest, evaluate_start,
 };
 #[cfg(feature = "evaluate")]
 use hellas_rpc::pb::evaluate::EvaluateRequest as PbEvaluateRequest;
@@ -24,33 +20,26 @@ use hellas_rpc::run_ticket::ticket_to_pb;
 #[cfg(feature = "evaluate")]
 use hellas_rpc::run_ticket::{public_key_from_pb, public_key_to_pb};
 #[cfg(feature = "evaluate")]
-use hellas_rpc::spec::DEFAULT_MODEL_REVISION;
-#[cfg(feature = "evaluate")]
 use hellas_rpc::stream::output_event_to_pb;
 use hellas_rpc::{Assurance, ContentId, Digest, JobTerms, PublicKey, RequestCommitment};
 #[cfg(feature = "evaluate")]
-use hellas_rpc::{EvaluateRequest, OutputEventEnvelope, Retention};
+use hellas_rpc::{
+    DEFAULT_MAX_NEW_TOKENS, EvaluateRequest, MAX_STOP_TOKEN_IDS, OutputEventEnvelope, Retention,
+    normalize_stop_token_ids,
+};
 use uuid::Uuid;
 
 pub use crate::StateError;
 
 pub(crate) const QUOTE_AMOUNT: u64 = 1000;
 pub(crate) const QUOTE_TTL: Duration = Duration::from_secs(30);
-
-#[cfg(feature = "evaluate")]
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct ModelLocator {
-    pub model_id: String,
-    pub revision: String,
-    pub dtype: Dtype,
-}
-
-#[cfg(feature = "evaluate")]
-impl ModelLocator {
-    pub(crate) fn spec(&self) -> String {
-        model_spec(&self.model_id, &self.revision)
-    }
-}
+pub(crate) const MAX_OUTSTANDING_QUOTES: usize = 1024;
+/// Quotes are unauthenticated preparation and may carry large prompt bodies.
+/// Bound their conservative logical retained heap independently of entry
+/// count: fixed quote values and their directly owned allocations are charged,
+/// while shared environment metadata is deliberately charged once per quote.
+/// The entry cap separately bounds hash-table and allocator bookkeeping.
+pub(crate) const MAX_OUTSTANDING_QUOTE_BYTES: usize = 128 * 1024 * 1024;
 
 #[cfg(feature = "evaluate")]
 #[derive(Clone, Debug)]
@@ -62,7 +51,8 @@ pub struct Invocation {
 
 #[cfg(feature = "evaluate")]
 pub(crate) struct QuotePlan {
-    pub locator: ModelLocator,
+    pub vocabulary_size: u64,
+    pub maximum_capacity: u64,
     pub execution_environment: ContentId,
     pub invocation: Invocation,
     pub initial_artifact_id: Option<Digest>,
@@ -73,83 +63,31 @@ pub(crate) struct QuotePlan {
 
 #[cfg(feature = "evaluate")]
 impl QuotePlan {
-    /// The content id of this model's program manifest, built only from
-    /// files this node already holds.
-    ///
-    /// [`hellas_models::Reach::Local`] is the whole security property of
-    /// the quote path. Resolving a HuggingFace file path is downloading
-    /// it, so with download reach this function — reachable by any peer
-    /// that can dial us, with a model id it chooses — is a remote fetch
-    /// primitive: name a 700 GB repo and the node fetches it. Local
-    /// reach cannot: it holds no HTTP client at all, and a model that is
-    /// not here is [`ExecutorError::ModelNotMaterialized`].
-    ///
-    /// Still split out because it remains the expensive step even when
-    /// it downloads nothing: it reads every weight shard to hash it.
-    /// Callers on an async task must run it through
-    /// [`tokio::task::spawn_blocking`]; run inline it holds the
-    /// executor's single actor task for the whole read, so one quote
-    /// stalls every run ticket, receipt and settle behind it.
-    pub(crate) fn execution_environment(
-        locator: &ModelLocator,
-        backend: &str,
-    ) -> Result<ContentId, ExecutorError> {
-        let manifest = hellas_models::program_manifest(
-            &locator.spec(),
-            locator.dtype,
-            backend,
-            hellas_models::Reach::Local,
-        )
-        .map_err(|err| refusal_for(&locator.spec(), err))?;
-        Ok(hellas_rpc::ProgramManifest::Evaluate(manifest).content_id())
-    }
-
-    /// Builds the plan, refusing before the expensive part if
-    /// `execute_policy` will not run this model.
-    ///
-    /// The policy is checked *here*, not by the caller afterwards.
-    /// Building the manifest reads every shard of the model to hash it,
-    /// so a check that runs after this function has returned has already
-    /// paid for a model it is about to refuse.
-    ///
-    /// The policy is not what makes this safe, though — its default is
-    /// `Eager`, which permits everything. What makes it safe is that
-    /// [`Self::execution_environment`] resolves locally: the plan can
-    /// only be built for a model this node already holds.
-    pub(crate) fn from_prepared_text_request(
-        request: QuotePreparedTextRequest,
-        supported_dtypes: &[Dtype],
-        execute_policy: &hellas_rpc::policy::ExecutePolicy,
+    /// Builds a token-native quote from a locally bound canonical environment.
+    pub(crate) fn from_tokens_request(
+        request: QuoteTokensRequest,
+        environment: &crate::CausalLmEnvironmentSource,
     ) -> Result<Self, ExecutorError> {
-        let model_id = request.huggingface_model_id.trim();
-        if model_id.is_empty() {
-            return Err(ExecutorError::InvalidQuoteRequest(
-                "missing huggingface_model_id".to_string(),
-            ));
+        let manifest_id = environment.manifest_id();
+        let metadata = environment.environment();
+        let requested_manifest_id = ContentId::hash(&request.program_manifest);
+        if requested_manifest_id != manifest_id {
+            return Err(ExecutorError::InvalidQuoteRequest(format!(
+                "loaded environment is {}, but caller pinned {}",
+                manifest_id, requested_manifest_id
+            )));
         }
+        let max_new_tokens = request.max_new_tokens.unwrap_or(DEFAULT_MAX_NEW_TOKENS);
 
-        let revision = request.huggingface_revision.trim();
-        let revision = if revision.is_empty() {
-            DEFAULT_MODEL_REVISION
-        } else {
-            revision
+        if request.stop_token_ids.len() > MAX_STOP_TOKEN_IDS {
+            return Err(ExecutorError::InvalidTokenPayload(format!(
+                "stop_token_ids contains {} entries, over the limit of {MAX_STOP_TOKEN_IDS}",
+                request.stop_token_ids.len()
+            )));
         }
-        .to_string();
-
-        let dtype = resolve_accept_dtypes(&request.accept_dtypes, supported_dtypes)?;
-        let max_new_tokens = if request.max_new_tokens == 0 {
-            DEFAULT_MAX_SEQ
-        } else {
-            request.max_new_tokens
-        };
-
-        let input_ids = request.prompt_token_ids.clone();
-        if input_ids.is_empty() {
-            return Err(ExecutorError::InvalidTokenPayload(
-                "prompt is empty after decoding".to_string(),
-            ));
-        }
-        let stop_token_ids = request.stop_token_ids;
+        let input_ids = request.prompt_token_ids;
+        let mut stop_token_ids = request.stop_token_ids;
+        normalize_stop_token_ids(&mut stop_token_ids);
         let initial_artifact_id = parse_evaluate_start(request.start)?;
         let runner_public_key = request
             .runner_public_key
@@ -163,29 +101,11 @@ impl QuotePlan {
             })?;
         let assurance = hellas_rpc::run_ticket::assurance_from_pb(request.assurance)
             .map_err(|err| ExecutorError::InvalidQuoteRequest(err.to_string()))?;
-        let retention = Retention::from_retain(request.retain.unwrap_or(true));
-
-        let locator = ModelLocator {
-            model_id: model_id.to_string(),
-            revision,
-            dtype,
-        };
-        let backend = if cfg!(any(feature = "candle-cuda", feature = "candle-metal")) {
-            "accelerated"
-        } else {
-            "cpu"
-        };
-        if !execute_policy.allows_execute(&locator.spec(), Some(locator.model_id.as_str())) {
-            return Err(ExecutorError::PolicyDenied(format!(
-                "execute policy denied model {}",
-                locator.spec()
-            )));
-        }
-
-        let execution_environment = Self::execution_environment(&locator, backend)?;
-        Ok(Self {
-            locator,
-            execution_environment,
+        let retention = Retention::from_retain(request.retain.unwrap_or(false));
+        let plan = Self {
+            vocabulary_size: metadata.vocabulary_size(),
+            maximum_capacity: metadata.maximum_capacity(),
+            execution_environment: manifest_id,
             invocation: Invocation {
                 input_ids,
                 max_new_tokens,
@@ -195,64 +115,63 @@ impl QuotePlan {
             runner_public_key,
             assurance,
             retention,
-        })
-    }
-}
-
-/// Turns a model-layer failure into what a serving path says back.
-///
-/// One case is lifted out of the transparent `ModelAssets` passthrough:
-/// "this node does not hold that model" is a distinct, actionable answer
-/// and deserves a variant a client can match on, rather than being one
-/// more opaque asset error.
-#[cfg(feature = "evaluate")]
-pub(crate) fn refusal_for(
-    model: &str,
-    err: hellas_models::ModelAssetsError,
-) -> crate::ExecutorError {
-    match err {
-        hellas_models::ModelAssetsError::NotMaterialized { .. } => {
-            tracing::info!(model = %model, "refused a quote for a model this node does not hold");
-            ExecutorError::ModelNotMaterialized(err.to_string())
-        }
-        other => other.into(),
+        };
+        validate_invocation(
+            &plan.invocation,
+            plan.vocabulary_size,
+            plan.maximum_capacity,
+        )?;
+        Ok(plan)
     }
 }
 
 #[cfg(feature = "evaluate")]
-pub(crate) fn resolve_accept_dtypes(
-    prefs: &[String],
-    supported_dtypes: &[Dtype],
-) -> Result<Dtype, ExecutorError> {
-    if supported_dtypes.is_empty() {
-        return Err(ExecutorError::InvalidQuoteRequest(
-            "executor must support at least one dtype".to_string(),
+pub(crate) fn validate_invocation(
+    invocation: &Invocation,
+    vocabulary_size: u64,
+    maximum_capacity: u64,
+) -> Result<(), ExecutorError> {
+    if invocation.input_ids.is_empty() {
+        return Err(ExecutorError::InvalidTokenPayload(
+            "input token IDs must not be empty".to_string(),
         ));
     }
-    if prefs.is_empty() {
-        return Ok(supported_dtypes[0]);
+    if invocation.max_new_tokens == 0 {
+        return Err(ExecutorError::InvalidTokenPayload(
+            "max_new_tokens must be greater than zero".to_string(),
+        ));
     }
-    let mut parsed = Vec::with_capacity(prefs.len());
-    for raw in prefs {
-        let dtype = Dtype::from_str(raw).map_err(|e| {
-            ExecutorError::InvalidQuoteRequest(format!("invalid dtype `{raw}`: {e}"))
-        })?;
-        if !dtype.is_model_dtype() {
-            return Err(ExecutorError::InvalidQuoteRequest(
-                "model dtype must be f32, f16, bf16, or f8".to_string(),
-            ));
+    if invocation.stop_token_ids.len() > MAX_STOP_TOKEN_IDS {
+        return Err(ExecutorError::InvalidTokenPayload(format!(
+            "stop token IDs contains {} entries, over the limit of {MAX_STOP_TOKEN_IDS}",
+            invocation.stop_token_ids.len()
+        )));
+    }
+    for (field, tokens) in [
+        ("input token IDs", invocation.input_ids.as_slice()),
+        ("stop token IDs", invocation.stop_token_ids.as_slice()),
+    ] {
+        if let Some(token) = tokens
+            .iter()
+            .copied()
+            .find(|&token| u64::from(token) >= vocabulary_size)
+        {
+            return Err(ExecutorError::InvalidTokenPayload(format!(
+                "{field} contain token {token}, but environment vocabulary size is {}",
+                vocabulary_size
+            )));
         }
-        parsed.push(dtype);
     }
-    for dtype in &parsed {
-        if supported_dtypes.contains(dtype) {
-            return Ok(*dtype);
-        }
+    let total_tokens = u64::try_from(invocation.input_ids.len())
+        .unwrap_or(u64::MAX)
+        .saturating_add(u64::from(invocation.max_new_tokens));
+    if total_tokens > maximum_capacity {
+        return Err(ExecutorError::InvalidTokenPayload(format!(
+            "prompt plus max_new_tokens is {total_tokens} tokens, but environment capacity is {}",
+            maximum_capacity
+        )));
     }
-    Err(ExecutorError::DtypeNotSupported {
-        request: parsed[0],
-        supported: supported_dtypes.to_vec(),
-    })
+    Ok(())
 }
 
 #[cfg(feature = "evaluate")]
@@ -294,7 +213,7 @@ pub(crate) fn evaluate_request_from_pb(
         nonce: bytes32(&request.nonce, "nonce")?,
         assurance: hellas_rpc::run_ticket::assurance_from_pb(request.assurance)
             .map_err(|err| ExecutorError::InvalidQuoteRequest(err.to_string()))?,
-        retain: request.retain.unwrap_or(true),
+        retain: request.retain.unwrap_or(false),
     })
 }
 
@@ -312,36 +231,30 @@ fn parse_evaluate_start(start: Option<PbEvaluateStart>) -> Result<Option<Digest>
     }
 }
 
+/// Decodes a fixed-width byte field, naming it in the failure.
+///
+/// The crate's one copy of this: `state` and `evaluate` wrap it in
+/// their own error type rather than restating the conversion.
+#[cfg(feature = "evaluate")]
+pub(crate) fn fixed<const N: usize>(field: &str, bytes: &[u8]) -> Result<[u8; N], String> {
+    bytes
+        .try_into()
+        .map_err(|_| format!("{field} must be {N} bytes, got {}", bytes.len()))
+}
+
 #[cfg(feature = "evaluate")]
 fn bytes32(bytes: &[u8], field: &str) -> Result<[u8; 32], ExecutorError> {
-    crate::chain::fixed(field, bytes).map_err(ExecutorError::InvalidQuoteRequest)
+    fixed(field, bytes).map_err(ExecutorError::InvalidQuoteRequest)
 }
 
 fn hex32(bytes: &[u8; 32]) -> String {
     Digest::from_bytes(*bytes).to_string()
 }
 
-#[cfg(feature = "evaluate")]
-pub(crate) fn model_spec(model_id: &str, revision: &str) -> String {
-    if revision.is_empty() {
-        model_id.to_string()
-    } else {
-        format!("{model_id}@{revision}")
-    }
-}
-
-#[cfg(feature = "evaluate")]
-#[derive(Clone, Debug)]
-pub(crate) enum LocalModelStatus {
-    Ready,
-    Failed(String),
-}
-
 #[derive(Clone)]
 pub struct QuoteRecord {
     pub terms: JobTerms,
     pub expires_at: Instant,
-    pub model_id: String,
     pub runner_public_key: PublicKey,
     pub kind: QuoteKind,
 }
@@ -383,15 +296,31 @@ pub(crate) fn validate_job_terms(
 #[derive(Clone)]
 pub enum QuoteKind {
     #[cfg(feature = "evaluate")]
-    Scheme(Box<dyn crate::scheme::SchemeJob>),
+    Evaluate(Box<crate::evaluate::EvaluateJob>),
     Fetch {
-        request: FetchProviderRequest,
+        call: FetchCall,
     },
+}
+
+impl QuoteRecord {
+    pub(crate) fn retained_heap_bytes(&self) -> Option<usize> {
+        let variable = match &self.kind {
+            #[cfg(feature = "evaluate")]
+            QuoteKind::Evaluate(job) => job.retained_heap_bytes()?,
+            QuoteKind::Fetch { call } => call
+                .service
+                .capacity()
+                .checked_add(call.method.capacity())?
+                .checked_add(call.body.retained_heap_bytes())?,
+        };
+        std::mem::size_of::<QuoteRecord>().checked_add(variable)
+    }
 }
 
 #[derive(Default)]
 pub struct ExecutorState {
     quotes: HashMap<[u8; 32], QuoteRecord>,
+    quote_bytes: usize,
 }
 
 impl ExecutorState {
@@ -399,10 +328,45 @@ impl ExecutorState {
         Self::default()
     }
 
-    pub fn create_quote(&mut self, quote: QuoteRecord) -> [u8; 32] {
+    pub fn create_quote(&mut self, quote: QuoteRecord) -> Result<[u8; 32], ExecutorError> {
+        self.create_quote_with_limits(quote, MAX_OUTSTANDING_QUOTES, MAX_OUTSTANDING_QUOTE_BYTES)
+    }
+
+    fn create_quote_with_limits(
+        &mut self,
+        quote: QuoteRecord,
+        entry_capacity: usize,
+        byte_capacity: usize,
+    ) -> Result<[u8; 32], ExecutorError> {
         let key = *quote.terms.request.as_bytes();
+        if !self.quotes.contains_key(&key) && self.quotes.len() >= entry_capacity {
+            return Err(ExecutorError::QueueFull {
+                capacity: entry_capacity,
+            });
+        }
+        let retained_bytes = quote.retained_heap_bytes().ok_or_else(|| {
+            ExecutorError::ResourceExhausted(
+                "outstanding quote logical retained-heap accounting overflowed".to_string(),
+            )
+        })?;
+        let replaced_bytes = self
+            .quotes
+            .get(&key)
+            .and_then(QuoteRecord::retained_heap_bytes)
+            .unwrap_or(0);
+        let next_bytes = self
+            .quote_bytes
+            .checked_sub(replaced_bytes)
+            .and_then(|bytes| bytes.checked_add(retained_bytes))
+            .filter(|bytes| *bytes <= byte_capacity)
+            .ok_or_else(|| {
+                ExecutorError::ResourceExhausted(format!(
+                    "outstanding quote logical retained-heap capacity of {byte_capacity} bytes is exhausted"
+                ))
+            })?;
         self.quotes.insert(key, quote);
-        key
+        self.quote_bytes = next_bytes;
+        Ok(key)
     }
 
     pub fn get_quote(
@@ -428,13 +392,26 @@ impl ExecutorState {
 
     pub fn remove_quote(&mut self, request_commitment: &[u8]) -> Option<QuoteRecord> {
         let key: [u8; 32] = request_commitment.try_into().ok()?;
-        self.quotes.remove(&key)
+        let quote = self.quotes.remove(&key)?;
+        self.quote_bytes = quote
+            .retained_heap_bytes()
+            .and_then(|removed| self.quote_bytes.checked_sub(removed))
+            // Stored quotes are immutable and were accounted before insert.
+            // Fail closed on an impossible internal mismatch.
+            .unwrap_or(usize::MAX);
+        Some(quote)
     }
 
     pub fn prune_expired_quotes(&mut self, now: Instant) -> usize {
-        let before = self.quotes.len();
-        self.quotes.retain(|_, quote| quote.expires_at > now);
-        before - self.quotes.len()
+        let expired = self
+            .quotes
+            .iter()
+            .filter_map(|(key, quote)| (quote.expires_at <= now).then_some(*key))
+            .collect::<Vec<_>>();
+        for key in &expired {
+            let _ = self.remove_quote(key);
+        }
+        expired.len()
     }
 }
 
@@ -449,16 +426,16 @@ fn make_id(prefix: &str) -> String {
 #[cfg(feature = "evaluate")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopReason {
-    EndOfSequence,
+    StopToken(u32),
     MaxNewTokens,
-    Cancelled,
 }
 
 #[cfg(feature = "evaluate")]
 #[derive(Debug, Clone)]
 pub enum Termination {
     Completed {
-        output_events: Vec<OutputEventEnvelope>,
+        streamed_prefix: Arc<[OutputEventEnvelope]>,
+        terminal_output_event: Box<OutputEventEnvelope>,
     },
     Failed {
         position: u64,
@@ -470,8 +447,11 @@ pub enum Termination {
 impl Termination {
     pub fn into_pb(self) -> PbWorkEvent {
         let kind = match self {
-            Self::Completed { output_events } => work_event::Kind::Finished(PbWorkFinished {
-                output_events: output_events.iter().map(output_event_to_pb).collect(),
+            Self::Completed {
+                terminal_output_event,
+                ..
+            } => work_event::Kind::Finished(PbWorkFinished {
+                terminal_output_event: Some(output_event_to_pb(terminal_output_event.as_ref())),
                 assurance_evidence: Vec::new(),
             }),
             Self::Failed { position, error } => {
@@ -479,5 +459,129 @@ impl Termination {
             }
         };
         PbWorkEvent { kind: Some(kind) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn quote(index: u32) -> QuoteRecord {
+        quote_with_body(index, Vec::new())
+    }
+
+    fn quote_with_body(index: u32, body: Vec<u8>) -> QuoteRecord {
+        let mut bytes = [0_u8; 32];
+        bytes[..4].copy_from_slice(&index.to_be_bytes());
+        let digest = Digest::from_bytes(bytes);
+        let input = hellas_rpc::InputCommitment::from_digest(digest);
+        QuoteRecord {
+            terms: JobTerms {
+                request: RequestCommitment::from_digest(digest),
+                provider_genesis: ContentId::from_bytes([1; 32]),
+                assurance: Assurance::ProducerSigned,
+                amount: QUOTE_AMOUNT,
+                ttl_ms: QUOTE_TTL.as_millis() as u64,
+            },
+            expires_at: Instant::now() + QUOTE_TTL,
+            runner_public_key: hellas_rpc::ProducerSigningKey::from_secret_bytes([2; 32])
+                .unwrap()
+                .public_key(),
+            kind: QuoteKind::Fetch {
+                call: FetchCall::new("test", "run", hellas_rpc::JsonBytes::new(body), input),
+            },
+        }
+    }
+
+    #[test]
+    fn outstanding_quotes_are_bounded_without_evicting_live_tickets() {
+        let mut state = ExecutorState::new();
+        for index in 0..MAX_OUTSTANDING_QUOTES as u32 {
+            state.create_quote(quote(index)).unwrap();
+        }
+        let Err(error) = state.create_quote(quote(MAX_OUTSTANDING_QUOTES as u32)) else {
+            panic!("a quote over the bound must be refused");
+        };
+        assert!(matches!(
+            error,
+            ExecutorError::QueueFull {
+                capacity: MAX_OUTSTANDING_QUOTES
+            }
+        ));
+
+        // Repeating an existing deterministic commitment is replacement, not
+        // attacker-controlled cardinality growth.
+        state.create_quote(quote(0)).unwrap();
+    }
+
+    #[test]
+    fn outstanding_quote_heap_is_bounded_and_replacements_are_accounted() {
+        let first = quote_with_body(1, vec![1; 64]);
+        let per_quote = first.retained_heap_bytes().unwrap();
+        let empty_quote = quote_with_body(1, Vec::new())
+            .retained_heap_bytes()
+            .unwrap();
+        let two_full_quotes = per_quote.checked_mul(2).unwrap();
+        let byte_capacity = two_full_quotes.checked_add(empty_quote).unwrap();
+        let mut state = ExecutorState::new();
+
+        state
+            .create_quote_with_limits(first, 10, byte_capacity)
+            .unwrap();
+        state
+            .create_quote_with_limits(quote_with_body(2, vec![2; 64]), 10, byte_capacity)
+            .unwrap();
+        assert_eq!(state.quote_bytes, two_full_quotes);
+
+        let error = state
+            .create_quote_with_limits(quote_with_body(3, vec![3; 64]), 10, byte_capacity)
+            .unwrap_err();
+        assert!(matches!(error, ExecutorError::ResourceExhausted(_)));
+
+        state
+            .create_quote_with_limits(quote_with_body(1, Vec::new()), 10, byte_capacity)
+            .unwrap();
+        state
+            .create_quote_with_limits(quote_with_body(3, vec![3; 64]), 10, byte_capacity)
+            .unwrap();
+        assert!(state.quote_bytes <= byte_capacity);
+    }
+
+    #[test]
+    fn fetch_quote_heap_accounting_uses_owned_buffer_capacity() {
+        let mut body = Vec::with_capacity(4_096);
+        body.extend_from_slice(b"{}");
+        let body_capacity = body.capacity();
+        let quote = quote_with_body(9, body);
+        let call = match &quote.kind {
+            #[cfg(feature = "evaluate")]
+            QuoteKind::Evaluate(_) => unreachable!("fixture is a Fetch quote"),
+            QuoteKind::Fetch { call } => call,
+        };
+        let expected = std::mem::size_of::<QuoteRecord>()
+            + call.service.capacity()
+            + call.method.capacity()
+            + body_capacity;
+
+        assert_eq!(quote.retained_heap_bytes(), Some(expected));
+        assert!(body_capacity > call.body.as_bytes().len());
+    }
+
+    #[test]
+    fn removing_and_pruning_quotes_release_heap_accounting() {
+        let now = Instant::now();
+        let mut expired = quote_with_body(1, vec![1; 64]);
+        expired.expires_at = now;
+        let live = quote_with_body(2, vec![2; 64]);
+        let live_key = *live.terms.request.as_bytes();
+        let live_bytes = live.retained_heap_bytes().unwrap();
+        let mut state = ExecutorState::new();
+        state.create_quote(expired).unwrap();
+        state.create_quote(live).unwrap();
+
+        assert_eq!(state.prune_expired_quotes(now), 1);
+        assert_eq!(state.quote_bytes, live_bytes);
+        assert!(state.remove_quote(&live_key).is_some());
+        assert_eq!(state.quote_bytes, 0);
     }
 }

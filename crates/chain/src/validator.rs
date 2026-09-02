@@ -4,7 +4,7 @@ use crate::domain::{
 };
 use crate::{
     ActivityReporter, Application, ApplicationConfig, BlockStore, ChainIndexer, ConsensusInfo,
-    Mempool, OwnerIndex, UtxoDb,
+    LightClientRpcState, Mempool, OwnerIndex, UtxoDb,
     config::{
         Config, ConfigError, Genesis, GenesisEntry, GenesisValidator, PeerEntry, ValidatorConfig,
         encode_private_key, encode_threshold_polynomial, encode_threshold_share,
@@ -13,7 +13,7 @@ use crate::{
     init_block_store, init_finalization_store,
     relay::{authenticated_relay_request, serve_light_client_relay},
     rpc::LocalLightClient,
-    utxo_db_config,
+    spawn_light_client_server, utxo_db_config,
 };
 use commonware_broadcast::buffered;
 use commonware_codec::{DecodeExt, Encode};
@@ -125,6 +125,8 @@ pub enum ValidatorError {
     NonUtf8StorageDirectory(PathBuf),
     #[error("failed to replay owner index: {0}")]
     OwnerIndex(String),
+    #[error("failed to bind light-client server at {addr}: {source}")]
+    LightClientBind { addr: SocketAddr, source: io::Error },
     #[error("invalid relay configuration")]
     Relay(#[from] crate::relay::RelayConnectError),
 }
@@ -151,6 +153,7 @@ pub enum Command {
         addresses: Option<Vec<String>>,
         relay_urls: Vec<String>,
         metrics_port: Option<u16>,
+        light_client_bind: Option<SocketAddr>,
         genesis: Option<PathBuf>,
         genesis_allocations: Vec<String>,
     },
@@ -195,6 +198,7 @@ pub fn run_command(command: Command) -> Result<(), ValidatorError> {
             addresses,
             relay_urls,
             metrics_port,
+            light_client_bind,
             genesis,
             genesis_allocations,
         } => setup(SetupArgs {
@@ -205,6 +209,7 @@ pub fn run_command(command: Command) -> Result<(), ValidatorError> {
             addresses,
             relay_urls,
             metrics_port,
+            light_client_bind,
             genesis,
             genesis_allocations,
         }),
@@ -221,6 +226,7 @@ struct SetupArgs {
     addresses: Option<Vec<String>>,
     relay_urls: Vec<String>,
     metrics_port: Option<u16>,
+    light_client_bind: Option<SocketAddr>,
     genesis: Option<PathBuf>,
     genesis_allocations: Vec<String>,
 }
@@ -314,7 +320,7 @@ fn generate_network(args: GenerateNetworkArgs) -> Result<(), ValidatorError> {
         signing_key
     });
     let genesis = Genesis {
-        schema_version: hellas_genesis::GENESIS_SCHEMA_VERSION,
+        schema_version: crate::genesis::GENESIS_SCHEMA_VERSION,
         network_id,
         validators: keys
             .iter()
@@ -368,6 +374,7 @@ fn generate_network(args: GenerateNetworkArgs) -> Result<(), ValidatorError> {
             threshold_polynomial: encode_threshold_polynomial(&threshold_polynomial),
             listen_port: start_port + index as u16,
             metrics_port: Some(metrics_base_port + index as u16),
+            light_client_bind: None,
             relay_urls: relay_urls.clone(),
             genesis: genesis.clone(),
             peers,
@@ -395,6 +402,7 @@ fn setup(args: SetupArgs) -> Result<(), ValidatorError> {
         addresses,
         relay_urls,
         metrics_port,
+        light_client_bind,
         genesis,
         genesis_allocations,
     } = args;
@@ -487,8 +495,8 @@ fn setup(args: SetupArgs) -> Result<(), ValidatorError> {
             genesis
         }
         None => Genesis {
-            schema_version: hellas_genesis::GENESIS_SCHEMA_VERSION,
-            network_id: hellas_genesis::HELLAS_DEVNET_1_ID.to_string(),
+            schema_version: crate::genesis::GENESIS_SCHEMA_VERSION,
+            network_id: crate::genesis::HELLAS_DEVNET_1_ID.to_string(),
             validators: generated_validators,
             allocations: genesis_allocations
                 .iter()
@@ -503,6 +511,7 @@ fn setup(args: SetupArgs) -> Result<(), ValidatorError> {
         threshold_polynomial: encode_threshold_polynomial(&threshold_polynomial),
         listen_port: start_port + validator as u16,
         metrics_port: Some(metrics_port.unwrap_or(9090 + validator as u16)),
+        light_client_bind,
         relay_urls,
         genesis,
         peers,
@@ -537,16 +546,18 @@ mod genesis_allocation_tests {
     use crate::domain::{SettlementKey, addr_from_signing_key, secp256r1_key_from_seed};
 
     #[test]
-    fn rejects_non_p256_settlement_key() {
+    fn rejects_settlement_key_valid_on_neither_curve() {
         let key = SettlementKey::from_bytes([0xa5; SettlementKey::LENGTH]);
         let err = match parse_genesis_allocation(&format!("{key}:10")) {
-            Ok(_) => panic!("non-P-256 genesis owner was accepted"),
+            Ok(_) => panic!("invalid genesis owner was accepted"),
             Err(err) => err,
         };
         assert!(matches!(
             err,
             ValidatorError::InvalidSetup(message)
-                if message.contains(&key.to_string()) && message.contains("P-256")
+                if message.contains(&key.to_string())
+                    && message.contains("P-256")
+                    && message.contains("secp256k1")
         ));
     }
 
@@ -785,6 +796,7 @@ enum ShutdownTrigger {
     Signal(&'static str),
     NetworkExited,
     EngineExited,
+    LightClientServerExited,
     RelayExited,
 }
 
@@ -1224,6 +1236,23 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
             ChainIndexer::new(marshal_mailbox.clone()),
             consensus_info.clone(),
         );
+        let light_client_rpc_state = LightClientRpcState::default();
+        let light_client_server_handle = if let Some(addr) = validator_config.light_client_bind {
+            Some(
+                spawn_light_client_server(
+                    addr,
+                    light_client.clone(),
+                    activity_tx.clone(),
+                    light_client_rpc_state.clone(),
+                )
+                .await
+                .unwrap_or_else(|source| {
+                    panic!("{}", ValidatorError::LightClientBind { addr, source })
+                }),
+            )
+        } else {
+            None
+        };
         let relay_handles: Vec<_> = validator_config
             .relay_urls
             .iter()
@@ -1233,6 +1262,7 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
                 let private_key = relay_private_key.clone();
                 let light_client = light_client.clone();
                 let activity_tx = activity_tx.clone();
+                let rpc_state = light_client_rpc_state.clone();
                 ::tokio::spawn(async move {
                     let mut retry = Duration::from_secs(1);
                     loop {
@@ -1244,6 +1274,7 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
                             &private_key,
                             light_client.clone(),
                             activity_tx.clone(),
+                            rpc_state.clone(),
                         )
                         .await
                         {
@@ -1286,6 +1317,11 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
         let qmdb_resolver_waiter = qmdb_resolver_handle
             .map(|_| ShutdownTrigger::EngineExited)
             .boxed();
+        let light_client_server_waiter = light_client_server_handle.map(|handle| {
+            handle
+                .map(|_| ShutdownTrigger::LightClientServerExited)
+                .boxed()
+        });
         let mut waiters = vec![
             signal_waiter,
             network_waiter,
@@ -1295,6 +1331,9 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
             stateful_waiter,
             qmdb_resolver_waiter,
         ];
+        if let Some(waiter) = light_client_server_waiter {
+            waiters.push(waiter);
+        }
         waiters.extend(
             relay_handles
                 .into_iter()
@@ -1313,6 +1352,9 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
             }
             ShutdownTrigger::EngineExited => {
                 warn!("engine task exited unexpectedly; triggering shutdown");
+            }
+            ShutdownTrigger::LightClientServerExited => {
+                warn!("light-client server exited unexpectedly; triggering shutdown");
             }
             ShutdownTrigger::RelayExited => {
                 warn!("relay task exited unexpectedly; triggering shutdown");

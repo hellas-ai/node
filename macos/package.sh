@@ -35,7 +35,7 @@ test "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.developer.devicecheck.app-a
 application_id=$(/usr/libexec/PlistBuddy -c 'Print :com.apple.application-identifier' "$entitlements")
 bundle_id=${application_id#*.}
 
-MACOSX_DEPLOYMENT_TARGET=27.0 cargo rustc --release -p hellas-cli --features apple-app-attest,node,gateway,evaluate,candle-metal -- \
+MACOSX_DEPLOYMENT_TARGET=27.0 cargo rustc --release -p hellas-cli --features apple-app-attest,node,gateway,otel -- \
     -C linker="$linker" -C link-arg=-isysroot -C link-arg="$sdk"
 mkdir -p "$contents/MacOS"
 cp macos/Info.plist "$contents/Info.plist"

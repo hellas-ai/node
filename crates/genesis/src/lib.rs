@@ -4,6 +4,12 @@
 //! implementation. It is the small document shared by validators, relays,
 //! indexers, browsers, and deployment tooling. Cryptographic consumers decode
 //! and validate the key strings at their own boundary.
+//!
+//! It is `std` and it is a crate, because the document is `String`s, `Vec`s
+//! and a `BTreeSet` of them, and because the readers are not all nodes: a
+//! `wasm32-unknown-unknown` browser build and a relay in another repository
+//! read the same shipped bytes as the validator does. `hellas-chain`
+//! re-exports it whole as `hellas_chain::genesis`.
 
 use std::collections::BTreeSet;
 
@@ -12,15 +18,13 @@ use serde::{Deserialize, Serialize};
 pub const GENESIS_SCHEMA_VERSION: u16 = 1;
 
 /// The in-tree development network's document.
-pub const HELLAS_DEVNET_1_JSON: &str =
-    include_str!("../../../networks/hellas-devnet-1/genesis.json");
+pub const HELLAS_DEVNET_1_JSON: &str = include_str!("../networks/hellas-devnet-1/genesis.json");
 
 /// The id that document names.
 pub const HELLAS_DEVNET_1_ID: &str = "hellas-devnet-1";
 
 /// The in-tree test network's document.
-pub const HELLAS_TESTNET_1_JSON: &str =
-    include_str!("../../../networks/hellas-testnet-1/genesis.json");
+pub const HELLAS_TESTNET_1_JSON: &str = include_str!("../networks/hellas-testnet-1/genesis.json");
 
 /// The id that document names.
 pub const HELLAS_TESTNET_1_ID: &str = "hellas-testnet-1";
@@ -285,6 +289,33 @@ mod tests {
                     allocation.address,
                 );
             }
+        }
+    }
+
+    /// The shipped documents are pinned by their bytes, not by the
+    /// facts a parser can be talked into agreeing with. `include_str!`
+    /// takes a path, and a path is a thing that can be re-pointed by a
+    /// move, a symlink, or a directory rename — after which every
+    /// assertion above still passes while the committee has changed.
+    /// Two networks differing in one hex digit are two networks, and a
+    /// node that joined the wrong one has forked.
+    #[test]
+    fn shipped_documents_hash_to_the_bytes_that_were_reviewed() {
+        use sha2::{Digest as _, Sha256};
+
+        for (json, expected) in [
+            (
+                HELLAS_DEVNET_1_JSON,
+                "caab04a9350edbe0d50aa9375dcee2742145cf5c24c57f42c844ebf4f27aa4b6",
+            ),
+            (
+                HELLAS_TESTNET_1_JSON,
+                "2c845c34455dc96e818ce40f4200edac79e6fb43f3e68a24e522d2030c3d8680",
+            ),
+        ] {
+            let digest = Sha256::digest(json.as_bytes());
+            let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+            assert_eq!(hex, expected);
         }
     }
 

@@ -5,30 +5,16 @@
 //! inbound RPCs here.
 
 use std::pin::Pin;
-#[cfg(feature = "evaluate")]
-use std::sync::Arc;
 
 use crate::ExecutorError;
 use futures_core::Stream;
-#[cfg(feature = "evaluate")]
-use futures_util::StreamExt;
-#[cfg(feature = "evaluate")]
-use hellas_models::{ModelAssets, TextOutputDecoder};
-#[cfg(feature = "evaluate")]
-use hellas_rpc::Dtype;
 use hellas_rpc::call::WithTrailer;
 use hellas_rpc::pb::courtesy::{
-    DecodeTokensRequest, DecodeTokensResponse, GetArtifactRequest, GetArtifactResponse,
-    GetModelStatsRequest, GetModelStatsResponse, GetStatsRequest, GetStatsResponse,
-    ListModelsRequest, ListModelsResponse, PutArtifactRequest, PutArtifactResponse,
-    QuoteChatPromptRequest, QuoteChatPromptResponse, QuotePreparedTextRequest,
-    QuotePreparedTextResponse, QuotePromptRequest, QuotePromptResponse,
+    GetArtifactRequest, GetArtifactResponse, GetStatsRequest, GetStatsResponse, QuoteResponse,
+    QuoteTokensRequest,
 };
 use hellas_rpc::pb::evaluate::EvaluateRequest as PbEvaluateRequest;
-use hellas_rpc::pb::execute::{
-    OpenRequest, OpenResponse, ReceiptRequest, ReceiptResponse, RunTicketRequest, SettleRequest,
-    SettleResponse, Ticket, WorkEvent,
-};
+use hellas_rpc::pb::execute::{OpenRequest, OpenResponse, RunTicketRequest, Ticket, WorkEvent};
 use hellas_rpc::pb::fetch::FetchRequest as PbFetchRequest;
 use hellas_rpc::provenance::write_provenance_metadata;
 use hellas_rpc::services::courtesy::CourtesyHandler;
@@ -39,25 +25,47 @@ use hellas_wire::{Metadata, WireCode, WireStatus};
 use tokio::sync::oneshot;
 use tokio_stream::wrappers::ReceiverStream;
 
-#[cfg(feature = "evaluate")]
-use crate::state::model_spec;
-
-use super::{ExecuteOutcome, ExecutorHandle, ExecutorMessage, TicketOutcome};
+use super::{ExecuteOutcome, ExecutorHandle, ExecutorOwedRequest, ExecutorRequest, TicketOutcome};
 
 type ExecuteStream = Pin<Box<dyn Stream<Item = Result<WorkEvent, WireStatus>> + Send>>;
-type DecodeTokensRequestStream =
-    Pin<Box<dyn Stream<Item = Result<DecodeTokensRequest, WireStatus>> + Send>>;
-type DecodeTokensStream =
-    Pin<Box<dyn Stream<Item = Result<DecodeTokensResponse, WireStatus>> + Send>>;
-
 impl ExecutorHandle {
-    async fn send<T>(
+    /// Submit one request that may originate at the peer-facing RPC surface.
+    ///
+    /// Refusal is immediate when the bounded actor mailbox is full. Waiting
+    /// here would let one adversarial client turn executor pressure into an
+    /// unbounded population of suspended RPC tasks.
+    pub(crate) async fn send<T>(
         &self,
-        make_message: impl FnOnce(oneshot::Sender<Result<T, ExecutorError>>) -> ExecutorMessage,
+        make_request: impl FnOnce(oneshot::Sender<Result<T, ExecutorError>>) -> ExecutorRequest,
     ) -> Result<T, ExecutorError> {
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.tx
-            .send(make_message(reply_tx))
+        match self.tx.try_send(make_request(reply_tx)) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                return Err(ExecutorError::ResourceExhausted(
+                    "executor request mailbox is full".to_string(),
+                ));
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                return Err(ExecutorError::ChannelClosed);
+            }
+        }
+        reply_rx.await.map_err(|_| ExecutorError::ChannelClosed)?
+    }
+
+    /// Submit work whose dispatch is already durable and therefore owed.
+    ///
+    /// Unlike peer-facing admission, this waits for bounded mailbox capacity:
+    /// refusing a journaled `RunPaidEvaluate` because unrelated RPCs filled the
+    /// ingress queue would strand a decision the paid-work gate already made.
+    pub(crate) async fn send_owed<T>(
+        &self,
+        make_request: impl FnOnce(oneshot::Sender<Result<T, ExecutorError>>) -> ExecutorOwedRequest,
+    ) -> Result<T, ExecutorError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.owed_tx
+            .send(make_request(reply_tx))
+            .await
             .map_err(|_| ExecutorError::ChannelClosed)?;
         reply_rx.await.map_err(|_| ExecutorError::ChannelClosed)?
     }
@@ -66,7 +74,7 @@ impl ExecutorHandle {
         &self,
         request: PbEvaluateRequest,
     ) -> Result<TicketOutcome<Ticket>, ExecutorError> {
-        self.send(|reply| ExecutorMessage::QuoteEvaluate { request, reply })
+        self.send(|reply| ExecutorRequest::QuoteEvaluate { request, reply })
             .await
     }
 
@@ -74,39 +82,15 @@ impl ExecutorHandle {
         &self,
         request: PbFetchRequest,
     ) -> Result<TicketOutcome<Ticket>, ExecutorError> {
-        self.send(|reply| ExecutorMessage::QuoteFetch { request, reply })
+        self.send(|reply| ExecutorRequest::QuoteFetch { request, reply })
             .await
     }
 
-    pub async fn quote_prompt(
+    pub async fn quote_tokens(
         &self,
-        request: QuotePromptRequest,
-    ) -> Result<TicketOutcome<QuotePromptResponse>, ExecutorError> {
-        self.send(|reply| ExecutorMessage::QuotePrompt { request, reply })
-            .await
-    }
-
-    pub async fn quote_prepared_text(
-        &self,
-        request: QuotePreparedTextRequest,
-    ) -> Result<TicketOutcome<QuotePreparedTextResponse>, ExecutorError> {
-        self.send(|reply| ExecutorMessage::QuotePreparedText { request, reply })
-            .await
-    }
-
-    pub async fn quote_chat_prompt(
-        &self,
-        request: QuoteChatPromptRequest,
-    ) -> Result<TicketOutcome<QuoteChatPromptResponse>, ExecutorError> {
-        self.send(|reply| ExecutorMessage::QuoteChatPrompt { request, reply })
-            .await
-    }
-
-    pub async fn put_artifact_handle(
-        &self,
-        request: PutArtifactRequest,
-    ) -> Result<PutArtifactResponse, ExecutorError> {
-        self.send(|reply| ExecutorMessage::PutArtifact { request, reply })
+        request: QuoteTokensRequest,
+    ) -> Result<TicketOutcome<QuoteResponse>, ExecutorError> {
+        self.send(|reply| ExecutorRequest::QuoteTokens { request, reply })
             .await
     }
 
@@ -117,22 +101,7 @@ impl ExecutorHandle {
         &self,
         request: GetArtifactRequest,
     ) -> Result<GetArtifactResponse, ExecutorError> {
-        self.send(|reply| ExecutorMessage::GetArtifact { request, reply })
-            .await
-    }
-
-    pub async fn list_models_handle(&self) -> Result<ListModelsResponse, ExecutorError> {
-        self.send(|reply| ExecutorMessage::ListModels { reply })
-            .await
-    }
-
-    /// Makes a model available on this node, downloading it if needed.
-    ///
-    /// Only an owner of the handle can call this — there is no RPC for
-    /// it — and calling it is what lets quotes for that model be
-    /// answered at all.
-    pub async fn materialize_model(&self, model: String) -> Result<(), ExecutorError> {
-        self.send(|reply| ExecutorMessage::MaterializeModel { model, reply })
+        self.send(|reply| ExecutorRequest::GetArtifact { request, reply })
             .await
     }
 
@@ -140,36 +109,12 @@ impl ExecutorHandle {
         &self,
         request: RunTicketRequest,
     ) -> Result<ExecuteOutcome, ExecutorError> {
-        self.send(|reply| ExecutorMessage::Execute { request, reply })
-            .await
-    }
-
-    pub async fn receipt_handle(
-        &self,
-        request: ReceiptRequest,
-    ) -> Result<ReceiptResponse, ExecutorError> {
-        self.send(|reply| ExecutorMessage::Receipt { request, reply })
-            .await
-    }
-
-    pub async fn settle_handle(
-        &self,
-        request: SettleRequest,
-    ) -> Result<SettleResponse, ExecutorError> {
-        self.send(|reply| ExecutorMessage::Settle { request, reply })
+        self.send(|reply| ExecutorRequest::Execute { request, reply })
             .await
     }
 
     pub async fn get_stats_handle(&self) -> Result<GetStatsResponse, ExecutorError> {
-        self.send(|reply| ExecutorMessage::GetStats { reply }).await
-    }
-
-    pub async fn get_model_stats_handle(
-        &self,
-        request: GetModelStatsRequest,
-    ) -> Result<GetModelStatsResponse, ExecutorError> {
-        self.send(|reply| ExecutorMessage::GetModelStats { request, reply })
-            .await
+        self.send(|reply| ExecutorRequest::GetStats { reply }).await
     }
 }
 
@@ -193,16 +138,6 @@ impl ExecuteHandler for ExecutorHandle {
         } = outcome;
         let stream: ExecuteStream = Box::pin(ReceiverStream::new(events));
         Ok(stream)
-    }
-
-    #[allow(refining_impl_trait)]
-    async fn receipt(&self, request: ReceiptRequest) -> Result<ReceiptResponse, WireStatus> {
-        Ok(self.receipt_handle(request).await?)
-    }
-
-    #[allow(refining_impl_trait)]
-    async fn settle(&self, request: SettleRequest) -> Result<SettleResponse, WireStatus> {
-        Ok(self.settle_handle(request).await?)
     }
 }
 
@@ -253,38 +188,13 @@ impl CourtesyHandler for ExecutorHandle {
         ))
     }
 
-    async fn quote_prompt(
+    async fn quote_tokens(
         &self,
-        request: QuotePromptRequest,
-    ) -> Result<WithTrailer<QuotePromptResponse>, WireStatus> {
-        let outcome = self.quote_prompt(request).await?;
+        request: QuoteTokensRequest,
+    ) -> Result<WithTrailer<QuoteResponse>, WireStatus> {
+        let outcome = self.quote_tokens(request).await?;
         let result = with_provenance(outcome);
         Ok(result)
-    }
-
-    async fn quote_prepared_text(
-        &self,
-        request: QuotePreparedTextRequest,
-    ) -> Result<WithTrailer<QuotePreparedTextResponse>, WireStatus> {
-        let outcome = self.quote_prepared_text(request).await?;
-        let result = with_provenance(outcome);
-        Ok(result)
-    }
-
-    async fn quote_chat_prompt(
-        &self,
-        request: QuoteChatPromptRequest,
-    ) -> Result<WithTrailer<QuoteChatPromptResponse>, WireStatus> {
-        let outcome = self.quote_chat_prompt(request).await?;
-        let result = with_provenance(outcome);
-        Ok(result)
-    }
-
-    async fn put_artifact(
-        &self,
-        request: PutArtifactRequest,
-    ) -> Result<PutArtifactResponse, WireStatus> {
-        Ok(self.put_artifact_handle(request).await?)
     }
 
     async fn get_artifact(
@@ -294,141 +204,51 @@ impl CourtesyHandler for ExecutorHandle {
         Ok(self.get_artifact_handle(request).await?)
     }
 
-    async fn list_models(
-        &self,
-        _request: ListModelsRequest,
-    ) -> Result<ListModelsResponse, WireStatus> {
-        Ok(self.list_models_handle().await?)
-    }
-
     async fn get_stats(&self, _request: GetStatsRequest) -> Result<GetStatsResponse, WireStatus> {
         Ok(self.get_stats_handle().await?)
     }
-
-    async fn get_model_stats(
-        &self,
-        request: GetModelStatsRequest,
-    ) -> Result<GetModelStatsResponse, WireStatus> {
-        Ok(self.get_model_stats_handle(request).await?)
-    }
-
-    async fn decode_tokens(
-        &self,
-        request: DecodeTokensRequestStream,
-    ) -> Result<DecodeTokensStream, WireStatus> {
-        #[cfg(feature = "evaluate")]
-        {
-            Ok(decode_tokens_stream(request, self.preferred_dtype))
-        }
-        #[cfg(not(feature = "evaluate"))]
-        {
-            let _ = request;
-            Err(WireStatus::new(
-                WireCode::FailedPrecondition,
-                "evaluate scheme is not enabled on this node",
-            ))
-        }
-    }
 }
 
-#[cfg(feature = "evaluate")]
-fn decode_tokens_stream(
-    mut requests: DecodeTokensRequestStream,
-    dtype: Dtype,
-) -> DecodeTokensStream {
-    Box::pin(async_stream::try_stream! {
-        let mut decoder: Option<DecodeSession> = None;
-        while let Some(item) = requests.next().await {
-            let request = item?;
-            if decoder.is_none() {
-                let assets = load_decode_assets(
-                    request.huggingface_model_id.clone(),
-                    request.huggingface_revision.clone(),
-                    dtype,
-                )
-                .await?;
-                decoder = Some(DecodeSession::new(
-                    request.huggingface_model_id.clone(),
-                    request.huggingface_revision.clone(),
-                    assets,
-                ));
-            }
+#[cfg(test)]
+mod mailbox_tests {
+    use std::time::Duration;
 
-            let session = decoder
-                .as_mut()
-                .expect("decode session is initialized before use");
-            session.validate_request_model(&request)?;
-            if request.token_bytes.is_empty() {
-                continue;
-            }
-            let text = session.push_bytes(&request.token_bytes)?;
-            if !text.is_empty() {
-                yield DecodeTokensResponse { text };
-            }
-        }
-    })
-}
+    use tokio::sync::{mpsc, oneshot};
+    use tokio::time::timeout;
 
-#[cfg(feature = "evaluate")]
-async fn load_decode_assets(
-    model_id: String,
-    revision: String,
-    dtype: Dtype,
-) -> Result<Arc<ModelAssets>, WireStatus> {
-    if model_id.is_empty() {
-        return Err(WireStatus::new(
-            WireCode::InvalidArgument,
-            "huggingface_model_id is required on the first decode_tokens request",
+    use super::*;
+
+    fn handle_with_capacity(capacity: usize) -> (ExecutorHandle, mpsc::Receiver<ExecutorRequest>) {
+        let (tx, rx) = mpsc::channel(capacity);
+        let (owed_tx, _owed_rx) = mpsc::channel(capacity);
+        (ExecutorHandle { tx, owed_tx }, rx)
+    }
+
+    fn stats_request() -> ExecutorRequest {
+        let (reply, _receiver) = oneshot::channel();
+        ExecutorRequest::GetStats { reply }
+    }
+
+    #[tokio::test]
+    async fn peer_request_refuses_a_full_mailbox_immediately() {
+        let (handle, _rx) = handle_with_capacity(1);
+        assert!(handle.tx.try_send(stats_request()).is_ok());
+
+        let result = timeout(Duration::from_millis(100), handle.get_stats_handle())
+            .await
+            .expect("full-mailbox refusal must not wait");
+
+        assert!(matches!(result, Err(ExecutorError::ResourceExhausted(_))));
+    }
+
+    #[tokio::test]
+    async fn peer_submission_reports_actor_closure() {
+        let (handle, rx) = handle_with_capacity(1);
+        drop(rx);
+
+        assert!(matches!(
+            handle.get_stats_handle().await,
+            Err(ExecutorError::ChannelClosed)
         ));
-    }
-    let spec = model_spec(&model_id, &revision);
-    // `decode_tokens` is a courtesy convenience any peer can call with a
-    // model id it chooses. Local reach, like every other peer-reachable
-    // path: it detokenizes with what this node holds or it refuses.
-    let assets = tokio::task::spawn_blocking(move || {
-        ModelAssets::load(&spec, dtype, hellas_models::Reach::Local)
-    })
-    .await
-    .map_err(|err| WireStatus::internal(format!("tokenizer load task failed: {err}")))??;
-    Ok(Arc::new(assets))
-}
-
-#[cfg(feature = "evaluate")]
-struct DecodeSession {
-    model_id: String,
-    revision: String,
-    decoder: TextOutputDecoder,
-}
-
-#[cfg(feature = "evaluate")]
-impl DecodeSession {
-    fn new(model_id: String, revision: String, assets: Arc<ModelAssets>) -> Self {
-        let decoder = TextOutputDecoder::for_model(assets);
-        Self {
-            model_id,
-            revision,
-            decoder,
-        }
-    }
-
-    fn validate_request_model(&self, request: &DecodeTokensRequest) -> Result<(), WireStatus> {
-        if request.huggingface_model_id.is_empty() && request.huggingface_revision.is_empty() {
-            return Ok(());
-        }
-        if request.huggingface_model_id == self.model_id
-            && request.huggingface_revision == self.revision
-        {
-            return Ok(());
-        }
-        Err(WireStatus::new(
-            WireCode::InvalidArgument,
-            "decode_tokens stream cannot switch tokenizer after the first request",
-        ))
-    }
-
-    fn push_bytes(&mut self, bytes: &[u8]) -> Result<String, WireStatus> {
-        self.decoder
-            .push_bytes(bytes)
-            .map_err(hellas_wire::WireStatus::from)
     }
 }

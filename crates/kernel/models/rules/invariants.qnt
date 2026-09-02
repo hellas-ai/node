@@ -1,8 +1,10 @@
 // -*- mode: Bluespec; -*-
 //
 // Established invariants — properties the L1 model *guarantees* hold in
-// every reachable state, given that the assumed invariants in
-// `deps/assumptions.qnt` are satisfied.
+// every reachable state, given that the premises the kernel takes on
+// faith are satisfied. Those premises are not modelled: they live with
+// the code that relies on them (`src/context.rs`, `src/block.rs`,
+// `src/store.rs`, `src/object.rs`) and at the top of `verifier.qnt`.
 //
 // Each rule is a `pure def` predicate that takes the relevant state
 // projection and returns a bool. The top-level `l1.qnt` lifts these to
@@ -120,7 +122,7 @@ module invariants {
   // Every live payout coin carries the canonical (MakerPayout,
   // TakerPayout) split. Holds in every reachable state: every close
   // witness binds payouts (Mutual via signature, Timeout via
-  // `terms.timeout_outputs`, Violation via dispute seal), and `canClose`
+  // `terms.timeout_outputs`), and `canClose`
   // enforces the binding through `payoutsBound`.
   pure def payoutsHonorBindings(
     coins: Coin -> int,

@@ -21,12 +21,27 @@ mod linux {
 /// shell redirection on the wrapped command works as the user expects, and
 /// is configured with `kill_on_drop(true)` so dropping the returned `Child`
 /// (e.g. on gateway shutdown) tears it down too.
-pub fn spawn(cmd: &str, args: &[String], base_url: &str) -> anyhow::Result<Child> {
+///
+/// The gateway's routes require this run's credential, so the child is
+/// handed it in the two environment variables whose clients put it in
+/// `Authorization: Bearer …` — `OPENAI_API_KEY` and, for Anthropic
+/// clients, `ANTHROPIC_AUTH_TOKEN` rather than `ANTHROPIC_API_KEY`, which
+/// would send `x-api-key` and be refused. Both overwrite whatever the
+/// operator had: the base URL already points at us, so an upstream key
+/// would be the wrong secret to send anyway.
+pub fn spawn(
+    cmd: &str,
+    args: &[String],
+    base_url: &str,
+    credential: &str,
+) -> anyhow::Result<Child> {
     let mut command = Command::new(cmd);
     command
         .args(args)
         .env("OPENAI_BASE_URL", format!("{base_url}/v1"))
         .env("ANTHROPIC_BASE_URL", base_url)
+        .env("OPENAI_API_KEY", credential)
+        .env("ANTHROPIC_AUTH_TOKEN", credential)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())

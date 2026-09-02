@@ -1,15 +1,26 @@
 use std::collections::{BTreeSet, HashMap};
-use std::fs::{self, OpenOptions};
+use std::fs::{self, OpenOptions, TryLockError};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use hellas_rpc::peers::TokenBucket;
-use hellas_rpc::{ProducerId, PublicKey, canonical_dag_cbor, decode_dag_cbor};
+use hellas_rpc::{
+    Digest, InputCommitment, ProducerId, PublicKey, canonical_dag_cbor, decode_dag_cbor,
+};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::fetch_projection::FetchRequestView;
+
+/// A spend window is also a bounded accounting structure. This cap prevents
+/// tiny successful requests from turning each admission into an ever-growing
+/// scan and rewrite.
+const MAX_FETCH_SPEND_LEDGER_ENTRIES: usize = 4_096;
+/// 4,096 runtime UUID reservations encode well below this ceiling. Keeping a
+/// separate byte bound makes corrupt legacy state an I/O error before it can
+/// allocate without limit.
+const MAX_FETCH_SPEND_LEDGER_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct FetchAccessPolicy {
@@ -53,12 +64,17 @@ impl FetchAccessPolicy {
         self
     }
 
+    pub(crate) fn init_store(&self) -> Result<(), FetchAccessError> {
+        self.quota_store.init()
+    }
+
     pub fn authorize_admission(
         &mut self,
         caller_key: &PublicKey,
         request: &FetchRequestView,
         now_ms: u64,
         reservation_id: String,
+        input_commitment: InputCommitment,
         capabilities: &FetchRoutePolicy,
     ) -> Result<FetchAdmission, FetchAccessError> {
         let caller_id = ProducerId::from_public_key(caller_key);
@@ -96,7 +112,14 @@ impl FetchAccessPolicy {
         let reservation = match caller.spend {
             Some(spend) => {
                 let reserved_units = reserved_units(request, &effective)?;
-                self.reserve_spend(caller_id, reservation_id, now_ms, reserved_units, spend)?
+                self.reserve_spend(
+                    caller_id,
+                    reservation_id,
+                    input_commitment,
+                    now_ms,
+                    reserved_units,
+                    spend,
+                )?
             }
             None => None,
         };
@@ -108,25 +131,12 @@ impl FetchAccessPolicy {
         &mut self,
         reservation: Option<&FetchQuotaReservation>,
     ) -> Result<(), FetchAccessError> {
-        let Some(reservation) = reservation else {
-            return Ok(());
-        };
-        let Some(caller) = self.callers.get(&reservation.caller_id) else {
-            return Ok(());
-        };
-        if caller.spend.is_none() {
-            return Ok(());
-        }
-        let mut ledger = self.quota_store.load(reservation.caller_id)?;
-        ledger.entries.retain(|entry| entry.id != reservation.id);
-        self.quota_store.put(reservation.caller_id, &ledger)?;
-        Ok(())
+        self.remove_pending_reservation(reservation)
     }
 
-    pub fn reconcile_reservation(
+    fn remove_pending_reservation(
         &mut self,
         reservation: Option<&FetchQuotaReservation>,
-        billable_units: u64,
     ) -> Result<(), FetchAccessError> {
         let Some(reservation) = reservation else {
             return Ok(());
@@ -138,27 +148,299 @@ impl FetchAccessPolicy {
             return Ok(());
         }
         let mut ledger = self.quota_store.load(reservation.caller_id)?;
-        if let Some(entry) = ledger
+        let Some(index) = ledger
+            .entries
+            .iter()
+            .position(|entry| entry.id == reservation.id)
+        else {
+            // Cancellation is idempotent so a retry after an ambiguous store
+            // acknowledgement can retire without manufacturing an error.
+            return Ok(());
+        };
+        let lifecycle = ledger.entries[index].lifecycle();
+        if lifecycle != SpendLifecycle::Pending {
+            return Err(FetchAccessError::InvalidReservationLifecycle {
+                id: reservation.id.clone(),
+                expected: "pending",
+                actual: lifecycle.to_string(),
+            });
+        }
+        ledger.entries.remove(index);
+        self.quota_store.put(reservation.caller_id, &ledger)?;
+        Ok(())
+    }
+
+    /// Persist the authority to undo an activation that returned an error
+    /// before any provider task could be spawned. Marker rollback may begin
+    /// only after this transition is durably acknowledged. Rewriting an
+    /// already-Cancelling ledger is intentional: it closes the ambiguity of a
+    /// previous post-write error before the caller removes durable evidence.
+    pub(crate) fn begin_reservation_cancellation(
+        &mut self,
+        reservation: Option<&FetchQuotaReservation>,
+    ) -> Result<(), FetchAccessError> {
+        let Some(reservation) = reservation else {
+            return Ok(());
+        };
+        let Some(caller) = self.callers.get(&reservation.caller_id) else {
+            return Ok(());
+        };
+        if caller.spend.is_none() {
+            return Ok(());
+        }
+        let mut ledger = self.quota_store.load(reservation.caller_id)?;
+        let Some(entry) = ledger
             .entries
             .iter_mut()
             .find(|entry| entry.id == reservation.id)
-        {
-            entry.units = billable_units;
+        else {
+            return Ok(());
+        };
+        match entry.lifecycle() {
+            SpendLifecycle::Pending | SpendLifecycle::Dispatched => entry.mark_cancelling(),
+            SpendLifecycle::Cancelling => {}
+            actual @ SpendLifecycle::Spent => {
+                return Err(FetchAccessError::InvalidReservationLifecycle {
+                    id: reservation.id.clone(),
+                    expected: "pending, dispatched, or cancelling",
+                    actual: actual.to_string(),
+                });
+            }
+        }
+        self.quota_store.put(reservation.caller_id, &ledger)
+    }
+
+    /// Delete a cancellation only after its running marker has been durably
+    /// removed. Missing is success so a retry can retire an ambiguous store
+    /// acknowledgement without recreating liability.
+    pub(crate) fn finish_reservation_cancellation(
+        &mut self,
+        reservation: Option<&FetchQuotaReservation>,
+    ) -> Result<(), FetchAccessError> {
+        let Some(reservation) = reservation else {
+            return Ok(());
+        };
+        let Some(caller) = self.callers.get(&reservation.caller_id) else {
+            return Ok(());
+        };
+        if caller.spend.is_none() {
+            return Ok(());
+        }
+        let mut ledger = self.quota_store.load(reservation.caller_id)?;
+        let Some(index) = ledger
+            .entries
+            .iter()
+            .position(|entry| entry.id == reservation.id)
+        else {
+            return Ok(());
+        };
+        let lifecycle = ledger.entries[index].lifecycle();
+        if lifecycle != SpendLifecycle::Cancelling {
+            return Err(FetchAccessError::InvalidReservationLifecycle {
+                id: reservation.id.clone(),
+                expected: "cancelling",
+                actual: lifecycle.to_string(),
+            });
+        }
+        ledger.entries.remove(index);
+        self.quota_store.put(reservation.caller_id, &ledger)
+    }
+
+    /// Durably cross the billing boundary immediately before a provider task
+    /// can be spawned. A Dispatched reservation never ages automatically: after
+    /// this acknowledgement, a crash cannot prove whether the upstream was
+    /// reached.
+    pub fn activate_reservation(
+        &mut self,
+        reservation: Option<&FetchQuotaReservation>,
+    ) -> Result<(), FetchAccessError> {
+        let Some(reservation) = reservation else {
+            return Ok(());
+        };
+        let Some(caller) = self.callers.get(&reservation.caller_id) else {
+            return Ok(());
+        };
+        if caller.spend.is_none() {
+            return Ok(());
+        }
+        let mut ledger = self.quota_store.load(reservation.caller_id)?;
+        let entry = ledger
+            .entries
+            .iter_mut()
+            .find(|entry| entry.id == reservation.id)
+            .ok_or_else(|| FetchAccessError::MissingReservation(reservation.id.clone()))?;
+        match entry.lifecycle() {
+            SpendLifecycle::Pending => entry.mark_dispatched(),
+            SpendLifecycle::Dispatched => return Ok(()),
+            actual @ (SpendLifecycle::Cancelling | SpendLifecycle::Spent) => {
+                return Err(FetchAccessError::InvalidReservationLifecycle {
+                    id: reservation.id.clone(),
+                    expected: "pending",
+                    actual: actual.to_string(),
+                });
+            }
+        }
+        self.quota_store.put(reservation.caller_id, &ledger)
+    }
+
+    pub fn reconcile_reservation(
+        &mut self,
+        reservation: Option<&FetchQuotaReservation>,
+        billable_units: u64,
+        now_ms: u64,
+    ) -> Result<(), FetchAccessError> {
+        let Some(reservation) = reservation else {
+            return Ok(());
+        };
+        if billable_units > reservation.reserved_units {
+            return Err(FetchAccessError::BillableUnitsExceedReservation {
+                billable_units,
+                reserved_units: reservation.reserved_units,
+            });
+        }
+        let Some(caller) = self.callers.get(&reservation.caller_id) else {
+            return Ok(());
+        };
+        if caller.spend.is_none() {
+            return Ok(());
+        }
+        let mut ledger = self.quota_store.load(reservation.caller_id)?;
+        let Some(index) = ledger
+            .entries
+            .iter()
+            .position(|entry| entry.id == reservation.id)
+        else {
+            return if billable_units == 0 {
+                Ok(())
+            } else {
+                Err(FetchAccessError::MissingReservation(reservation.id.clone()))
+            };
+        };
+        let lifecycle = ledger.entries[index].lifecycle();
+        if lifecycle == SpendLifecycle::Spent && ledger.entries[index].units == billable_units {
+            return Ok(());
+        }
+        if lifecycle != SpendLifecycle::Dispatched {
+            return Err(FetchAccessError::InvalidReservationLifecycle {
+                id: reservation.id.clone(),
+                expected: "dispatched",
+                actual: lifecycle.to_string(),
+            });
+        }
+        if billable_units == 0 {
+            ledger.entries.remove(index);
+        } else {
+            ledger.entries[index].mark_spent(billable_units, now_ms);
         }
         self.quota_store.put(reservation.caller_id, &ledger)?;
         Ok(())
+    }
+
+    /// Recover reservations that belonged to a previous process incarnation.
+    ///
+    /// The quota root is single-owner. At executor startup there can be no live
+    /// queued work, so Pending and Cancelling entries are safe to remove after
+    /// their running marker. A Dispatched entry may have reached the upstream,
+    /// so it becomes worst-case Spent for one fresh window instead of either
+    /// vanishing or consuming quota forever. The actual legacy format had no
+    /// lifecycle bit; it receives the same conservative fresh-window charge.
+    pub(crate) fn recover_reservations(
+        &mut self,
+        now_ms: u64,
+        mut remove_running_marker: impl FnMut(InputCommitment) -> Result<(), String>,
+    ) -> Result<usize, FetchAccessError> {
+        let caller_ids = self
+            .callers
+            .iter()
+            .filter_map(|(caller_id, caller)| caller.spend.map(|_| *caller_id))
+            .collect::<Vec<_>>();
+        let mut recovered = 0_usize;
+        for caller_id in caller_ids {
+            let mut ledger = self.quota_store.load(caller_id)?;
+            let mut reclaim = Vec::new();
+            let mut changed = false;
+            for entry in &mut ledger.entries {
+                if entry.lifecycle.is_none() {
+                    entry.mark_spent(entry.units, now_ms);
+                    recovered = recovered.checked_add(1).ok_or_else(|| {
+                        FetchAccessError::Store(
+                            "recovered fetch quota reservation count overflowed".to_string(),
+                        )
+                    })?;
+                    changed = true;
+                    continue;
+                }
+                match entry.lifecycle() {
+                    SpendLifecycle::Pending | SpendLifecycle::Cancelling => {
+                        let input = entry.input_commitment.ok_or_else(|| {
+                            FetchAccessError::Store(format!(
+                                "recoverable fetch quota reservation `{}` has no input commitment",
+                                entry.id
+                            ))
+                        })?;
+                        reclaim.push(input);
+                    }
+                    SpendLifecycle::Dispatched => {
+                        entry.mark_spent(entry.units, now_ms);
+                        recovered = recovered.checked_add(1).ok_or_else(|| {
+                            FetchAccessError::Store(
+                                "recovered fetch quota reservation count overflowed".to_string(),
+                            )
+                        })?;
+                        changed = true;
+                    }
+                    SpendLifecycle::Spent => {}
+                }
+            }
+            if reclaim.is_empty() && !changed {
+                continue;
+            }
+            for input in reclaim.iter().copied() {
+                remove_running_marker(InputCommitment::from_digest(Digest::from_bytes(input)))
+                    .map_err(|error| {
+                        FetchAccessError::Store(format!(
+                            "failed to remove a pre-dispatch Fetch running marker: {error}"
+                        ))
+                    })?;
+            }
+            ledger.entries.retain(|entry| {
+                !matches!(
+                    entry.lifecycle(),
+                    SpendLifecycle::Pending | SpendLifecycle::Cancelling
+                )
+            });
+            self.quota_store.put(caller_id, &ledger)?;
+            recovered = recovered.checked_add(reclaim.len()).ok_or_else(|| {
+                FetchAccessError::Store(
+                    "recovered fetch quota reservation count overflowed".to_string(),
+                )
+            })?;
+        }
+        Ok(recovered)
     }
 
     fn reserve_spend(
         &mut self,
         caller_id: ProducerId,
         reservation_id: String,
+        input_commitment: InputCommitment,
         now_ms: u64,
         reserved_units: u64,
         spend: SpendLimit,
     ) -> Result<Option<FetchQuotaReservation>, FetchAccessError> {
+        if reserved_units == 0 {
+            return Ok(None);
+        }
         let mut ledger = self.quota_store.load(caller_id)?;
         prune_ledger(&mut ledger, now_ms, spend.window);
+        if ledger.entries.len() >= MAX_FETCH_SPEND_LEDGER_ENTRIES {
+            return Err(FetchAccessError::QuotaExceeded {
+                retry_after_ms: spend_retry_after_ms(&ledger, now_ms, spend.window),
+                message: format!(
+                    "fetch spend ledger reached its {MAX_FETCH_SPEND_LEDGER_ENTRIES}-entry limit"
+                ),
+            });
+        }
         let used = ledger
             .entries
             .iter()
@@ -169,17 +451,23 @@ impl FetchAccessPolicy {
                 message: "fetch token spend quota exceeded".to_string(),
             });
         }
-        ledger.entries.push(SpendEntry {
-            id: reservation_id.clone(),
-            at_ms: now_ms,
-            units: reserved_units,
-        });
-        self.quota_store.put(caller_id, &ledger)?;
-        Ok(Some(FetchQuotaReservation {
+        let reservation = FetchQuotaReservation {
             caller_id,
-            id: reservation_id,
+            id: reservation_id.clone(),
             reserved_units,
-        }))
+        };
+        ledger.entries.push(SpendEntry::pending(
+            reservation_id,
+            input_commitment,
+            reserved_units,
+        ));
+        if let Err(error) = self.quota_store.put(caller_id, &ledger) {
+            return Err(FetchAccessError::AdmissionReservationIndeterminate {
+                authority: AdmissionRollbackAuthority(reservation),
+                message: error.to_string(),
+            });
+        }
+        Ok(Some(reservation))
     }
 }
 
@@ -200,12 +488,21 @@ fn reserved_units(
 
 fn prune_ledger(ledger: &mut SpendLedger, now_ms: u64, window: Duration) {
     let window_ms = u64::try_from(window.as_millis()).unwrap_or(u64::MAX);
-    ledger
-        .entries
-        .retain(|entry| now_ms.saturating_sub(entry.at_ms) < window_ms);
+    ledger.entries.retain(|entry| {
+        entry.units != 0
+            && (entry.lifecycle() != SpendLifecycle::Spent
+                || now_ms.saturating_sub(entry.at_ms) < window_ms)
+    });
 }
 
 fn spend_retry_after_ms(ledger: &SpendLedger, now_ms: u64, window: Duration) -> Option<u64> {
+    if ledger
+        .entries
+        .iter()
+        .any(|entry| entry.lifecycle() != SpendLifecycle::Spent)
+    {
+        return None;
+    }
     let window_ms = u64::try_from(window.as_millis()).unwrap_or(u64::MAX);
     ledger
         .entries
@@ -383,17 +680,37 @@ impl FetchQuotaStoreBackend {
         Self::Fs(FsFetchQuotaStore::new(root))
     }
 
+    fn init(&self) -> Result<(), FetchAccessError> {
+        match self {
+            Self::Memory(_) => Ok(()),
+            Self::Fs(store) => {
+                let store = store.clone();
+                crate::private_fs::run_blocking_io(move || store.init())
+                    .map_err(FetchAccessError::Io)?
+            }
+        }
+    }
+
     fn load(&self, caller_id: ProducerId) -> Result<SpendLedger, FetchAccessError> {
         match self {
             Self::Memory(store) => store.load(caller_id),
-            Self::Fs(store) => store.load(caller_id),
+            Self::Fs(store) => {
+                let store = store.clone();
+                crate::private_fs::run_blocking_io(move || store.load(caller_id))
+                    .map_err(FetchAccessError::Io)?
+            }
         }
     }
 
     fn put(&self, caller_id: ProducerId, ledger: &SpendLedger) -> Result<(), FetchAccessError> {
         match self {
             Self::Memory(store) => store.put(caller_id, ledger),
-            Self::Fs(store) => store.put(caller_id, ledger),
+            Self::Fs(store) => {
+                let store = store.clone();
+                let ledger = ledger.clone();
+                crate::private_fs::run_blocking_io(move || store.put(caller_id, &ledger))
+                    .map_err(FetchAccessError::Io)?
+            }
         }
     }
 }
@@ -401,9 +718,48 @@ impl FetchQuotaStoreBackend {
 #[derive(Clone, Debug, Default)]
 pub struct MemoryFetchQuotaStore {
     ledgers: std::sync::Arc<std::sync::Mutex<HashMap<ProducerId, SpendLedger>>>,
+    #[cfg(test)]
+    faults: std::sync::Arc<MemoryFetchQuotaStoreFaults>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct MemoryFetchQuotaStoreFaults {
+    puts: std::sync::atomic::AtomicUsize,
+    fail_put_before: std::sync::atomic::AtomicUsize,
+    fail_put_after: std::sync::atomic::AtomicUsize,
 }
 
 impl MemoryFetchQuotaStore {
+    #[cfg(test)]
+    pub(crate) fn fail_put_number(&self, put: usize) {
+        assert!(put > 0, "fault injection uses one-based put numbers");
+        self.faults
+            .fail_put_before
+            .store(put, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_put_after_write_number(&self, put: usize) {
+        assert!(put > 0, "fault injection uses one-based put numbers");
+        self.faults
+            .fail_put_after
+            .store(put, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn puts(&self) -> usize {
+        self.faults.puts.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn entry_count(&self, caller_id: ProducerId) -> usize {
+        self.load(caller_id)
+            .expect("fetch quota memory store should remain readable")
+            .entries
+            .len()
+    }
+
     fn load(&self, caller_id: ProducerId) -> Result<SpendLedger, FetchAccessError> {
         let ledgers = self.ledgers.lock().map_err(|_| {
             FetchAccessError::Store("fetch quota memory store lock is poisoned".to_string())
@@ -412,10 +768,48 @@ impl MemoryFetchQuotaStore {
     }
 
     fn put(&self, caller_id: ProducerId, ledger: &SpendLedger) -> Result<(), FetchAccessError> {
+        #[cfg(test)]
+        let put = self
+            .faults
+            .puts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        #[cfg(test)]
+        if self
+            .faults
+            .fail_put_before
+            .compare_exchange(
+                put,
+                0,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_ok()
+        {
+            return Err(FetchAccessError::Io(io::Error::other(format!(
+                "injected fetch quota put failure {put}"
+            ))));
+        }
         let mut ledgers = self.ledgers.lock().map_err(|_| {
             FetchAccessError::Store("fetch quota memory store lock is poisoned".to_string())
         })?;
         ledgers.insert(caller_id, ledger.clone());
+        #[cfg(test)]
+        if self
+            .faults
+            .fail_put_after
+            .compare_exchange(
+                put,
+                0,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_ok()
+        {
+            return Err(FetchAccessError::Io(io::Error::other(format!(
+                "injected fetch quota post-write failure {put}"
+            ))));
+        }
         Ok(())
     }
 }
@@ -423,11 +817,60 @@ impl MemoryFetchQuotaStore {
 #[derive(Clone, Debug)]
 pub struct FsFetchQuotaStore {
     root: PathBuf,
+    /// Every clone belongs to one cooperating executor ownership claim. A
+    /// separately constructed store has a separate claim and must fail while
+    /// this root directory inode is locked, including when the competing
+    /// executable has no Evaluate feature.
+    owner: std::sync::Arc<std::sync::Mutex<Option<fs::File>>>,
 }
 
 impl FsFetchQuotaStore {
+    /// Opens a quota root owned by one cooperating executor process.
+    ///
+    /// Atomic replacement provides crash-safe persistence, not multi-process
+    /// transactions. The process-lifetime root lock below is what makes each
+    /// load/modify/replace sequence part of one serialized executor instead of
+    /// two cooperating processes' lost update. It is advisory and requires a
+    /// stable path beneath trusted ancestors; same-user malicious code can
+    /// ignore it or replace names used by later path-based access.
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            owner: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    fn init(&self) -> Result<(), FetchAccessError> {
+        self.ensure_owned()
+    }
+
+    fn ensure_owned(&self) -> Result<(), FetchAccessError> {
+        let mut owner = self.owner.lock().map_err(|_| {
+            FetchAccessError::Store("fetch quota owner lock is poisoned".to_string())
+        })?;
+        if owner.is_some() {
+            return Ok(());
+        }
+
+        crate::private_fs::create_private_dir_all(&self.root).map_err(FetchAccessError::Io)?;
+        let root_directory =
+            crate::private_fs::open_directory(&self.root).map_err(FetchAccessError::Io)?;
+        match root_directory.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
+                return Err(FetchAccessError::Io(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!(
+                        "fetch quota store at {} is already open by another executor",
+                        self.root.display()
+                    ),
+                )));
+            }
+            Err(TryLockError::Error(error)) => return Err(FetchAccessError::Io(error)),
+        }
+        crate::private_fs::make_directory_private(&root_directory).map_err(FetchAccessError::Io)?;
+        *owner = Some(root_directory);
+        Ok(())
     }
 
     fn path(&self, caller_id: ProducerId) -> PathBuf {
@@ -435,22 +878,33 @@ impl FsFetchQuotaStore {
     }
 
     fn load(&self, caller_id: ProducerId) -> Result<SpendLedger, FetchAccessError> {
+        self.ensure_owned()?;
         let path = self.path(caller_id);
-        let bytes = match fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(SpendLedger::default()),
-            Err(err) => return Err(FetchAccessError::Io(err)),
-        };
+        let bytes =
+            match crate::private_fs::read_bounded_regular_file(&path, MAX_FETCH_SPEND_LEDGER_BYTES)
+            {
+                Ok(bytes) => bytes,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                    return Ok(SpendLedger::default());
+                }
+                Err(err) => return Err(FetchAccessError::Io(err)),
+            };
         decode_dag_cbor(&bytes).map_err(|err| {
             FetchAccessError::Store(format!("fetch quota ledger decode failed: {err}"))
         })
     }
 
     fn put(&self, caller_id: ProducerId, ledger: &SpendLedger) -> Result<(), FetchAccessError> {
-        fs::create_dir_all(&self.root).map_err(FetchAccessError::Io)?;
+        self.ensure_owned()?;
         let bytes = canonical_dag_cbor(ledger).map_err(|err| {
             FetchAccessError::Store(format!("fetch quota ledger encode failed: {err}"))
         })?;
+        if bytes.len() > MAX_FETCH_SPEND_LEDGER_BYTES {
+            return Err(FetchAccessError::Store(format!(
+                "fetch quota ledger is {} bytes, over the {MAX_FETCH_SPEND_LEDGER_BYTES}-byte limit",
+                bytes.len()
+            )));
+        }
         atomic_replace(&self.path(caller_id), &bytes)
     }
 }
@@ -477,6 +931,8 @@ fn atomic_replace(path: &Path, bytes: &[u8]) -> Result<(), FetchAccessError> {
         file.sync_all().map_err(FetchAccessError::Io)?;
         drop(file);
         fs::rename(&tmp, path).map_err(FetchAccessError::Io)?;
+        #[cfg(unix)]
+        crate::private_fs::sync_directory(parent).map_err(FetchAccessError::Io)?;
         Ok(())
     })();
 
@@ -489,11 +945,86 @@ struct SpendLedger {
     entries: Vec<SpendEntry>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SpendLifecycle {
+    Pending,
+    Dispatched,
+    Cancelling,
+    Spent,
+}
+
+impl std::fmt::Display for SpendLifecycle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pending => formatter.write_str("pending"),
+            Self::Dispatched => formatter.write_str("dispatched"),
+            Self::Cancelling => formatter.write_str("cancelling"),
+            Self::Spent => formatter.write_str("spent"),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct SpendEntry {
     id: String,
     at_ms: u64,
     units: u64,
+    /// Mirrors lifecycle for compatibility with the short-lived intermediate
+    /// schema that learned `reserved`; the actual predecessor ignores it and
+    /// is protected by unresolved entries' `at_ms = u64::MAX`.
+    #[serde(default)]
+    reserved: bool,
+    /// Absent in the actual legacy format, whose entries are conservatively
+    /// recovered as a full fresh window because their state is unknowable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lifecycle: Option<SpendLifecycle>,
+    /// Required for new Pending entries so startup recovery can remove a marker
+    /// created immediately before a crash at the activation boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    input_commitment: Option<[u8; 32]>,
+}
+
+impl SpendEntry {
+    fn pending(id: String, input_commitment: InputCommitment, units: u64) -> Self {
+        Self {
+            id,
+            // The actual predecessor schema sees only id/at_ms/units. MAX
+            // therefore makes old readers retain unresolved work forever
+            // instead of silently aging it during a downgrade.
+            at_ms: u64::MAX,
+            units,
+            reserved: true,
+            lifecycle: Some(SpendLifecycle::Pending),
+            input_commitment: Some(*input_commitment.as_bytes()),
+        }
+    }
+
+    fn lifecycle(&self) -> SpendLifecycle {
+        // The real legacy format had no `reserved` or `lifecycle` field, so an
+        // absent lifecycle cannot distinguish in-flight from completed spend.
+        // Stay fail-closed until startup recovery charges one fresh window.
+        self.lifecycle.unwrap_or(SpendLifecycle::Dispatched)
+    }
+
+    fn mark_dispatched(&mut self) {
+        self.at_ms = u64::MAX;
+        self.reserved = true;
+        self.lifecycle = Some(SpendLifecycle::Dispatched);
+    }
+
+    fn mark_cancelling(&mut self) {
+        self.at_ms = u64::MAX;
+        self.reserved = true;
+        self.lifecycle = Some(SpendLifecycle::Cancelling);
+    }
+
+    fn mark_spent(&mut self, units: u64, at_ms: u64) {
+        self.at_ms = at_ms;
+        self.units = units;
+        self.reserved = false;
+        self.lifecycle = Some(SpendLifecycle::Spent);
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -505,16 +1036,62 @@ pub enum FetchAccessError {
         retry_after_ms: Option<u64>,
         message: String,
     },
+    #[error(
+        "fetch completion reported {billable_units} billable units, exceeding its {reserved_units}-unit reservation"
+    )]
+    BillableUnitsExceedReservation {
+        billable_units: u64,
+        reserved_units: u64,
+    },
+    #[error("fetch quota reservation `{0}` disappeared before reconciliation")]
+    MissingReservation(String),
+    #[error("{message}")]
+    AdmissionReservationIndeterminate {
+        #[doc(hidden)]
+        authority: AdmissionRollbackAuthority,
+        message: String,
+    },
+    #[error(
+        "fetch quota reservation `{id}` is {actual}, but this operation requires it to be {expected}"
+    )]
+    InvalidReservationLifecycle {
+        id: String,
+        expected: &'static str,
+        actual: String,
+    },
     #[error("fetch quota store error: {0}")]
     Store(String),
     #[error("fetch quota store I/O error: {0}")]
     Io(#[source] io::Error),
 }
 
+/// Opaque outside this crate: external callers may propagate the public error,
+/// but cannot manufacture rollback authority for an arbitrary reservation.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct AdmissionRollbackAuthority(FetchQuotaReservation);
+
+impl FetchAccessError {
+    /// The actor must retain this authority until it has cancelled a Pending
+    /// reservation whose admission write returned an ambiguous error.
+    pub(crate) const fn admission_reservation(&self) -> Option<&FetchQuotaReservation> {
+        match self {
+            Self::AdmissionReservationIndeterminate { authority, .. } => Some(&authority.0),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use hellas_rpc::ProducerSigningKey;
+
+    fn fs_root(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/fetch-quota-tests")
+            .join(format!("{name}-{}", Uuid::new_v4().simple()))
+    }
 
     fn key(byte: u8) -> PublicKey {
         ProducerSigningKey::from_secret_bytes([byte; 32])
@@ -529,6 +1106,10 @@ mod tests {
             model: Some("gpt-5.5-codex".to_string()),
             max_output_units,
         }
+    }
+
+    fn input(byte: u8) -> InputCommitment {
+        InputCommitment::from_digest(Digest::from_bytes([byte; 32]))
     }
 
     fn route_policy() -> FetchRoutePolicy {
@@ -597,6 +1178,7 @@ mod tests {
                 &request(Some(32)),
                 1_000,
                 "r1".to_string(),
+                input(1),
                 &capabilities,
             )
             .unwrap_err();
@@ -621,6 +1203,7 @@ mod tests {
                 &request(Some(32)),
                 1_000,
                 "r1".to_string(),
+                input(1),
                 &FetchRoutePolicy::default(),
             )
             .unwrap();
@@ -646,6 +1229,7 @@ mod tests {
                     &request(Some(1)),
                     1_000,
                     "r1".to_string(),
+                    input(1),
                     &FetchRoutePolicy::default()
                 )
                 .unwrap_err(),
@@ -663,6 +1247,7 @@ mod tests {
                     },
                     1_000,
                     "r2".to_string(),
+                    input(2),
                     &FetchRoutePolicy::default(),
                 )
                 .unwrap_err(),
@@ -690,6 +1275,7 @@ mod tests {
                     &wrong_model,
                     1_000,
                     "r1".to_string(),
+                    input(1),
                     &FetchRoutePolicy::default()
                 )
                 .unwrap_err(),
@@ -702,6 +1288,7 @@ mod tests {
                     &request(Some(101)),
                     1_000,
                     "r2".to_string(),
+                    input(2),
                     &FetchRoutePolicy::default()
                 )
                 .unwrap_err(),
@@ -725,6 +1312,7 @@ mod tests {
                 &request(None),
                 1_000,
                 "r1".to_string(),
+                input(1),
                 &FetchRoutePolicy::default(),
             )
             .unwrap();
@@ -735,6 +1323,7 @@ mod tests {
                     &request(None),
                     1_000,
                     "r2".to_string(),
+                    input(2),
                     &FetchRoutePolicy::default()
                 )
                 .unwrap_err(),
@@ -749,6 +1338,7 @@ mod tests {
                 &request(None),
                 2_000,
                 "r3".to_string(),
+                input(3),
                 &FetchRoutePolicy::default(),
             )
             .unwrap();
@@ -770,6 +1360,7 @@ mod tests {
                 &request(Some(90)),
                 1_000,
                 "r1".to_string(),
+                input(1),
                 &FetchRoutePolicy::default(),
             )
             .unwrap();
@@ -780,6 +1371,7 @@ mod tests {
                     &request(Some(20)),
                     1_000,
                     "r2".to_string(),
+                    input(2),
                     &FetchRoutePolicy::default()
                 )
                 .unwrap_err(),
@@ -787,7 +1379,10 @@ mod tests {
         ));
 
         policy
-            .reconcile_reservation(admission.reservation.as_ref(), 40)
+            .activate_reservation(admission.reservation.as_ref())
+            .unwrap();
+        policy
+            .reconcile_reservation(admission.reservation.as_ref(), 40, 1_500)
             .unwrap();
         policy
             .authorize_admission(
@@ -795,17 +1390,357 @@ mod tests {
                 &request(Some(60)),
                 1_000,
                 "r3".to_string(),
+                input(3),
                 &FetchRoutePolicy::default(),
             )
             .unwrap();
     }
 
     #[test]
-    fn spend_persists_across_fs_store_reload() {
-        let root = std::env::temp_dir().join(format!(
-            "hellas-fetch-quota-test-{}",
-            Uuid::new_v4().simple()
+    fn queued_pending_spend_cannot_age_out_before_dispatch() {
+        let caller = key(1);
+        let caller_id = ProducerId::from_public_key(&caller);
+        let mut access = CallerAccess::allow_all(caller);
+        access.spend = Some(SpendLimit {
+            max_units: 100,
+            window: Duration::from_secs(1),
+        });
+        let store = MemoryFetchQuotaStore::default();
+        let mut policy = FetchAccessPolicy::with_quota_store(
+            [access],
+            FetchQuotaStoreBackend::Memory(store.clone()),
+        );
+        let admission = policy
+            .authorize_admission(
+                &caller,
+                &request(Some(90)),
+                1_000,
+                "long-running".to_string(),
+                input(1),
+                &FetchRoutePolicy::default(),
+            )
+            .unwrap();
+
+        let pending = store.load(caller_id).unwrap();
+        assert_eq!(pending.entries.len(), 1);
+        assert_eq!(pending.entries[0].lifecycle(), SpendLifecycle::Pending);
+        assert_eq!(pending.entries[0].at_ms, u64::MAX);
+
+        assert!(matches!(
+            policy
+                .authorize_admission(
+                    &caller,
+                    &request(Some(11)),
+                    3_000,
+                    "would-overbook".to_string(),
+                    input(2),
+                    &FetchRoutePolicy::default(),
+                )
+                .unwrap_err(),
+            FetchAccessError::QuotaExceeded { .. }
         ));
+
+        policy
+            .activate_reservation(admission.reservation.as_ref())
+            .unwrap();
+        policy
+            .reconcile_reservation(admission.reservation.as_ref(), 40, 3_000)
+            .unwrap();
+        let ledger = store.load(caller_id).unwrap();
+        assert_eq!(ledger.entries.len(), 1);
+        assert_eq!(ledger.entries[0].units, 40);
+        assert_eq!(ledger.entries[0].at_ms, 3_000);
+        assert!(!ledger.entries[0].reserved);
+
+        policy
+            .authorize_admission(
+                &caller,
+                &request(Some(60)),
+                3_000,
+                "after-reconcile".to_string(),
+                input(3),
+                &FetchRoutePolicy::default(),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn worst_case_failure_spend_denies_immediately_then_expires_after_its_window() {
+        const ADMITTED_AT_MS: u64 = 1_000;
+        const FAILED_AT_MS: u64 = 2_000;
+        const WINDOW_MS: u64 = 60_000;
+
+        let caller = key(1);
+        let mut access = CallerAccess::allow_all(caller);
+        access.spend = Some(SpendLimit {
+            max_units: 100,
+            window: Duration::from_millis(WINDOW_MS),
+        });
+        let store = MemoryFetchQuotaStore::default();
+        let mut policy = FetchAccessPolicy::with_quota_store(
+            [access],
+            FetchQuotaStoreBackend::Memory(store.clone()),
+        );
+        let admission = policy
+            .authorize_admission(
+                &caller,
+                &request(Some(90)),
+                ADMITTED_AT_MS,
+                "failed-dispatch".to_string(),
+                input(1),
+                &FetchRoutePolicy::default(),
+            )
+            .unwrap();
+        let reservation = admission.reservation.as_ref().unwrap();
+
+        policy.activate_reservation(Some(reservation)).unwrap();
+        policy
+            .reconcile_reservation(Some(reservation), reservation.reserved_units, FAILED_AT_MS)
+            .unwrap();
+
+        assert!(matches!(
+            policy
+                .authorize_admission(
+                    &caller,
+                    &request(Some(11)),
+                    FAILED_AT_MS,
+                    "immediate-retry".to_string(),
+                    input(2),
+                    &FetchRoutePolicy::default(),
+                )
+                .unwrap_err(),
+            FetchAccessError::QuotaExceeded { .. }
+        ));
+        policy
+            .authorize_admission(
+                &caller,
+                &request(Some(100)),
+                FAILED_AT_MS + WINDOW_MS,
+                "after-window".to_string(),
+                input(3),
+                &FetchRoutePolicy::default(),
+            )
+            .unwrap();
+
+        let caller_id = ProducerId::from_public_key(&caller);
+        let ledger = store.load(caller_id).unwrap();
+        assert_eq!(ledger.entries.len(), 1);
+        assert_eq!(ledger.entries[0].id, "after-window");
+        assert!(ledger.entries[0].reserved);
+    }
+
+    #[test]
+    fn zero_billable_completion_removes_ledger_entry() {
+        let caller = key(1);
+        let caller_id = ProducerId::from_public_key(&caller);
+        let mut access = CallerAccess::allow_all(caller);
+        access.spend = Some(SpendLimit {
+            max_units: 100,
+            window: Duration::from_secs(60),
+        });
+        let store = MemoryFetchQuotaStore::default();
+        let mut policy = FetchAccessPolicy::with_quota_store(
+            [access],
+            FetchQuotaStoreBackend::Memory(store.clone()),
+        );
+        let admission = policy
+            .authorize_admission(
+                &caller,
+                &request(Some(90)),
+                1_000,
+                "r1".to_string(),
+                input(1),
+                &FetchRoutePolicy::default(),
+            )
+            .unwrap();
+
+        policy
+            .activate_reservation(admission.reservation.as_ref())
+            .unwrap();
+        policy
+            .reconcile_reservation(admission.reservation.as_ref(), 0, 1_500)
+            .unwrap();
+
+        assert!(store.load(caller_id).unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn queued_cancellation_releases_reserved_spend() {
+        let caller = key(1);
+        let mut access = CallerAccess::allow_all(caller);
+        access.spend = Some(SpendLimit {
+            max_units: 100,
+            window: Duration::from_secs(60),
+        });
+        let mut policy = FetchAccessPolicy::new([access]);
+        let admission = policy
+            .authorize_admission(
+                &caller,
+                &request(Some(90)),
+                1_000,
+                "queued".to_string(),
+                input(1),
+                &FetchRoutePolicy::default(),
+            )
+            .unwrap();
+
+        policy
+            .cancel_reservation(admission.reservation.as_ref())
+            .unwrap();
+        policy
+            .authorize_admission(
+                &caller,
+                &request(Some(100)),
+                1_000,
+                "replacement".to_string(),
+                input(2),
+                &FetchRoutePolicy::default(),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn spend_ledger_entry_count_is_bounded() {
+        let caller = key(1);
+        let caller_id = ProducerId::from_public_key(&caller);
+        let mut access = CallerAccess::allow_all(caller);
+        access.spend = Some(SpendLimit {
+            max_units: u64::MAX,
+            window: Duration::from_secs(60),
+        });
+        let store = MemoryFetchQuotaStore::default();
+        store
+            .put(
+                caller_id,
+                &SpendLedger {
+                    entries: (0..MAX_FETCH_SPEND_LEDGER_ENTRIES)
+                        .map(|index| SpendEntry {
+                            id: format!("r{index}"),
+                            at_ms: 1_000,
+                            units: 1,
+                            reserved: false,
+                            lifecycle: Some(SpendLifecycle::Spent),
+                            input_commitment: None,
+                        })
+                        .collect(),
+                },
+            )
+            .unwrap();
+        let mut policy =
+            FetchAccessPolicy::with_quota_store([access], FetchQuotaStoreBackend::Memory(store));
+
+        let error = policy
+            .authorize_admission(
+                &caller,
+                &request(Some(1)),
+                1_000,
+                "overflow".to_string(),
+                input(1),
+                &FetchRoutePolicy::default(),
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, FetchAccessError::QuotaExceeded { .. }));
+        assert!(error.to_string().contains("4096-entry limit"));
+    }
+
+    #[test]
+    fn spend_quota_rejects_billable_units_above_the_reservation() {
+        let caller = key(1);
+        let mut access = CallerAccess::allow_all(caller);
+        access.spend = Some(SpendLimit {
+            max_units: 100,
+            window: Duration::from_secs(60),
+        });
+        let mut policy = FetchAccessPolicy::new([access]);
+        let admission = policy
+            .authorize_admission(
+                &caller,
+                &request(Some(90)),
+                1_000,
+                "r1".to_string(),
+                input(1),
+                &FetchRoutePolicy::default(),
+            )
+            .unwrap();
+
+        policy
+            .activate_reservation(admission.reservation.as_ref())
+            .unwrap();
+        assert!(matches!(
+            policy
+                .reconcile_reservation(admission.reservation.as_ref(), 91, 1_500)
+                .unwrap_err(),
+            FetchAccessError::BillableUnitsExceedReservation {
+                billable_units: 91,
+                reserved_units: 90,
+            }
+        ));
+        policy
+            .authorize_admission(
+                &caller,
+                &request(Some(10)),
+                1_000,
+                "r2".to_string(),
+                input(2),
+                &FetchRoutePolicy::default(),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn pending_restart_is_reclaimed_from_memory_store() {
+        let caller = key(1);
+        let mut access = CallerAccess::allow_all(caller);
+        access.spend = Some(SpendLimit {
+            max_units: 10,
+            window: Duration::from_secs(60),
+        });
+        let store = MemoryFetchQuotaStore::default();
+        let mut policy = FetchAccessPolicy::with_quota_store(
+            [access.clone()],
+            FetchQuotaStoreBackend::Memory(store.clone()),
+        );
+        policy
+            .authorize_admission(
+                &caller,
+                &request(Some(10)),
+                1_000,
+                "previous-process".to_string(),
+                input(1),
+                &FetchRoutePolicy::default(),
+            )
+            .unwrap();
+        drop(policy);
+
+        let mut removed = Vec::new();
+        let mut restarted =
+            FetchAccessPolicy::with_quota_store([access], FetchQuotaStoreBackend::Memory(store));
+        assert_eq!(
+            restarted
+                .recover_reservations(2_000, |input| {
+                    removed.push(input);
+                    Ok(())
+                })
+                .unwrap(),
+            1
+        );
+        assert_eq!(removed, [input(1)]);
+        restarted
+            .authorize_admission(
+                &caller,
+                &request(Some(10)),
+                1_000,
+                "new-process".to_string(),
+                input(2),
+                &FetchRoutePolicy::default(),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn pending_restart_is_reclaimed_from_filesystem_store() {
+        let root = fs_root("pending-recovery");
         let caller = key(1);
         let mut access = CallerAccess::allow_all(caller);
         access.spend = Some(SpendLimit {
@@ -821,25 +1756,420 @@ mod tests {
                 &caller,
                 &request(Some(10)),
                 1_000,
-                "r1".to_string(),
+                "previous-process".to_string(),
+                input(1),
                 &FetchRoutePolicy::default(),
             )
             .unwrap();
+        drop(policy);
 
-        let mut reloaded =
+        let mut restarted =
             FetchAccessPolicy::with_quota_store([access], FetchQuotaStoreBackend::fs(&root));
+        let mut removed = Vec::new();
+        assert_eq!(
+            restarted
+                .recover_reservations(2_000, |input| {
+                    removed.push(input);
+                    Ok(())
+                })
+                .unwrap(),
+            1
+        );
+        assert_eq!(removed, [input(1)]);
+        restarted
+            .authorize_admission(
+                &caller,
+                &request(Some(10)),
+                1_000,
+                "new-process".to_string(),
+                input(2),
+                &FetchRoutePolicy::default(),
+            )
+            .unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn dispatched_reservation_becomes_worst_case_spend_for_one_fresh_window() {
+        let root = fs_root("dispatched-recovery");
+        let caller = key(1);
+        let mut access = CallerAccess::allow_all(caller);
+        access.spend = Some(SpendLimit {
+            max_units: 10,
+            window: Duration::from_millis(100),
+        });
+        let mut policy = FetchAccessPolicy::with_quota_store(
+            [access.clone()],
+            FetchQuotaStoreBackend::fs(&root),
+        );
+        let admission = policy
+            .authorize_admission(
+                &caller,
+                &request(Some(10)),
+                1_000,
+                "possibly-dispatched".to_string(),
+                input(1),
+                &FetchRoutePolicy::default(),
+            )
+            .unwrap();
+        policy
+            .activate_reservation(admission.reservation.as_ref())
+            .unwrap();
+        drop(policy);
+
+        let mut marker_removals = 0;
+        let restarted_store = FsFetchQuotaStore::new(&root);
+        let mut restarted = FetchAccessPolicy::with_quota_store(
+            [access],
+            FetchQuotaStoreBackend::Fs(restarted_store.clone()),
+        );
+        assert_eq!(
+            restarted
+                .recover_reservations(10_000, |_| {
+                    marker_removals += 1;
+                    Ok(())
+                })
+                .unwrap(),
+            1
+        );
+        assert_eq!(marker_removals, 0);
+        let caller_id = ProducerId::from_public_key(&caller);
+        let loaded = restarted_store.load(caller_id).unwrap();
+        assert_eq!(loaded.entries[0].lifecycle(), SpendLifecycle::Spent);
+        assert_eq!(loaded.entries[0].at_ms, 10_000);
+        let error = restarted
+            .authorize_admission(
+                &caller,
+                &request(Some(1)),
+                10_099,
+                "within-recovery-window".to_string(),
+                input(2),
+                &FetchRoutePolicy::default(),
+            )
+            .unwrap_err();
         assert!(matches!(
-            reloaded
+            error,
+            FetchAccessError::QuotaExceeded {
+                retry_after_ms: Some(1),
+                ..
+            }
+        ));
+        restarted
+            .authorize_admission(
+                &caller,
+                &request(Some(10)),
+                10_100,
+                "after-recovery-window".to_string(),
+                input(2),
+                &FetchRoutePolicy::default(),
+            )
+            .unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cancelling_restart_reclaims_marker_and_reservation_without_charge() {
+        let caller = key(1);
+        let mut access = CallerAccess::allow_all(caller);
+        access.spend = Some(SpendLimit {
+            max_units: 10,
+            window: Duration::from_secs(60),
+        });
+        let store = MemoryFetchQuotaStore::default();
+        let mut policy = FetchAccessPolicy::with_quota_store(
+            [access.clone()],
+            FetchQuotaStoreBackend::Memory(store.clone()),
+        );
+        let admission = policy
+            .authorize_admission(
+                &caller,
+                &request(Some(10)),
+                1_000,
+                "cancel-at-crash".to_string(),
+                input(1),
+                &FetchRoutePolicy::default(),
+            )
+            .unwrap();
+        policy
+            .activate_reservation(admission.reservation.as_ref())
+            .unwrap();
+        policy
+            .begin_reservation_cancellation(admission.reservation.as_ref())
+            .unwrap();
+        drop(policy);
+
+        let mut removed = Vec::new();
+        let mut restarted =
+            FetchAccessPolicy::with_quota_store([access], FetchQuotaStoreBackend::Memory(store));
+        assert_eq!(
+            restarted
+                .recover_reservations(2_000, |commitment| {
+                    removed.push(commitment);
+                    Ok(())
+                })
+                .unwrap(),
+            1
+        );
+        assert_eq!(removed, [input(1)]);
+        restarted
+            .authorize_admission(
+                &caller,
+                &request(Some(10)),
+                2_000,
+                "replacement".to_string(),
+                input(2),
+                &FetchRoutePolicy::default(),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn actual_legacy_entry_is_charged_for_one_fresh_window_on_upgrade() {
+        #[derive(Serialize)]
+        struct LegacySpendLedger {
+            entries: Vec<LegacySpendEntry>,
+        }
+
+        #[derive(Serialize)]
+        struct LegacySpendEntry {
+            id: String,
+            at_ms: u64,
+            units: u64,
+        }
+
+        let root = fs_root("legacy-actual");
+        let caller = key(1);
+        let caller_id = ProducerId::from_public_key(&caller);
+        let store = FsFetchQuotaStore::new(&root);
+        fs::create_dir_all(&root).unwrap();
+        let legacy = LegacySpendLedger {
+            entries: vec![LegacySpendEntry {
+                id: "legacy-ambiguous".to_string(),
+                at_ms: 1_000,
+                units: 10,
+            }],
+        };
+        atomic_replace(
+            &store.path(caller_id),
+            &canonical_dag_cbor(&legacy).unwrap(),
+        )
+        .unwrap();
+
+        let mut access = CallerAccess::allow_all(caller);
+        access.spend = Some(SpendLimit {
+            max_units: 10,
+            window: Duration::from_millis(100),
+        });
+        let mut restarted = FetchAccessPolicy::with_quota_store(
+            [access],
+            FetchQuotaStoreBackend::Fs(store.clone()),
+        );
+        assert_eq!(
+            restarted
+                .recover_reservations(10_000, |_| {
+                    panic!("actual legacy entries have no trustworthy marker commitment")
+                })
+                .unwrap(),
+            1
+        );
+        let loaded = store.load(caller_id).unwrap();
+        assert_eq!(loaded.entries[0].lifecycle(), SpendLifecycle::Spent);
+        assert_eq!(loaded.entries[0].at_ms, 10_000);
+        assert!(matches!(
+            restarted
                 .authorize_admission(
                     &caller,
                     &request(Some(1)),
-                    1_000,
-                    "r2".to_string(),
-                    &FetchRoutePolicy::default()
+                    10_099,
+                    "still-charged".to_string(),
+                    input(2),
+                    &FetchRoutePolicy::default(),
                 )
                 .unwrap_err(),
             FetchAccessError::QuotaExceeded { .. }
         ));
+        restarted
+            .authorize_admission(
+                &caller,
+                &request(Some(10)),
+                10_100,
+                "fresh-window-ended".to_string(),
+                input(2),
+                &FetchRoutePolicy::default(),
+            )
+            .unwrap();
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn filesystem_quota_root_has_one_process_lifetime_owner() {
+        use std::io::{BufRead as _, BufReader};
+        use std::process::{Command, Stdio};
+
+        let root = fs_root("exclusive-owner");
+        fs::create_dir_all(&root).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o777)).unwrap();
+        }
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "fetch_policy::tests::hold_filesystem_quota_root",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("HELLAS_FETCH_QUOTA_LOCK_TEST_ROOT", &root)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut output = BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        loop {
+            line.clear();
+            assert_ne!(
+                output.read_line(&mut line).unwrap(),
+                0,
+                "lock holder exited"
+            );
+            if line == "locked\n" {
+                break;
+            }
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        // Replacing the child used by the old implementation must not replace
+        // the ownership claim: the live lock belongs to the directory inode.
+        let obsolete_child = root.join(".hellas-fetch-quota.lock");
+        match fs::remove_file(&obsolete_child) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => panic!("remove obsolete child: {error}"),
+        }
+        fs::write(&obsolete_child, b"replacement").unwrap();
+        let competitor = FsFetchQuotaStore::new(&root);
+        let error = competitor.init().unwrap_err();
+        assert!(
+            matches!(&error, FetchAccessError::Io(error) if error.kind() == io::ErrorKind::WouldBlock)
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("already open by another executor")
+        );
+
+        child.kill().unwrap();
+        child.wait().unwrap();
+        competitor
+            .init()
+            .expect("the released root can be reopened");
+        drop(competitor);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn filesystem_quota_ledger_rejects_a_fifo_without_blocking() {
+        let root = fs_root("fifo-ledger");
+        let store = FsFetchQuotaStore::new(&root);
+        store.init().unwrap();
+        assert!(!root.join(".hellas-fetch-quota.lock").exists());
+        let caller_id = ProducerId::from_public_key(&key(91));
+        let status = std::process::Command::new("mkfifo")
+            .arg(store.path(caller_id))
+            .status()
+            .unwrap();
+        assert!(status.success(), "the fixture needs a FIFO");
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let reader = store.clone();
+        std::thread::spawn(move || {
+            let _ = sender.send(reader.load(caller_id));
+        });
+        let error = receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("quota ledger open blocked on a FIFO")
+            .expect_err("quota ledger must be a regular file");
+        assert!(
+            matches!(error, FetchAccessError::Io(error) if error.kind() == io::ErrorKind::InvalidInput)
+        );
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "started by filesystem_quota_root_has_one_process_lifetime_owner"]
+    fn hold_filesystem_quota_root() {
+        let root = std::env::var_os("HELLAS_FETCH_QUOTA_LOCK_TEST_ROOT")
+            .map(PathBuf::from)
+            .unwrap();
+        let store = FsFetchQuotaStore::new(root);
+        store.init().unwrap();
+        store
+            .clone()
+            .init()
+            .expect("clones share the same ownership claim");
+        println!("locked");
+        std::thread::sleep(Duration::from_secs(30));
+    }
+
+    #[test]
+    fn old_reader_cannot_age_new_pending_or_dispatched_entries() {
+        #[derive(Deserialize)]
+        struct LegacySpendLedger {
+            entries: Vec<LegacySpendEntry>,
+        }
+
+        #[derive(Deserialize)]
+        struct LegacySpendEntry {
+            #[allow(dead_code)]
+            id: String,
+            at_ms: u64,
+            #[allow(dead_code)]
+            units: u64,
+        }
+
+        let caller = key(1);
+        let caller_id = ProducerId::from_public_key(&caller);
+        let mut access = CallerAccess::allow_all(caller);
+        access.spend = Some(SpendLimit {
+            max_units: 10,
+            window: Duration::from_millis(100),
+        });
+        let store = MemoryFetchQuotaStore::default();
+        let mut policy = FetchAccessPolicy::with_quota_store(
+            [access],
+            FetchQuotaStoreBackend::Memory(store.clone()),
+        );
+        let admission = policy
+            .authorize_admission(
+                &caller,
+                &request(Some(10)),
+                1_000,
+                "new-entry".to_string(),
+                input(1),
+                &FetchRoutePolicy::default(),
+            )
+            .unwrap();
+
+        for activate in [false, true] {
+            if activate {
+                policy
+                    .activate_reservation(admission.reservation.as_ref())
+                    .unwrap();
+            }
+            let bytes = canonical_dag_cbor(&store.load(caller_id).unwrap()).unwrap();
+            let old: LegacySpendLedger = decode_dag_cbor(&bytes).unwrap();
+            assert_eq!(old.entries[0].at_ms, u64::MAX);
+            assert!(u64::MAX.saturating_sub(old.entries[0].at_ms) < 100);
+        }
     }
 }

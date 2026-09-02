@@ -65,6 +65,11 @@ impl BackendStream {
                 }
                 OutputEvent::ToolCallEnd(end) => output.finish_tool_call(end.index, end.arguments),
                 OutputEvent::StructuredOutputDelta(delta) => output.push_structured(delta),
+                OutputEvent::Adaptor(_) => {
+                    return Err(BackendError::failed(
+                        "adaptor-specific streams cannot be collected as generic output",
+                    ));
+                }
                 OutputEvent::Usage(next) => usage = Some(next),
                 OutputEvent::Provenance(next) => merge_provenance(&mut provenance, next),
                 OutputEvent::Error { message, code } => {

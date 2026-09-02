@@ -2,12 +2,14 @@ use std::collections::HashMap;
 
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
 
+use super::project_response_format;
+
 use crate::{
     AdaptorError, AdaptorResult, BackendError, CanonicalExecution, ContentPart, ExecutionRequest,
     ExecutionResult, Input, InputItem, Message, ModelRef, OutputEvent, OutputItem, RawRequest,
-    ReasoningOptions, RenderContext, ResponseFormat, SseDecoder, StopReason, StructuredDelta,
-    TextChannel, ToolCallArgumentsDelta, ToolCallEnd, ToolCallStart, ToolChoice, ToolKind,
-    ToolSpec, Usage, WireAdaptor, WireEventData, WireIngress, WireResponse, WireStreamEvent,
+    ReasoningOptions, RenderContext, SseDecoder, StopReason, StructuredDelta, TextChannel,
+    ToolCallArgumentsDelta, ToolCallEnd, ToolCallStart, ToolChoice, ToolKind, ToolSpec, Usage,
+    WireAdaptor, WireEventData, WireIngress, WireResponse, WireStreamEvent,
     json::{
         optional_array, optional_bool, optional_f32, optional_string, optional_u32,
         provenance_json, required_string,
@@ -226,6 +228,9 @@ impl WireAdaptor for OpenAiResponsesAdaptor {
             }
             OutputEvent::ToolCallEnd(end) => render_tool_call_end(state, end),
             OutputEvent::StructuredOutputDelta(delta) => render_structured_delta(state, delta),
+            OutputEvent::Adaptor(_) => Err(AdaptorError::unsupported(
+                "OpenAI Responses cannot render another adaptor's signed events",
+            )),
             OutputEvent::Usage(usage) => {
                 state.usage = Some(usage);
                 Ok(Vec::new())
@@ -751,28 +756,6 @@ fn project_tool_choice(value: &JsonValue) -> ToolChoice {
                 name: name.to_string(),
             })
             .unwrap_or_else(|| ToolChoice::Raw(value.clone())),
-    }
-}
-
-fn project_response_format(value: &JsonValue) -> ResponseFormat {
-    match value.get("type").and_then(JsonValue::as_str) {
-        Some("text") => ResponseFormat::Text,
-        Some("json_object") => ResponseFormat::JsonObject,
-        Some("json_schema") => {
-            let schema_object = value.get("json_schema").unwrap_or(value);
-            ResponseFormat::JsonSchema {
-                name: schema_object
-                    .get("name")
-                    .and_then(JsonValue::as_str)
-                    .map(ToString::to_string),
-                schema: schema_object
-                    .get("schema")
-                    .cloned()
-                    .unwrap_or_else(|| schema_object.clone()),
-                strict: schema_object.get("strict").and_then(JsonValue::as_bool),
-            }
-        }
-        _ => ResponseFormat::Raw(value.clone()),
     }
 }
 

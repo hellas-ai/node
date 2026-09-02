@@ -32,11 +32,3 @@ message GetKnownPeersRequest {
 message GetKnownPeersResponse {
   repeated bytes peer_ids = 1;
 }
-
-message Presence {
-  string hf_id = 1;
-  string req_id = 2;
-  string peer_id = 3;
-  uint64 ttl_ms = 4;
-  bool is_executor = 5;
-}

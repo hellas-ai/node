@@ -12,5 +12,20 @@
   # module as HOME / WorkingDirectory, and as the base for any documented
   # path examples.
   defaultStateDir = "/var/lib/hellas";
-  hf = import ./hf.nix { inherit pkgs; };
+
+  # One coherent ROCm prefix for hipcc, runtime loading, and device bitcode.
+  # Generated Catena sources and shared objects are runtime data elsewhere;
+  # this derivation contains only the provider toolchain.
+  rocmToolkit = pkgs.symlinkJoin {
+    name = "hellas-rocm-toolkit";
+    paths = [
+      pkgs.rocmPackages.clang
+      pkgs.rocmPackages.clr
+      pkgs.rocmPackages.hip-common
+      pkgs.rocmPackages.hipcc
+      pkgs.rocmPackages.rocm-core
+      pkgs.rocmPackages.rocm-device-libs
+      pkgs.rocmPackages.rocm-runtime
+    ];
+  };
 }

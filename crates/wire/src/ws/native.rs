@@ -16,7 +16,7 @@ use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest, http::R
 
 use crate::clock::DefaultClock;
 use crate::mux::{MessagePipe, MuxConfig, MuxTransport, Role};
-use crate::transport::PeerIdentity;
+use crate::transport::{AuthLevel, PeerIdentity, TransportContext};
 
 use super::WsTransport;
 
@@ -118,12 +118,15 @@ async fn connect_with_role<const N: usize>(
         .await
         .map_err(|e| WsError::Connect(format!("{e}")))?;
     let pipe = WsPipe::new(ws);
+    // A WebSocket mux vouches for nothing on its own: the TLS below it
+    // is the browser's or the runtime's, and this layer can neither
+    // name the peer nor export the session's keying material.
     let transport = MuxTransport::spawn::<N, DefaultClock, _>(
         role,
         DefaultClock,
         MuxConfig::default(),
         pipe,
-        None,
+        TransportContext::default(),
     );
     Ok(transport)
 }
@@ -161,7 +164,15 @@ where
         DefaultClock,
         MuxConfig::default(),
         pipe,
-        peer,
+        TransportContext {
+            auth_level: if peer.is_some() {
+                AuthLevel::Vouched
+            } else {
+                AuthLevel::None
+            },
+            peer,
+            ..TransportContext::default()
+        },
     )
 }
 
@@ -198,7 +209,7 @@ mod tests {
                 DefaultClock,
                 MuxConfig::default(),
                 WsPipe::new(ws),
-                None,
+                TransportContext::default(),
             );
             transport.open(0xfeed_beef, Metadata::new()).await.unwrap()
         });

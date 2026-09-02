@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use hellas_store::ContentStore;
-use hellas_store::hf_cache::{HfCache, adopted_caches_in, remember_adopted};
+use hellas_store::hf_cache::HfCache;
 use hellas_xet::XetHash;
 
 fn bytes(len: usize, seed: u64) -> Vec<u8> {
@@ -225,60 +225,6 @@ fn a_record_for_a_changed_file_is_not_used() {
     assert!(
         !after.have(XetHash::hash(&first)),
         "the stale record must not survive the file changing",
-    );
-}
-
-/// Adopting must leave behind *where* it adopted, or the quote path —
-/// which resolves models by cache path, not by content id — has never
-/// heard of the cache this command just indexed.
-#[test]
-fn adopting_records_the_root_for_whoever_resolves_paths_later() {
-    let cache = Cache::new("registry");
-    cache.repo(
-        "models--org--name",
-        "6666666666666666666666666666666666666666",
-        &[("config.json", b"{}")],
-    );
-    let registry = cache.0.join("state/adopted-caches");
-    assert!(adopted_caches_in(&registry).is_empty(), "nothing yet");
-
-    remember_adopted(&registry, &cache.0).expect("remember");
-    let canonical = std::fs::canonicalize(&cache.0).expect("canonical root");
-    assert_eq!(adopted_caches_in(&registry), vec![canonical.clone()]);
-
-    // Adopting the same cache twice is one entry, and a second cache is
-    // appended rather than replacing the first.
-    remember_adopted(&registry, &cache.0).expect("remember again");
-    let other = Cache::new("registry-other");
-    remember_adopted(&registry, &other.0).expect("remember other");
-    assert_eq!(
-        adopted_caches_in(&registry),
-        vec![
-            canonical,
-            std::fs::canonicalize(&other.0).expect("canonical")
-        ],
-    );
-}
-
-/// The registry is a list of places to look. A missing one is not an
-/// error, and a root that has since gone away is not one either — the
-/// resolver stats, and finds nothing.
-#[test]
-fn a_missing_or_stale_registry_is_a_shorter_list_and_not_a_failure() {
-    let cache = Cache::new("registry-missing");
-    let registry = cache.0.join("state/adopted-caches");
-    assert!(adopted_caches_in(&registry).is_empty());
-
-    std::fs::create_dir_all(registry.parent().expect("parent")).expect("state dir");
-    std::fs::write(
-        &registry,
-        "\n/gone/for/good\n\n  /also/gone  \n/gone/for/good\n",
-    )
-    .expect("write");
-    assert_eq!(
-        adopted_caches_in(&registry),
-        vec![PathBuf::from("/gone/for/good"), PathBuf::from("/also/gone")],
-        "blank lines dropped, duplicates collapsed, order kept",
     );
 }
 

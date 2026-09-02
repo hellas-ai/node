@@ -1,0 +1,13 @@
+[package]
+name = "hellas-presentation"
+description = "Optional host-side text presentation for Hellas clients"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation.workspace = true
+
+[dependencies]
+anyhow = "1"
+hellas-rpc = { workspace = true, features = ["execute"] }
+tokenizers = { version = "0.22", default-features = false, features = ["onig"] }

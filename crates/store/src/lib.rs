@@ -36,9 +36,9 @@
 //! with matching sha256 confirming the bytes were the ones HF meant.
 //!
 //! So an advertised id is a hint that lets us skip work when it agrees,
-//! and never a key. Ids in this store are ones we computed, because they
-//! end up signed into an execution environment and a key we cannot
-//! defend is a claim we can lose.
+//! and never a key. Ids in this store are ones we computed: a
+//! content-addressed store cannot defend a key it did not derive from
+//! the bytes.
 
 pub mod fastresume;
 pub mod hf;
@@ -47,6 +47,9 @@ pub mod state;
 pub mod xorb;
 
 use std::collections::HashMap;
+#[cfg(any(unix, test))]
+use std::fs::OpenOptions;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
@@ -55,6 +58,137 @@ use hellas_xet::{Chunk, XetFileHasher, XetHash};
 /// Bytes read per `read` while hashing. Large enough that the syscall is
 /// not the bottleneck, small enough to be irrelevant beside a model.
 const STREAM_BUFFER: usize = 1024 * 1024;
+
+/// Opens a local regular file without first opening a FIFO or device for I/O.
+///
+/// Explicit content paths may be symlinks: the target descriptor, rather than
+/// the symlink name, is the authority. Linux first acquires an `O_PATH`
+/// descriptor, which does not open the underlying object, checks its type, and
+/// then reopens that exact inode through `/proc/self/fd`. Consequently a path
+/// replacement between the type check and the readable open cannot substitute
+/// a FIFO or device. The returned descriptor is read-only, seekable, and
+/// close-on-exec.
+///
+/// Other platforms do not expose an equivalent through `std`: they preflight
+/// the followed path, use nonblocking open where Unix provides it, and verify
+/// the resulting descriptor. That rejects stable special files but cannot
+/// close an adversarial replacement race as Linux does.
+pub fn open_regular_file(path: &Path) -> io::Result<std::fs::File> {
+    open_regular_file_impl(path)
+}
+
+fn not_a_regular_file(path: &Path) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("{} is not a regular file", path.display()),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn open_regular_file_impl(path: &Path) -> io::Result<std::fs::File> {
+    let path_handle = open_path_handle(path)?;
+    reopen_regular_path_handle(path, &path_handle)
+}
+
+/// Acquires an inode reference without invoking the target's file operations.
+#[cfg(target_os = "linux")]
+fn open_path_handle(path: &Path) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_CLOEXEC);
+    options.open(path)
+}
+
+/// Converts an `O_PATH` reference to a readable descriptor for the same inode.
+#[cfg(target_os = "linux")]
+fn reopen_regular_path_handle(
+    path: &Path,
+    path_handle: &std::fs::File,
+) -> io::Result<std::fs::File> {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+    let expected = path_handle.metadata()?;
+    if !expected.file_type().is_file() {
+        return Err(not_a_regular_file(path));
+    }
+
+    let descriptor_path = Path::new("/proc/self/fd").join(path_handle.as_raw_fd().to_string());
+    let mut options = OpenOptions::new();
+    options.read(true).custom_flags(libc::O_CLOEXEC);
+    let file = options.open(&descriptor_path).map_err(|source| {
+        // Once the held descriptor has been fstat-ed successfully, ENOENT can
+        // only mean procfs cannot provide the safe reopen. Do not report the
+        // caller's existing content as a cache miss.
+        let kind = if source.kind() == io::ErrorKind::NotFound {
+            io::ErrorKind::Unsupported
+        } else {
+            source.kind()
+        };
+        io::Error::new(
+            kind,
+            format!(
+                "cannot safely reopen {} through {}: {source}",
+                path.display(),
+                descriptor_path.display()
+            ),
+        )
+    })?;
+    let actual = file.metadata()?;
+    if !actual.file_type().is_file()
+        || (expected.dev(), expected.ino()) != (actual.dev(), actual.ino())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{} did not reopen the inode held by its path descriptor",
+                path.display()
+            ),
+        ));
+    }
+    Ok(file)
+}
+
+/// Best available fallback where `O_PATH` plus descriptor reopen is absent.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn open_regular_file_impl(path: &Path) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+    let expected = std::fs::metadata(path)?;
+    if !expected.file_type().is_file() {
+        return Err(not_a_regular_file(path));
+    }
+
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC);
+    let file = options.open(path)?;
+    let actual = file.metadata()?;
+    if !actual.file_type().is_file()
+        || (expected.dev(), expected.ino()) != (actual.dev(), actual.ino())
+    {
+        return Err(not_a_regular_file(path));
+    }
+    Ok(file)
+}
+
+/// Best available fallback for non-Unix targets.
+#[cfg(not(unix))]
+fn open_regular_file_impl(path: &Path) -> io::Result<std::fs::File> {
+    let expected = std::fs::metadata(path)?;
+    if !expected.file_type().is_file() {
+        return Err(not_a_regular_file(path));
+    }
+    let file = std::fs::File::open(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(not_a_regular_file(path));
+    }
+    Ok(file)
+}
 
 /// What indexing one file learned about it.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -68,11 +202,84 @@ pub struct Indexed {
     pub len: u64,
 }
 
+/// Hashes exactly the length captured from the descriptor, then probes one
+/// byte past it. `None` means the file was truncated or grew while it was
+/// being read; importantly, a writer that grows forever cannot extend this
+/// loop forever.
+fn hash_exact_length(reader: &mut impl io::Read, expected_len: u64) -> io::Result<Option<Indexed>> {
+    let mut hasher = XetFileHasher::new();
+    let mut buffer = vec![0_u8; STREAM_BUFFER];
+    let mut remaining = expected_len;
+    while remaining != 0 {
+        let wanted = usize::try_from(remaining.min(STREAM_BUFFER as u64))
+            .expect("the read is bounded by STREAM_BUFFER");
+        let read = reader.read(&mut buffer[..wanted])?;
+        if read == 0 {
+            return Ok(None);
+        }
+        remaining -= read as u64;
+        hasher.update(&buffer[..read]);
+    }
+
+    let mut sentinel = [0_u8; 1];
+    if reader.read(&mut sentinel)? != 0 {
+        return Ok(None);
+    }
+
+    let chunks = hasher.finalize_chunks();
+    Ok(Some(Indexed {
+        id: hellas_xet::file_hash(&chunks),
+        chunks,
+        len: expected_len,
+    }))
+}
+
+/// A read-only handle to content whose identity and exact length the store
+/// verified.
+///
+/// The descriptor, rather than its path, is the authority. A cache name may
+/// be replaced after this value is returned without changing the inode that a
+/// consumer receives. This is not an immutable-file seal: another writable
+/// descriptor can still modify the same inode after verification.
+#[derive(Debug)]
+pub struct VerifiedFile {
+    file: std::fs::File,
+    id: XetHash,
+    len: u64,
+}
+
+impl VerifiedFile {
+    /// The Xet content id this descriptor was verified against.
+    #[must_use]
+    pub fn id(&self) -> XetHash {
+        self.id
+    }
+
+    /// The exact verified length of the file.
+    #[must_use]
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    /// Whether the verified file is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Transfers the read-only descriptor to its consumer.
+    #[must_use]
+    pub fn into_file(self) -> std::fs::File {
+        self.file
+    }
+}
+
 /// Anything that can make content appear that is not here yet.
 ///
 /// Separate from [`Substituter`] on purpose. A substituter answers
-/// cheaply and locally; a fetcher spends bandwidth. Only one of those
-/// may be reached from a quote.
+/// cheaply and locally; a fetcher may spend bandwidth and disk. Keeping
+/// the interfaces separate lets callers choose explicitly whether an
+/// operation may perform remote work.
 pub trait Fetcher: Send + Sync {
     /// Name, for diagnostics.
     fn name(&self) -> &str;
@@ -95,7 +302,8 @@ pub trait Fetcher: Send + Sync {
 /// Deliberately narrow: a substituter answers "do you have this, and
 /// where", and nothing else. It does not fetch, because a source that
 /// can fetch and a source that can answer cheaply have very different
-/// costs and a quote may only ever consult the cheap question.
+/// costs. An availability check must not silently become network
+/// activity.
 pub trait Substituter: Send + Sync {
     /// Name, for diagnostics.
     fn name(&self) -> &str;
@@ -123,6 +331,20 @@ pub enum StoreError {
     WrongContent {
         expected: String,
         actual: String,
+        path: PathBuf,
+    },
+    #[error("{path} is {actual} bytes, not the {expected} bytes declared for {id}")]
+    WrongLength {
+        id: String,
+        expected: u64,
+        actual: u64,
+        path: PathBuf,
+    },
+    #[error("{path} is {actual} bytes, over the {maximum}-byte limit for {id}")]
+    TooLarge {
+        id: String,
+        maximum: u64,
+        actual: u64,
         path: PathBuf,
     },
     #[error("materialising {id}")]
@@ -184,7 +406,13 @@ impl ContentStore {
     /// file is hashed once: [`fastresume`] remembers the result against
     /// the file's identity.
     pub fn index(&self, path: &Path) -> Result<Indexed> {
-        use std::io::Read as _;
+        self.index_open(path).map(|(indexed, _file)| indexed)
+    }
+
+    /// Indexes `path` while retaining the descriptor whose bytes justified
+    /// the result.
+    fn index_open(&self, path: &Path) -> Result<(Indexed, std::fs::File)> {
+        use std::io::Seek as _;
 
         if fastresume::is_cache_debris(path) {
             return Err(StoreError::Debris {
@@ -196,32 +424,18 @@ impl ContentStore {
             path: path.to_path_buf(),
             source,
         };
-        let mut file = std::fs::File::open(path).map_err(read_err)?;
+        let mut file = open_regular_file(path).map_err(read_err)?;
         let before = file.metadata().map_err(read_err)?;
         let identity = fastresume::FileIdentity::of(&before);
 
         let remembered = self.records.get(&before);
         let indexed = match remembered.clone() {
             Some(indexed) => indexed,
-            None => {
-                let mut hasher = XetFileHasher::new();
-                let mut buffer = vec![0_u8; STREAM_BUFFER];
-                let mut len = 0_u64;
-                loop {
-                    let read = file.read(&mut buffer).map_err(read_err)?;
-                    if read == 0 {
-                        break;
-                    }
-                    len += read as u64;
-                    hasher.update(&buffer[..read]);
-                }
-                let chunks = hasher.finalize_chunks();
-                Indexed {
-                    id: hellas_xet::file_hash(&chunks),
-                    chunks,
-                    len,
-                }
-            }
+            None => hash_exact_length(&mut file, before.len())
+                .map_err(read_err)?
+                .ok_or_else(|| StoreError::Raced {
+                    path: path.to_path_buf(),
+                })?,
         };
 
         // Nothing is remembered, recorded or returned until this holds.
@@ -230,11 +444,12 @@ impl ContentStore {
         // name to still refer to the same file, and an id that cannot be
         // bound to what was read is an error rather than an answer.
         still_the_file_that_was_read(path, identity, &file)?;
+        file.rewind().map_err(read_err)?;
         if remembered.is_none() {
             self.records.put(&before, &indexed);
         }
         self.record(path, identity, &indexed);
-        Ok(indexed)
+        Ok((indexed, file))
     }
 
     /// Indexes every regular file under `directory`, skipping cache
@@ -280,9 +495,8 @@ impl ContentStore {
     /// True when this content is available locally, right now, without
     /// touching the network.
     ///
-    /// The question a quote is allowed to ask. Answering a quote for
-    /// content we do not hold is what turns quoting into a remote fetch
-    /// primitive.
+    /// Deliberately narrower than [`Self::materialize`]: checking
+    /// availability never causes a remote fetch.
     #[must_use]
     pub fn have(&self, id: XetHash) -> bool {
         self.locate(id).is_some()
@@ -300,8 +514,8 @@ impl ContentStore {
             // Existence is not the question. The question is whether the
             // name still refers to the file whose bytes produced this id:
             // an ordinary rewrite leaves the path there and the entry
-            // false, and a quote answered on it commits to weights this
-            // node no longer holds.
+            // false, and `have` must not claim bytes the store no longer
+            // holds.
             if std::fs::metadata(&entry.path)
                 .is_ok_and(|metadata| fastresume::FileIdentity::of(&metadata) == entry.identity)
             {
@@ -314,6 +528,83 @@ impl ContentStore {
         self.substituters
             .iter()
             .find_map(|substituter| substituter.locate(id))
+    }
+
+    /// Opens locally available content as the exact inode the store verified.
+    ///
+    /// An indexed hit is opened and matched against the full file identity
+    /// recorded when it was hashed, so replacing its path cannot substitute a
+    /// different inode between lookup and open. This path does not rehash an
+    /// unchanged indexed file. A substituter hit is less trusted: it is
+    /// indexed, checked against `id`, and returned through the same descriptor
+    /// that was indexed. No fetcher is consulted and no content is acquired.
+    ///
+    /// `expected_len` is part of the caller's content contract and must match
+    /// the descriptor exactly.
+    pub fn open_verified(&self, id: XetHash, expected_len: u64) -> Result<Option<VerifiedFile>> {
+        self.open_verified_with(id, LengthContract::Exact(expected_len))
+    }
+
+    /// Opens locally available content whose exact length is not known by the
+    /// caller, refusing it before allocation when it exceeds `maximum_len`.
+    ///
+    /// This is for content-addressed metadata such as an application-owned
+    /// manifest root: its hash is the identity, while its decoder owns the
+    /// exact shape and length. As with [`Self::open_verified`], this performs
+    /// no network fetch and returns the descriptor whose identity was checked.
+    pub fn open_verified_bounded(
+        &self,
+        id: XetHash,
+        maximum_len: u64,
+    ) -> Result<Option<VerifiedFile>> {
+        self.open_verified_with(id, LengthContract::AtMost(maximum_len))
+    }
+
+    fn open_verified_with(
+        &self,
+        id: XetHash,
+        length: LengthContract,
+    ) -> Result<Option<VerifiedFile>> {
+        if let Some(entry) = self
+            .index
+            .read()
+            .ok()
+            .and_then(|index| index.get(&id).cloned())
+        {
+            if let Some(verified) = open_indexed_file(id, length, &entry)? {
+                return Ok(Some(verified));
+            }
+            self.forget_if_stale(id, &entry);
+        }
+
+        for substituter in self.substituters.iter() {
+            let Some(path) = substituter.locate(id) else {
+                continue;
+            };
+            let (indexed, file) = self.index_open(&path)?;
+            if indexed.id != id {
+                return Err(StoreError::WrongContent {
+                    expected: id.to_string(),
+                    actual: indexed.id.to_string(),
+                    path,
+                });
+            }
+            let actual = file
+                .metadata()
+                .map_err(|source| StoreError::Read {
+                    path: path.clone(),
+                    source,
+                })?
+                .len();
+            check_length(id, actual, &path, length)?;
+            return Ok(Some(VerifiedFile {
+                file,
+                id,
+                len: actual,
+            }));
+        }
+
+        Ok(None)
     }
 
     /// The chunk list for indexed content — the metainfo needed to
@@ -329,12 +620,8 @@ impl ContentStore {
     /// Makes content `id` available locally, fetching it if it is not
     /// already here, and indexes the result.
     ///
-    /// The privileged operation. [`Self::have`] is the question a quote
-    /// may ask; this is the one that costs bandwidth and disk, and so
-    /// belongs behind whatever admission control the caller applies.
-    /// Separating them is the whole reason answering a quote can stop
-    /// being a way to make a stranger's node download an arbitrary
-    /// repository.
+    /// Unlike [`Self::have`], this operation may cost bandwidth and disk.
+    /// The caller decides when that remote work is permitted.
     ///
     /// `fetch` is handed the chunk list when we already hold one, so a
     /// partial response can be checked chunk by chunk rather than only
@@ -415,6 +702,84 @@ impl ContentStore {
             );
         }
     }
+
+    fn forget_if_stale(&self, id: XetHash, stale: &Entry) {
+        if let Ok(mut index) = self.index.write()
+            && index.get(&id).is_some_and(|current| {
+                current.path == stale.path && current.identity == stale.identity
+            })
+        {
+            index.remove(&id);
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum LengthContract {
+    Exact(u64),
+    AtMost(u64),
+}
+
+/// Opens an indexed path, then decides from the descriptor rather than from a
+/// second lookup of the name. If replacement happened before `open`, the new
+/// inode is refused. If it happened after `open`, the already-open verified
+/// inode remains the one returned.
+fn open_indexed_file(
+    id: XetHash,
+    length: LengthContract,
+    entry: &Entry,
+) -> Result<Option<VerifiedFile>> {
+    let file = match open_regular_file(&entry.path) {
+        Ok(file) => file,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(StoreError::Read {
+                path: entry.path.clone(),
+                source,
+            });
+        }
+    };
+    verify_opened_indexed_file(id, length, entry, file)
+}
+
+fn verify_opened_indexed_file(
+    id: XetHash,
+    length: LengthContract,
+    entry: &Entry,
+    file: std::fs::File,
+) -> Result<Option<VerifiedFile>> {
+    let metadata = file.metadata().map_err(|source| StoreError::Read {
+        path: entry.path.clone(),
+        source,
+    })?;
+    if fastresume::FileIdentity::of(&metadata) != entry.identity {
+        return Ok(None);
+    }
+    let actual = metadata.len();
+    check_length(id, actual, &entry.path, length)?;
+    Ok(Some(VerifiedFile {
+        file,
+        id,
+        len: actual,
+    }))
+}
+
+fn check_length(id: XetHash, actual: u64, path: &Path, contract: LengthContract) -> Result<()> {
+    match contract {
+        LengthContract::Exact(expected) if actual != expected => Err(StoreError::WrongLength {
+            id: id.to_string(),
+            expected,
+            actual,
+            path: path.to_path_buf(),
+        }),
+        LengthContract::AtMost(maximum) if actual > maximum => Err(StoreError::TooLarge {
+            id: id.to_string(),
+            maximum,
+            actual,
+            path: path.to_path_buf(),
+        }),
+        LengthContract::Exact(_) | LengthContract::AtMost(_) => Ok(()),
+    }
 }
 
 /// The file that was read is still the file this name refers to.
@@ -494,6 +859,189 @@ mod tests {
         (file, identity)
     }
 
+    /// The Linux primitive is the contract, not merely an implementation
+    /// detail: a harmless path descriptor is acquired before type inspection,
+    /// and the readable descriptor remains bound to that inode even if the
+    /// name is replaced with a device.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn regular_open_is_safe_readable_seekable_and_close_on_exec() {
+        use std::io::{Read as _, Seek as _, SeekFrom};
+        use std::os::fd::AsRawFd as _;
+
+        let dir = scratch("regular-open");
+        let target = dir.join("blob");
+        let content = b"ordinary bytes";
+        std::fs::write(&target, content).expect("write target");
+        let link = dir.join("snapshot");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+
+        let mut file = open_regular_file(&link).expect("open regular symlink");
+        let mut read = Vec::new();
+        file.read_to_end(&mut read).expect("read");
+        assert_eq!(read, content);
+        file.seek(SeekFrom::Start(0)).expect("seek");
+        read.clear();
+        file.read_to_end(&mut read).expect("read again");
+        assert_eq!(read, content);
+        // SAFETY: F_GETFD only observes the live descriptor owned by `file`.
+        let descriptor_flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) };
+        assert!(
+            descriptor_flags >= 0,
+            "F_GETFD: {}",
+            io::Error::last_os_error()
+        );
+        assert_ne!(descriptor_flags & libc::FD_CLOEXEC, 0);
+
+        // Hold the ordinary inode without opening it for I/O, replace its
+        // public name with a device, then finish the reopen. The bytes must
+        // still come from the held inode.
+        let path_handle = open_path_handle(&link).expect("path handle");
+        let replacement = dir.join("replacement");
+        std::os::unix::fs::symlink("/dev/null", &replacement).expect("device symlink");
+        std::fs::rename(&replacement, &link).expect("replace link");
+        let mut held = reopen_regular_path_handle(&link, &path_handle).expect("reopen held inode");
+        read.clear();
+        held.read_to_end(&mut read).expect("read held inode");
+        assert_eq!(read, content);
+
+        let fifo = dir.join("fifo");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo");
+        assert!(status.success(), "the fixture needs a fifo");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(open_regular_file(&fifo));
+        });
+        let fifo_error = receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("opening the FIFO blocked before its type check")
+            .expect_err("a FIFO is not regular content");
+        assert_eq!(fifo_error.kind(), io::ErrorKind::InvalidInput);
+
+        if Path::new("/dev/null").exists() {
+            let device_error = open_regular_file(Path::new("/dev/null"))
+                .expect_err("a character device is not regular content");
+            assert_eq!(device_error.kind(), io::ErrorKind::InvalidInput);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Hashing is bounded by the descriptor length captured before the read.
+    /// Mutations are injected between real file reads, so growth is found by
+    /// the one-byte sentinel and truncation by an early EOF.
+    #[test]
+    fn mid_hash_growth_and_truncation_are_bounded_and_rejected() {
+        use std::io::{Seek as _, SeekFrom, Write as _};
+
+        enum Mutation {
+            Grow,
+            Truncate(u64),
+        }
+
+        struct MutatingFile {
+            reader: std::fs::File,
+            writer: std::fs::File,
+            mutation: Option<Mutation>,
+        }
+
+        impl std::io::Read for MutatingFile {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                let read = self.reader.read(buffer)?;
+                if read != 0 {
+                    match self.mutation.take() {
+                        Some(Mutation::Grow) => {
+                            self.writer.seek(SeekFrom::End(0))?;
+                            self.writer.write_all(b"growth after hashing began")?;
+                            self.writer.flush()?;
+                        }
+                        Some(Mutation::Truncate(len)) => self.writer.set_len(len)?,
+                        None => {}
+                    }
+                }
+                Ok(read)
+            }
+        }
+
+        let dir = scratch("bounded-hash");
+        let original = vec![0x5a; STREAM_BUFFER * 2 + 17];
+
+        let grow_path = dir.join("grow");
+        std::fs::write(&grow_path, &original).expect("write growing file");
+        let grow_reader = open_regular_file(&grow_path).expect("open growing file");
+        let grow_len = grow_reader.metadata().expect("metadata").len();
+        let grow_writer = OpenOptions::new()
+            .write(true)
+            .open(&grow_path)
+            .expect("open growth writer");
+        let mut growing = MutatingFile {
+            reader: grow_reader,
+            writer: grow_writer,
+            mutation: Some(Mutation::Grow),
+        };
+        assert!(
+            hash_exact_length(&mut growing, grow_len)
+                .expect("bounded growth read")
+                .is_none(),
+            "a byte beyond the captured length must reject growth",
+        );
+
+        let truncate_path = dir.join("truncate");
+        std::fs::write(&truncate_path, &original).expect("write truncated file");
+        let truncate_reader = open_regular_file(&truncate_path).expect("open truncated file");
+        let truncate_len = truncate_reader.metadata().expect("metadata").len();
+        let truncate_writer = OpenOptions::new()
+            .write(true)
+            .open(&truncate_path)
+            .expect("open truncation writer");
+        let mut truncating = MutatingFile {
+            reader: truncate_reader,
+            writer: truncate_writer,
+            mutation: Some(Mutation::Truncate(STREAM_BUFFER as u64)),
+        };
+        assert!(
+            hash_exact_length(&mut truncating, truncate_len)
+                .expect("bounded truncation read")
+                .is_none(),
+            "EOF before the captured length must reject truncation",
+        );
+
+        let mut stable = std::io::Cursor::new(&original);
+        let indexed = hash_exact_length(&mut stable, original.len() as u64)
+            .expect("stable hash")
+            .expect("stable length");
+        assert_eq!(indexed.id, XetHash::hash(&original));
+        assert_eq!(indexed.len, original.len() as u64);
+
+        struct Endless {
+            bytes_read: u64,
+        }
+        impl std::io::Read for Endless {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                buffer.fill(0xa5);
+                self.bytes_read += buffer.len() as u64;
+                Ok(buffer.len())
+            }
+        }
+        let bounded_len = STREAM_BUFFER as u64 * 3 + 23;
+        let mut endless = Endless { bytes_read: 0 };
+        assert!(
+            hash_exact_length(&mut endless, bounded_len)
+                .expect("bounded endless read")
+                .is_none(),
+        );
+        assert_eq!(
+            endless.bytes_read,
+            bounded_len + 1,
+            "even a source that never reaches EOF gets one bounded prefix and one sentinel byte",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The binding, asserted where it can be made to happen rather than
     /// raced for: an id is about a descriptor, and recording it against a
     /// name requires the name to still mean that descriptor.
@@ -562,6 +1110,71 @@ mod tests {
             still_the_file_that_was_read(&link, identity, &file),
             Err(StoreError::Replaced { .. }),
         ));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The path lookup and the descriptor open are deliberately separate in
+    /// `open_verified`; exercise both sides of that boundary without hoping to
+    /// win a scheduler race.
+    #[test]
+    fn a_path_replacement_cannot_change_the_inode_being_lent() {
+        use std::io::Read as _;
+
+        let dir = scratch("verified-open-replacement");
+        let blobs = dir.join("blobs");
+        std::fs::create_dir_all(&blobs).expect("blobs");
+        let original = b"blob a";
+        std::fs::write(blobs.join("a"), original).expect("blob a");
+        std::fs::write(blobs.join("b"), b"blob b").expect("blob b");
+        let link = dir.join("weights.bin");
+        std::os::unix::fs::symlink(blobs.join("a"), &link).expect("symlink");
+
+        let store = ContentStore::new();
+        let indexed = store.index(&link).expect("index through link");
+        let entry = store
+            .index
+            .read()
+            .expect("index lock")
+            .get(&indexed.id)
+            .expect("entry")
+            .clone();
+
+        // This descriptor models replacement after `open`: repointing the
+        // symlink does not and cannot retarget an already-open file.
+        let opened_before_replacement = std::fs::File::open(&link).expect("open original");
+        let swap = dir.join("swap");
+        std::os::unix::fs::symlink(blobs.join("b"), &swap).expect("replacement link");
+        std::fs::rename(&swap, &link).expect("replace link");
+
+        let verified = verify_opened_indexed_file(
+            indexed.id,
+            LengthContract::Exact(indexed.len),
+            &entry,
+            opened_before_replacement,
+        )
+        .expect("verify open descriptor")
+        .expect("the old inode is still verified");
+        let mut file = verified.into_file();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).expect("read old inode");
+        assert_eq!(bytes, original);
+
+        // This call models replacement between lookup and `open`: opening the
+        // stale name reaches blob b, whose descriptor identity is refused.
+        assert!(
+            open_indexed_file(indexed.id, LengthContract::Exact(indexed.len), &entry)
+                .expect("inspect replacement")
+                .is_none(),
+            "the replacement inode must not be lent under blob a's id",
+        );
+        assert!(
+            store
+                .open_verified(indexed.id, indexed.len)
+                .expect("public open")
+                .is_none(),
+            "a stale index entry becomes a local miss",
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

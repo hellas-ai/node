@@ -20,7 +20,7 @@ pub(super) fn usage(input_tokens: u32, total_tokens: u64) -> Usage {
 
 pub(super) fn stop_reason_from_runtime(stop_reason: RuntimeStopReason) -> StopReason {
     match stop_reason {
-        RuntimeStopReason::EndOfSequence => StopReason::EndOfText,
+        RuntimeStopReason::StopToken(_) => StopReason::EndOfText,
         RuntimeStopReason::MaxNewTokens => StopReason::MaxOutputTokens,
     }
 }

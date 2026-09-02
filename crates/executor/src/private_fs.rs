@@ -1,0 +1,362 @@
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read as _};
+use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
+
+/// Creates and durably publishes a runtime-state directory that only its owner
+/// can traverse.
+///
+/// `DirBuilderExt::mode` prevents a permissive umask from making a newly
+/// created component group- or world-accessible. Resetting the final path's
+/// permissions also narrows a pre-existing operator-supplied root. Every newly
+/// created directory is synced from leaf to root, followed by the first
+/// pre-existing parent, so a successful return means the complete new path can
+/// survive a power loss rather than only the files later written beneath it.
+pub(crate) fn create_private_dir_all(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+
+        let path = absolute(path)?;
+        let missing = missing_ancestry(&path)?;
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700).create(&path)?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
+
+        if missing.is_empty() {
+            sync_directory(&path)?;
+        } else {
+            for directory in &missing {
+                sync_directory(directory)?;
+            }
+            if let Some(parent) = missing.last().and_then(|directory| directory.parent()) {
+                sync_directory(parent)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(path)
+    }
+}
+
+/// Opens the directory inode named by `path` without allowing a concurrent
+/// replacement with a FIFO or device to turn the open into a wait.
+///
+/// Symlinks to directories remain supported for operator-managed state paths.
+/// A retained descriptor pins the opened inode for locking, permission changes,
+/// and syncing even if a child name is later unlinked and recreated. It does
+/// not make later path-based child access descriptor-relative: those callers
+/// still require stable, trusted ancestors. Directory advisory locks coordinate
+/// cooperating processes; they cannot exclude malicious code running as the
+/// same user.
+pub(crate) fn open_directory(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_DIRECTORY | libc::O_NONBLOCK);
+    }
+    let directory = options.open(path)?;
+    if !directory.metadata()?.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a directory", path.display()),
+        ));
+    }
+    Ok(directory)
+}
+
+/// Narrows the opened directory inode itself, rather than looking its path up
+/// again after the caller has acquired a lock on it.
+pub(crate) fn make_directory_private(directory: &File) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        directory.set_permissions(fs::Permissions::from_mode(0o700))?;
+        directory.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = directory;
+        Ok(())
+    }
+}
+
+/// Makes prior directory-entry changes durable without a name-based blocking
+/// open if the directory path was concurrently replaced.
+pub(crate) fn sync_directory(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        open_directory(path)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
+/// Reads at most `maximum` bytes from an ordinary file descriptor.
+///
+/// The nonblocking open happens before descriptor metadata is inspected, so a
+/// FIFO/device or a symlink swapped to one cannot hang startup. The extra byte
+/// in the read limit also rejects a regular file which grows after `fstat`.
+pub(crate) fn read_bounded_regular_file(path: &Path, maximum: usize) -> io::Result<Vec<u8>> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    let maximum_u64 = u64::try_from(maximum).unwrap_or(u64::MAX);
+    if metadata.len() > maximum_u64 {
+        return Err(too_large(path, maximum));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len().try_into().unwrap_or(maximum));
+    file.take(maximum_u64.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > maximum {
+        return Err(too_large(path, maximum));
+    }
+    Ok(bytes)
+}
+
+fn too_large(path: &Path, maximum: usize) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("{} exceeds the {maximum}-byte limit", path.display()),
+    )
+}
+
+#[cfg(unix)]
+fn absolute(path: &Path) -> io::Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()?.join(path))
+    }
+}
+
+/// Missing directories from the requested leaf back to, but not including,
+/// the first ancestor already present on disk.
+#[cfg(unix)]
+fn missing_ancestry(path: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut missing = Vec::new();
+    let mut candidate = path;
+    loop {
+        match fs::metadata(candidate) {
+            Ok(metadata) if metadata.is_dir() => return Ok(missing),
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("{} exists and is not a directory", candidate.display()),
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                missing.push(candidate.to_path_buf());
+            }
+            Err(error) => return Err(error),
+        }
+        candidate = candidate.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{} has no existing directory ancestor", path.display()),
+            )
+        })?;
+    }
+}
+
+/// Runs one complete synchronous filesystem transaction without executing its
+/// filesystem work on a Tokio worker thread.
+///
+/// Executor state remains serialized because the caller waits for the whole
+/// operation. The actual I/O runs on Tokio's blocking pool. On a multi-thread
+/// runtime, `block_in_place` first yields this worker's task lane while the
+/// synchronous store API waits for the result. A current-thread runtime cannot
+/// yield its sole worker through a synchronous API, but the filesystem syscall
+/// still runs on the blocking pool rather than on that worker. Plain
+/// synchronous callers with no Tokio runtime execute directly.
+pub(crate) fn run_blocking_io<T, F>(operation: F) -> io::Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return Ok(operation());
+    };
+    let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+    let _blocking_task = tokio::task::spawn_blocking(move || {
+        let _ = result_tx.send(operation());
+    });
+    let receive = || result_rx.recv().map_err(io::Error::other);
+    if matches!(
+        handle.runtime_flavor(),
+        tokio::runtime::RuntimeFlavor::MultiThread
+    ) {
+        tokio::task::block_in_place(receive)
+    } else {
+        receive()
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::*;
+
+    #[test]
+    fn creation_and_reopen_leave_the_root_owner_only() {
+        let parent = std::env::current_dir()
+            .expect("current directory")
+            .join("target/private-directory-tests")
+            .join(uuid::Uuid::new_v4().to_string());
+        let root = parent.join("state");
+
+        create_private_dir_all(&root).expect("create private root");
+        assert_eq!(
+            fs::metadata(&root)
+                .expect("root metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o777))
+            .expect("make existing fixture permissive");
+        create_private_dir_all(&root).expect("narrow existing root");
+        assert_eq!(
+            fs::metadata(&root)
+                .expect("root metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+
+        fs::remove_dir_all(parent).expect("remove fixture");
+    }
+
+    #[test]
+    fn permission_narrowing_applies_to_the_opened_directory_inode() {
+        let parent = std::env::current_dir()
+            .expect("current directory")
+            .join("target/private-directory-tests")
+            .join(uuid::Uuid::new_v4().to_string());
+        let root = parent.join("state");
+        let displaced = parent.join("opened-state");
+        fs::create_dir_all(&root).expect("create fixture root");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o777))
+            .expect("make opened fixture permissive");
+        let directory = open_directory(&root).expect("open fixture directory");
+        fs::rename(&root, &displaced).expect("move opened directory");
+        fs::create_dir(&root).expect("create replacement path");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755))
+            .expect("set replacement permissions");
+
+        make_directory_private(&directory).expect("narrow opened inode");
+        assert_eq!(
+            fs::metadata(&displaced)
+                .expect("opened inode metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(&root)
+                .expect("replacement metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755,
+            "descriptor permission changes must not follow a replacement path"
+        );
+
+        fs::remove_dir_all(parent).expect("remove fixture");
+    }
+
+    #[test]
+    fn directory_open_rejects_a_fifo_without_blocking() {
+        let parent = std::env::current_dir()
+            .expect("current directory")
+            .join("target/private-directory-tests")
+            .join(uuid::Uuid::new_v4().to_string());
+        fs::create_dir_all(&parent).expect("create fixture parent");
+        let fifo = parent.join("not-a-directory");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo");
+        assert!(status.success(), "the fixture needs a FIFO");
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(open_directory(&fifo));
+        });
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("directory open blocked on a FIFO")
+            .expect_err("a FIFO is not a directory");
+        fs::remove_dir_all(parent).expect("remove fixture");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn blocking_io_releases_the_shared_runtime_worker() {
+        let progressed = Arc::new(AtomicBool::new(false));
+        let task_progress = Arc::clone(&progressed);
+        let progress = tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            task_progress.store(true, Ordering::SeqCst);
+        });
+        let observed_progress = Arc::clone(&progressed);
+
+        let shared_runtime_progressed = run_blocking_io(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            while !observed_progress.load(Ordering::SeqCst) && std::time::Instant::now() < deadline
+            {
+                std::thread::yield_now();
+            }
+            observed_progress.load(Ordering::SeqCst)
+        })
+        .expect("blocking operation joins");
+
+        progress.await.expect("runtime task");
+        assert!(shared_runtime_progressed);
+    }
+
+    #[tokio::test]
+    async fn current_thread_runtime_runs_the_filesystem_operation_off_worker() {
+        let runtime_thread = std::thread::current().id();
+        let operation_thread =
+            run_blocking_io(|| std::thread::current().id()).expect("blocking operation returns");
+        assert_ne!(operation_thread, runtime_thread);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_blocking_pool_caller_can_run_a_store_operation() {
+        let value = tokio::task::spawn_blocking(|| run_blocking_io(|| 42_u8))
+            .await
+            .expect("outer blocking task joins")
+            .expect("nested store operation returns");
+        assert_eq!(value, 42);
+    }
+}

@@ -4,52 +4,112 @@ pub const GIT_REV: &str = match option_env!("GIT_REV") {
     None => "unknown",
 };
 
+/// Maximum canonical size of one submitted transaction.
+pub const MAX_CANONICAL_TRANSACTION_BYTES: usize = 65_536;
+/// Exact protobuf envelope size of a maximum-size `SubmitTx` kernel payload.
+pub const MAX_SUBMIT_TX_PROTO_BYTES: usize = 65_540;
+/// Raw protobuf request-body ceiling for `SubmitWorkResponse`.
+pub const MAX_SUBMIT_WORK_RESPONSE_PROTO_BYTES: usize = 65_536;
+
+/// What happened when a transaction was submitted to a node.
+///
+/// This type deliberately has no unspecified variant. The protobuf zero value
+/// is a wire error, not an outcome an in-process caller can mistake for
+/// acceptance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubmitTxOutcome {
+    /// The transaction is resident locally, pending consensus inclusion.
+    Enqueued,
+    /// The same transaction digest is already resident locally.
+    Duplicate,
+    /// The bounded mempool had no room for the transaction.
+    Full,
+    /// Snapshot-local admission validation rejected the transaction.
+    ValidationRejected,
+}
+
+impl core::fmt::Display for SubmitTxOutcome {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str(match self {
+            Self::Enqueued => "enqueued, pending inclusion",
+            Self::Duplicate => "duplicate, pending inclusion",
+            Self::Full => "mempool full, not enqueued",
+            Self::ValidationRejected => "validation rejected, not enqueued",
+        })
+    }
+}
+
 pub mod call;
 #[cfg(feature = "evaluate")]
 pub mod evaluate;
 #[cfg(feature = "fetch")]
 pub mod fetch;
+pub mod observe;
 #[cfg(feature = "execute")]
 pub mod open;
 #[cfg(feature = "fetch")]
 pub mod output;
 /// Peer registry, admission, and connection directory module.
 pub mod peers;
+/// Execution authorization policy module.
+#[cfg(feature = "execute")]
+pub mod policy;
 pub mod protocol;
 #[cfg(feature = "execute")]
 pub mod run_ticket;
 pub mod serve;
-pub mod spec;
 #[cfg(feature = "execute")]
 pub mod stream;
-pub use spec::ModelSpec;
-
-/// Execution authorization policy module.
-#[cfg(feature = "execute")]
-pub mod policy;
+/// The paid-work RPC: the acceptance exchange, its two endpoints, and
+/// the refusals they answer with.
+#[cfg(feature = "work")]
+pub mod work;
+/// Settling paid work on chain: the finalized cursor every deadline is
+/// measured against, and the close that spends a certificate.
+#[cfg(feature = "work")]
+pub mod work_close;
+/// The two-Open handshake on the wire: the exchange that gives two
+/// endpoints a channel to do paid work on.
+#[cfg(feature = "work")]
+pub mod work_handshake;
+/// Posting a completed handshake: the driver that submits the two
+/// Opens, observes them finalize, and records where the channel began.
+#[cfg(feature = "work")]
+pub mod work_open;
+/// Durable endpoint state for paid work: the setup journal, the channel
+/// journal, and the counterparty loss ledger.
+#[cfg(feature = "work")]
+pub mod work_store;
 
 pub mod provenance;
 
 #[cfg(feature = "execute")]
 mod tokens;
 #[cfg(feature = "execute")]
-pub use tokens::{TokenBytesError, decode_token_ids, encode_token_ids};
+pub use tokens::{
+    DEFAULT_MAX_NEW_TOKENS, MAX_STOP_TOKEN_IDS, TokenBytesError, decode_token_ids,
+    encode_token_ids, normalize_stop_token_ids,
+};
 
 pub use protocol::{
-    APPLE_APP_ATTEST, AppleAppAttestEnrollment, Assurance, CanonicalizationId, ContentId,
-    DagCborDecodeError, DagCborDecoder, DagCborEncodeError, DagCborEncoder, Digest, Dtype,
-    Evaluate, EvaluateProgramManifest, EvaluateRequest, EventCommitment, FetchProgramManifest,
-    InputCommitment, InputEventBody, InputEventBodyParts, InputEventEnvelope,
-    InputTranscriptBuilder, JobTerms, JsonBytes, OPEN_EXPORTER_LEN, OPEN_NONCE_LEN,
-    OPEN_PROOF_DOMAIN, OPEN_PROVIDER_ROLE, Operation, OutputEventBody, OutputEventBodyParts,
-    OutputEventEnvelope, OutputTranscriptBuilder, ParseDtypeError, PlatformCredential,
-    PlatformEnrollment, ProducerId, ProducerSigningKey, ProgramManifest, ProviderEnrollmentBundle,
-    ProviderGenesisDecodeError, ProviderGenesisStatement, ProviderIdentityV1, PublicKey,
-    RequestCommitment, Retention, RootKind, RootProof, SchemeId, Signature, SignatureError,
-    SignatureKind, SignedInputEvent, SignedOutputEvent, SignedProviderGenesis, StreamId,
-    StreamVerifyError, canonical_dag_cbor, decode_dag_cbor, hash_tuple, input_genesis,
-    open_proof_binding, output_genesis, scheme_id, verify_input_event_envelopes,
-    verify_input_transcript, verify_output_event_envelopes, verify_output_transcript,
+    APPLE_APP_ATTEST, AppleAppAttestEnrollment, Application, ApplicationError, Assurance,
+    CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR, CODEX_RESPONSES_ADAPTOR, CODEX_RESPONSES_ENDPOINT,
+    CanonicalizationId, CausalLmEnvironment, CausalLmEnvironmentError, ContentId, ContentRef,
+    DagCborDecodeError, DagCborDecoder, DagCborEncodeError, DagCborEncoder, Digest, Evaluate,
+    EvaluateRequest, EventCommitment, FETCH_EVALUATOR, FetchEnvironment, InputCommitment,
+    InputEventBody, InputEventBodyParts, InputEventEnvelope, InputTranscriptBuilder, JobTerms,
+    JsonBytes, MAX_APPLICATION_ID_BYTES, MAX_CAUSAL_LM_ENVIRONMENT_BYTES,
+    MAX_CAUSAL_LM_STATIC_BYTES, OPEN_EXPORTER_LEN, OPEN_NONCE_LEN, OPEN_PROOF_DOMAIN,
+    OPEN_PROVIDER_ROLE, OPENAI_RESPONSES_ADAPTOR, OPENAI_RESPONSES_ENDPOINT, Operation,
+    OutputEventBody, OutputEventBodyParts, OutputEventEnvelope, OutputTranscriptBuilder,
+    PlatformCredential, PlatformEnrollment, ProducerId, ProducerSigningKey, ProgramManifest,
+    ProviderEnrollmentBundle, ProviderGenesisDecodeError, ProviderGenesisStatement,
+    ProviderIdentityV1, PublicKey, RequestCommitment, Retention, RootKind, RootProof, SchemeId,
+    Signature, SignatureError, SignatureKind, SignedInputEvent, SignedOutputEvent,
+    SignedProviderGenesis, StaticSlice, StreamId, StreamVerifyError, canonical_dag_cbor,
+    decode_dag_cbor, hash_tuple, input_genesis, open_proof_binding, output_genesis, scheme_id,
+    verify_input_event_envelopes, verify_input_transcript, verify_output_event_continuation,
+    verify_output_event_envelopes, verify_output_transcript,
 };
 pub use protocol::{commitment, digest, retention, signature, tags, value};
 
@@ -99,3 +159,13 @@ pub const DEFAULT_FETCH_MAX_IN_FLIGHT: usize = 16;
 /// Default bound on Fetch executions waiting behind active provider streams.
 #[cfg(feature = "execute")]
 pub const DEFAULT_FETCH_QUEUE_CAPACITY: usize = 64;
+
+/// Default maximum number of distinct retained Fetch transcripts, including
+/// both completed transcripts and indeterminate running markers.
+#[cfg(feature = "execute")]
+pub const DEFAULT_FETCH_RETAINED_TRANSCRIPT_CAPACITY: usize = 1024;
+
+/// Default maximum number of retained Fetch transcripts being replayed to
+/// consumers at once.
+#[cfg(feature = "execute")]
+pub const DEFAULT_FETCH_REPLAY_MAX_IN_FLIGHT: usize = 16;

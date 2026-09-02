@@ -1,17 +1,11 @@
-//! Where a node keeps what the store learned.
+//! Where the store keeps its fast-resume record.
 //!
-//! Two files, one directory:
-//!
-//! - `fastresume.bin` — what has already been hashed
-//!   ([`crate::fastresume`]).
-//! - `adopted-caches` — which HuggingFace caches `adopt` was pointed at
-//!   ([`crate::hf_cache::adopted_caches`]).
-//!
-//! Both live beside the rest of this node's state and never inside the
+//! `fastresume.bin` records what has already been hashed
+//! ([`crate::fastresume`]). It lives in Hellas state and never inside the
 //! HuggingFace cache. That cache belongs to somebody else's tool, and
 //! writing our bookkeeping into it is how programs end up blamed for
 //! each other's bugs — and how a `huggingface-cli delete-cache` takes
-//! our records with it.
+//! the record with it.
 //!
 //! `HELLAS_STORE_DIR` moves the directory, for a node whose state does
 //! not live under `$HOME` and for tests, which must never read or write
@@ -38,14 +32,7 @@ pub fn records_path() -> Option<PathBuf> {
     dir().map(|dir| dir.join(RECORDS_FILE))
 }
 
-/// Where the list of adopted HuggingFace caches lives by default.
-#[must_use]
-pub fn adopted_caches_path() -> Option<PathBuf> {
-    dir().map(|dir| dir.join(ADOPTED_CACHES_FILE))
-}
-
 const RECORDS_FILE: &str = "fastresume.bin";
-const ADOPTED_CACHES_FILE: &str = "adopted-caches";
 
 fn resolve_dir(
     override_dir: Option<std::ffi::OsString>,

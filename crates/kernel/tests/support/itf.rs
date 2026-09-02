@@ -19,10 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use itf::de::{As, Integer, Same};
 use serde::Deserialize;
 
-use hellas_kernel::{
-    BlockHash, BlockHeight, CloseKind, Context, EdgeId, List, MAX_EDGE_OUTPUTS, Parties, Payout,
-    Proof, ProtocolCode, Seal, Terms, Tx,
-};
+use hellas_kernel::{BlockHash, BlockHeight, Context, Parties, Proof, Terms, Tx};
 
 use super::l1;
 
@@ -73,7 +70,6 @@ pub(crate) enum EdgeTag {
 pub(crate) enum ProofTag {
     Mutual,
     Timeout,
-    Violation,
 }
 
 /// Quint `Party` enum.
@@ -236,10 +232,6 @@ fn rejected_close_op(body: &CloseInputBody) -> Tx {
             super::placeholder_mutual(input, terms.hash(), &canonical, l1::MAKER, l1::TAKER)
         }
         ProofTag::Timeout => Proof::timeout(terms),
-        ProofTag::Violation => {
-            let seal = super::placeholder_seal(input, &terms, &canonical);
-            Proof::violation(terms, seal)
-        }
     };
     Tx::close(input, proof, outputs)
 }
@@ -260,18 +252,6 @@ pub(crate) fn close_op(body: &CloseInputBody) -> Tx {
             super::placeholder_mutual(input, terms.hash(), &outputs, l1::MAKER, l1::TAKER)
         }
         ProofTag::Timeout => Proof::timeout(terms),
-        ProofTag::Violation => Proof::violation(terms, seal_for(input, &outputs)),
     };
     Tx::close(input, proof, outputs)
-}
-
-fn seal_for(input: EdgeId, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> Seal {
-    let hash = Tx::payload_hash(
-        super::NETWORK,
-        input,
-        CloseKind::Violation,
-        l1::terms().hash(),
-        outputs,
-    );
-    Seal::placeholder(ProtocolCode::new(1), CloseKind::Violation, hash)
 }

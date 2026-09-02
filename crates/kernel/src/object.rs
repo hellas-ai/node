@@ -2,9 +2,17 @@
 //!
 //! Abstract counterpart: `models/types.qnt` (the closed-universe `Coin` /
 //! `Edge` ADTs and their canonical wiring) plus the conservation, shape,
-//! and binding rules in `models/rules/invariants.qnt`. Genesis seeding
-//! mirrors the assumed `genesisFunded` predicate in
-//! `models/deps/assumptions.qnt`.
+//! and binding rules in `models/rules/invariants.qnt`.
+//!
+//! # Assumed of genesis
+//!
+//! **Genesis is operator-trusted.** [`Genesis`] accepts caller-supplied
+//! coin ids and values without authentication — it is the one path that
+//! creates value from nothing, and the kernel checks nobody's right to
+//! use it. The models bake the same premise in by initializing
+//! `MakerCoin` / `TakerCoin` to fixed values in `init`, so no model
+//! action can ever exercise a hostile seeding. A deployment must control
+//! the genesis-seeding path itself; nothing here does.
 
 use crate::{
     canonical::{
@@ -161,8 +169,15 @@ impl Edge {
         }
     }
 
-    pub(super) fn open<const N: usize>(
-        coins: &List<(CoinId, Coin), N>,
+    /// Builds the edge an open leaves behind: the funding total less the
+    /// three debits it is charged.
+    ///
+    /// Takes the total rather than the coins because the endpoint-facing
+    /// projection prices an open it has not submitted, and holds funding
+    /// values without holding [`Coin`]s. Summing is the caller's; what
+    /// the sum buys is here.
+    pub(super) fn open(
+        total: u64,
         parties: Parties,
         terms: TermsHash,
         debits: (u64, u64, u64, Fees),
@@ -170,7 +185,6 @@ impl Edge {
         allowed: CloseKindSet,
     ) -> Result<Self, InvalidOpenReason> {
         let (open_fee, lifetime_fee, reserve, close_fees) = debits;
-        let total = Self::total(coins).ok_or(InvalidOpenReason::FundingOverflow)?;
         let value = total
             .checked_sub(open_fee)
             .and_then(|after_open_fee| after_open_fee.checked_sub(lifetime_fee))
@@ -181,31 +195,51 @@ impl Edge {
         ))
     }
 
-    /// Validates a close against the edge's locked principal and reserve.
+    /// Validates a close against the edge's locked principal and reserve,
+    /// returning the value it distributes.
     ///
     /// Payouts must sum to the principal locked at open plus the part of the
     /// open-time close reserve not consumed by this close kind. The committed
     /// close fee is priced by the fee schedule stored on the edge at open time,
     /// so current block fees cannot make an already-open edge unclosable.
+    ///
+    /// The distributed total is returned rather than discarded because
+    /// the work-payment proofs derive their payout split from it, and a
+    /// second [`Self::close_value`] call there would be a second place
+    /// for the two to disagree.
     pub(super) fn closes<const N: usize>(
         self,
         coins: &List<(CoinId, Coin), N>,
         close_cost: Cost,
-    ) -> Result<(), InvalidCloseReason> {
+    ) -> Result<u64, InvalidCloseReason> {
         let expected = self
             .close_value(close_cost)
             .ok_or(InvalidCloseReason::ReserveTooSmall)?;
         match Self::total(coins) {
             None => Err(InvalidCloseReason::PayoutOverflow),
             Some(total) if total != expected => Err(InvalidCloseReason::ValueMismatch),
-            Some(_) => Ok(()),
+            Some(_) => Ok(expected),
         }
     }
 
     pub(super) fn close_value(self, close_cost: Cost) -> Option<u64> {
-        let fee = self.close_fees.charge(close_cost)?;
-        let surplus = self.reserve.checked_sub(fee)?;
-        self.value.checked_add(surplus)
+        self.values().close_value(close_cost)
+    }
+
+    /// Returns the three numbers a close distributes from.
+    ///
+    /// The projection exists because the work-payment settlement
+    /// arithmetic is public and an endpoint cannot hold an [`Edge`]: it
+    /// reads a finalized edge's values from a light client. Keeping the
+    /// formula on the values, and this type as the only way to reach it,
+    /// is what stops the endpoint's copy from being a second formula.
+    #[must_use]
+    pub const fn values(self) -> EdgeValues {
+        EdgeValues {
+            value: self.value,
+            reserve: self.reserve,
+            close_fees: self.close_fees,
+        }
     }
 
     fn total<const N: usize>(coins: &List<(CoinId, Coin), N>) -> Option<u64> {
@@ -258,6 +292,62 @@ impl Edge {
     #[must_use]
     pub const fn allows(self, kind: CloseKind) -> bool {
         self.allowed.contains(kind)
+    }
+}
+
+/// The locked principal, the close reserve, and the fee schedule that
+/// prices the reserve: everything a close distributes from.
+///
+/// Deliberately not the whole edge. An endpoint reconstructs these three
+/// numbers from a finalized light-client read and asks the kernel what
+/// they settle to; it has no store, no terms body, and no business
+/// forming an [`Edge`].
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+pub struct EdgeValues {
+    value: u64,
+    reserve: u64,
+    close_fees: Fees,
+}
+
+impl EdgeValues {
+    /// Creates the value projection of a finalized edge.
+    #[must_use]
+    pub const fn new(value: u64, reserve: u64, close_fees: Fees) -> Self {
+        Self {
+            value,
+            reserve,
+            close_fees,
+        }
+    }
+
+    /// Returns the principal locked by the edge.
+    #[must_use]
+    pub const fn value(self) -> u64 {
+        self.value
+    }
+
+    /// Returns the close reserve locked when the edge opened.
+    #[must_use]
+    pub const fn reserve(self) -> u64 {
+        self.reserve
+    }
+
+    /// Returns the fee schedule committed for future close execution.
+    #[must_use]
+    pub const fn close_fees(self) -> Fees {
+        self.close_fees
+    }
+
+    /// Returns what a close of this cost distributes: the principal plus
+    /// the part of the open-time reserve that close does not consume.
+    ///
+    /// `None` when the committed reserve does not cover the committed
+    /// fee, or when the sum would wrap. The fee comes from the schedule
+    /// stored at open, so current block fees cannot strand an open edge.
+    pub(crate) fn close_value(self, close_cost: Cost) -> Option<u64> {
+        let fee = self.close_fees.charge(close_cost)?;
+        let surplus = self.reserve.checked_sub(fee)?;
+        self.value.checked_add(surplus)
     }
 }
 
@@ -380,7 +470,7 @@ mod tests {
                 Key::from_bytes([3; Key::LENGTH]),
             ),
             TermsHash::from_bytes([4; TermsHash::LENGTH]),
-            CloseKindSet::all(),
+            CloseKindSet::BASIC,
         );
         let mut edge_buf = [0; Edge::MAX_ENCODED_SIZE + 1];
         assert_canonical_round_trip(edge, &mut edge_buf);

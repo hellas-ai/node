@@ -1,24 +1,26 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::protocol::value::{CanonicalDecodeError, decode_canonical_dag_cbor};
 use crate::{
     Assurance, CanonicalizationId, Digest, Evaluate, EvaluateRequest, InputCommitment, Operation,
     OutputEventEnvelope, OutputTranscriptBuilder, ProducerSigningKey, PublicKey, StreamVerifyError,
-    decode_dag_cbor, encode_token_ids, scheme_id, verify_output_event_envelopes,
+    encode_token_ids, scheme_id, verify_output_event_envelopes,
 };
-use crate::{DagCborDecodeError, DagCborEncodeError, canonical_dag_cbor};
+use crate::{DagCborEncodeError, canonical_dag_cbor};
 
-const OUTPUT_CANONICALIZATION: &[u8] = b"hellas.evaluate.output.v2";
-pub const TOKEN_DELTA_EVENT_KIND: &str = "evaluate.token_delta.v2";
-pub const TERMINAL_EVENT_KIND: &str = "evaluate.terminal.v2";
-const TOKEN_DELTA_CODEC: &str = "hellas.evaluate.output.token_delta.v2";
-const TERMINAL_CODEC: &str = "hellas.evaluate.output.terminal.v2";
+const OUTPUT_CANONICALIZATION: &[u8] = b"hellas.evaluate.output.v4";
+pub const TOKEN_DELTA_EVENT_KIND: &str = "evaluate.token_delta.v4";
+pub const TERMINAL_EVENT_KIND: &str = "evaluate.terminal.v4";
+const TOKEN_DELTA_CODEC: &str = "hellas.evaluate.output.token_delta.v4";
+const TERMINAL_CODEC: &str = "hellas.evaluate.output.terminal.v4";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvaluateStopReason(u8);
 
 impl EvaluateStopReason {
-    pub const END_OF_SEQUENCE: Self = Self(1);
+    /// Generation produced one of the caller-selected stop token IDs.
+    pub const STOP_TOKEN: Self = Self(1);
     pub const MAX_OUTPUT: Self = Self(2);
 
     pub const fn as_u8(self) -> u8 {
@@ -27,7 +29,7 @@ impl EvaluateStopReason {
 
     pub fn from_u8(value: u8) -> Result<Self, EvaluateProtocolError> {
         match value {
-            1 => Ok(Self::END_OF_SEQUENCE),
+            1 => Ok(Self::STOP_TOKEN),
             2 => Ok(Self::MAX_OUTPUT),
             other => Err(EvaluateProtocolError::UnknownStopReason(other)),
         }
@@ -73,6 +75,9 @@ impl EvaluateTokenDelta {
 pub struct EvaluateTerminal {
     pub final_position: u64,
     pub stop_reason: EvaluateStopReason,
+    /// The caller-selected token that stopped generation. Catena does not emit
+    /// this token as output, so the signed terminal carries it explicitly.
+    pub matched_stop_token_id: Option<u32>,
     pub text_artifact: Digest,
     pub usage: EvaluateUsage,
     pub billable_units: u64,
@@ -102,12 +107,15 @@ pub fn encode_token_delta_payload(
 pub fn decode_token_delta_payload(
     bytes: &[u8],
 ) -> Result<EvaluateTokenDelta, EvaluateProtocolError> {
-    let (codec, payload): (String, EvaluateTokenDelta) = decode_dag_cbor(bytes)?;
+    let (codec, payload): (String, EvaluateTokenDelta) = decode_canonical_dag_cbor(bytes)?;
     if codec != TOKEN_DELTA_CODEC {
         return Err(EvaluateProtocolError::CodecMismatch {
             expected: TOKEN_DELTA_CODEC,
             actual: codec,
         });
+    }
+    if payload.token_ids.is_empty() {
+        return Err(EvaluateProtocolError::EmptyTokenDelta);
     }
     Ok(payload)
 }
@@ -119,19 +127,19 @@ pub fn encode_terminal_payload(
 }
 
 pub fn decode_terminal_payload(bytes: &[u8]) -> Result<EvaluateTerminal, EvaluateProtocolError> {
-    let (codec, payload): (String, EvaluateTerminal) = decode_dag_cbor(bytes)?;
+    let (codec, payload): (String, EvaluateTerminal) = decode_canonical_dag_cbor(bytes)?;
     if codec != TERMINAL_CODEC {
         return Err(EvaluateProtocolError::CodecMismatch {
             expected: TERMINAL_CODEC,
             actual: codec,
         });
     }
-    EvaluateStopReason::from_u8(payload.stop_reason.as_u8())?;
     validate_terminal(&payload)?;
     Ok(payload)
 }
 
 fn validate_terminal(terminal: &EvaluateTerminal) -> Result<(), EvaluateProtocolError> {
+    validate_terminal_stop_witness(terminal)?;
     if terminal.usage.output_units != terminal.final_position {
         return Err(EvaluateProtocolError::UsagePositionMismatch);
     }
@@ -141,6 +149,22 @@ fn validate_terminal(terminal: &EvaluateTerminal) -> Result<(), EvaluateProtocol
             expected,
             actual: terminal.billable_units,
         });
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_terminal_stop_witness(
+    terminal: &EvaluateTerminal,
+) -> Result<(), EvaluateProtocolError> {
+    EvaluateStopReason::from_u8(terminal.stop_reason.as_u8())?;
+    match (terminal.stop_reason, terminal.matched_stop_token_id) {
+        (EvaluateStopReason::STOP_TOKEN, None) => {
+            return Err(EvaluateProtocolError::MissingMatchedStopTokenId);
+        }
+        (EvaluateStopReason::MAX_OUTPUT, Some(token_id)) => {
+            return Err(EvaluateProtocolError::UnexpectedMatchedStopTokenId { token_id });
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -236,47 +260,29 @@ pub fn verify_output_events(
         .ok_or(EvaluateProtocolError::EmptyOutputTranscript)?
         .event()
         .public_key();
+    verify_output_events_for_producer(input, assurance, &producer_key, events)
+}
+
+/// Verify an evaluate transcript against the producer identity selected by
+/// the caller rather than trusting the key carried by the transcript itself.
+pub fn verify_output_events_for_producer(
+    input: InputCommitment,
+    assurance: Assurance,
+    producer_key: &PublicKey,
+    events: &[OutputEventEnvelope],
+) -> Result<EvaluateOutput, EvaluateProtocolError> {
     verify_output_event_envelopes(
         scheme_id(Operation::Evaluate, assurance),
         input,
-        &producer_key,
+        producer_key,
         events,
     )?;
     let (token_deltas, terminal) = output_payloads(events)?;
     Ok(EvaluateOutput {
-        producer_key,
+        producer_key: *producer_key,
         token_deltas,
         terminal,
     })
-}
-
-pub fn verify_terminal_continuation(
-    assurance: Assurance,
-    streamed_prefix: &[OutputEventEnvelope],
-    finished: &[OutputEventEnvelope],
-) -> Result<(), EvaluateProtocolError> {
-    if finished.len() < streamed_prefix.len() {
-        return Err(EvaluateProtocolError::WrongOutputEventCount {
-            actual: finished.len(),
-        });
-    }
-    let first = finished
-        .first()
-        .ok_or(EvaluateProtocolError::EmptyOutputTranscript)?;
-    let input = first.event().body().input();
-    verify_output_events(input, assurance, finished)?;
-    for (index, streamed) in streamed_prefix.iter().enumerate() {
-        expect_output_event(streamed, index, TOKEN_DELTA_EVENT_KIND)?;
-        let Some(finished_event) = finished.get(index) else {
-            return Err(EvaluateProtocolError::WrongOutputEventCount {
-                actual: finished.len(),
-            });
-        };
-        if finished_event != streamed {
-            return Err(EvaluateProtocolError::OutputPrefixMismatch { index });
-        }
-    }
-    Ok(())
 }
 
 fn verify_token_prefix(events: &[OutputEventEnvelope]) -> Result<u64, EvaluateProtocolError> {
@@ -342,7 +348,7 @@ pub enum EvaluateProtocolError {
     #[error("evaluate payload encode failed: {0}")]
     Encode(#[from] DagCborEncodeError),
     #[error("evaluate payload decode failed: {0}")]
-    Decode(#[from] DagCborDecodeError),
+    Decode(#[from] CanonicalDecodeError),
     #[error("evaluate payload codec mismatch: expected {expected}, got {actual}")]
     CodecMismatch {
         expected: &'static str,
@@ -350,6 +356,10 @@ pub enum EvaluateProtocolError {
     },
     #[error("unknown evaluate stop reason byte 0x{0:02x}")]
     UnknownStopReason(u8),
+    #[error("evaluate STOP_TOKEN terminal is missing its matched stop token ID")]
+    MissingMatchedStopTokenId,
+    #[error("evaluate MAX_OUTPUT terminal unexpectedly carries matched stop token ID {token_id}")]
+    UnexpectedMatchedStopTokenId { token_id: u32 },
     #[error("evaluate stream verification failed: {0}")]
     Stream(#[from] StreamVerifyError),
     #[error("evaluate output transcript is empty")]
@@ -368,10 +378,6 @@ pub enum EvaluateProtocolError {
         expected: &'static str,
         actual: String,
     },
-    #[error("evaluate output transcript event count mismatch: got {actual}")]
-    WrongOutputEventCount { actual: usize },
-    #[error("evaluate streamed output prefix diverges at event {index}")]
-    OutputPrefixMismatch { index: usize },
     #[error("evaluate output transcript producer key does not match signing key")]
     ProducerKeyMismatch,
     #[error("evaluate output position exceeded u64 range")]
@@ -395,6 +401,95 @@ mod tests {
         ProducerSigningKey::from_secret_bytes([byte; 32]).unwrap()
     }
 
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    fn overlong_tuple_header(canonical: &[u8]) -> Vec<u8> {
+        assert_eq!(canonical[0], 0x82);
+        let mut noncanonical = vec![0x98, 0x02];
+        noncanonical.extend_from_slice(&canonical[1..]);
+        noncanonical
+    }
+
+    #[test]
+    fn evaluate_v4_domains_and_first_event_commitment_are_pinned() {
+        assert_eq!(OUTPUT_CANONICALIZATION, b"hellas.evaluate.output.v4");
+        assert_eq!(TOKEN_DELTA_EVENT_KIND, "evaluate.token_delta.v4");
+        assert_eq!(TERMINAL_EVENT_KIND, "evaluate.terminal.v4");
+        assert_eq!(TOKEN_DELTA_CODEC, "hellas.evaluate.output.token_delta.v4");
+        assert_eq!(TERMINAL_CODEC, "hellas.evaluate.output.terminal.v4");
+        assert_eq!(
+            scheme_id(Operation::Evaluate, Assurance::ProducerSigned).to_byte(),
+            0x00
+        );
+
+        let producer = key(2);
+        let input = InputCommitment::from_digest(Digest::from_bytes([3; 32]));
+        let event = EvaluateOutputTranscriptBuilder::new(input, TEST_ASSURANCE, &producer)
+            .push_token_delta(vec![10, 11])
+            .unwrap();
+        assert_eq!(
+            hex(event.event_commitment().as_bytes()),
+            "0fb828e10fa5cdffe684ff4028617384ee02f8b0f19a382a7cff386a28675883"
+        );
+    }
+
+    #[test]
+    fn decoded_token_delta_must_not_be_empty() {
+        let bytes = encode_token_delta_payload(&EvaluateTokenDelta {
+            start_position: 0,
+            token_ids: Vec::new(),
+        })
+        .unwrap();
+
+        assert!(matches!(
+            decode_token_delta_payload(&bytes),
+            Err(EvaluateProtocolError::EmptyTokenDelta)
+        ));
+    }
+
+    #[test]
+    fn decoded_token_delta_must_be_canonical_dag_cbor() {
+        let canonical = encode_token_delta_payload(&EvaluateTokenDelta {
+            start_position: 0,
+            token_ids: vec![7],
+        })
+        .unwrap();
+        let noncanonical = overlong_tuple_header(&canonical);
+        let _: (String, EvaluateTokenDelta) = serde_ipld_dagcbor::from_slice(&noncanonical)
+            .expect("the permissive decoder accepts the equivalent tuple header");
+
+        assert!(matches!(
+            decode_token_delta_payload(&noncanonical),
+            Err(EvaluateProtocolError::Decode(_))
+        ));
+    }
+
+    #[test]
+    fn decoded_terminal_must_be_canonical_dag_cbor() {
+        let canonical = encode_terminal_payload(&EvaluateTerminal {
+            final_position: 0,
+            stop_reason: EvaluateStopReason::MAX_OUTPUT,
+            matched_stop_token_id: None,
+            text_artifact: Digest::from_bytes([4; 32]),
+            usage: EvaluateUsage {
+                input_units: 3,
+                output_units: 0,
+            },
+            billable_units: 3,
+        })
+        .unwrap();
+        let noncanonical = overlong_tuple_header(&canonical);
+        let _: (String, EvaluateTerminal) = serde_ipld_dagcbor::from_slice(&noncanonical)
+            .expect("the permissive decoder accepts the equivalent tuple header");
+
+        assert!(matches!(
+            decode_terminal_payload(&noncanonical),
+            Err(EvaluateProtocolError::Decode(_))
+        ));
+    }
+
     #[test]
     fn output_events_round_trip_through_shape_verifier() {
         let producer = key(2);
@@ -403,7 +498,8 @@ mod tests {
         let first = builder.push_token_delta(vec![10, 11]).unwrap();
         let terminal = EvaluateTerminal {
             final_position: 2,
-            stop_reason: EvaluateStopReason::END_OF_SEQUENCE,
+            stop_reason: EvaluateStopReason::STOP_TOKEN,
+            matched_stop_token_id: Some(7),
             text_artifact: Digest::from_bytes([4; 32]),
             usage: EvaluateUsage {
                 input_units: 7,
@@ -437,6 +533,7 @@ mod tests {
             .finish(EvaluateTerminal {
                 final_position: 1,
                 stop_reason: EvaluateStopReason::MAX_OUTPUT,
+                matched_stop_token_id: None,
                 text_artifact: Digest::from_bytes([4; 32]),
                 usage: EvaluateUsage {
                     input_units: 0,
@@ -447,7 +544,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(events[0], prefix[0]);
-        verify_terminal_continuation(TEST_ASSURANCE, &prefix, &events).unwrap();
+        verify_output_events_for_producer(input, TEST_ASSURANCE, &producer.public_key(), &events)
+            .unwrap();
     }
 
     #[test]
@@ -461,7 +559,8 @@ mod tests {
             builder
                 .finish(EvaluateTerminal {
                     final_position: 2,
-                    stop_reason: EvaluateStopReason::END_OF_SEQUENCE,
+                    stop_reason: EvaluateStopReason::STOP_TOKEN,
+                    matched_stop_token_id: Some(7),
                     text_artifact: Digest::from_bytes([4; 32]),
                     usage: EvaluateUsage {
                         input_units: 0,
@@ -475,5 +574,38 @@ mod tests {
                 actual: 2
             }
         ));
+    }
+
+    #[test]
+    fn terminal_stop_reason_requires_exact_witness_shape() {
+        let usage = EvaluateUsage {
+            input_units: 0,
+            output_units: 0,
+        };
+        let mut terminal = EvaluateTerminal {
+            final_position: 0,
+            stop_reason: EvaluateStopReason::STOP_TOKEN,
+            matched_stop_token_id: None,
+            text_artifact: Digest::from_bytes([4; 32]),
+            usage,
+            billable_units: 0,
+        };
+        assert!(matches!(
+            validate_terminal(&terminal),
+            Err(EvaluateProtocolError::MissingMatchedStopTokenId)
+        ));
+
+        terminal.stop_reason = EvaluateStopReason::MAX_OUTPUT;
+        terminal.matched_stop_token_id = Some(7);
+        assert!(matches!(
+            validate_terminal(&terminal),
+            Err(EvaluateProtocolError::UnexpectedMatchedStopTokenId { token_id: 7 })
+        ));
+
+        terminal.stop_reason = EvaluateStopReason::STOP_TOKEN;
+        assert!(validate_terminal(&terminal).is_ok());
+        terminal.stop_reason = EvaluateStopReason::MAX_OUTPUT;
+        terminal.matched_stop_token_id = None;
+        assert!(validate_terminal(&terminal).is_ok());
     }
 }

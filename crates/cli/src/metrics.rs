@@ -34,7 +34,10 @@ impl MetricsBundle {
 }
 
 pub fn spawn_metrics_server(port: u16, bundle: MetricsBundle) {
-    let addr: SocketAddr = ([0, 0, 0, 0], port).into();
+    // Metrics carry provider activity and have no authentication. Keep the
+    // default surface local; operators can publish it through their monitored
+    // host rather than silently exposing it on every network interface.
+    let addr = metrics_address(port);
     let bundle = Arc::new(bundle);
 
     tokio::spawn(async move {
@@ -72,6 +75,10 @@ pub fn spawn_metrics_server(port: u16, bundle: MetricsBundle) {
     });
 }
 
+fn metrics_address(port: u16) -> SocketAddr {
+    ([127, 0, 0, 1], port).into()
+}
+
 fn encode_metrics(bundle: &MetricsBundle) -> Result<String, std::fmt::Error> {
     let mut buf = String::new();
     encode(&mut buf, &bundle.prometheus)?;
@@ -103,3 +110,15 @@ fn append_iroh_metrics(buf: &mut String, bundle: &MetricsBundle) {
 
 #[cfg(not(feature = "otel"))]
 fn append_iroh_metrics(_buf: &mut String, _bundle: &MetricsBundle) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unauthenticated_metrics_bind_only_to_loopback() {
+        let address = metrics_address(9400);
+        assert!(address.ip().is_loopback());
+        assert_eq!(address.port(), 9400);
+    }
+}

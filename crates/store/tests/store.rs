@@ -6,11 +6,11 @@
 //! list, because that is the half that makes a partial fetch
 //! verifiable.
 
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use hellas_store::{ContentStore, Substituter};
+use hellas_store::{ContentStore, StoreError, Substituter};
 use hellas_xet::{XetHash, file_hash};
 
 fn bytes(len: usize, seed: u64) -> Vec<u8> {
@@ -166,6 +166,68 @@ fn adoption_indexes_regular_files_and_nothing_else() {
     );
 }
 
+/// Explicit paths may follow a symlink to ordinary content, but neither that
+/// convenience nor the adoption walk's earlier `file_type` observation may
+/// turn a FIFO or device into a blocking content read.
+#[cfg(unix)]
+#[test]
+fn explicit_indexing_opens_only_regular_file_descriptors() {
+    let fixture = Fixture::new("explicit-file-types");
+    let content = b"ordinary content reached through a symlink";
+    let target = fixture.write("blobs/ordinary", content);
+    let regular_link = fixture.0.join("regular-link");
+    std::os::unix::fs::symlink(&target, &regular_link).expect("regular symlink");
+    let store = ContentStore::new();
+    let indexed = store
+        .index(&regular_link)
+        .expect("an explicit symlink to a regular file remains supported");
+    assert_eq!(indexed.id, XetHash::hash(content));
+
+    let fifo = fixture.0.join("pipe");
+    let status = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("mkfifo");
+    assert!(status.success(), "the fixture needs a fifo");
+    let fifo_link = fixture.0.join("fifo-link");
+    std::os::unix::fs::symlink(&fifo, &fifo_link).expect("fifo symlink");
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(ContentStore::new().index(&fifo_link));
+    });
+    let error = receiver
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("indexing blocked while opening a FIFO")
+        .expect_err("a FIFO is not content");
+    assert!(
+        matches!(error, StoreError::Read { source, .. } if source.kind() == std::io::ErrorKind::InvalidInput)
+    );
+
+    let fifo_replacement = fixture.0.join("fifo-replacement");
+    std::os::unix::fs::symlink(&fifo, &fifo_replacement).expect("replacement symlink");
+    std::fs::rename(&fifo_replacement, &regular_link).expect("replace indexed path");
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(store.open_verified(indexed.id, indexed.len));
+    });
+    let error = receiver
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("opening an indexed path blocked on its FIFO replacement")
+        .expect_err("a FIFO replacement is not verified content");
+    assert!(
+        matches!(error, StoreError::Read { source, .. } if source.kind() == std::io::ErrorKind::InvalidInput)
+    );
+
+    if Path::new("/dev/zero").exists() {
+        let error = ContentStore::new()
+            .index(Path::new("/dev/zero"))
+            .expect_err("a character device is not content");
+        assert!(
+            matches!(error, StoreError::Read { source, .. } if source.kind() == std::io::ErrorKind::InvalidInput)
+        );
+    }
+}
+
 /// A HuggingFace cache is littered with things that are not content.
 /// Indexing them would put ids of lock files and half-downloads into a
 /// store whose whole value is that an id means the bytes.
@@ -236,10 +298,121 @@ fn a_substituter_can_answer_for_content_the_store_lacks() {
     assert!(store.have(id));
     assert_eq!(store.locate(id).as_deref(), Some(path.as_path()));
     assert!(!store.have(XetHash::hash(b"something else")));
+
+    let verified = store
+        .open_verified(id, content.len() as u64)
+        .expect("verify the substituter hit")
+        .expect("the content is local");
+    assert_eq!(verified.id(), id);
+    assert_eq!(verified.len(), content.len() as u64);
+    assert!(!verified.is_empty());
+    let mut file = verified.into_file();
+    let mut read = Vec::new();
+    file.read_to_end(&mut read)
+        .expect("read verified descriptor");
+    assert_eq!(read, content);
+    assert_eq!(
+        store.records().remembered(),
+        1,
+        "a substituter's answer must be indexed before it is lent",
+    );
+}
+
+/// Opening an entry the store already indexed is an identity check, not a
+/// second content hash.
+#[test]
+fn opening_unchanged_indexed_content_does_not_rehash_it() {
+    let fixture = Fixture::new("open-without-rehash");
+    let content = bytes(200_000, 41);
+    let path = fixture.write("weights.bin", &content);
+    let store = ContentStore::new();
+    let indexed = store.index(&path).expect("index");
+
+    // Emptying fast-resume makes an accidental call back through `index`
+    // observable: it would hash the file and repopulate this table.
+    store.records().force_recheck();
+    assert_eq!(store.records().remembered(), 0);
+    let verified = store
+        .open_verified(indexed.id, indexed.len)
+        .expect("open")
+        .expect("indexed content");
+
+    assert_eq!(verified.id(), indexed.id);
+    assert_eq!(store.records().remembered(), 0, "must not hash again");
+}
+
+/// Length is part of the lending contract, even when the id itself is known.
+#[test]
+fn opening_verified_content_refuses_the_wrong_length() {
+    let fixture = Fixture::new("wrong-open-length");
+    let content = bytes(20_000, 42);
+    let path = fixture.write("weights.bin", &content);
+    let store = ContentStore::new();
+    let indexed = store.index(&path).expect("index");
+
+    assert!(matches!(
+        store.open_verified(indexed.id, indexed.len + 1),
+        Err(StoreError::WrongLength {
+            expected,
+            actual,
+            ..
+        }) if expected == indexed.len + 1 && actual == indexed.len
+    ));
+}
+
+/// Content-addressed metadata has no redundant declared length, but its
+/// decoder's allocation budget must be enforced before bytes are read.
+#[test]
+fn opening_verified_content_with_a_bound_refuses_oversize_files() {
+    let fixture = Fixture::new("bounded-open");
+    let content = bytes(20_000, 43);
+    let path = fixture.write("environment.cbor", &content);
+    let store = ContentStore::new();
+    let indexed = store.index(&path).expect("index");
+
+    let verified = store
+        .open_verified_bounded(indexed.id, indexed.len)
+        .expect("open at the bound")
+        .expect("indexed content");
+    assert_eq!(verified.len(), indexed.len);
+
+    assert!(matches!(
+        store.open_verified_bounded(indexed.id, indexed.len - 1),
+        Err(StoreError::TooLarge {
+            maximum,
+            actual,
+            ..
+        }) if maximum == indexed.len - 1 && actual == indexed.len
+    ));
+}
+
+/// A substituter supplies a candidate path, never evidence that the bytes at
+/// that path have the id it claimed.
+#[test]
+fn opening_verified_content_refuses_a_lying_substituter() {
+    struct Lying(XetHash, PathBuf);
+    impl Substituter for Lying {
+        fn name(&self) -> &str {
+            "lying"
+        }
+        fn locate(&self, id: XetHash) -> Option<PathBuf> {
+            (id == self.0).then(|| self.1.clone())
+        }
+    }
+
+    let fixture = Fixture::new("lying-open-substituter");
+    let wanted = XetHash::hash(b"the requested weights");
+    let other = b"a different set of weights";
+    let path = fixture.write("elsewhere.bin", other);
+    let store = ContentStore::new().with_substituter(Arc::new(Lying(wanted, path)));
+
+    assert!(matches!(
+        store.open_verified(wanted, other.len() as u64),
+        Err(StoreError::WrongContent { .. })
+    ));
 }
 
 /// `have` must not claim content that has been deleted underneath it.
-/// A quote answered on a stale entry commits to weights that are gone.
 #[test]
 fn have_is_false_once_the_file_is_gone() {
     let fixture = Fixture::new("vanish");

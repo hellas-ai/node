@@ -1,42 +1,20 @@
 {
   "nodes": {
-    "catgrad": {
-      "inputs": {
-        "flake-utils": "flake-utils",
-        "nixpkgs": [
-          "nixpkgs"
-        ]
-      },
+    "catena-lang": {
+      "flake": false,
       "locked": {
-        "lastModified": 1781073667,
-        "narHash": "sha256-0ylGTfMbQ2rbOrvrpWshzZeMuVbWAC3uEHwbcGQ+WJE=",
-        "owner": "hellas-ai",
-        "repo": "catgrad",
-        "rev": "7629a506680fdd9380706bd31b43017d1bf153fc",
-        "type": "github"
+        "lastModified": 1788196629,
+        "narHash": "sha256-kB9Xj8JItEd3mGuVK7MNIfzxoApKb/6FV4TUeSNdpaI=",
+        "ref": "grw/hellas-safe-runtime",
+        "rev": "be373057d9e974c1cae0c5b8cc93238ae79104ef",
+        "revCount": 271,
+        "type": "git",
+        "url": "file:../catena-lang"
       },
       "original": {
-        "owner": "hellas-ai",
-        "repo": "catgrad",
-        "type": "github"
-      }
-    },
-    "flake-utils": {
-      "inputs": {
-        "systems": "systems"
-      },
-      "locked": {
-        "lastModified": 1731533236,
-        "narHash": "sha256-l0KFg5HjrsfsO/JpG+r7fRrqm12kzFHyUHqHCVpMMbI=",
-        "owner": "numtide",
-        "repo": "flake-utils",
-        "rev": "11707dc2f618dd54ca8739b309ec4fc024de578b",
-        "type": "github"
-      },
-      "original": {
-        "owner": "numtide",
-        "repo": "flake-utils",
-        "type": "github"
+        "ref": "grw/hellas-safe-runtime",
+        "type": "git",
+        "url": "file:../catena-lang"
       }
     },
     "nixpkgs": {
@@ -73,7 +51,7 @@
     },
     "root": {
       "inputs": {
-        "catgrad": "catgrad",
+        "catena-lang": "catena-lang",
         "nixpkgs": "nixpkgs",
         "rust-overlay": "rust-overlay"
       }
@@ -93,21 +71,6 @@
       "original": {
         "owner": "oxalica",
         "repo": "rust-overlay",
-        "type": "github"
-      }
-    },
-    "systems": {
-      "locked": {
-        "lastModified": 1681028828,
-        "narHash": "sha256-Vy1rq5AaRuLzOxct8nz4T6wlgyUR7zLU309k9mBC768=",
-        "owner": "nix-systems",
-        "repo": "default",
-        "rev": "da67096a3b9bf56a91d16901293e51ba5b49a27e",
-        "type": "github"
-      },
-      "original": {
-        "owner": "nix-systems",
-        "repo": "default",
         "type": "github"
       }
     }

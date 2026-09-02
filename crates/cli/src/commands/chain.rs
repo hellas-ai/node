@@ -262,6 +262,9 @@ pub enum ValidatorCommand {
         /// Prometheus metrics port
         #[arg(long)]
         metrics_port: Option<u16>,
+        /// Direct light-client RPC bind address
+        #[arg(long)]
+        light_client_bind: Option<std::net::SocketAddr>,
         /// Canonical genesis JSON; validator identities must match --seed
         #[arg(long)]
         genesis: Option<PathBuf>,
@@ -466,7 +469,8 @@ async fn run_open(args: OpenArgs) -> CliResult {
     if let Some(path) = args.terms_out {
         write_terms(&path, &terms)?;
     }
-    client.submit_tx(Transaction::Kernel(tx)).await?;
+    let outcome = client.submit_tx(Transaction::Kernel(tx)).await?;
+    println!("{outcome}");
 
     println!("edge_id {}", hex::encode(edge_id.to_bytes()));
     println!("terms_hash {}", hex::encode(terms.hash().to_bytes()));
@@ -521,7 +525,7 @@ async fn run_close(args: CloseArgs) -> CliResult {
             if terms.hash() != edge.terms_hash {
                 anyhow::bail!("terms file does not match the live edge commitment");
             }
-            if terms.timeout_outputs() != &outputs {
+            if terms.timeout_outputs() != Some(&outputs) {
                 anyhow::bail!("timeout payouts do not match the committed Terms file");
             }
             Proof::timeout(terms)
@@ -529,9 +533,10 @@ async fn run_close(args: CloseArgs) -> CliResult {
     };
 
     let output_ids = Tx::close_output_ids(edge_id, &outputs);
-    client
+    let outcome = client
         .submit_tx(Transaction::Kernel(Tx::close(edge_id, proof, outputs)))
         .await?;
+    println!("{outcome}");
     println!("edge_id {}", hex::encode(edge_id.to_bytes()));
     for output_id in output_ids {
         println!("payout_id {}", hex::encode(output_id.to_bytes()));
@@ -783,6 +788,7 @@ async fn run_validator(command: ValidatorCommand) -> CliResult {
             addresses,
             relay_urls,
             metrics_port,
+            light_client_bind,
             genesis,
             genesis_allocations,
         } => hellas_chain::validator::Command::Config {
@@ -793,6 +799,7 @@ async fn run_validator(command: ValidatorCommand) -> CliResult {
             addresses,
             relay_urls,
             metrics_port,
+            light_client_bind,
             genesis,
             genesis_allocations,
         },

@@ -48,13 +48,13 @@ let
     validator: index:
     let
       cli = getExe validator.package;
-      addressesFlag = optionalString (validator.addresses != [ ]) (
-        "--addresses ${escapeShellArg (concatStringsSep "," validator.addresses)}"
-      );
+      addressesFlag = optionalString (
+        validator.addresses != [ ]
+      ) "--addresses ${escapeShellArg (concatStringsSep "," validator.addresses)}";
       seedFlag = optionalString (validator.seed != null) "--seed ${toString validator.seed}";
-      genesisFlag = optionalString (validator.genesis != null) (
-        "--genesis ${escapeShellArg validator.genesis}"
-      );
+      genesisFlag = optionalString (
+        validator.genesis != null
+      ) "--genesis ${escapeShellArg validator.genesis}";
       relayFlags = concatStringsSep " " (
         map (url: "--relay-url ${escapeShellArg url}") validator.relayUrls
       );
@@ -270,10 +270,7 @@ in
               serviceName = "hellas-validator-${name}-node${toString index}";
               stateDirectory = "hellas-validator-${name}/node${toString index}";
               usesRuntimeConfig = validator.runtimeConfigFiles != [ ];
-              configFile =
-                if usesRuntimeConfig
-                then "%d/validator-config"
-                else mkConfigFile validator index;
+              configFile = if usesRuntimeConfig then "%d/validator-config" else mkConfigFile validator index;
             in
             {
               name = serviceName;

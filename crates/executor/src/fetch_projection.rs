@@ -1,6 +1,7 @@
 use thiserror::Error;
 
-use crate::fetch_provider::FetchProviderRequest;
+use crate::fetch_provider::{FetchCall, FetchProviderResponseHead, PreparedFetchRequest};
+use hellas_rpc::ContentId;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProjectedFetch {
@@ -17,7 +18,7 @@ pub struct FetchRequestView {
 }
 
 impl FetchRequestView {
-    pub fn from_provider_request(request: &FetchProviderRequest) -> Self {
+    pub fn from_call(request: &FetchCall) -> Self {
         Self {
             service: request.service.clone(),
             method: request.method.clone(),
@@ -27,31 +28,54 @@ impl FetchRequestView {
     }
 }
 
-pub struct FetchProjectionSession {
+pub struct FetchAdaptorSession {
     pub request_view: FetchRequestView,
+    /// Provider-only request constructed inside the trusted Fetch app.
+    pub provider_request: PreparedFetchRequest,
     pub projector: Box<dyn FetchProjector>,
 }
 
 pub trait FetchProjector: Send + Sync + 'static {
-    fn project(&mut self, bytes: &[u8]) -> Result<Vec<ProjectedFetch>, FetchProjectionError>;
-    fn finish(&mut self) -> Result<Vec<ProjectedFetch>, FetchProjectionError>;
+    /// Receive the closed semantic HTTP response head before body projection.
+    /// Adaptors that do not define a head contract reject populated claims so
+    /// adversarial upstream claims can never disappear silently.
+    fn begin(
+        &mut self,
+        head: FetchProviderResponseHead,
+    ) -> Result<Vec<ProjectedFetch>, FetchAdaptorError> {
+        if head.is_empty() {
+            Ok(Vec::new())
+        } else {
+            Err(FetchAdaptorError::failed(
+                "fetch projector does not accept response-head claims",
+            ))
+        }
+    }
+
+    fn project(&mut self, bytes: &[u8]) -> Result<Vec<ProjectedFetch>, FetchAdaptorError>;
+    fn finish(&mut self) -> Result<Vec<ProjectedFetch>, FetchAdaptorError>;
 }
 
-pub trait FetchProjectorFactory: Send + Sync + 'static {
-    fn create(
-        &self,
-        request: &FetchProviderRequest,
-    ) -> Result<FetchProjectionSession, FetchProjectionError>;
+pub trait FetchAdaptorFactory: Send + Sync + 'static {
+    /// The complete manifest commitment for the exact structuring,
+    /// destructuring, and trusted config implemented by this factory.
+    ///
+    /// A route derives its quoted execution environment from this method; an
+    /// operator cannot pair this adaptor with a separately claimed
+    /// environment identity.
+    fn execution_environment(&self) -> ContentId;
+
+    fn create(&self, request: &FetchCall) -> Result<FetchAdaptorSession, FetchAdaptorError>;
 }
 
-/// A projection error always means projection actually failed. Routing
-/// happens in [`crate::FetchRouteRegistry`] before a projector is created,
-/// so there is no "not my route" rejection variant.
+/// Request construction or response projection failed inside the selected
+/// trusted adaptor. Routing happens before the adaptor is created, so there is
+/// no "not my route" rejection variant.
 #[derive(Debug, Error)]
-#[error("fetch projection failed: {0}")]
-pub struct FetchProjectionError(String);
+#[error("fetch adaptor failed: {0}")]
+pub struct FetchAdaptorError(String);
 
-impl FetchProjectionError {
+impl FetchAdaptorError {
     pub fn failed(message: impl Into<String>) -> Self {
         Self(message.into())
     }

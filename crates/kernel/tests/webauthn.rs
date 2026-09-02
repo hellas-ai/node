@@ -12,9 +12,8 @@ mod support;
 
 use hellas_kernel::{
     ApplyError, Auth, BlockHash, BlockHeight, CoinId, Context, Funding, Genesis, InvalidOpenReason,
-    Key, List, MAX_EDGE_OUTPUTS, Parties, PayloadHash, Payout, ProtocolCode, Seal,
-    SealPublicInputs, SealVerifier, Sig, SigVerifier, SoftPasskey, Terms, Tx,
-    verify_webauthn_assertion,
+    Key, List, MAX_EDGE_OUTPUTS, Parties, PayloadHash, Payout, ProtocolCode, Sig, SigVerifier,
+    SoftPasskey, Terms, Tx, verify_webauthn_assertion,
 };
 use support::{FixedStore, coin_id, list, state};
 
@@ -43,12 +42,6 @@ impl SigVerifier for MixedVerifier {
                 verify_webauthn_assertion(assertion, party_key, hash).is_ok()
             }
         }
-    }
-}
-
-impl SealVerifier for MixedVerifier {
-    fn verify_seal(&self, _seal: Seal, _public: &SealPublicInputs<'_>) -> bool {
-        false
     }
 }
 

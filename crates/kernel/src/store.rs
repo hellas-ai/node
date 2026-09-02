@@ -1,18 +1,39 @@
 //! Object-store boundary.
 //!
-//! The store presents a typed transactional view over coin and edge slots.
-//! Storage representation is left to the implementation; the kernel only ever
-//! addresses slots through their typed identifier.
+//! The store presents a typed transactional view over coin, edge, and
+//! registry-chunk slots. Storage representation is left to the
+//! implementation; the kernel only ever addresses slots through their
+//! typed identifier.
 //!
-//! Abstract counterpart: the store atomicity / read-isolation assumptions
-//! in `models/deps/assumptions.qnt`. The Quint model captures atomicity by
-//! updating all primed variables in one `action` block; this trait is the
-//! Rust contract callers must honor for that abstraction to hold.
+//! Registry chunks share this one store rather than getting their own.
+//! They are consensus state, so they have to live under the same
+//! authenticated root as coins and edges; a second store beside this one
+//! would be state consensus agrees on but does not commit to.
+//!
+//! # Assumed of the implementation
+//!
+//! Two premises the kernel takes on faith. They are not properties this
+//! crate establishes; they are the contract an implementation must
+//! honour, and every correctness argument that reads this store stops
+//! applying if one is violated.
+//!
+//! - **Transactions are atomic.** All writes staged in one [`Batch`]
+//!   commit together or none commit at all. The kernel relies on this to
+//!   roll back a rejected operation; `models/l1.qnt` captures the same
+//!   thing by updating every primed variable inside one `action` block.
+//!   Violation: a partially applied operation, which no abstract state
+//!   of any model here can represent.
+//! - **Slot reads observe the working transaction.** A read through a
+//!   [`Batch`] sees that batch's own staged writes and no concurrent
+//!   modification from elsewhere. The kernel's two-phase validate-then-
+//!   fold depends on it. The abstract models have no concurrency, so
+//!   this holds there trivially and is checked nowhere.
 
 use crate::{
     error::{InsertError, KernelResult},
     object::{Coin, Edge},
     primitive::{CoinId, EdgeId},
+    registry::{RegistryChunk, RegistryChunkId},
 };
 
 /// Storage boundary for on-chain objects.
@@ -60,6 +81,28 @@ pub trait Batch {
 
     /// Removes and returns the edge stored under `id`, if any.
     fn remove_edge(&mut self, id: EdgeId) -> Option<Edge>;
+
+    /// Returns the registry chunk stored under `id`, if any.
+    fn registry_chunk(&self, id: RegistryChunkId) -> Option<RegistryChunk>;
+
+    /// Inserts `chunk` under `id`.
+    ///
+    /// Replacing a chunk is a remove followed by an insert, not an
+    /// overwrite: the same two steps a coin or edge slot takes, so one
+    /// slot rule covers all three object kinds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InsertError::Exists`] if `id` is already occupied, or
+    /// [`InsertError::Unavailable`] if the store cannot accept `id`.
+    fn insert_registry_chunk(
+        &mut self,
+        id: RegistryChunkId,
+        chunk: RegistryChunk,
+    ) -> KernelResult<(), InsertError>;
+
+    /// Removes and returns the registry chunk stored under `id`, if any.
+    fn remove_registry_chunk(&mut self, id: RegistryChunkId) -> Option<RegistryChunk>;
 
     /// Commits staged mutations to the backing store.
     fn commit(self);

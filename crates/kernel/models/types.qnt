@@ -2,8 +2,8 @@
 //
 // Common type vocabulary for the L1 abstract model.
 //
-// These ADTs are pure values shared across `verifier.qnt`, `deps/`, `rules/`,
-// and `l1.qnt` itself. They mirror the Rust kernel's public types one-to-one:
+// These ADTs are pure values shared across `verifier.qnt`, `rules/`, and
+// `l1.qnt` itself. They mirror the Rust kernel's public types one-to-one:
 //
 //   Coin   ↔ src/object.rs::Coin       (live coin id, abstracted to a tag)
 //   Edge   ↔ src/object.rs::Edge       (live edge id, abstracted to a tag)
@@ -69,13 +69,12 @@ module types {
       | TakerOut2 => Taker
     }
 
-  // Close witness kind. The kernel admits exactly these three shapes; all
-  // close-validity policy (terms binding, height, payout shape, signature,
-  // seal) lives in the verifier.
+  // Close witness kind of a generic bilateral edge. The kernel admits
+  // exactly these two shapes; all close-validity policy (terms binding,
+  // height, payout shape, signature) lives in the verifier.
   type Proof =
     | Mutual
     | Timeout
-    | Violation
 
   // The action that produced the current state. `NoInput` marks the initial
   // state; every other action records its input here. The Rust ITF runner
@@ -119,7 +118,7 @@ module types {
     TakerOut2,
   )
   pure val AllEdges = Set(Edge1, Edge2)
-  pure val AllProofs = Set(Mutual, Timeout, Violation)
+  pure val AllProofs = Set(Mutual, Timeout)
   pure val AllParties = Set(Maker, Taker, Adversary)
 
   // Concrete model parameters. Picked small for finite exploration.

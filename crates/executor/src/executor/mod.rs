@@ -3,18 +3,12 @@ mod handle;
 
 use crate::ExecutorError;
 #[cfg(feature = "evaluate")]
-use hellas_rpc::Dtype;
+use crate::worker::WorkerCompletion;
 use hellas_rpc::pb::courtesy::{
-    GetArtifactRequest, GetArtifactResponse, GetModelStatsRequest, GetModelStatsResponse,
-    GetStatsResponse, ListModelsResponse, PutArtifactRequest, PutArtifactResponse,
-    QuoteChatPromptRequest, QuoteChatPromptResponse, QuotePreparedTextRequest,
-    QuotePreparedTextResponse, QuotePromptRequest, QuotePromptResponse,
+    GetArtifactRequest, GetArtifactResponse, GetStatsResponse, QuoteResponse, QuoteTokensRequest,
 };
 use hellas_rpc::pb::evaluate::EvaluateRequest as PbEvaluateRequest;
-use hellas_rpc::pb::execute::{
-    ReceiptRequest, ReceiptResponse, RunTicketRequest, SettleRequest, SettleResponse, Ticket,
-    WorkEvent,
-};
+use hellas_rpc::pb::execute::{RunTicketRequest, Ticket, WorkEvent};
 use hellas_rpc::pb::fetch::FetchRequest as PbFetchRequest;
 use hellas_rpc::provenance::ExecutionProvenance;
 use hellas_rpc::{Assurance, InputCommitment, OutputEventEnvelope, ProducerSigningKey};
@@ -22,9 +16,11 @@ use hellas_wire::WireStatus;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
+#[cfg(all(test, feature = "evaluate"))]
+use crate::evaluate::EvaluateJob;
 use crate::fetch_policy::FetchQuotaReservation;
 use crate::fetch_projection::FetchProjector;
-use crate::fetch_provider::{FetchProvider, FetchProviderError, FetchProviderRequest};
+use crate::fetch_provider::{FetchProvider, FetchProviderError, PreparedFetchRequest};
 pub use actor::{Executor, ExecutorSpawnConfig};
 
 #[derive(Clone)]
@@ -36,7 +32,7 @@ pub(crate) struct ProviderContext {
 
 /// Per-execution receiver returned to the streaming `Execute` consumer.
 /// Dropping it closes the matching sender held by the worker, which the
-/// worker observes on its next chunk send and converts into a cancel.
+/// worker observes on its next chunk send and reports as an execution failure.
 pub(crate) type ExecuteEventReceiver = mpsc::Receiver<Result<WorkEvent, WireStatus>>;
 
 /// Quote response paired with the provenance the executor committed to.
@@ -59,7 +55,12 @@ pub struct ExecuteOutcome {
     pub events: ExecuteEventReceiver,
 }
 
-pub(crate) enum ExecutorMessage {
+/// Requests entering the executor actor from its in-process clients.
+///
+/// The channel carrying these is bounded because most senders are ultimately
+/// driven by peers. Completion notifications use a separate channel: an
+/// adversary filling this mailbox must not prevent accepted work from retiring.
+pub(crate) enum ExecutorRequest {
     QuoteEvaluate {
         request: PbEvaluateRequest,
         reply: oneshot::Sender<Result<TicketOutcome<Ticket>, ExecutorError>>,
@@ -68,29 +69,13 @@ pub(crate) enum ExecutorMessage {
         request: PbFetchRequest,
         reply: oneshot::Sender<Result<TicketOutcome<Ticket>, ExecutorError>>,
     },
-    QuotePrompt {
-        request: QuotePromptRequest,
-        reply: oneshot::Sender<Result<TicketOutcome<QuotePromptResponse>, ExecutorError>>,
-    },
-    QuotePreparedText {
-        request: QuotePreparedTextRequest,
-        reply: oneshot::Sender<Result<TicketOutcome<QuotePreparedTextResponse>, ExecutorError>>,
-    },
-    QuoteChatPrompt {
-        request: QuoteChatPromptRequest,
-        reply: oneshot::Sender<Result<TicketOutcome<QuoteChatPromptResponse>, ExecutorError>>,
-    },
-    PutArtifact {
-        request: PutArtifactRequest,
-        reply: oneshot::Sender<Result<PutArtifactResponse, ExecutorError>>,
+    QuoteTokens {
+        request: QuoteTokensRequest,
+        reply: oneshot::Sender<Result<TicketOutcome<QuoteResponse>, ExecutorError>>,
     },
     GetArtifact {
         request: GetArtifactRequest,
         reply: oneshot::Sender<Result<GetArtifactResponse, ExecutorError>>,
-    },
-    MaterializeModel {
-        model: String,
-        reply: oneshot::Sender<Result<(), ExecutorError>>,
     },
     /// Single streaming entry point: validate the quote, accept the job
     /// (queueing if the worker is busy), and return a Receiver wired to
@@ -99,35 +84,51 @@ pub(crate) enum ExecutorMessage {
         request: RunTicketRequest,
         reply: oneshot::Sender<Result<ExecuteOutcome, ExecutorError>>,
     },
-    /// Staked flow: sign the in-flight job's acceptance and terminal
-    /// result so the client can hold a fraud artifact.
-    Receipt {
-        request: ReceiptRequest,
-        reply: oneshot::Sender<Result<ReceiptResponse, ExecutorError>>,
-    },
-    /// Staked flow: the chain reached `height`. Time-based obligations
-    /// (closing an expired channel, releasing an abandoned job) are driven
-    /// by chain progress, never by a wall clock.
-    StakedHeight(hellas_kernel::BlockHeight),
-    /// Staked flow: settle the in-flight job with the client's frontier
-    /// voucher, releasing the serialization lock.
-    Settle {
-        request: SettleRequest,
-        reply: oneshot::Sender<Result<SettleResponse, ExecutorError>>,
-    },
-    #[cfg(feature = "evaluate")]
-    SchemeFinished(Box<dyn crate::scheme::SchemeCompletion>),
-    FetchFinished(FetchCompletion),
-    ListModels {
-        reply: oneshot::Sender<Result<ListModelsResponse, ExecutorError>>,
-    },
     GetStats {
         reply: oneshot::Sender<Result<GetStatsResponse, ExecutorError>>,
     },
-    GetModelStats {
-        request: GetModelStatsRequest,
-        reply: oneshot::Sender<Result<GetModelStatsResponse, ExecutorError>>,
+    #[cfg(all(test, feature = "evaluate"))]
+    StartEvaluateForTest {
+        job: Box<EvaluateJob>,
+        execution_id: String,
+        request_commitment: [u8; 32],
+        reply: oneshot::Sender<Result<ExecuteOutcome, ExecutorError>>,
     },
+    #[cfg(all(test, feature = "evaluate"))]
+    BarrierForTest {
+        entered: oneshot::Sender<()>,
+        release: oneshot::Receiver<()>,
+    },
+}
+
+/// Trusted work whose invocation has already been made durable by its owner.
+///
+/// This has a distinct bounded ingress so peer RPC traffic cannot delay its
+/// admission past queued best-effort execution.
+pub(crate) enum ExecutorOwedRequest {
+    /// Start one already-authorized paid job.
+    ///
+    /// No ticket, no quote, and no admission of its own: the paid endpoint
+    /// decided this invocation was owed and made that decision durable before
+    /// this message was sent.
+    RunPaidEvaluate {
+        input: Box<hellas_rpc::work::PreparedEvaluateInput>,
+        reply: oneshot::Sender<Result<ExecuteOutcome, ExecutorError>>,
+    },
+    #[cfg(all(test, feature = "evaluate"))]
+    StartEvaluateForTest {
+        job: Box<EvaluateJob>,
+        execution_id: String,
+        request_commitment: [u8; 32],
+        reply: oneshot::Sender<Result<ExecuteOutcome, ExecutorError>>,
+    },
+}
+
+/// Trusted notifications from the bounded set of active execution producers.
+pub(crate) enum ExecutorCompletion {
+    #[cfg(feature = "evaluate")]
+    EvaluateFinished(Box<WorkerCompletion>),
+    FetchFinished(Box<FetchCompletion>),
 }
 
 pub(crate) struct FetchCompletion {
@@ -135,7 +136,7 @@ pub(crate) struct FetchCompletion {
     pub request_commitment_id: [u8; 32],
     pub quota_reservation: Option<FetchQuotaReservation>,
     pub execution_id: String,
-    pub model_id: String,
+    pub metric_name: String,
     pub sender: ExecuteEventReceiverSender,
     pub result: Result<FetchProviderRun, FetchProviderFailure>,
 }
@@ -144,6 +145,7 @@ pub(crate) type ExecuteEventReceiverSender = mpsc::Sender<Result<WorkEvent, Wire
 
 pub(crate) struct FetchProviderRun {
     pub output_events: Vec<OutputEventEnvelope>,
+    pub position: u64,
 }
 
 pub(crate) struct FetchProviderFailure {
@@ -152,7 +154,7 @@ pub(crate) struct FetchProviderFailure {
 }
 
 pub(crate) struct PendingFetch {
-    pub request: FetchProviderRequest,
+    pub request: PreparedFetchRequest,
     pub provider: Arc<dyn FetchProvider>,
     pub projector: Box<dyn FetchProjector>,
     pub quota_reservation: Option<FetchQuotaReservation>,
@@ -160,13 +162,12 @@ pub(crate) struct PendingFetch {
     pub assurance: Assurance,
     pub request_commitment_id: [u8; 32],
     pub execution_id: String,
-    pub model_id: String,
+    pub metric_name: String,
     pub sender: ExecuteEventReceiverSender,
 }
 
 #[derive(Clone)]
 pub struct ExecutorHandle {
-    pub(super) tx: mpsc::UnboundedSender<ExecutorMessage>,
-    #[cfg(feature = "evaluate")]
-    pub(super) preferred_dtype: Dtype,
+    pub(super) tx: mpsc::Sender<ExecutorRequest>,
+    pub(super) owed_tx: mpsc::Sender<ExecutorOwedRequest>,
 }

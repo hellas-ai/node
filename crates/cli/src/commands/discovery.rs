@@ -1,9 +1,10 @@
 use anyhow::Context;
+#[cfg(feature = "evaluate")]
 use hellas_rpc::services::courtesy::Courtesy;
-use hellas_rpc::services::evaluate::Evaluate;
-use hellas_rpc::services::execute::Execute;
 use hellas_rpc::services::fetch::Fetch;
 use hellas_rpc::services::node::Node;
+use hellas_rpc::services::work::Work;
+use hellas_rpc::services::work_setup::WorkSetup;
 use hellas_wire::ServiceMarker;
 use hellas_wire::iroh::swarm::{DhtBackend, DhtPublisherConfig};
 use iroh::Endpoint;
@@ -26,19 +27,29 @@ impl DiscoveryAdvertiser {
             task,
         } = self;
         let _ = shutdown.send(());
+        // DHT publication is disposable discovery state, and an in-flight
+        // network write may not observe the signal promptly. Do not hold node
+        // shutdown behind it.
+        task.abort();
         let _ = task.await;
         drop(mdns);
     }
 }
 
-pub(crate) fn served_alpns() -> Vec<Vec<u8>> {
-    vec![
-        Execute::ALPN.as_bytes().to_vec(),
-        Evaluate::ALPN.as_bytes().to_vec(),
-        Fetch::ALPN.as_bytes().to_vec(),
-        Courtesy::ALPN.as_bytes().to_vec(),
+pub(crate) fn served_alpns(work_configured: bool) -> Vec<Vec<u8>> {
+    let mut alpns = vec![
         Node::ALPN.as_bytes().to_vec(),
-    ]
+        Fetch::ALPN.as_bytes().to_vec(),
+    ];
+    #[cfg(feature = "evaluate")]
+    alpns.push(Courtesy::ALPN.as_bytes().to_vec());
+    if work_configured {
+        alpns.extend([
+            WorkSetup::ALPN.as_bytes().to_vec(),
+            Work::ALPN.as_bytes().to_vec(),
+        ]);
+    }
+    alpns
 }
 
 pub(crate) fn start_server_advertising(
@@ -73,4 +84,52 @@ pub(crate) fn start_server_advertising(
         shutdown,
         task,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn execution_capabilities_match_the_compiled_node() {
+        #[cfg(feature = "evaluate")]
+        assert_eq!(
+            served_alpns(false),
+            [
+                Node::ALPN.as_bytes(),
+                Fetch::ALPN.as_bytes(),
+                Courtesy::ALPN.as_bytes(),
+            ]
+        );
+        #[cfg(not(feature = "evaluate"))]
+        assert_eq!(
+            served_alpns(false),
+            [Node::ALPN.as_bytes(), Fetch::ALPN.as_bytes()]
+        );
+    }
+
+    #[test]
+    fn work_config_advertises_exactly_both_work_alpns_with_node() {
+        #[cfg(feature = "evaluate")]
+        assert_eq!(
+            served_alpns(true),
+            [
+                Node::ALPN.as_bytes(),
+                Fetch::ALPN.as_bytes(),
+                Courtesy::ALPN.as_bytes(),
+                WorkSetup::ALPN.as_bytes(),
+                Work::ALPN.as_bytes(),
+            ]
+        );
+        #[cfg(not(feature = "evaluate"))]
+        assert_eq!(
+            served_alpns(true),
+            [
+                Node::ALPN.as_bytes(),
+                Fetch::ALPN.as_bytes(),
+                WorkSetup::ALPN.as_bytes(),
+                Work::ALPN.as_bytes(),
+            ]
+        );
+    }
 }

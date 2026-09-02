@@ -1,7 +1,7 @@
 //! Dev faucet: bridges P-256 genesis funds to secp256k1 coins.
 //!
 //! Genesis allocations on a dev chain are owned by P-256 (WebAuthn)
-//! settlement keys, but the staked payment/bond flow funds its edges
+//! settlement keys, but the work payment/bond flow funds its edges
 //! with secp256k1 kernel party keys. The kernel treats a coin owner and
 //! a party key as opaque 33-byte values — no curve check — so a single
 //! `Basic` edge bridges the two: the faucet's P-256 identity funds the
@@ -169,7 +169,8 @@ mod tests {
             let merkleized = batches.merkleize().await.expect("open merkleizes");
             database.finalize(merkleized).await;
 
-            let close = KernelTx::timeout_close(edge, &terms);
+            let close = KernelTx::timeout_close(edge, &terms)
+                .expect("faucet terms are basic and commit a timeout payout");
             let batches = execute_all(
                 context(TIMEOUT),
                 &verifier,
@@ -184,7 +185,12 @@ mod tests {
                 batches.get(&edge_object_id(edge)).await.expect("edge read"),
                 None,
             );
-            let ids = KernelTx::close_output_ids(edge, terms.timeout_outputs());
+            let ids = KernelTx::close_output_ids(
+                edge,
+                terms
+                    .timeout_outputs()
+                    .expect("faucet terms commit a timeout payout"),
+            );
             assert_eq!(
                 batches
                     .get(&coin_object_id(ids.as_slice()[0]))

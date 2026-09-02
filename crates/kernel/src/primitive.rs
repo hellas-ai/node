@@ -385,6 +385,13 @@ impl Decode for Sig {
 
 /// Compact chain-version-local protocol code.
 ///
+/// A deployment's own label on a [`crate::Terms::basic`] edge, carried in
+/// the terms preimage and therefore in the edge id. No kernel rule reads
+/// it: it separates one operator's Basic edges from another's — the
+/// faucet's from the CLI's — and that separation is the whole of its
+/// behaviour. It has no meaning on the work-payment or work-stake bodies,
+/// which do not carry it.
+///
 /// This is deliberately one byte in v1: protocol tags are scarce, governed hot
 /// path identifiers. Widening it changes terms commitments and requires a chain
 /// version boundary.
@@ -449,6 +456,20 @@ impl Party {
             0 => Some(Self::Maker),
             1 => Some(Self::Taker),
             _ => None,
+        }
+    }
+
+    /// Returns the settlement key `parties` assigns to this position.
+    ///
+    /// The work-channel roles *are* these positions — on a payment edge
+    /// the client is the maker and the provider is the taker — so one
+    /// closed enum names the signer of every payment-close action, and a
+    /// role that could not answer this question could not be checked.
+    #[must_use]
+    pub const fn key_of(self, parties: crate::object::Parties) -> Key {
+        match self {
+            Self::Maker => parties.maker(),
+            Self::Taker => parties.taker(),
         }
     }
 }

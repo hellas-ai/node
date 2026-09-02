@@ -2,16 +2,16 @@
 extern crate tracing;
 
 mod error;
-pub use error::{BackendInitError, ExecutorError, StateError};
+pub use error::{ExecutorError, StateError};
 
 #[cfg(feature = "evaluate")]
 mod artifact_store;
 #[cfg(feature = "evaluate")]
 mod artifacts;
 
-#[cfg(feature = "evaluate")]
-mod backend;
 mod chain;
+#[cfg(feature = "evaluate")]
+mod environment;
 #[cfg(feature = "evaluate")]
 mod evaluate;
 mod executor;
@@ -21,19 +21,17 @@ mod fetch_projection;
 mod fetch_provider;
 mod fetch_registry;
 mod metrics;
-#[cfg(feature = "evaluate")]
-mod model;
-mod scheme;
+mod private_fs;
 mod state;
+mod work;
 #[cfg(feature = "evaluate")]
 mod worker;
 
 #[cfg(feature = "evaluate")]
-pub use artifact_store::ArtifactStoreConfig;
-pub use chain::{
-    ChainView, FakeChainView, HeightStream, StakedProvider, acceptance_from_pb, acceptance_to_pb,
-    kernel_signer,
-};
+pub use artifact_store::{ArtifactStoreConfig, DEFAULT_EVALUATE_RETAINED_EXECUTION_CAPACITY};
+pub use chain::{ChainView, kernel_signer};
+#[cfg(feature = "evaluate")]
+pub use environment::{CausalLmEnvironmentSource, CausalLmEnvironmentSourceError};
 pub use executor::{Executor, ExecutorHandle, ExecutorSpawnConfig};
 pub use fetch::FetchTranscriptStoreBackend;
 pub use fetch_policy::{
@@ -42,19 +40,25 @@ pub use fetch_policy::{
     RouteSet, SpendLimit,
 };
 pub use fetch_projection::{
-    FetchProjectionError, FetchProjectionSession, FetchProjector, FetchProjectorFactory,
-    FetchRequestView, ProjectedFetch,
+    FetchAdaptorError, FetchAdaptorFactory, FetchAdaptorSession, FetchProjector, FetchRequestView,
+    ProjectedFetch,
 };
 pub use fetch_provider::{
-    FetchProvider, FetchProviderError, FetchProviderFuture, FetchProviderRequest,
-    FetchProviderStream, MockFetchProvider,
+    FetchCall, FetchProvider, FetchProviderError, FetchProviderFuture, FetchProviderResponse,
+    FetchProviderResponseHead, FetchProviderStream, MockFetchProvider, PreparedFetchRequest,
 };
-pub use fetch_registry::{DuplicateFetchRoute, FetchRouteEntry, FetchRouteRegistry};
+pub use fetch_registry::{
+    DuplicateFetchRoute, FetchRouteBindingError, FetchRouteEntry, FetchRouteRegistry,
+};
 pub use hellas_rpc::services::courtesy::CourtesyServer;
 pub use hellas_rpc::services::evaluate::EvaluateServer;
 pub use hellas_rpc::services::execute::ExecuteServer;
 pub use hellas_rpc::services::fetch::FetchServer;
 pub use metrics::ExecutorMetrics;
-
 #[cfg(feature = "evaluate")]
-pub(crate) const DEFAULT_MAX_SEQ: u32 = 16;
+pub use worker::{
+    DEFAULT_GPU_COMPILE_TIMEOUT_SECS, DEFAULT_GPU_EXECUTION_TIMEOUT_SECS,
+    DEFAULT_GPU_MAX_GENERATION_CAPACITY, DEFAULT_GPU_MAX_GENERATION_DEVICE_BYTES,
+    DEFAULT_GPU_SESSION_ASSET_BYTES, DEFAULT_GPU_SESSION_PROGRAMS, GpuConfig,
+    MAX_GPU_GENERATION_CAPACITY,
+};

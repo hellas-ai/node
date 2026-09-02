@@ -15,32 +15,51 @@ iroh = [
     "dep:iroh",
     "dep:iroh-mdns-address-lookup",
     "dep:hellas-attestation",
+    "dep:tokio",
     "hellas-rpc/courtesy",
     "hellas-wire/iroh",
     "hellas-wire/discovery-dht",
     "hellas-wire/discovery-mdns",
 ]
 evaluate = ["hellas-rpc/evaluate"]
+# The paid-work half: the acceptance and delivery wire, and the
+# independent reexecution check the client makes before a result is
+# payable. Off by default because it pulls the consensus kernel into a
+# client that may only want to fetch.
+work = ["dep:hellas-kernel", "hellas-rpc/work"]
 
 [dependencies]
 async-stream = { version = "0.3", optional = true }
 futures = { workspace = true, optional = true }
-hellas-rpc = { workspace = true, features = ["execute", "fetch"] }
 hellas-attestation = { workspace = true, features = [
     "apple-app-attest",
 ], optional = true }
+# The re-execution names the network its outcome is bound to, and that
+# type is the consensus kernel's. `work` is the only feature that reaches
+# it.
+hellas-kernel = { workspace = true, optional = true }
+hellas-rpc = { workspace = true, features = ["execute", "fetch"] }
 hellas-wire.workspace = true
 iroh = { workspace = true, features = ["tls-ring"], optional = true }
 iroh-mdns-address-lookup = { version = "0.4", optional = true }
 rand.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, optional = true }
 
 [dev-dependencies]
 base64.workspace = true
+bytes.workspace = true
 ciborium.workspace = true
+hellas-kernel = { workspace = true, features = ["secp256k1"] }
+# The paid-work path runs over a real multiplexed transport rather than a
+# handler call: framing, method routing, and trailers are where a
+# wire-shaped mistake actually shows up.
+hellas-wire = { workspace = true, features = ["mux"] }
 hex.workspace = true
 p256.workspace = true
 serde.workspace = true
 serde_bytes.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+tempfile = "3"
+tokio.workspace = true

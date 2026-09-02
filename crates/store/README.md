@@ -21,7 +21,7 @@ other.
 | metainfo / `.torrent` | the chunk list |
 | piece + piece hash | chunk + `DATA_KEY`-keyed chunk hash |
 | HTTP seed | HuggingFace, ModelScope |
-| peers | other providers *(not built)* |
+| peers | other nodes *(not built)* |
 | fastresume | `fastresume::Records` |
 
 ## Using it
@@ -39,27 +39,18 @@ unchanged blob, because the result is persisted.
 
 Measured on a real 29-blob cache: **647 ms cold, 549 µs warm.**
 
-## Adopting is what makes a model quotable
+## Persisting hashing work
 
-`adopt` writes two things under `$HOME/.hellas/store` — or
-`$HELLAS_STORE_DIR`, and never inside the HuggingFace cache, which is
-not ours:
+`adopt` writes `fastresume.bin` under `$HOME/.hellas/store` — or
+`$HELLAS_STORE_DIR`, and never inside the HuggingFace cache, which is not
+ours. The record contains the file identity, content id, and chunk list
+from earlier hashing work, so a later run can skip files that are still
+unchanged.
 
-| file | what it is |
-| --- | --- |
-| `fastresume.bin` | what has already been hashed |
-| `adopted-caches` | which cache roots were adopted |
-
-A node reads both. It loads the record at startup (`hellas serve
---store-records`) so it does not re-hash a cache the CLI already read,
-and it resolves `Reach::Local` model files against every adopted root —
-which is what makes `hellas store adopt --cache /data/hf` followed by a
-quote for a model in `/data/hf` succeed.
-
-Neither file is trusted. A record is re-checked against the live file's
-identity before it is used, and the cache list is a list of places to
-look that carries no ids and asserts nothing about what is there.
-Presence is still a `stat`, and integrity is still a hash.
+The record is a cache of work, not a registry of cache roots and not a
+source of truth. Every entry is checked against the live file's identity
+before it is reused. Presence is still a `stat`, and integrity is still a
+hash.
 
 ## Indexing produces two things, and the second is the valuable one
 
@@ -82,10 +73,9 @@ measurably *not*, with sha256 confirming the bytes were the ones HF
 meant. Ids in this store are ones we computed.
 
 **`have` and `materialize` are different questions.** `have` is local,
-cheap, and touches no network — it is the only one a quote may ask.
-`materialize` spends bandwidth and disk, and belongs behind admission
-control. The split is enforced by two traits: a `Substituter` answers
-where content already is; only a `Fetcher` can make it appear.
+cheap, and touches no network. `materialize` may spend bandwidth and
+disk. The split is enforced by two traits: a `Substituter` answers where
+content already is; only a `Fetcher` can make it appear.
 
 ## Verification
 
@@ -114,27 +104,20 @@ Still not covered: multi-term and multi-xorb reconstructions, a non-zero
 
 ## Why this crate uses `ureq` and not `reqwest`
 
-Measured, not preferred. The workspace cannot have one HTTP client: at
-whole-workspace scope, `iroh` pulls `reqwest` and `hf-hub` pulls `ureq`
-regardless of what this crate chooses. Dropping `ureq` here removes
-**zero** crates from the workspace and three from a CLI-only build, out
-of 381.
-
-The rule, so nobody has to re-derive it:
+The rule is:
 
 > **Streaming or async-context HTTP uses `reqwest`. Synchronous,
 > fully-buffered content fetch inside `hellas-store` uses `ureq`.**
 
-`reqwest::blocking` would panic if called from inside an async runtime,
-and `ContentStore::index` is a sync fn reachable from async code. `ureq`
-has no such landmine. Converging the other way — `reqwest` everywhere —
-would take this crate from 46 to 121 dependencies to save three.
+The store API is synchronous and its HTTP responses are fully buffered.
+`ureq` fits that interface without introducing `reqwest::blocking` and
+its async-runtime constraints.
 
 Both clients are configured with **bundled Mozilla roots**
 (`rustls-webpki-roots` / `webpki-roots`) rather than the OS trust store.
 Two clients in one binary trusting two different sets of certificate
 authorities is a silent policy split, and "which roots did we trust when
-we pulled these weights" should have one answer — a reproducible one,
+we fetched this content" should have one answer — a reproducible one,
 independent of what an admin or MDM installed on the host.
 
 ## Not built

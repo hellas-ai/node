@@ -35,12 +35,20 @@ chain = []
 courtesy = ["execute", "evaluate"]
 swarm = []
 all-protocols = ["swarm", "courtesy", "execute", "evaluate", "fetch", "chain"]
+# Paid private work: the canonical authorization, result, invoice, and
+# allocation records. Gated because it is the only protocol module that
+# needs the consensus kernel's types — the certificate, the network id,
+# and the edge/terms commitments — and a wasm or fetch-only client has no
+# use for them. The alternative was restating those kernel types here,
+# which is how two definitions of a signed digest start.
+work = ["dep:hellas-kernel", "evaluate", "hellas-kernel/secp256k1"]
 
 [dependencies]
 bytes = "1"
 ed25519-dalek = { workspace = true }
 futures-core = "0.3"
 futures-util = { version = "0.3", default-features = false }
+hellas-kernel = { workspace = true, optional = true }
 hellas-wire = { workspace = true }
 hellas-xet = { workspace = true, features = ["chunking", "serde"] }
 k256 = { workspace = true }
@@ -52,6 +60,9 @@ serde_ipld_dagcbor = { workspace = true }
 serde_json = { workspace = true, optional = true }
 smol_str = "0.3"
 thiserror = { workspace = true }
+# The measurement seams' one channel out. Nothing here decides on a
+# sample, and a node with no subscriber pays one atomic load per seam.
+tracing = { workspace = true }
 web-time = "1"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
@@ -68,4 +79,13 @@ quote = "1"
 syn = { version = "2", features = ["full"] }
 
 [dev-dependencies]
+# Real settlement signatures in the paid-work vectors: the kernel's own
+# secp256k1 signer, not a placeholder that proves nothing about the keys
+# a channel actually settles with.
+hellas-kernel = { workspace = true, features = ["secp256k1"] }
+# The paid-work acceptance test runs over a real multiplexed transport
+# rather than a handler call: framing, method routing, and trailers are
+# where a wire-shaped mistake actually shows up.
+hellas-wire = { workspace = true, features = ["mux"] }
+tempfile = "3"
 tokio.workspace = true

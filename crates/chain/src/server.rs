@@ -3,12 +3,14 @@ use crate::domain::{
     Address, Coin, DecodeExt, Digest, MAX_MERGE_INPUTS, ObjectId, SettlementKey, Transaction,
     UserPublicKey, UserSignature, WebAuthnSignature,
 };
+use crate::work_view::{FinalizedWorkView, WorkChannelQuery, WorkChannelSnapshot};
 use crate::{
     ConsensusActivity, ConsensusInfo, EdgeLookup, EdgeState, FinalizedBlock, FinalizedBlockQuery,
-    LatestBlock, LightClient as LightClientApi, OwnerEdges, ProposalInfo,
+    LatestBlock, LightClient as LightClientApi, MAX_CANONICAL_TRANSACTION_BYTES, OwnerEdges,
+    ProposalInfo,
 };
 use futures_util::{Stream, StreamExt as _};
-use hellas_kernel::{Decode as _, Tx as KernelTx};
+use hellas_kernel::{Decode as _, EdgeId, Move as KernelMove, Tx as KernelTx};
 use hellas_rpc::pb::{
     chain::{
         self as pb, ActivityEvent, CoinEntry, EdgeEntry, EdgeState as ProtoEdgeState,
@@ -16,18 +18,27 @@ use hellas_rpc::pb::{
         GetCoinResponse, GetCoinsByOwnerResponse, GetConsensusInfoResponse, GetEdgeResponse,
         GetEdgesByOwnerResponse, GetFinalizationResponse, GetFinalizedBlockResponse,
         GetLatestBlockResponse, GetProofResponse, GetRelayInfoResponse, GetStateRootResponse,
-        GetValidatorsResponse, KernelFees, MergeCoinTx, NotarizationEvent, NotarizeEvent,
-        NullificationEvent, NullifyEvent, SubmitTxResponse, TransferTx,
-        WebAuthnSignature as ProtoWebAuthnSignature, activity_event, submit_tx_request,
+        GetValidatorsResponse, GetWorkChannelSnapshotResponse, KernelFees, MergeCoinTx,
+        NotarizationEvent, NotarizeEvent, NullificationEvent, NullifyEvent, RegistrySlot,
+        SubmitTxOutcome as ProtoSubmitTxOutcome, SubmitTxResponse, SubmitWorkResponseRequest,
+        TransferTx, WebAuthnSignature as ProtoWebAuthnSignature, activity_event, submit_tx_request,
     },
     services::light_client::{LightClientHandler, LightClientServer},
 };
-use hellas_wire::{Dispatcher, StreamTransport, WireCode, WireStatus};
+use hellas_rpc::{
+    SubmitTxOutcome,
+    call::{GeneralSubmitRoute, WorkResponseRoute},
+};
+use hellas_wire::{
+    Dispatcher, PeerIdentity, StreamTransport, TransportContext, WireCode, WireStatus,
+};
 use p256::ecdsa::Signature as P256Signature;
 use std::{
+    collections::HashMap,
     io,
     net::SocketAddr,
     pin::Pin,
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::{
@@ -47,14 +58,80 @@ pub type LightClientServerError = Box<dyn std::error::Error + Send + Sync + 'sta
 pub struct LightClientRpc<T> {
     client: T,
     activity_tx: broadcast::Sender<ConsensusActivity>,
+    state: LightClientRpcState,
+}
+
+/// Node-scoped concurrency and source-accounting state for light-client RPCs.
+///
+/// Every transport served by one node must receive a clone of the same state,
+/// so reconnecting or opening another connection cannot multiply its bounds.
+#[derive(Clone)]
+pub struct LightClientRpcState {
+    response_route: Arc<WorkResponseRoute>,
+    general_route: Arc<GeneralSubmitRoute>,
+    general_sources: Arc<tokio::sync::Mutex<GeneralSourceTable>>,
+}
+
+impl Default for LightClientRpcState {
+    fn default() -> Self {
+        Self {
+            response_route: Arc::new(WorkResponseRoute::default()),
+            general_route: Arc::new(GeneralSubmitRoute::default()),
+            general_sources: Arc::new(tokio::sync::Mutex::new(GeneralSourceTable::default())),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum GeneralSourceKey {
+    Anonymous,
+    Peer(PeerIdentity),
+}
+
+#[derive(Default)]
+struct GeneralSourceTable {
+    height: Option<u64>,
+    attempts: HashMap<GeneralSourceKey, u8>,
 }
 
 impl<T> LightClientRpc<T> {
     pub fn new(client: T, activity_tx: broadcast::Sender<ConsensusActivity>) -> Self {
+        Self::with_state(client, activity_tx, LightClientRpcState::default())
+    }
+
+    pub fn with_state(
+        client: T,
+        activity_tx: broadcast::Sender<ConsensusActivity>,
+        state: LightClientRpcState,
+    ) -> Self {
         Self {
             client,
             activity_tx,
+            state,
         }
+    }
+
+    async fn consume_general_attempt(&self, context: &TransportContext, height: u64) -> bool {
+        let mut table = self.state.general_sources.lock().await;
+        if table.height != Some(height) {
+            table.height = Some(height);
+            table.attempts.clear();
+        }
+        let key = context
+            .peer
+            .map_or(GeneralSourceKey::Anonymous, GeneralSourceKey::Peer);
+        if let Some(attempts) = table.attempts.get_mut(&key) {
+            if *attempts >= 8 {
+                return false;
+            }
+            *attempts += 1;
+            return true;
+        }
+        if table.attempts.len() >= 256 {
+            return false;
+        }
+        table.attempts.insert(key, 1);
+        true
     }
 }
 
@@ -62,9 +139,10 @@ pub async fn spawn_light_client_server<T>(
     addr: SocketAddr,
     client: T,
     activity_tx: broadcast::Sender<ConsensusActivity>,
+    state: LightClientRpcState,
 ) -> io::Result<JoinHandle<()>>
 where
-    T: LightClientApi,
+    T: LightClientApi + FinalizedWorkView,
 {
     let listener = TcpListener::bind(addr).await?;
     Ok(tokio::spawn(async move {
@@ -77,7 +155,8 @@ where
                     continue;
                 }
             };
-            let service = LightClientRpc::new(client.clone(), activity_tx.clone());
+            let service =
+                LightClientRpc::with_state(client.clone(), activity_tx.clone(), state.clone());
             tokio::spawn(async move {
                 if let Err(err) = serve_connection(stream, service).await {
                     warn!(?err, %peer, "light client rpc connection failed");
@@ -92,7 +171,7 @@ async fn serve_connection<T>(
     service: LightClientRpc<T>,
 ) -> Result<(), LightClientServerError>
 where
-    T: LightClientApi,
+    T: LightClientApi + FinalizedWorkView,
 {
     let ws = accept_async(stream).await?;
     let transport = hellas_wire::ws::accept_upgraded(ws, None);
@@ -112,11 +191,15 @@ where
     T::Stream: 'static,
     <T::Stream as hellas_wire::Stream>::RecvHalf: 'static,
     <T::Stream as hellas_wire::Stream>::SendHalf: 'static,
-    C: LightClientApi,
+    C: LightClientApi + FinalizedWorkView,
 {
     let mut calls = tokio::task::JoinSet::new();
     while let Some(inbound) = transport.accept().await? {
-        let dispatch = LightClientServer(service.clone());
+        let dispatch = LightClientServer(
+            service.clone(),
+            service.state.response_route.clone(),
+            service.state.general_route.clone(),
+        );
         calls.spawn(async move {
             <LightClientServer<LightClientRpc<C>> as Dispatcher<T>>::dispatch(&dispatch, inbound)
                 .await
@@ -146,7 +229,7 @@ where
 #[allow(refining_impl_trait)]
 impl<T> LightClientHandler for LightClientRpc<T>
 where
-    T: LightClientApi,
+    T: LightClientApi + FinalizedWorkView,
 {
     fn get_state_root(
         &self,
@@ -208,6 +291,29 @@ where
         }
     }
 
+    fn get_work_channel_snapshot(
+        &self,
+        request: pb::GetWorkChannelSnapshotRequest,
+    ) -> impl Future<Output = Result<GetWorkChannelSnapshotResponse, WireStatus>> + Send {
+        let client = self.client.clone();
+        async move {
+            let mut funding = std::collections::BTreeSet::new();
+            for bytes in request.funding_coins {
+                funding.insert(coin_id_from_bytes(bytes, "funding_coins")?);
+            }
+            let query = WorkChannelQuery {
+                bond_edge: edge_id_from_bytes(request.bond_edge, "bond_edge")?,
+                payment_edge: edge_id_from_bytes(request.payment_edge, "payment_edge")?,
+                funding,
+            };
+            let snapshot = client
+                .work_channel_snapshot(query)
+                .await
+                .map_err(WireStatus::from)?;
+            Ok(work_channel_snapshot_response(snapshot))
+        }
+    }
+
     fn get_finalization(
         &self,
         request: pb::GetFinalizationRequest,
@@ -252,12 +358,63 @@ where
     fn submit_tx(
         &self,
         request: pb::SubmitTxRequest,
+        context: TransportContext,
     ) -> impl Future<Output = Result<SubmitTxResponse, WireStatus>> + Send {
         let client = self.client.clone();
         async move {
             let tx = transaction_from_proto(request)?;
-            client.submit_tx(tx).await.map_err(WireStatus::from)?;
-            Ok(SubmitTxResponse {})
+            if payment_close_response(&tx).is_some() {
+                return Err(WireStatus::new(
+                    WireCode::InvalidArgument,
+                    "PaymentCloseResponse must use SubmitWorkResponse",
+                ));
+            }
+            if crate::light_client::canonical_submission_size(&tx) > MAX_CANONICAL_TRANSACTION_BYTES
+            {
+                return Err(WireStatus::new(
+                    WireCode::InvalidArgument,
+                    format!(
+                        "canonical transaction exceeds {MAX_CANONICAL_TRANSACTION_BYTES} bytes"
+                    ),
+                ));
+            }
+            let height = client
+                .get_latest_block()
+                .await
+                .map_err(WireStatus::from)?
+                .map_or(0, |latest| latest.height);
+            if !self.consume_general_attempt(&context, height).await {
+                return Ok(SubmitTxResponse {
+                    outcome: ProtoSubmitTxOutcome::Full as i32,
+                });
+            }
+            let outcome = client.submit_tx(tx).await.map_err(WireStatus::from)?;
+            Ok(SubmitTxResponse {
+                outcome: submit_tx_outcome_to_proto(outcome) as i32,
+            })
+        }
+    }
+
+    fn submit_work_response(
+        &self,
+        request: SubmitWorkResponseRequest,
+    ) -> impl Future<Output = Result<SubmitTxResponse, WireStatus>> + Send {
+        let client = self.client.clone();
+        async move {
+            let response = hellas_kernel::PaymentCloseResponse::decode_exact(&request.response)
+                .map_err(|_| {
+                    WireStatus::new(
+                        WireCode::InvalidArgument,
+                        "response must be one canonical PaymentCloseResponse",
+                    )
+                })?;
+            let tx = Transaction::Kernel(KernelTx::move_action(KernelMove::RespondPaymentClose(
+                response,
+            )));
+            let outcome = client.submit_tx(tx).await.map_err(WireStatus::from)?;
+            Ok(SubmitTxResponse {
+                outcome: submit_tx_outcome_to_proto(outcome) as i32,
+            })
         }
     }
 
@@ -451,6 +608,25 @@ fn webauthn_signature_from_proto(
     })
 }
 
+fn submit_tx_outcome_to_proto(outcome: SubmitTxOutcome) -> ProtoSubmitTxOutcome {
+    match outcome {
+        SubmitTxOutcome::Enqueued => ProtoSubmitTxOutcome::Enqueued,
+        SubmitTxOutcome::Duplicate => ProtoSubmitTxOutcome::Duplicate,
+        SubmitTxOutcome::Full => ProtoSubmitTxOutcome::Full,
+        SubmitTxOutcome::ValidationRejected => ProtoSubmitTxOutcome::ValidationRejected,
+    }
+}
+
+fn payment_close_response(tx: &Transaction) -> Option<&hellas_kernel::PaymentCloseResponse> {
+    let Transaction::Kernel(KernelTx::Move {
+        action: KernelMove::RespondPaymentClose(response),
+    }) = tx
+    else {
+        return None;
+    };
+    Some(response)
+}
+
 fn transaction_from_proto(request: pb::SubmitTxRequest) -> Result<Transaction, WireStatus> {
     match request
         .tx
@@ -536,6 +712,78 @@ fn edge_response(lookup: Option<EdgeLookup>) -> GetEdgeResponse {
             state_root: None,
         },
     }
+}
+
+pub(crate) fn work_channel_snapshot_response(
+    snapshot: Option<WorkChannelSnapshot>,
+) -> GetWorkChannelSnapshotResponse {
+    match snapshot {
+        Some(snapshot) => GetWorkChannelSnapshotResponse {
+            snapshot: Some(latest_block_to_proto(snapshot.block().clone())),
+            bond_edge: snapshot.bond().map(kernel_bytes),
+            payment_edge: snapshot.payment().map(kernel_bytes),
+            lease_slots: snapshot
+                .lease_slots()
+                .iter()
+                .map(|slot| RegistrySlot {
+                    chunk: slot.as_ref().map(kernel_bytes),
+                })
+                .collect(),
+            pending_slot: Some(RegistrySlot {
+                chunk: snapshot.pending_slot().as_ref().map(kernel_bytes),
+            }),
+            live_funding: snapshot
+                .live_funding()
+                .iter()
+                .map(|coin| coin.to_bytes().to_vec())
+                .collect(),
+        },
+        None => GetWorkChannelSnapshotResponse {
+            snapshot: None,
+            bond_edge: None,
+            payment_edge: None,
+            lease_slots: Vec::new(),
+            pending_slot: None,
+            live_funding: Vec::new(),
+        },
+    }
+}
+
+/// Returns one kernel object's canonical bytes.
+///
+/// The wire carries exactly what consensus stored rather than a
+/// re-spelling of its fields, so a caller decodes the object with the
+/// kernel's own decoder and there is no second definition of an edge on
+/// this path.
+fn kernel_bytes<E: hellas_kernel::Encode>(value: &E) -> Vec<u8> {
+    let mut buf = vec![0_u8; value.encoded_size()];
+    let written = value.write_to(&mut buf);
+    buf.truncate(written);
+    buf
+}
+
+fn coin_id_from_bytes(
+    bytes: Vec<u8>,
+    field: &'static str,
+) -> Result<hellas_kernel::CoinId, WireStatus> {
+    hellas_kernel::CoinId::decode_exact(&bytes).map_err(|_| {
+        WireStatus::new(
+            WireCode::InvalidArgument,
+            format!(
+                "{field} was not {} canonical bytes",
+                hellas_kernel::CoinId::LENGTH
+            ),
+        )
+    })
+}
+
+fn edge_id_from_bytes(bytes: Vec<u8>, field: &'static str) -> Result<EdgeId, WireStatus> {
+    EdgeId::decode_exact(&bytes).map_err(|_| {
+        WireStatus::new(
+            WireCode::InvalidArgument,
+            format!("{field} was not {} canonical bytes", EdgeId::LENGTH),
+        )
+    })
 }
 
 fn edge_state_to_proto(edge: EdgeState) -> ProtoEdgeState {
@@ -715,15 +963,49 @@ fn activity_to_proto(activity: ConsensusActivity) -> ActivityEvent {
 mod tests {
     use super::*;
     use crate::{Mempool, OwnerCoins, light_client::QueryError};
+    use bytes::Bytes;
     use hellas_kernel::Encode as _;
     use hellas_kernel::test_support::valid_open_tx;
+    use hellas_rpc::pb::services::light_client::LightClientClientImpl;
+    use hellas_wire::DefaultClock;
+    use hellas_wire::mux::{MessagePipe, MuxConfig, MuxTransport, Role as MuxRole};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+    use tokio::sync::{Notify, Semaphore, mpsc};
+
+    struct ResponseBlocker {
+        started: AtomicUsize,
+        notify: Notify,
+        release: Semaphore,
+    }
+
+    impl Default for ResponseBlocker {
+        fn default() -> Self {
+            Self {
+                started: AtomicUsize::new(0),
+                notify: Notify::new(),
+                release: Semaphore::new(0),
+            }
+        }
+    }
 
     #[derive(Clone, Default)]
     struct MempoolClient {
         mempool: Mempool,
         edge_result: Option<Result<Option<EdgeLookup>, QueryError>>,
         owner_edges_result: Option<Result<Option<OwnerEdges>, QueryError>>,
+        snapshot_result: Option<WorkChannelSnapshot>,
+        response_blocker: Option<Arc<ResponseBlocker>>,
+        forced_submit_outcome: Arc<std::sync::Mutex<Option<SubmitTxOutcome>>>,
+    }
+
+    impl FinalizedWorkView for MempoolClient {
+        async fn work_channel_snapshot(
+            &self,
+            _query: WorkChannelQuery,
+        ) -> Result<Option<WorkChannelSnapshot>, QueryError> {
+            Ok(self.snapshot_result.clone())
+        }
     }
 
     impl LightClientApi for MempoolClient {
@@ -756,7 +1038,7 @@ mod tests {
         }
 
         async fn get_latest_block(&self) -> Result<Option<LatestBlock>, QueryError> {
-            panic!("unused test method")
+            Ok(None)
         }
 
         async fn get_finalized_block(
@@ -766,9 +1048,18 @@ mod tests {
             panic!("unused test method")
         }
 
-        async fn submit_tx(&self, tx: Transaction) -> Result<(), QueryError> {
-            self.mempool.submit(tx).await;
-            Ok(())
+        async fn submit_tx(&self, tx: Transaction) -> Result<SubmitTxOutcome, QueryError> {
+            if let Some(outcome) = *self.forced_submit_outcome.lock().unwrap() {
+                return Ok(outcome);
+            }
+            if payment_close_response(&tx).is_some()
+                && let Some(blocker) = &self.response_blocker
+            {
+                blocker.started.fetch_add(1, Ordering::SeqCst);
+                blocker.notify.notify_one();
+                blocker.release.acquire().await.unwrap().forget();
+            }
+            Ok(self.mempool.test_submit(tx).await)
         }
 
         async fn get_validators(&self) -> Result<Vec<String>, QueryError> {
@@ -800,6 +1091,115 @@ mod tests {
         }
     }
 
+    struct Pipe {
+        out: mpsc::UnboundedSender<Bytes>,
+        inbox: mpsc::UnboundedReceiver<Bytes>,
+    }
+
+    impl MessagePipe for Pipe {
+        type SendError = std::io::Error;
+        type RecvError = std::io::Error;
+
+        async fn send_message(&mut self, bytes: Bytes) -> Result<(), Self::SendError> {
+            self.out
+                .send(bytes)
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "closed"))
+        }
+
+        async fn recv_message(&mut self) -> Result<Option<Bytes>, Self::RecvError> {
+            Ok(self.inbox.recv().await)
+        }
+    }
+
+    fn transport_pair() -> (MuxTransport, MuxTransport) {
+        let (to_server, server_inbox) = mpsc::unbounded_channel();
+        let (to_client, client_inbox) = mpsc::unbounded_channel();
+        let client = MuxTransport::spawn::<64, _, _>(
+            MuxRole::Client,
+            DefaultClock,
+            MuxConfig::default(),
+            Pipe {
+                out: to_server,
+                inbox: client_inbox,
+            },
+            TransportContext::default(),
+        );
+        let server = MuxTransport::spawn::<64, _, _>(
+            MuxRole::Server,
+            DefaultClock,
+            MuxConfig::default(),
+            Pipe {
+                out: to_client,
+                inbox: server_inbox,
+            },
+            TransportContext::default(),
+        );
+        (client, server)
+    }
+
+    fn synthetic_response_request() -> SubmitWorkResponseRequest {
+        use hellas_kernel::{
+            EarnedCertificate, Party, PaymentCloseResponse, Sig, StartId, TermsHash,
+        };
+
+        let edge = EdgeId::from_bytes([0x31; EdgeId::LENGTH]);
+        let response = PaymentCloseResponse::new(
+            edge,
+            StartId::from_bytes([0x32; StartId::LENGTH]),
+            Party::Taker,
+            (
+                EarnedCertificate::new(edge, TermsHash::from_bytes([0x33; 32]), 9),
+                Sig::from_bytes([0x34; Sig::LENGTH]),
+            ),
+            Sig::from_bytes([0x35; Sig::LENGTH]),
+        );
+        let mut bytes = vec![0; PaymentCloseResponse::MAX_ENCODED_SIZE];
+        let written = response.write_to(&mut bytes);
+        bytes.truncate(written);
+        SubmitWorkResponseRequest { response: bytes }
+    }
+
+    /// The endpoint's two boundary answers: an argument that is not an
+    /// edge id, and a node with no finalized state to answer from.
+    ///
+    /// Absence is reported as an absent snapshot rather than an empty
+    /// one, because an empty snapshot would read as "this channel does
+    /// not exist" — a different fact, and the one that would let an
+    /// endpoint conclude a live lease was gone.
+    #[tokio::test]
+    async fn work_channel_snapshot_endpoint_separates_a_bad_argument_from_no_state() {
+        let rpc = LightClientRpc::new(MempoolClient::default(), broadcast::channel(4).0);
+        let ok = EdgeId::from_bytes([0x11; EdgeId::LENGTH])
+            .to_bytes()
+            .to_vec();
+
+        let short = LightClientHandler::get_work_channel_snapshot(
+            &rpc,
+            pb::GetWorkChannelSnapshotRequest {
+                bond_edge: ok[..EdgeId::LENGTH - 1].to_vec(),
+                payment_edge: ok.clone(),
+                funding_coins: Vec::new(),
+            },
+        )
+        .await
+        .expect_err("a 31-byte edge id is not an edge id");
+        assert_eq!(short.code(), WireCode::InvalidArgument);
+
+        let absent = LightClientHandler::get_work_channel_snapshot(
+            &rpc,
+            pb::GetWorkChannelSnapshotRequest {
+                bond_edge: ok.clone(),
+                payment_edge: ok,
+                funding_coins: Vec::new(),
+            },
+        )
+        .await
+        .expect("an absent snapshot is an answer");
+        assert!(absent.snapshot.is_none());
+        assert!(absent.lease_slots.is_empty());
+        assert!(absent.pending_slot.is_none());
+    }
+
     #[tokio::test]
     async fn kernel_submit_boundary_accepts_only_exact_bounded_canonical_bytes() {
         let client = MempoolClient::default();
@@ -811,10 +1211,15 @@ mod tests {
         let encoded_len = tx.write_to(&mut canonical);
         canonical.truncate(encoded_len);
 
-        LightClientHandler::submit_tx(&rpc, kernel_request(canonical.clone()))
-            .await
-            .expect("canonical kernel transaction is accepted");
-        let pending = mempool.snapshot().await;
+        let response = LightClientHandler::submit_tx(
+            &rpc,
+            kernel_request(canonical.clone()),
+            TransportContext::default(),
+        )
+        .await
+        .expect("canonical kernel transaction is accepted");
+        assert_eq!(response.outcome, ProtoSubmitTxOutcome::Enqueued as i32);
+        let pending = mempool.test_transactions().await;
         assert_eq!(pending.len(), 1);
         let Transaction::Kernel(pending_tx) = &pending[0] else {
             panic!("pending transaction was not a kernel transaction")
@@ -828,12 +1233,170 @@ mod tests {
             trailing,
             vec![0; KernelTx::MAX_ENCODED_SIZE + 1],
         ] {
-            let error = LightClientHandler::submit_tx(&rpc, kernel_request(invalid))
-                .await
-                .expect_err("invalid kernel transaction is rejected");
+            let error = LightClientHandler::submit_tx(
+                &rpc,
+                kernel_request(invalid),
+                TransportContext::default(),
+            )
+            .await
+            .expect_err("invalid kernel transaction is rejected");
             assert_eq!(error.code(), WireCode::InvalidArgument);
         }
-        assert_eq!(mempool.snapshot().await.len(), 1);
+        assert_eq!(mempool.test_transactions().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn round2_full_is_observable() {
+        use crate::execution::test_support::kernel_fixture_at;
+
+        let client = MempoolClient::default();
+        let mut first = None;
+        for index in 0..crate::GENERAL_MEMPOOL_CAPACITY {
+            let fixture = kernel_fixture_at(10, (index * 2) as u16, 7, 8)
+                .expect("distinct valid kernel fixture");
+            let tx = Transaction::Kernel(fixture.open);
+            first.get_or_insert_with(|| tx.clone());
+            assert_eq!(
+                client.mempool.test_submit(tx).await,
+                SubmitTxOutcome::Enqueued
+            );
+        }
+        assert_eq!(
+            client
+                .mempool
+                .test_submit(first.expect("the capacity is non-zero"))
+                .await,
+            SubmitTxOutcome::Duplicate,
+            "a resident digest stays duplicate even when the mempool is full",
+        );
+
+        let (activity_tx, _activity_rx) = broadcast::channel(1);
+        let rpc = LightClientRpc::new(client, activity_tx);
+        let fixture = kernel_fixture_at(10, 400, 7, 8).expect("overflow fixture");
+        let mut canonical = vec![0; KernelTx::MAX_ENCODED_SIZE];
+        let encoded_len = fixture.open.write_to(&mut canonical);
+        canonical.truncate(encoded_len);
+
+        let response = LightClientHandler::submit_tx(
+            &rpc,
+            kernel_request(canonical),
+            TransportContext::default(),
+        )
+        .await
+        .expect("a full mempool is an observable submission outcome");
+        assert_eq!(response.outcome, ProtoSubmitTxOutcome::Full as i32);
+    }
+
+    #[tokio::test]
+    async fn bound_and_relay_transports_answer_from_one_node_state() {
+        let state = LightClientRpcState::default();
+        let blocker = Arc::new(ResponseBlocker::default());
+        let client = MempoolClient {
+            response_blocker: Some(blocker.clone()),
+            ..MempoolClient::default()
+        };
+        let forced_submit_outcome = client.forced_submit_outcome.clone();
+        let (activity_tx, _activity_rx) = broadcast::channel(1);
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+        let bound_server =
+            spawn_light_client_server(addr, client.clone(), activity_tx.clone(), state.clone())
+                .await
+                .unwrap();
+        let bound_transport = hellas_wire::ws::connect(&format!("ws://{addr}"))
+            .await
+            .unwrap();
+
+        // This pair has the direction of an outbound relay connection: the
+        // relay owns the client-role half and opens calls toward the node's
+        // server-role half.
+        let (relay_transport, node_transport) = transport_pair();
+        let relay_server = tokio::spawn(serve_light_client_transport(
+            node_transport,
+            LightClientRpc::with_state(client, activity_tx, state),
+        ));
+        let wire_a = LightClientClientImpl::new(bound_transport);
+        let wire_b = LightClientClientImpl::new(relay_transport);
+
+        for wire in [&wire_a, &wire_b] {
+            let validators = wire
+                .get_validators(pb::GetValidatorsRequest {})
+                .await
+                .expect("both transports answer a real light-client request");
+            assert_eq!(validators.validators, ["validator-a"]);
+        }
+
+        let response_request = synthetic_response_request();
+        let mut held = Vec::new();
+        for _ in 0..16 {
+            let wire = wire_a.clone();
+            let request = response_request.clone();
+            held.push(tokio::spawn(async move {
+                wire.submit_work_response(request).await
+            }));
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while blocker.started.load(Ordering::SeqCst) < 4 {
+                blocker.notify.notified().await;
+            }
+        })
+        .await
+        .expect("four response workers start");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let overflow = tokio::time::timeout(
+            Duration::from_secs(1),
+            wire_b.submit_work_response(response_request.clone()),
+        )
+        .await
+        .expect("the second transport receives a prompt saturation result")
+        .expect_err("all sixteen node response permits are held by the first transport");
+        assert_eq!(overflow.code(), WireCode::ResourceExhausted);
+
+        blocker.release.add_permits(16);
+        for call in held {
+            call.await
+                .expect("response task")
+                .expect("held response eventually completes");
+        }
+
+        let tx = valid_open_tx().expect("general transaction fixture");
+        let mut canonical = vec![0; KernelTx::MAX_ENCODED_SIZE];
+        let written = tx.write_to(&mut canonical);
+        canonical.truncate(written);
+        let request = kernel_request(canonical);
+        for wire in [
+            &wire_a, &wire_a, &wire_a, &wire_a, &wire_b, &wire_b, &wire_b, &wire_b,
+        ] {
+            let response = wire
+                .submit_tx(request.clone())
+                .await
+                .expect("the first eight anonymous attempts reach the handler");
+            assert!(matches!(
+                ProtoSubmitTxOutcome::try_from(response.outcome),
+                Ok(ProtoSubmitTxOutcome::Enqueued | ProtoSubmitTxOutcome::Duplicate)
+            ));
+        }
+        let ninth = wire_b
+            .submit_tx(request)
+            .await
+            .expect("the shared anonymous budget returns an outcome");
+        assert_eq!(ninth.outcome, ProtoSubmitTxOutcome::Full as i32);
+
+        *forced_submit_outcome.lock().unwrap() = Some(SubmitTxOutcome::ValidationRejected);
+        let rejected = wire_b
+            .submit_work_response(response_request)
+            .await
+            .expect("validation rejection survives the response wire route");
+        assert_eq!(rejected.outcome, 4);
+        assert_eq!(
+            ProtoSubmitTxOutcome::try_from(rejected.outcome),
+            Ok(ProtoSubmitTxOutcome::ValidationRejected),
+        );
+
+        bound_server.abort();
+        relay_server.abort();
     }
 
     #[cfg(feature = "client")]
@@ -846,9 +1409,14 @@ mod tests {
         drop(probe);
 
         let (activity_tx, _activity_rx) = broadcast::channel(8);
-        let server = spawn_light_client_server(addr, MempoolClient::default(), activity_tx)
-            .await
-            .unwrap();
+        let server = spawn_light_client_server(
+            addr,
+            MempoolClient::default(),
+            activity_tx,
+            LightClientRpcState::default(),
+        )
+        .await
+        .unwrap();
         let client = RemoteLightClient::connect(format!("ws://{addr}"))
             .await
             .unwrap();
@@ -1090,5 +1658,54 @@ mod tests {
 
         assert_eq!(event.relay_timestamps.len(), 1);
         assert!((before..=after).contains(&event.relay_timestamps[0]));
+    }
+
+    /// One submission to one validator is one `rpc_ms` sample.
+    ///
+    /// §4 maximises `rpc_ms + response_worker_ms + validation_ms` over
+    /// six validators, and this tree fans a write to one validator at a
+    /// time (`crates/cli/src/commands/serve/node.rs`), so what a seam can
+    /// honestly emit is the per-validator term and the maximum is the
+    /// reader's. The interval is the whole call, which is where a
+    /// submitter actually waits — the server's own worker and validation
+    /// samples happen inside it.
+    #[cfg(feature = "client")]
+    #[tokio::test]
+    async fn one_validator_submission_is_one_rpc_sample() {
+        use crate::{LightClient as _, client::RemoteLightClient};
+        use hellas_rpc::observe::Samples;
+        use tracing::instrument::WithSubscriber as _;
+
+        let (client_transport, server_transport) = transport_pair();
+        let (activity_tx, _activity_rx) = broadcast::channel(1);
+        let server = tokio::spawn(serve_light_client_transport(
+            server_transport,
+            LightClientRpc::new(MempoolClient::default(), activity_tx),
+        ));
+        let client = RemoteLightClient::new(client_transport);
+        let samples = std::sync::Arc::new(Samples::new());
+
+        let tx = Transaction::Kernel(valid_open_tx().expect("general transaction fixture"));
+        let outcome = client
+            .submit_tx(tx)
+            .with_subscriber(samples.clone())
+            .await
+            .expect("the validator answers");
+        assert!(matches!(
+            outcome,
+            SubmitTxOutcome::Enqueued | SubmitTxOutcome::Duplicate
+        ));
+
+        let calls = samples.of("rpc_ms");
+        assert_eq!(calls.len(), 1, "one submission, one sample");
+        assert_eq!(
+            calls[0].field("method"),
+            Some("SubmitTx"),
+            "which of the two submission methods this validator was asked",
+        );
+        assert_eq!(calls[0].field("answered"), Some("true"));
+        assert!(calls[0].ms >= 0.0);
+
+        server.abort();
     }
 }

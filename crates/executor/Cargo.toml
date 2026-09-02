@@ -8,38 +8,25 @@ repository.workspace = true
 documentation.workspace = true
 
 [features]
-default = ["evaluate", "candle"]
-evaluate = [
-    "dep:catgrad",
-    "dep:catgrad-llm",
-    "dep:catgrad-llm-models",
-    "dep:commonware-runtime",
-    "dep:hellas-models",
-]
-candle = ["evaluate", "catgrad/candle-backend"]
-candle-cuda = ["candle", "catgrad/cuda"]
-candle-metal = ["candle", "catgrad/metal"]
+default = ["evaluate"]
+evaluate = ["dep:catena-lang", "dep:commonware-runtime", "dep:hellas-store"]
 
 [dependencies]
-async-stream = "0.3"
 async-trait = "0.1"
-catgrad = { workspace = true, default-features = false, features = [
-    "serde",
-], optional = true }
-catgrad-llm = { workspace = true, default-features = false, optional = true }
-catgrad-llm-models = { workspace = true, default-features = false, optional = true }
+catena-lang = { workspace = true, optional = true }
 commonware-runtime = { workspace = true, optional = true }
 futures-core = "0.3"
 futures-util = "0.3"
 hellas-chain = { workspace = true, features = ["client"] }
 hellas-kernel = { workspace = true, features = ["secp256k1"] }
-hellas-models = { workspace = true, optional = true }
 hellas-rpc = { workspace = true, features = [
     "execute",
     "evaluate",
     "fetch",
     "courtesy",
+    "work",
 ] }
+hellas-store = { workspace = true, optional = true }
 hellas-wire = { workspace = true }
 prometheus-client = { workspace = true }
 rand = { workspace = true }
@@ -48,7 +35,9 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
-tokio-util = "0.7"
 tracing = { workspace = true }
 uuid = { version = "1", features = ["v4"] }
 zeroize = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

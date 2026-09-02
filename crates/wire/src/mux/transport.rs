@@ -11,11 +11,12 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use crate::clock::Clock;
 use crate::metadata::Metadata;
 use crate::status::WireCode;
-use crate::transport::{AuthLevel, Inbound, PeerIdentity, StreamTransport, TransportContext};
+use crate::transport::{Inbound, StreamTransport, TransportContext};
 
 use super::slot::{Role, SlotIndex};
 use super::state::{Event, Multiplexer, MuxConfig, MuxError};
 use super::stream::MuxStream;
+use super::wire::StreamKey;
 
 /// Trait for the underlying message-oriented byte pipe (one WS message
 /// = one mux frame). Implemented by the ws-native + ws-wasm adapters.
@@ -35,6 +36,11 @@ pub trait MessagePipe: Send + 'static {
 
 /// Commands the I/O loop accepts. The MuxTransport's public API funnels
 /// through these so `Multiplexer` can stay sans-io.
+///
+/// Everything but `Open` names an existing stream, and names it by the
+/// same `StreamKey` the wire uses. A bare slot index would not do: a
+/// command travels a channel and is served later, by which time the peer
+/// may have seated a different stream in that index.
 pub(crate) enum Command {
     Open {
         method_id: u32,
@@ -42,21 +48,21 @@ pub(crate) enum Command {
         reply: oneshot::Sender<Result<MuxStream, MuxError>>,
     },
     SendBody {
-        slot: SlotIndex,
+        key: StreamKey,
         payload: Bytes,
         reply: oneshot::Sender<Result<(), MuxError>>,
     },
     CloseSend {
-        slot: SlotIndex,
+        key: StreamKey,
         trailer: Option<crate::metadata::Trailer>,
         reply: oneshot::Sender<Result<(), MuxError>>,
     },
     Reset {
-        slot: SlotIndex,
+        key: StreamKey,
         code: WireCode,
     },
     Consumed {
-        slot: SlotIndex,
+        key: StreamKey,
         bytes: u32,
     },
 }
@@ -65,6 +71,12 @@ pub(crate) enum Command {
 pub struct MuxTransport {
     cmd_tx: mpsc::UnboundedSender<Command>,
     inbound_rx: Arc<Mutex<mpsc::UnboundedReceiver<Inbound<MuxStream>>>>,
+    /// What the enclosing session vouches for: the peer it authenticated,
+    /// and the keying material it can export. A mux is carried by
+    /// something else — a WebSocket, a QUIC connection — and only that
+    /// carrier knows either. It is held here as well as in the driver so
+    /// outbound callers read the same facts inbound ones are handed.
+    context: TransportContext,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -85,9 +97,9 @@ impl MuxTransport {
         clock: C,
         config: MuxConfig,
         pipe: P,
-        peer: Option<PeerIdentity>,
+        context: TransportContext,
     ) -> Self {
-        Self::spawn_with::<N, C, P, _>(role, clock, config, pipe, peer, |fut| {
+        Self::spawn_with::<N, C, P, _>(role, clock, config, pipe, context, |fut| {
             tokio::spawn(fut);
         })
     }
@@ -103,7 +115,7 @@ impl MuxTransport {
         clock: C,
         config: MuxConfig,
         pipe: P,
-        peer: Option<PeerIdentity>,
+        context: TransportContext,
         spawn: F,
     ) -> Self
     where
@@ -121,13 +133,14 @@ impl MuxTransport {
             inbound_tx,
             slot_to_chans: Default::default(),
             pending_sends: Default::default(),
-            peer,
+            context: context.clone(),
         };
         spawn(Box::pin(driver.run()));
 
         Self {
             cmd_tx,
             inbound_rx: Arc::new(Mutex::new(inbound_rx)),
+            context,
         }
     }
 }
@@ -135,6 +148,10 @@ impl MuxTransport {
 impl StreamTransport for MuxTransport {
     type Stream = MuxStream;
     type Error = MuxTransportError;
+
+    fn context(&self) -> TransportContext {
+        self.context.clone()
+    }
 
     async fn open(&self, method_id: u32, headers: Metadata) -> Result<Self::Stream, Self::Error> {
         let (tx, rx) = oneshot::channel();
@@ -171,7 +188,7 @@ struct MuxDriver<const N: usize, C: Clock + Clone, P: MessagePipe> {
     /// At most one blocked send per slot; `SendHalf::send_body` takes
     /// `&mut self`, so well-formed callers cannot create a second one.
     pending_sends: std::collections::HashMap<SlotIndex, PendingSend>,
-    peer: Option<PeerIdentity>,
+    context: TransportContext,
 }
 
 struct PendingSend {
@@ -216,46 +233,92 @@ impl<const N: usize, C: Clock + Clone, P: MessagePipe> MuxDriver<N, C, P> {
                         "transport owner disappeared while opening stream",
                     ))
                     .and_then(|cmd_tx| {
-                        self.mux.open(method_id, headers).map(|slot| {
-                            let (recv_tx, recv_rx) = mpsc::unbounded_channel();
-                            let (trailer_tx, trailer_rx) = oneshot::channel();
-                            self.slot_to_chans.insert(
-                                slot,
-                                SlotChannels {
-                                    recv_tx,
-                                    trailer_tx: Some(trailer_tx),
-                                },
-                            );
-                            MuxStream::new(slot, cmd_tx, recv_rx, trailer_rx)
-                        })
+                        self.mux
+                            .open(method_id, headers)
+                            .and_then(|slot| self.register_stream(slot, cmd_tx))
                     });
                 let _ = reply.send(result);
             }
             Command::SendBody {
-                slot,
+                key,
                 payload,
                 reply,
-            } => {
-                self.start_send(slot, payload, reply);
-            }
+            } => match self.live(key) {
+                Some(slot) => self.start_send(slot, payload, reply),
+                None => {
+                    let _ = reply.send(Err(MuxError::SlotClosed(key.stream_id)));
+                }
+            },
             Command::CloseSend {
-                slot,
+                key,
                 trailer,
                 reply,
             } => {
-                let r = self.mux.close_send(slot, trailer);
-                let _ = reply.send(r);
+                let result = match self.live(key) {
+                    Some(slot) => self.mux.close_send(slot, trailer),
+                    None => Err(MuxError::SlotClosed(key.stream_id)),
+                };
+                let _ = reply.send(result);
             }
-            Command::Reset { slot, code } => {
-                self.fail_pending_send(slot);
-                self.mux.reset(slot, code);
+            Command::Reset { key, code } => {
+                if let Some(slot) = self.live(key) {
+                    self.fail_pending_send(slot);
+                    self.mux.reset(slot, code);
+                }
             }
-            Command::Consumed { slot, bytes } => {
-                if let Err(error) = self.mux.consume(slot, bytes) {
+            Command::Consumed { key, bytes } => {
+                if let Some(slot) = self.live(key)
+                    && let Err(error) = self.mux.consume(slot, bytes)
+                {
                     tracing::warn!("mux consume error: {error}");
                 }
             }
         }
+    }
+
+    /// Resolve a command's stream key to the slot it may act on.
+    ///
+    /// A command is written when its stream is alive and served some time
+    /// later, and `MuxRecvHalf`'s drop writes one after the caller has
+    /// finished with the stream entirely. If the index has since been
+    /// re-seated — a fresh `open`, or a peer's `Open` on an index whose
+    /// terminals have both crossed — the stream the command names no
+    /// longer exists, and the one occupying its index belongs to someone
+    /// else. Refuse rather than act on the wrong stream.
+    fn live(&self, key: StreamKey) -> Option<SlotIndex> {
+        (self.mux.generation(key.stream_id) == Some(key.generation)).then_some(key.stream_id)
+    }
+
+    /// Wire a freshly-seated slot to a `MuxStream`: the driver keeps the
+    /// sending ends, the stream keeps the receiving ends and the key that
+    /// names it for as long as it lives.
+    ///
+    /// The generation is read back from the mux rather than assumed, so a
+    /// stream can only ever be handed a key the state machine agrees with.
+    fn register_stream(
+        &mut self,
+        slot: SlotIndex,
+        cmd_tx: mpsc::UnboundedSender<Command>,
+    ) -> Result<MuxStream, MuxError> {
+        let generation = self
+            .mux
+            .generation(slot)
+            .ok_or(MuxError::Protocol("mux seated no stream in this slot"))?;
+        let (recv_tx, recv_rx) = mpsc::unbounded_channel();
+        let (trailer_tx, trailer_rx) = oneshot::channel();
+        self.slot_to_chans.insert(
+            slot,
+            SlotChannels {
+                recv_tx,
+                trailer_tx: Some(trailer_tx),
+            },
+        );
+        Ok(MuxStream::new(
+            StreamKey::new(slot, generation),
+            cmd_tx,
+            recv_rx,
+            trailer_rx,
+        ))
     }
 
     fn cmd_tx_clone(&self) -> Option<mpsc::UnboundedSender<Command>> {
@@ -351,34 +414,18 @@ impl<const N: usize, C: Clock + Clone, P: MessagePipe> MuxDriver<N, C, P> {
                 method_id,
                 headers,
             } => {
-                let Some(cmd_tx) = self.cmd_tx_clone() else {
+                let Some(stream) = self
+                    .cmd_tx_clone()
+                    .and_then(|cmd_tx| self.register_stream(slot, cmd_tx).ok())
+                else {
                     self.mux.reset(slot, WireCode::Cancelled);
                     return;
                 };
-                let (recv_tx, recv_rx) = mpsc::unbounded_channel();
-                let (trailer_tx, trailer_rx) = oneshot::channel();
-                self.slot_to_chans.insert(
-                    slot,
-                    SlotChannels {
-                        recv_tx,
-                        trailer_tx: Some(trailer_tx),
-                    },
-                );
-                let stream = MuxStream::new(slot, cmd_tx, recv_rx, trailer_rx);
                 let inbound = Inbound {
                     method_id,
                     headers,
                     stream,
-                    context: TransportContext {
-                        peer: self.peer,
-                        rtt_ms: None,
-                        auth_level: if self.peer.is_some() {
-                            AuthLevel::Vouched
-                        } else {
-                            AuthLevel::None
-                        },
-                        open_exporter: None,
-                    },
+                    context: self.context.clone(),
                 };
                 let _ = self.inbound_tx.send(inbound);
             }
@@ -436,8 +483,9 @@ impl<const N: usize, C: Clock + Clone, P: MessagePipe> MuxDriver<N, C, P> {
 mod tests {
     use super::*;
     use crate::clock::DefaultClock;
-    use crate::frame::{CreditFrame, Frame};
-    use crate::mux::{SendBodyOutcome, StreamKey, encode_keyed_frame};
+    use crate::frame::{CreditFrame, EndFrame, Frame, OpenFrame};
+    use crate::metadata::Trailer;
+    use crate::mux::{SendBodyOutcome, StreamKey, decode_keyed_frame, encode_keyed_frame};
 
     struct IdlePipe {
         recv_rx: mpsc::UnboundedReceiver<Bytes>,
@@ -465,6 +513,148 @@ mod tests {
         }
     }
 
+    /// A pipe that keeps every frame the driver ships, so a test can ask
+    /// what actually went out rather than what the driver meant to send.
+    struct RecordingPipe {
+        recv_rx: mpsc::UnboundedReceiver<Bytes>,
+        sent: mpsc::UnboundedSender<Bytes>,
+    }
+
+    impl MessagePipe for RecordingPipe {
+        type SendError = std::io::Error;
+        type RecvError = std::io::Error;
+
+        async fn send_message(&mut self, bytes: Bytes) -> Result<(), Self::SendError> {
+            let _ = self.sent.send(bytes);
+            Ok(())
+        }
+
+        async fn recv_message(&mut self) -> Result<Option<Bytes>, Self::RecvError> {
+            Ok(self.recv_rx.recv().await)
+        }
+    }
+
+    fn open_frame(slot: SlotIndex, generation: u16, method_id: u32) -> Bytes {
+        encode_keyed_frame(
+            StreamKey::new(slot, generation),
+            &Frame::Open(OpenFrame {
+                method_id,
+                headers: Metadata::new(),
+            }),
+        )
+    }
+
+    fn body_frame(slot: SlotIndex, generation: u16, payload: &'static [u8]) -> Bytes {
+        encode_keyed_frame(
+            StreamKey::new(slot, generation),
+            &Frame::Body(Bytes::from_static(payload)),
+        )
+    }
+
+    fn end_frame(slot: SlotIndex, generation: u16) -> Bytes {
+        encode_keyed_frame(
+            StreamKey::new(slot, generation),
+            &Frame::End(EndFrame {
+                status: WireCode::Ok,
+                trailer: Trailer::ok(),
+            }),
+        )
+    }
+
+    /// A slot index is a seat, not a name. A half that lets go of a
+    /// finished stream cancels that stream and no other — even when the
+    /// peer has already seated a new stream in the same index.
+    ///
+    /// The sequence is the one a unary server dispatch produces: it reads
+    /// one body and never drains to EOF, so its recv half is still "live"
+    /// when it drops and asks the driver to reset. The peer, meanwhile, is
+    /// free to reuse the index the moment both terminals have crossed.
+    #[tokio::test]
+    async fn a_finished_stream_s_reset_cannot_cancel_the_slot_s_next_tenant() {
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel();
+        let (_wire_tx, wire_rx) = mpsc::unbounded_channel();
+        let (sent_tx, mut sent_rx) = mpsc::unbounded_channel();
+        let mut driver = MuxDriver::<8, _, _> {
+            mux: Multiplexer::new(Role::Server, DefaultClock, MuxConfig::default()),
+            pipe: RecordingPipe {
+                recv_rx: wire_rx,
+                sent: sent_tx,
+            },
+            cmd_rx,
+            cmd_tx: cmd_tx.downgrade(),
+            inbound_tx,
+            slot_to_chans: Default::default(),
+            pending_sends: Default::default(),
+            context: TransportContext::default(),
+        };
+
+        // The peer opens slot 0 generation 1 and completes its request.
+        driver.handle_inbound(open_frame(0, 1, 7)).await;
+        let first = inbound_rx.try_recv().expect("first inbound stream");
+        let (_send, recv) = crate::transport::Stream::split(first.stream);
+        driver.handle_inbound(body_frame(0, 1, b"one")).await;
+        driver.handle_inbound(end_frame(0, 1)).await;
+
+        // We answer and close. Both terminals have now crossed on
+        // generation 1, which is precisely what entitles the peer to
+        // reuse the index.
+        let (reply, _replied) = oneshot::channel();
+        driver
+            .handle_command(Command::CloseSend {
+                key: StreamKey::new(0, 1),
+                trailer: None,
+                reply,
+            })
+            .await;
+        assert!(driver.flush_outbound().await);
+
+        // The handler drops a recv half it never drained, which asks the
+        // driver to reset the stream it was reading.
+        drop(recv);
+
+        // Before that command is served, the peer seats a new stream in
+        // the freed index.
+        driver.handle_inbound(open_frame(0, 2, 9)).await;
+        let second = inbound_rx.try_recv().expect("second inbound stream");
+        let (_send, recv) = crate::transport::Stream::split(second.stream);
+
+        let stale = driver
+            .cmd_rx
+            .try_recv()
+            .expect("dropping an undrained recv half resets its slot");
+        assert!(matches!(
+            stale,
+            Command::Reset {
+                key: StreamKey {
+                    stream_id: 0,
+                    generation: 1,
+                },
+                code: WireCode::Cancelled,
+            }
+        ));
+        driver.handle_command(stale).await;
+        assert!(driver.flush_outbound().await);
+
+        // Nothing may have gone out cancelling the new tenant.
+        while let Ok(bytes) = sent_rx.try_recv() {
+            let decoded = decode_keyed_frame(&bytes).expect("driver ships decodable frames");
+            assert!(
+                !(decoded.key == StreamKey::new(0, 2) && matches!(decoded.frame, Frame::Reset(_))),
+                "generation 1's reset was applied to generation 2"
+            );
+        }
+
+        // And the new tenant's request body must still reach it.
+        driver.handle_inbound(body_frame(0, 2, b"two")).await;
+        let mut recv = std::pin::pin!(recv);
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        match futures_core::Stream::poll_next(recv.as_mut(), &mut cx) {
+            std::task::Poll::Ready(Some(Ok(bytes))) => assert_eq!(&bytes[..], b"two"),
+            other => panic!("the new tenant lost its request body: {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn blocked_send_resumes_when_peer_credit_arrives() {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
@@ -481,7 +671,7 @@ mod tests {
             inbound_tx,
             slot_to_chans: Default::default(),
             pending_sends: Default::default(),
-            peer: None,
+            context: TransportContext::default(),
         };
 
         let slot = driver.mux.open(7, Metadata::new()).unwrap();
@@ -523,7 +713,7 @@ mod tests {
                 recv_rx: wire_rx,
                 dropped: Some(dropped_tx),
             },
-            None,
+            TransportContext::default(),
         );
 
         drop(transport);

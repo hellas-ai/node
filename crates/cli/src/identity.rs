@@ -154,17 +154,25 @@ pub(crate) struct LocalIdentity {
     pub(crate) producer_key: ProducerSigningKey,
     #[cfg(any(feature = "node", test))]
     pub(crate) genesis: SignedProviderGenesis,
-    #[cfg(any(feature = "node", feature = "evaluate", test))]
     pub(crate) enrollment: ProviderEnrollmentBundle,
     #[cfg(feature = "node")]
-    root: Arc<PlatformRoot>,
+    open_identity: Arc<OpenIdentity>,
 }
 
 #[cfg(feature = "node")]
-pub(crate) struct ProviderOpenIdentity {
-    root: Arc<PlatformRoot>,
-    producer_key: ProducerSigningKey,
+pub(crate) struct OpenIdentity {
+    signer: OpenSigner,
     enrollment: ProviderEnrollmentBundle,
+    #[cfg(all(target_os = "macos", feature = "apple-app-attest"))]
+    apple_open_limit: Arc<tokio::sync::Semaphore>,
+}
+
+#[cfg(feature = "node")]
+#[derive(Clone)]
+enum OpenSigner {
+    Software(ProducerSigningKey),
+    #[cfg(all(target_os = "macos", feature = "apple-app-attest"))]
+    AppleAppAttest(Arc<PlatformRoot>),
 }
 
 struct StoredIdentity {
@@ -220,7 +228,7 @@ impl PlatformRoot {
         }
     }
 
-    #[cfg(feature = "node")]
+    #[cfg(all(feature = "node", target_os = "macos", feature = "apple-app-attest"))]
     fn prove_open(&self, binding: Digest) -> anyhow::Result<RootProof> {
         self.prove_prehashed(
             binding,
@@ -231,22 +239,55 @@ impl PlatformRoot {
 }
 
 #[cfg(feature = "node")]
-impl ProviderOpenIdentity {
-    fn proof(&self, binding: Digest) -> anyhow::Result<RootProof> {
-        match self.root.as_ref() {
-            // Open is signed by the producer key recorded in genesis. The
-            // separate software root key only authenticates genesis itself.
-            PlatformRoot::Software(_) => {
-                PlatformRoot::Software(self.producer_key.clone()).prove_open(binding)
+impl OpenIdentity {
+    async fn proof(&self, binding: Digest) -> Result<RootProof, WireStatus> {
+        match &self.signer {
+            // Software enrollment authenticates the producer key once; the
+            // producer then proves each live transport binding.
+            OpenSigner::Software(key) => {
+                key.sign_digest(binding)
+                    .map(RootProof::Software)
+                    .map_err(|error| {
+                        tracing::warn!(%error, "confidential open proof generation failed");
+                        WireStatus::internal("confidential open proof generation failed")
+                    })
             }
             #[cfg(all(target_os = "macos", feature = "apple-app-attest"))]
-            PlatformRoot::AppleAppAttest { .. } => self.root.prove_open(binding),
+            OpenSigner::AppleAppAttest(root) => {
+                // Open is unauthenticated by design. Fail fast instead of
+                // queueing attacker-controlled native assertions, and keep
+                // App Attest's blocking run-loop wait off Tokio's workers.
+                let permit = self
+                    .apple_open_limit
+                    .clone()
+                    .try_acquire_owned()
+                    .map_err(|_| {
+                        WireStatus::new(
+                            WireCode::ResourceExhausted,
+                            "confidential open proof capacity is exhausted",
+                        )
+                    })?;
+                let root = root.clone();
+                tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    root.prove_open(binding)
+                })
+                .await
+                .map_err(|error| {
+                    tracing::warn!(%error, "confidential open proof task failed");
+                    WireStatus::internal("confidential open proof generation failed")
+                })?
+                .map_err(|error| {
+                    tracing::warn!(%error, "confidential open proof generation failed");
+                    WireStatus::internal("confidential open proof generation failed")
+                })
+            }
         }
     }
 }
 
 #[cfg(feature = "node")]
-impl OpenHandler for ProviderOpenIdentity {
+impl OpenHandler for OpenIdentity {
     async fn open(
         &self,
         request: OpenRequest,
@@ -275,10 +316,7 @@ impl OpenHandler for ProviderOpenIdentity {
             self.enrollment.content_id(),
             alpn,
         );
-        let proof = match self
-            .proof(binding)
-            .map_err(|error| WireStatus::internal(format!("open proof failed: {error}")))?
-        {
+        let proof = match self.proof(binding).await? {
             RootProof::Software(signature) => {
                 open_response::Proof::ProducerSignature(signature_to_pb(&signature))
             }
@@ -301,13 +339,30 @@ impl OpenHandler for ProviderOpenIdentity {
 
 #[cfg(feature = "node")]
 impl LocalIdentity {
-    pub(crate) fn open_identity(&self) -> Arc<ProviderOpenIdentity> {
-        Arc::new(ProviderOpenIdentity {
-            root: self.root.clone(),
-            producer_key: self.producer_key.clone(),
-            enrollment: self.enrollment.clone(),
-        })
+    pub(crate) fn open_identity(&self) -> Arc<OpenIdentity> {
+        self.open_identity.clone()
     }
+}
+
+#[cfg(feature = "node")]
+fn build_open_identity(
+    root: &Arc<PlatformRoot>,
+    producer_key: &ProducerSigningKey,
+    enrollment: &ProviderEnrollmentBundle,
+) -> Arc<OpenIdentity> {
+    let signer = match root.as_ref() {
+        // The enrollment root authenticates the producer once. It is not an
+        // online software key and must not survive identity materialization.
+        PlatformRoot::Software(_) => OpenSigner::Software(producer_key.clone()),
+        #[cfg(all(target_os = "macos", feature = "apple-app-attest"))]
+        PlatformRoot::AppleAppAttest { .. } => OpenSigner::AppleAppAttest(root.clone()),
+    };
+    Arc::new(OpenIdentity {
+        signer,
+        enrollment: enrollment.clone(),
+        #[cfg(all(target_os = "macos", feature = "apple-app-attest"))]
+        apple_open_limit: Arc::new(tokio::sync::Semaphore::new(1)),
+    })
 }
 
 pub(crate) fn load_or_create(
@@ -325,6 +380,19 @@ pub(crate) fn load_or_create(
             Err(error).with_context(|| format!("failed to read identity file {}", path.display()))
         }
     }
+}
+
+/// The key this identity settles a paid channel with.
+///
+/// Not a second key and not a new one: the provider's on-chain party key
+/// *is* its producer identity, one secp256k1 scalar read through two
+/// primitive crates ([`hellas_executor::kernel_signer`]). So `identity
+/// init` is where an operator's settlement key comes from, and there is
+/// nothing here that could invent one — a party nobody has funded stakes
+/// no bond and settles no channel.
+#[cfg(feature = "node")]
+pub(crate) fn settlement_signer(identity: &LocalIdentity) -> hellas_kernel::Secp256k1Signer {
+    hellas_executor::kernel_signer(&identity.producer_key)
 }
 
 pub(crate) fn load_existing(path: Option<&Path>) -> anyhow::Result<LocalIdentity> {
@@ -436,15 +504,16 @@ fn create(path: &Path, software_root: bool) -> anyhow::Result<LocalIdentity> {
         transport_key: transport_key.to_bytes(),
         enrollment: enrollment.clone(),
     };
+    #[cfg(feature = "node")]
+    let open_identity = build_open_identity(&root, &producer_key, &enrollment);
     let identity = LocalIdentity {
         transport_key,
         producer_key,
         #[cfg(any(feature = "node", test))]
         genesis,
-        #[cfg(any(feature = "node", feature = "evaluate", test))]
         enrollment,
         #[cfg(feature = "node")]
-        root,
+        open_identity,
     };
     if !persist(path, &stored)? {
         return load_existing(Some(path));
@@ -544,15 +613,16 @@ fn materialize(stored: &StoredIdentity) -> anyhow::Result<LocalIdentity> {
     if enrollment != stored.enrollment {
         bail!("stored provider enrollment does not match the persisted keys");
     }
+    #[cfg(feature = "node")]
+    let open_identity = build_open_identity(&root, &producer_key, &enrollment);
     Ok(LocalIdentity {
         transport_key,
         producer_key,
         #[cfg(any(feature = "node", test))]
         genesis,
-        #[cfg(any(feature = "node", feature = "evaluate", test))]
         enrollment,
         #[cfg(feature = "node")]
-        root,
+        open_identity,
     })
 }
 

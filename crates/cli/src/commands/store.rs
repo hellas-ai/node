@@ -1,10 +1,8 @@
 //! Operating the content store from the command line.
 //!
-//! The store is otherwise only reachable from inside the executor, which
-//! makes it impossible to answer "what does this node already hold?"
-//! without running one. These commands exist so adopting a cache,
-//! checking what is present, and pulling a file are things an operator
-//! can do and observe.
+//! These commands index existing content, inspect the persisted index, and
+//! fetch exact content-addressed files. Compilation and execution consume
+//! verified descriptors through the evaluator; the store does neither.
 
 use std::path::{Path, PathBuf};
 
@@ -18,8 +16,7 @@ use crate::commands::CliResult;
 
 #[derive(Subcommand)]
 pub enum StoreCommand {
-    /// Index a HuggingFace cache so its contents can be served without
-    /// re-downloading them
+    /// Index a HuggingFace cache without copying its contents
     Adopt {
         /// Cache root (default: HF_HUB_CACHE, else HF_HOME/hub, else
         /// ~/.cache/huggingface/hub)
@@ -100,14 +97,6 @@ fn adopt(cache: Option<PathBuf>, records: Option<PathBuf>, recheck: bool) -> Cli
     let elapsed = started.elapsed();
     let saved = store.records().save(&records_path)?;
 
-    // Adopting a cache the quote path has never heard of would leave the
-    // operator watching quotes refuse for models this command just said
-    // it holds. Recording the root is what makes those one question.
-    let registry = hellas_store::state::adopted_caches_path();
-    if let Some(registry) = registry.as_deref() {
-        hellas_store::hf_cache::remember_adopted(registry, cache.root())?;
-    }
-
     println!("cache      {}", cache.root().display());
     println!(
         "known      {loaded} remembered from {}",
@@ -116,10 +105,6 @@ fn adopt(cache: Option<PathBuf>, records: Option<PathBuf>, recheck: bool) -> Cli
     println!("adopted    {adopted} blobs in {elapsed:.2?}");
     println!("contents   {} distinct", store.len());
     println!("records    {saved} saved");
-    match registry.as_deref() {
-        Some(registry) => println!("quotable   from {}", registry.display()),
-        None => println!("quotable   no; set HELLAS_STORE_DIR or HOME so the root can be recorded"),
-    }
     Ok(())
 }
 
@@ -129,15 +114,6 @@ fn status(records: Option<PathBuf>) -> CliResult {
     let loaded = store.records().load(&path);
     println!("records    {}", path.display());
     println!("remembered {loaded} files");
-    // The caches a node resolves models against. Kept beside the record
-    // rather than derived from `--records`, because it is state about
-    // this node and not about one invocation of this command.
-    if let Some(registry) = hellas_store::state::adopted_caches_path() {
-        println!("caches     {}", registry.display());
-        for root in hellas_store::hf_cache::adopted_caches_in(&registry) {
-            println!("adopted    {}", root.display());
-        }
-    }
     if loaded == 0 && !path.exists() {
         println!("\nNothing adopted yet. Try: hellas store adopt");
     }

@@ -57,6 +57,8 @@ pub enum FollowerError {
     SnapshotBlockPayloadMismatch { snapshot: Digest, block: Digest },
     #[error("{0}")]
     Query(#[from] QueryError),
+    #[error("local follower state query failed: {0}")]
+    LocalQuery(QueryError),
     #[error("{0}")]
     Consensus(#[from] crate::ConsensusVerificationError),
     #[error("{0}")]
@@ -71,7 +73,10 @@ impl FollowerError {
                 | Self::ActivityStream(_)
                 | Self::MissingFinalizedBlock { .. }
                 | Self::Query(
-                    QueryError::ChannelClosed | QueryError::Remote(_) | QueryError::Connect(_)
+                    QueryError::ChannelClosed
+                        | QueryError::StateUnavailable(_)
+                        | QueryError::Remote(_)
+                        | QueryError::Connect(_)
                 )
         )
     }
@@ -244,7 +249,8 @@ async fn catch_up_batch(
 ) -> Result<bool, FollowerError> {
     let mut next_height = indexer
         .get_latest_block()
-        .await?
+        .await
+        .map_err(FollowerError::LocalQuery)?
         .map_or(1, |block| block.height.saturating_add(1));
     let Some(remote_latest) = client.get_latest_block().await? else {
         return Ok(false);
@@ -351,4 +357,27 @@ fn genesis_leader(info: &ConsensusInfo) -> Result<PublicKey, FollowerError> {
         .ok_or(FollowerError::InvalidValidatorKey)?;
     let bytes = hex::decode(validator).map_err(|_| FollowerError::InvalidValidatorKey)?;
     PublicKey::decode(bytes.as_slice()).map_err(|_| FollowerError::InvalidValidatorKey)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upstream_state_unavailability_is_retryable() {
+        let upstream = FollowerError::Query(QueryError::StateUnavailable(
+            "finalization is not visible yet".to_string(),
+        ));
+
+        assert!(upstream.retryable());
+    }
+
+    #[test]
+    fn local_state_unavailability_is_fatal() {
+        let local = FollowerError::LocalQuery(QueryError::StateUnavailable(
+            "stored finalization is missing".to_string(),
+        ));
+
+        assert!(!local.retryable());
+    }
 }

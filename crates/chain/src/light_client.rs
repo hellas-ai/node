@@ -1,5 +1,15 @@
 use crate::domain::{Coin, Digest, ObjectId, ObjectKind, SettlementKey, Transaction};
+use commonware_codec::EncodeSize;
+use hellas_kernel::Encode as _;
+use hellas_rpc::SubmitTxOutcome;
 use hellas_wire::{WireCode, WireStatus};
+
+pub(crate) fn canonical_submission_size(tx: &Transaction) -> usize {
+    match tx {
+        Transaction::Kernel(kernel) => kernel.encoded_size(),
+        _ => tx.encode_size(),
+    }
+}
 
 const WRONG_OBJECT_KIND_V1_PREFIX: &str = "hellas.wrong-object-kind.v1;expected=";
 
@@ -7,10 +17,18 @@ fn wrong_object_kind_message(expected: ObjectKind, actual: ObjectKind) -> String
     format!("{WRONG_OBJECT_KIND_V1_PREFIX}{expected};actual={actual}")
 }
 
+/// Parses one kind token out of a wrong-object-kind status message.
+///
+/// The tokens are exactly what [`ObjectKind`]'s `Display` writes, and the
+/// pairing is checked by `wrong_kind_survives_wire_status_mapping` below.
+/// An unrecognized token is not guessed at: the status falls back to
+/// [`QueryError::Remote`], carrying the message a newer peer sent rather
+/// than a kind this build invented.
 fn parse_object_kind(value: &str) -> Option<ObjectKind> {
     match value {
         "coin" => Some(ObjectKind::Coin),
         "edge" => Some(ObjectKind::Edge),
+        "registry-chunk" => Some(ObjectKind::RegistryChunk),
         _ => None,
     }
 }
@@ -159,6 +177,8 @@ pub enum QueryError {
         expected: ObjectKind,
         actual: ObjectKind,
     },
+    #[error("invalid transaction: {0}")]
+    InvalidTransaction(String),
     #[error("remote rpc error: {0}")]
     Remote(String),
     #[error("connection failed: {0}")]
@@ -178,6 +198,9 @@ impl From<QueryError> for WireStatus {
                 WireCode::Aborted,
                 wrong_object_kind_message(expected, actual),
             ),
+            QueryError::InvalidTransaction(message) => {
+                WireStatus::new(WireCode::InvalidArgument, message)
+            }
             QueryError::Remote(message) => WireStatus::new(WireCode::Unavailable, message),
             QueryError::Connect(message) => WireStatus::new(WireCode::Unavailable, message),
         }
@@ -194,6 +217,9 @@ impl From<WireStatus> for QueryError {
             // semantic until a later proto can carry these fields directly.
             WireCode::Aborted => parse_wrong_object_kind(status.message())
                 .unwrap_or_else(|| QueryError::Remote(status.to_string())),
+            WireCode::InvalidArgument => {
+                QueryError::InvalidTransaction(status.message().to_string())
+            }
             _ => QueryError::Remote(status.to_string()),
         }
     }
@@ -234,7 +260,10 @@ pub trait LightClient: Clone + Send + Sync + 'static {
         query: FinalizedBlockQuery,
     ) -> impl Future<Output = Result<Option<FinalizedBlock>, QueryError>> + Send;
 
-    fn submit_tx(&self, tx: Transaction) -> impl Future<Output = Result<(), QueryError>> + Send;
+    fn submit_tx(
+        &self,
+        tx: Transaction,
+    ) -> impl Future<Output = Result<SubmitTxOutcome, QueryError>> + Send;
 
     fn get_validators(&self) -> impl Future<Output = Result<Vec<String>, QueryError>> + Send;
 
@@ -260,6 +289,8 @@ mod tests {
         for (expected, actual) in [
             (ObjectKind::Coin, ObjectKind::Edge),
             (ObjectKind::Edge, ObjectKind::Coin),
+            (ObjectKind::Edge, ObjectKind::RegistryChunk),
+            (ObjectKind::RegistryChunk, ObjectKind::Coin),
         ] {
             let status = WireStatus::from(QueryError::WrongObjectKind { expected, actual });
             assert_eq!(status.code(), WireCode::Aborted);

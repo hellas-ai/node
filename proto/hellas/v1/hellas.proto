@@ -9,42 +9,7 @@ package hellas.v1;
 
 service Execute {
   rpc RunTicket(RunTicketRequest) returns (stream WorkEvent);
-  rpc Receipt(ReceiptRequest) returns (ReceiptResponse);
-  rpc Settle(SettleRequest) returns (SettleResponse);
 }
-
-// Staked-flow receipt: after a job's terminal output, the client asks
-// for the provider signatures that complete a fraud artifact. The
-// provider signs only its own recorded transcript — a client-supplied
-// transcript is never signed.
-message ReceiptRequest {
-  bytes acceptance_digest = 1; // exactly 32 bytes
-  // The caller must prove it is the channel's committed client. A
-  // receipt hands out the provider's signatures over the acceptance and
-  // its own result — the client's half of a fraud artifact — so it must
-  // never answer a party that merely observed the acceptance on the
-  // wire. secp256k1 over the acceptance digest.
-  Signature client_signature = 2;
-}
-
-message ReceiptResponse {
-  Signature provider_acceptance_signature = 1; // secp256k1 over the acceptance digest
-  bytes transcript = 2;                        // exactly 32 bytes: terminal event commitment
-  Signature provider_result_signature = 3;     // secp256k1 over the result digest
-}
-
-// Staked-flow settlement: the client's frontier voucher paying the
-// in-flight job's price. The provider reconstructs the canonical
-// two-output close shape itself; only the frontier value and the maker
-// authorization cross the wire.
-message SettleRequest {
-  bytes payment_edge = 1;             // exactly 32 bytes (kernel EdgeId)
-  bytes payment_terms = 2;            // exactly 32 bytes (kernel TermsHash)
-  uint64 cumulative = 3;              // frontier E after this job
-  Signature client_authorization = 4; // secp256k1 over the kernel Mutual payload
-}
-
-message SettleResponse {}
 
 message Ticket {
   bytes request_commitment = 1; // exactly 32 bytes
@@ -61,6 +26,8 @@ message JobTerms {
 
 // Numeric values are canonical protocol tags and must not be renumbered.
 enum Assurance {
+  // Producer-signed is the defined baseline assurance, not an absent value.
+  // buf:lint:ignore ENUM_ZERO_VALUE_SUFFIX
   ASSURANCE_PRODUCER_SIGNED = 0;
   ASSURANCE_APPLE_APP_ATTEST = 1;
 }
@@ -69,25 +36,6 @@ message RunTicketRequest {
   Ticket ticket = 1;
   Signature signature = 2;
   PublicKey public_key = 3;
-  // Staked job admission: present when the pairing runs the staked
-  // fraud game. A staked provider refuses execution without it; an
-  // unstaked provider refuses execution with it.
-  JobAcceptance acceptance = 4;
-}
-
-// Client-signed job acceptance binding one job to its stake bond and
-// payment edge (the chain `staked` vocabulary). Field order mirrors the
-// canonical acceptance digest.
-message JobAcceptance {
-  bytes bond_edge = 1;            // exactly 32 bytes (kernel EdgeId)
-  bytes bond_terms = 2;           // exactly 32 bytes (kernel TermsHash)
-  bytes payment_edge = 3;         // exactly 32 bytes (kernel EdgeId)
-  uint64 sequence = 4;
-  bytes request = 5;              // exactly 32 bytes (request commitment)
-  bytes environment = 6;          // exactly 32 bytes (provider genesis ContentId)
-  uint64 price = 7;
-  uint64 terminal_deadline = 8;   // block height
-  Signature client_signature = 9; // secp256k1 over the acceptance digest
 }
 
 message PublicKey {
@@ -158,9 +106,10 @@ message OutputEventEnvelope {
 
 // Wire protocol: zero or more WorkChunk events, terminated by exactly one
 // WorkFinished or WorkFailed, after which the stream ends. WorkChunk events
-// carry signed output events as they become available. Successful result
-// commitment lives in the terminal signed output event; WorkFinished is stream
-// framing, not a scheme result carrier.
+// carry the signed non-terminal prefix as it becomes available; WorkFinished
+// carries exactly the next signed terminal event. Successful result commitment
+// lives in that terminal event; WorkFinished is stream framing, not a second
+// copy of the transcript or a scheme result carrier.
 message WorkEvent {
   oneof kind {
     WorkChunk chunk = 1;
@@ -175,7 +124,7 @@ message WorkChunk {
 
 message WorkFinished {
   reserved 1, 2;
-  repeated OutputEventEnvelope output_events = 3;
+  OutputEventEnvelope terminal_output_event = 3;
   repeated AssuranceEvidence assurance_evidence = 4;
 }
 

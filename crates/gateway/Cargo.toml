@@ -12,6 +12,7 @@ default = []
 evaluate = [
     "dep:hellas-executor",
     "hellas-executor/evaluate",
+    "dep:hellas-store",
     "dep:tokio-stream",
 ]
 
@@ -23,11 +24,13 @@ futures = "0.3"
 hellas-adaptors.workspace = true
 hellas-client = { workspace = true, features = ["iroh", "evaluate"] }
 hellas-executor = { workspace = true, optional = true }
-hellas-models.workspace = true
+hellas-presentation.workspace = true
 hellas-rpc = { workspace = true, features = ["courtesy", "fetch"] }
+hellas-store = { workspace = true, optional = true }
 hellas-wire = { workspace = true, features = ["iroh"] }
 iroh.workspace = true
 prometheus-client.workspace = true
+rand.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

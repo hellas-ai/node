@@ -91,7 +91,7 @@ fn same_close_on_a_different_network_gives_a_different_payload_hash() {
     let edge = edge_id(EdgeKey::First);
     let outputs = payouts();
 
-    for kind in [CloseKind::Mutual, CloseKind::Timeout, CloseKind::Violation] {
+    for kind in [CloseKind::Mutual, CloseKind::Timeout] {
         assert_ne!(
             Tx::payload_hash(support::NETWORK, edge, kind, terms.hash(), &outputs),
             Tx::payload_hash(OTHER, edge, kind, terms.hash(), &outputs),

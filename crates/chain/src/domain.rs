@@ -28,7 +28,7 @@ pub use commonware_cryptography::Signer;
 use commonware_cryptography::{Hasher, Sha256, ed25519, secp256r1};
 use hellas_kernel::{
     Coin as KernelCoin, Decode as KernelDecode, Edge as KernelEdge, Encode as KernelEncode, Fees,
-    Key as KernelKey, NetworkId, Tx as KernelTx,
+    Key as KernelKey, NetworkId, RegistryChunk as KernelRegistryChunk, Tx as KernelTx,
 };
 use p256::ecdsa::signature::Verifier as _;
 use serde_json::Value as JsonValue;
@@ -464,6 +464,22 @@ pub(crate) fn edge_object_id(id: hellas_kernel::EdgeId) -> ObjectId {
     ObjectId::from(id.to_bytes())
 }
 
+/// Returns the chain object id for a kernel registry chunk id.
+///
+/// Like the coin and edge helpers, this is the identity map: the kernel
+/// already domain-separates the three derivations, so the chain does not
+/// separate them a second time.
+///
+/// Validator-only, unlike its coin and edge siblings. Those two are also
+/// read by the owner index, which an indexer builds; registry chunks are
+/// consensus state that no owner owns, so nothing outside execution
+/// addresses one.
+#[must_use]
+#[cfg(feature = "validator")]
+pub(crate) fn registry_chunk_object_id(id: hellas_kernel::RegistryChunkId) -> ObjectId {
+    ObjectId::from(id.to_bytes())
+}
+
 /// A genesis document names a network id the kernel cannot carry.
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 #[error("genesis network id `{0}` does not fit a kernel NetworkId")]
@@ -480,7 +496,7 @@ pub struct NetworkIdError(pub String);
 /// There is deliberately no compile-time default. A binary that
 /// carries one silently re-domains every signature in the tree the
 /// moment that constant moves, which is not hypothetical.
-pub fn network_id(genesis: &hellas_genesis::Genesis) -> Result<NetworkId, NetworkIdError> {
+pub fn network_id(genesis: &crate::genesis::Genesis) -> Result<NetworkId, NetworkIdError> {
     NetworkId::new(&genesis.network_id).ok_or_else(|| NetworkIdError(genesis.network_id.clone()))
 }
 
@@ -619,6 +635,10 @@ pub enum ObjectKind {
     Coin,
     /// Kernel settlement edge.
     Edge,
+    /// Kernel registry chunk. Consensus state with no owner: it is
+    /// authenticated by the same state root as coins and edges, but no
+    /// party spends it and no owner index tracks it.
+    RegistryChunk,
 }
 
 impl core::fmt::Display for ObjectKind {
@@ -626,6 +646,7 @@ impl core::fmt::Display for ObjectKind {
         match self {
             Self::Coin => f.write_str("coin"),
             Self::Edge => f.write_str("edge"),
+            Self::RegistryChunk => f.write_str("registry-chunk"),
         }
     }
 }
@@ -642,18 +663,32 @@ pub enum Object {
     Coin(Coin),
     /// Edge payload.
     Edge(KernelEdge),
+    /// Registry chunk payload.
+    RegistryChunk(KernelRegistryChunk),
+}
+
+/// The larger of two sizes, in a const context.
+const fn larger(left: usize, right: usize) -> usize {
+    if left > right { left } else { right }
 }
 
 impl Object {
     const COIN_TAG: u8 = 0;
     const EDGE_TAG: u8 = 1;
+    const REGISTRY_CHUNK_TAG: u8 = 2;
 
     /// Fixed payload area following the one-byte object-kind tag.
-    pub const PAYLOAD_SIZE: usize = if KernelCoin::MAX_ENCODED_SIZE > KernelEdge::MAX_ENCODED_SIZE {
-        KernelCoin::MAX_ENCODED_SIZE
-    } else {
-        KernelEdge::MAX_ENCODED_SIZE
-    };
+    ///
+    /// Derived, never written down: every stored object is padded to the
+    /// widest arm, so a literal here would silently truncate the moment
+    /// a kernel payload grew past it.
+    pub const PAYLOAD_SIZE: usize = larger(
+        KernelCoin::MAX_ENCODED_SIZE,
+        larger(
+            KernelEdge::MAX_ENCODED_SIZE,
+            KernelRegistryChunk::MAX_ENCODED_SIZE,
+        ),
+    );
 
     /// Returns the stored object's kind.
     #[must_use]
@@ -661,6 +696,7 @@ impl Object {
         match self {
             Self::Coin(_) => ObjectKind::Coin,
             Self::Edge(_) => ObjectKind::Edge,
+            Self::RegistryChunk(_) => ObjectKind::RegistryChunk,
         }
     }
 
@@ -704,6 +740,10 @@ impl Write for Object {
                 Self::EDGE_TAG.write(buf);
                 Self::write_payload(edge, buf);
             }
+            Self::RegistryChunk(chunk) => {
+                Self::REGISTRY_CHUNK_TAG.write(buf);
+                Self::write_payload(chunk, buf);
+            }
         }
     }
 }
@@ -720,9 +760,26 @@ impl Read for Object {
                 Ok(Self::Coin(Coin::from(coin)))
             }
             Self::EDGE_TAG => Ok(Self::Edge(Self::read_payload::<KernelEdge>(&payload)?)),
+            Self::REGISTRY_CHUNK_TAG => Ok(Self::RegistryChunk(Self::read_payload::<
+                KernelRegistryChunk,
+            >(&payload)?)),
             _ => Err(CodecError::InvalidEnum(tag)),
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) fn test_registry_chunk() -> KernelRegistryChunk {
+    // Two chunks, so the stored chunk is a full one rather than the
+    // easier remainder case.
+    let value = [0x5a_u8; hellas_kernel::REGISTRY_CHUNK_DATA_CAPACITY + 3];
+    hellas_kernel::RegistryChunk::split(
+        hellas_kernel::RegistryNamespace::BondLease,
+        hellas_kernel::RegistryRecordTag::BondLease,
+        &value,
+        0,
+    )
+    .expect("test value splits into two chunks")
 }
 
 #[cfg(test)]
@@ -741,8 +798,8 @@ pub(crate) fn test_edge() -> KernelEdge {
     bytes.extend_from_slice(&[2; KernelKey::LENGTH]);
     bytes.extend_from_slice(&[3; KernelKey::LENGTH]);
     bytes.extend_from_slice(&[4; 32]);
-    // CloseKindSet: all close kinds allowed.
-    bytes.push(0b111);
+    // CloseKindSet: the basic-terms set (mutual, timeout).
+    bytes.push(0b011);
     assert_eq!(bytes.len(), KernelEdge::MAX_ENCODED_SIZE);
     KernelEdge::decode_exact(&bytes).expect("test edge must use the kernel canonical layout")
 }
@@ -1334,6 +1391,50 @@ mod tests {
     }
 
     #[test]
+    fn stored_object_stays_164_bytes_across_every_arm() {
+        // The stored object is a one-byte kind tag plus a payload area
+        // padded to the widest kernel arm. A registry chunk is 130
+        // canonical bytes, under the 163-byte edge, so adding it did not
+        // widen a single stored coin, edge, or chunk. This number is
+        // load-bearing for the fixed-size QMDB journal: changing it
+        // rewrites every stored object.
+        assert_eq!(KernelRegistryChunk::MAX_ENCODED_SIZE, 130);
+        assert_eq!(KernelEdge::MAX_ENCODED_SIZE, 163);
+        const { assert!(KernelCoin::MAX_ENCODED_SIZE <= KernelEdge::MAX_ENCODED_SIZE) };
+        assert_eq!(Object::PAYLOAD_SIZE, 163);
+        assert_eq!(Object::SIZE, 164);
+
+        let chunk = test_registry_chunk();
+        for object in [
+            Object::Coin(Coin {
+                owner: SettlementKey::from_bytes([0x42; SettlementKey::LENGTH]),
+                value: 7,
+            }),
+            Object::Edge(test_edge()),
+            Object::RegistryChunk(chunk),
+        ] {
+            assert_eq!(object.encode().len(), Object::SIZE);
+        }
+    }
+
+    #[test]
+    fn object_registry_chunk_codec_uses_kernel_canonical_payload_and_zero_padding() {
+        let chunk = test_registry_chunk();
+        let object = Object::RegistryChunk(chunk);
+        let encoded = object.encode();
+
+        let mut canonical = [0_u8; KernelRegistryChunk::MAX_ENCODED_SIZE];
+        let canonical_len = chunk.write_to(&mut canonical);
+
+        assert_eq!(encoded[0], Object::REGISTRY_CHUNK_TAG);
+        assert_eq!(&encoded[1..1 + canonical_len], &canonical);
+        assert!(encoded[1 + canonical_len..].iter().all(|byte| *byte == 0));
+        assert_eq!(Object::decode(encoded).expect("object decode"), object);
+        assert_eq!(object.kind(), ObjectKind::RegistryChunk);
+        assert_eq!(ObjectKind::RegistryChunk.to_string(), "registry-chunk");
+    }
+
+    #[test]
     fn object_codec_rejects_non_zero_padding() {
         let object = Object::Coin(Coin {
             owner: SettlementKey::from_bytes([0x42; SettlementKey::LENGTH]),
@@ -1402,6 +1503,63 @@ mod tests {
         }
     }
 
+    /// A maximum-width close start: the widest revealed payment terms
+    /// plus a present certificate.
+    fn payment_close_start_tx() -> KernelTx {
+        use hellas_kernel::{
+            EarnedCertificate, Move, Party, PaymentCloseStart, Payout as KernelPayout, Sig,
+            Terms as KernelTerms, WorkPaymentTerms, WorkStakeBondTerms,
+        };
+
+        let maker = hellas_kernel::Key::from_bytes([0x31; 33]);
+        let taker = hellas_kernel::Key::from_bytes([0x32; 33]);
+        let bond = WorkStakeBondTerms {
+            parties: hellas_kernel::Parties::new(taker, maker),
+            timeout: hellas_kernel::BlockHeight::new(900),
+            timeout_outputs: hellas_kernel::List::all(
+                [KernelPayout::new(taker, 3); hellas_kernel::MAX_EDGE_OUTPUTS],
+            ),
+            max_job_price: 4,
+        };
+        let terms = KernelTerms::work_payment(WorkPaymentTerms {
+            bond_edge: hellas_kernel::EdgeId::from_bytes([0x44; 32]),
+            bond_terms: bond,
+            private_policy_commitment: [0x55; 32],
+            omit_response_blocks: 64,
+            start_validity_blocks: 8,
+            omission_bond: 2,
+        });
+        let edge = hellas_kernel::EdgeId::from_bytes([0x11; 32]);
+        let certificate = EarnedCertificate::new(edge, terms.hash(), 4_242);
+        KernelTx::move_action(Move::StartPaymentClose(PaymentCloseStart::new(
+            edge,
+            terms,
+            Party::Taker,
+            (900, 907),
+            Some((certificate, Sig::from_bytes([0x66; 64]))),
+            Sig::from_bytes([0x77; 64]),
+        )))
+    }
+
+    fn payment_close_response_tx() -> KernelTx {
+        use hellas_kernel::{
+            EarnedCertificate, Move, Party, PaymentCloseResponse, Sig, StartId, TermsHash,
+        };
+
+        let edge = hellas_kernel::EdgeId::from_bytes([0x11; 32]);
+        let terms = TermsHash::from_bytes([0x22; 32]);
+        KernelTx::move_action(Move::RespondPaymentClose(PaymentCloseResponse::new(
+            edge,
+            StartId::from_bytes([0x33; 32]),
+            Party::Taker,
+            (
+                EarnedCertificate::new(edge, terms, 4_242),
+                Sig::from_bytes([0x66; 64]),
+            ),
+            Sig::from_bytes([0x77; 64]),
+        )))
+    }
+
     fn assert_kernel_codec_roundtrip(kernel_tx: KernelTx) {
         let expected_payload_len = kernel_tx.encoded_size();
         let mut canonical = [0_u8; KernelTx::MAX_ENCODED_SIZE];
@@ -1431,6 +1589,38 @@ mod tests {
     #[test]
     fn kernel_close_codec_roundtrip() {
         assert_kernel_codec_roundtrip(valid_mutual_close_tx().expect("valid kernel close fixture"));
+    }
+
+    #[test]
+    fn kernel_move_codec_roundtrip() {
+        assert_kernel_codec_roundtrip(payment_close_start_tx());
+        assert_kernel_codec_roundtrip(payment_close_response_tx());
+    }
+
+    /// The chain wrapper is a tag byte plus the payload length as a
+    /// commonware-codec varint — **three** bytes for every payload in
+    /// `128..=16,383`, which is every payment-close body. A wrapped-size
+    /// quote of nine would be reading the length as a fixed `usize`.
+    #[test]
+    fn the_payment_close_chain_wrapper_is_three_bytes() {
+        for (kernel_tx, kernel_len, chain_len) in [
+            (payment_close_start_tx(), 619, 622),
+            (payment_close_response_tx(), 274, 277),
+        ] {
+            assert_eq!(kernel_tx.encoded_size(), kernel_len);
+            let encoded = Transaction::Kernel(kernel_tx).encode();
+            assert_eq!(encoded.len(), chain_len);
+            assert_eq!(encoded.len() - kernel_len, 3);
+            // Tag byte, then a two-byte varint length.
+            assert_eq!(encoded[0], 2);
+            assert_eq!(kernel_len.encode_size(), 2);
+        }
+
+        // The formula is length-dependent, not globally three: a payload
+        // under 128 bytes has a one-byte length.
+        assert_eq!(82_usize.encode_size(), 1);
+        assert_eq!(16_383_usize.encode_size(), 2);
+        assert_eq!(16_384_usize.encode_size(), 3);
     }
 
     #[test]
@@ -1585,10 +1775,10 @@ mod tests {
         }
 
         for (json, scalars) in [
-            (hellas_genesis::HELLAS_DEVNET_1_JSON, [1_u8, 2]),
-            (hellas_genesis::HELLAS_TESTNET_1_JSON, [3, 4]),
+            (crate::genesis::HELLAS_DEVNET_1_JSON, [1_u8, 2]),
+            (crate::genesis::HELLAS_TESTNET_1_JSON, [3, 4]),
         ] {
-            let genesis: hellas_genesis::Genesis =
+            let genesis: crate::genesis::Genesis =
                 serde_json::from_str(json).expect("shipped document parses");
             let funded: Vec<&str> = genesis
                 .allocations

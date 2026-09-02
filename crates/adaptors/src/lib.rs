@@ -45,10 +45,14 @@ pub use execution::{
 // transcripts); re-exported here because it appears throughout this
 // crate's own API.
 pub use hellas_rpc::output::{
-    OutputEvent, Provenance, StopReason, StructuredDelta, TextChannel, ToolCallArgumentsDelta,
-    ToolCallEnd, ToolCallStart, Usage,
+    AdaptorEvent, CodexCompleted, CodexInputTokenDetails, CodexItemStatus, CodexMessageContent,
+    CodexMessagePhase, CodexOutputTokenDetails, CodexReasoningContent, CodexReasoningSummary,
+    CodexResponseItem, CodexResponsesEvent, CodexToolSearchArguments, CodexUsage,
+    CodexUsageMetadata, OutputEvent, Provenance, StopReason, StructuredDelta, TextChannel,
+    ToolCallArgumentsDelta, ToolCallEnd, ToolCallStart, Usage,
 };
 pub use request::RawRequest;
 pub use wire::{
-    RenderContext, SseDecoder, WireBody, WireEventData, WireHeaders, WireResponse, WireStreamEvent,
+    MAX_SSE_RESPONSE_BYTES, RenderContext, SseDecoder, WireBody, WireEventData, WireHeaders,
+    WireResponse, WireStreamEvent,
 };

@@ -11,12 +11,12 @@ use crate::{
     block::Block,
     context::Context,
     error::{BatchError, InsertError, KernelResult},
-    event::{Change, Diff, Event},
+    event::{ApplyOutcome, Change, Diff},
     list::List,
     object::Genesis,
     store::{Batch, Store},
     tx::Tx,
-    verifier::{SealVerifier, SigVerifier},
+    verifier::SigVerifier,
     view::Snapshot,
 };
 
@@ -88,23 +88,28 @@ impl<S: Store> State<S> {
     /// Applies one ordered operation to the object store.
     ///
     /// Validation runs read-only against the staged transaction. If validation
-    /// succeeds, the resulting event is folded into the transaction and
+    /// succeeds, the resulting change is folded into the transaction and
     /// committed. A failing apply leaves the backing store unchanged.
+    ///
+    /// The returned [`ApplyOutcome`] carries everything the operation
+    /// committed: its public event, if it has one, and every registry
+    /// slot it wrote. A host that persists only the event drops
+    /// consensus state.
     ///
     /// # Errors
     ///
     /// Returns [`crate::ApplyError`] if the operation is not valid for the
     /// current store contents or if the backing store rejects an insertion.
-    pub fn apply<V: SigVerifier + SealVerifier + ?Sized>(
+    pub fn apply<V: SigVerifier + ?Sized>(
         &mut self,
         context: Context,
         verifier: &V,
         operation: &Tx,
-    ) -> KernelResult<Event> {
+    ) -> KernelResult<ApplyOutcome> {
         let mut tx = self.store.begin();
-        let event = Self::fold_one(&mut tx, context, verifier, operation)?;
+        let outcome = Self::fold_one(&mut tx, context, verifier, operation)?;
         tx.commit();
-        Ok(event)
+        Ok(outcome)
     }
 
     /// Applies an ordered operation batch atomically and returns its diff.
@@ -116,7 +121,7 @@ impl<S: Store> State<S> {
     /// # Errors
     ///
     /// Returns [`BatchError`] with the failed operation index and source error.
-    pub fn apply_all<V: SigVerifier + SealVerifier + ?Sized, const N: usize>(
+    pub fn apply_all<V: SigVerifier + ?Sized, const N: usize>(
         &mut self,
         context: Context,
         verifier: &V,
@@ -126,9 +131,9 @@ impl<S: Store> State<S> {
         let mut diff = Diff::empty();
 
         for (index, operation) in operations.iter().enumerate() {
-            let event = Self::fold_one(&mut tx, context, verifier, operation)
+            let outcome = Self::fold_one(&mut tx, context, verifier, operation)
                 .map_err(|source| BatchError::new(index, source))?;
-            diff.push(&event);
+            diff.push(&outcome);
         }
 
         tx.commit();
@@ -145,7 +150,7 @@ impl<S: Store> State<S> {
     /// # Errors
     ///
     /// Returns [`BatchError`] with the failed operation index and source error.
-    pub fn apply_block<V: SigVerifier + SealVerifier + ?Sized, const N: usize>(
+    pub fn apply_block<V: SigVerifier + ?Sized, const N: usize>(
         &mut self,
         verifier: &V,
         block: &Block<N>,
@@ -158,15 +163,15 @@ impl<S: Store> State<S> {
     /// Equivalent to [`Self::apply_all`] but for callers whose batch size is
     /// not known at the type level. The operation iterator may yield owned
     /// transactions or borrowed transactions. Validation and folding share one
-    /// staged transaction; the closure receives each emitted [`Event`] as the
-    /// batch progresses, so callers who only need to observe events without
-    /// allocating an event vector can do so. If any operation fails the
+    /// staged transaction; the closure receives each [`ApplyOutcome`] as the
+    /// batch progresses, so callers who only need to observe outcomes without
+    /// allocating a vector can do so. If any operation fails the
     /// transaction is dropped, the closure is not called for the failed or
     /// any subsequent operations, and the backing store is unchanged.
     ///
-    /// # Pre-commit event emission
+    /// # Pre-commit outcome emission
     ///
-    /// `on_event` fires *before* the batch commits. If operation _k_ succeeds
+    /// `on_outcome` fires *before* the batch commits. If operation _k_ succeeds
     /// the closure is called for it; if a later operation in the same batch
     /// fails, the whole transaction is rolled back — but the closure has
     /// already observed event _k_. Consumers that index events to external
@@ -183,38 +188,38 @@ impl<S: Store> State<S> {
         context: Context,
         verifier: &V,
         operations: I,
-        mut on_event: F,
+        mut on_outcome: F,
     ) -> KernelResult<(), BatchError>
     where
-        V: SigVerifier + SealVerifier + ?Sized,
+        V: SigVerifier + ?Sized,
         I: IntoIterator<Item = B>,
         B: Borrow<Tx>,
-        F: FnMut(usize, &Event),
+        F: FnMut(usize, &ApplyOutcome),
     {
         let mut tx = self.store.begin();
 
         for (index, operation) in operations.into_iter().enumerate() {
-            let event = Self::fold_one(&mut tx, context, verifier, operation.borrow())
+            let outcome = Self::fold_one(&mut tx, context, verifier, operation.borrow())
                 .map_err(|source| BatchError::new(index, source))?;
-            on_event(index, &event);
+            on_outcome(index, &outcome);
         }
 
         tx.commit();
         Ok(())
     }
 
-    fn fold_one<B: Batch, V: SigVerifier + SealVerifier + ?Sized>(
+    fn fold_one<B: Batch, V: SigVerifier + ?Sized>(
         batch: &mut B,
         context: Context,
         verifier: &V,
         operation: &Tx,
-    ) -> KernelResult<Event> {
+    ) -> KernelResult<ApplyOutcome> {
         let change = operation.apply(context, verifier, batch)?;
         Self::fold_change(batch, &change)
     }
 
-    fn fold_change<B: Batch>(batch: &mut B, change: &Change) -> KernelResult<Event> {
+    fn fold_change<B: Batch>(batch: &mut B, change: &Change) -> KernelResult<ApplyOutcome> {
         change.fold(batch)?;
-        Ok(change.event().clone())
+        Ok(change.outcome())
     }
 }

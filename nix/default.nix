@@ -3,7 +3,7 @@
   system,
   nixpkgs,
   rust-overlay,
-  catgrad,
+  catena-lang,
 }:
 let
   nativePkg = import ./package.nix {
@@ -12,6 +12,7 @@ let
       system
       nixpkgs
       rust-overlay
+      catena-lang
       ;
   };
   inherit (nativePkg)
@@ -39,6 +40,26 @@ let
     nixfmt
     taplo
   ];
+
+  # Buf's standard RPC naming rules assume generated gRPC APIs. Hellas uses
+  # service names in transport identities and deliberately shares protocol
+  # objects between methods, so those cosmetic rules would change the wire
+  # protocol or add one-field wrappers. Keep the exceptions with the check
+  # that needs them instead of a repository-root tool configuration file.
+  bufLintConfig = builtins.toJSON {
+    version = "v2";
+    modules = [ { path = "proto"; } ];
+    lint = {
+      use = [ "STANDARD" ];
+      except = [
+        "SERVICE_SUFFIX"
+        "RPC_RESPONSE_STANDARD_NAME"
+        "RPC_REQUEST_STANDARD_NAME"
+        "RPC_REQUEST_RESPONSE_UNIQUE"
+      ];
+    };
+  };
+  bufLintCommand = "buf lint --config ${lib.escapeShellArg bufLintConfig}";
 
   kernel = import ./kernel.nix {
     inherit
@@ -82,6 +103,7 @@ let
 
   ci = import ./ci.nix {
     inherit
+      bufLintCommand
       pkgs
       lib
       rustToolchain
@@ -109,8 +131,6 @@ let
         touch "$out"
       '';
 
-  hfCaches = pkgs.hellasLib.hf;
-
   packagesFor =
     crossSystem:
     let
@@ -120,47 +140,47 @@ let
           system
           nixpkgs
           rust-overlay
+          catena-lang
           crossSystem
           ;
       };
-      inherit (pkgSpec.pkgs.stdenv) hostPlatform;
     in
     {
       cli = pkgSpec.mkHellasPackage {
         buildNoDefaultFeatures = true;
-        # `gateway` is the slim HTTP gateway: model assets + network routing,
-        # no executor backend or telemetry exporter. Local execution and OTEL
-        # need a candle variant.
+        # Full network surface, but no local Catena runtime.
         buildFeatures = [
           "chain"
           "gateway"
+        ]
+        ++ lib.optionals (crossSystem == null) [
+          "node"
+          "otel"
         ];
       };
       cli-validator = pkgSpec.mkHellasPackage {
         buildNoDefaultFeatures = true;
         buildFeatures = [ "validator" ];
       };
-      cli-candle = pkgSpec.mkHellasPackage {
-        buildNoDefaultFeatures = true;
-        buildFeatures = [
-          "chain"
-          "candle"
-          "otel"
-        ];
-      };
     }
-    // lib.optionalAttrs hostPlatform.isDarwin {
-      cli-candle-metal = pkgSpec.mkHellasPackage {
-        buildNoDefaultFeatures = true;
-        buildFeatures = [
-          "chain"
-          "candle-metal"
-          "otel"
-        ];
-      };
-    };
+    # Do not advertise the safe local GPU runtime on platforms where the
+    # packaged provider toolchain is not yet supported.
+    //
+      lib.optionalAttrs (crossSystem == null && pkgSpec.pkgs.stdenv.hostPlatform.system == "x86_64-linux")
+        {
+          cli-catena = pkgSpec.mkHellasPackage {
+            buildNoDefaultFeatures = true;
+            buildFeatures = [
+              "evaluate"
+              "otel"
+            ];
+          };
+        };
 
   crossTargets = {
+    # The store's replacement-resistant file identity uses Unix device,
+    # inode, mtime, and ctime metadata. Do not advertise Windows until an
+    # equally strong platform-specific identity has an implementation/tests.
     "aarch64-linux" = nixpkgs.lib.systems.examples.aarch64-multiplatform;
     "riscv64-linux" = nixpkgs.lib.systems.examples.riscv64;
     "x86_64-linux-musl" = nixpkgs.lib.systems.examples.musl64 // {
@@ -169,7 +189,6 @@ let
     "aarch64-linux-musl" = nixpkgs.lib.systems.examples.aarch64-multiplatform-musl // {
       isStatic = true;
     };
-    "x86_64-windows" = nixpkgs.lib.systems.examples.mingwW64;
   };
 
   nativePackages = packagesFor null;
@@ -216,57 +235,75 @@ let
       docker = import ./docker.nix {
         inherit
           pkgs
-          lib
           rustToolchain
-          catgrad
-          system
           ;
-        inherit (nativePkg) mkHellasPackage;
-        cliCandle = nativePackages.cli-candle;
+        inherit (nativePackages) cli;
       };
 
       nixosTests = lib.optionalAttrs isX86_64Linux (
         import ./tests {
           inherit self pkgs lib;
-          package = nativePackages.cli-candle;
+          package = nativePackages.cli-catena;
+          networkPackage = nativePackages.cli;
           validatorPackage = nativePackages.cli-validator;
         }
       );
     in
     {
-      packages = {
-        cli-candle-cuda = docker.defaultCudaCli;
-        docker-cuda = docker.defaultCudaImage;
-      }
-      // lib.mapAttrs' (name: value: lib.nameValuePair "docker-${name}" value) docker.dockerImages
-      // lib.mapAttrs' (
-        name: value: lib.nameValuePair "cli-candle-cuda-${name}" value
-      ) docker.cudaCliPackages;
+      packages.docker = docker.image;
 
       apps."docker-push-all" = {
         type = "app";
-        program = "${docker.pushAll}/bin/docker-push-all";
-        meta.description = "Push all Hellas Docker images";
+        program = "${docker.push}/bin/docker-push";
+        meta.description = "Push the Hellas network-node Docker image";
       };
 
-      devShells.cuda = pkgs.mkShell {
-        packages = devShellPackages;
-        shellHook = envShellHook;
-        inherit (docker.defaultCudaEnv) nativeBuildInputs;
-        inherit (docker.defaultCudaEnv) buildInputs;
-        inherit (docker.defaultCudaEnv) CUDA_COMPUTE_CAP CUDA_TOOLKIT_ROOT_DIR;
-        LD_LIBRARY_PATH = "${docker.defaultCudaEnv.runtimeLibraryPath}:${docker.defaultCudaEnv.driverLink}/lib";
+      devShells = lib.optionalAttrs isX86_64Linux {
+        rocm = pkgs.mkShellNoCC {
+          packages = devShellPackages ++ [
+            pkgs.rocmPackages.clang
+            pkgs.rocmPackages.hipcc
+          ];
+          shellHook = envShellHook + ''
+            # hipcc's setup selects its clang as the host C compiler. That
+            # compiler emits LLVM 22 LTO objects which this Rust toolchain's
+            # lld cannot consume (notably while building alloca's C shim).
+            # Keep ordinary build scripts on nixpkgs' wrapped host compiler;
+            # Catena still reaches ROCm through hipcc and HIP_CLANG_PATH.
+            export CC=${pkgs.stdenv.cc}/bin/cc
+            export CXX=${pkgs.stdenv.cc}/bin/c++
+            export ROCM_PATH=${pkgs.hellasLib.rocmToolkit}
+            export HIP_PATH=${pkgs.hellasLib.rocmToolkit}
+            export HIP_CLANG_PATH=${pkgs.rocmPackages.clang}/bin
+            export DEVICE_LIB_PATH=${pkgs.rocmPackages.rocm-device-libs}/amdgcn/bitcode
+            export HIP_FLAGS="--rocm-path=${pkgs.hellasLib.rocmToolkit} --rocm-device-lib-path=${pkgs.rocmPackages.rocm-device-libs}/amdgcn/bitcode"
+            export LD_LIBRARY_PATH=${pkgs.hellasLib.rocmToolkit}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+          '';
+        };
       };
 
       inherit nixosTests;
     }
   );
 
+  noCatgradLock =
+    pkgs.runCommand "hellas-no-catgrad-lock" { nativeBuildInputs = [ pkgs.gnugrep ]; }
+      ''
+        if grep -Eqi 'catgrad' ${../flake.lock}; then
+          echo "flake.lock still contains Catgrad after the Catena cutover" >&2
+          exit 1
+        fi
+        touch "$out"
+      '';
+
   hydraLints = {
+    "no-catgrad-lock" = noCatgradLock;
+
     sort = mkHydraSourceCheck {
       name = "check-sort";
       inputs = [ pkgs.cargo-sort ];
-      command = "cargo-sort --workspace --check";
+      # Taplo owns TOML layout; cargo-sort owns table/key ordering.
+      command = "cargo-sort --workspace --check --no-format";
     };
 
     fmt = mkHydraSourceCheck {
@@ -299,7 +336,7 @@ let
     buf = mkHydraSourceCheck {
       name = "check-buf";
       inputs = [ pkgs.buf ];
-      command = "buf lint";
+      command = bufLintCommand;
     };
 
     deadnix = mkHydraSourceCheck {
@@ -330,13 +367,13 @@ let
   };
 
   hydraPackages = {
-    inherit (nativePackages) cli cli-candle cli-validator;
+    inherit (nativePackages) cli cli-validator;
   }
   // lib.optionalAttrs isX86_64Linux {
+    inherit (nativePackages) cli-catena;
     static-x86_64 = crossPackages.cross-x86_64-linux-musl-cli;
     static-aarch64 = crossPackages.cross-aarch64-linux-musl-cli;
-    static-windows = crossPackages.cross-x86_64-windows-cli;
-    inherit (linuxOutputs.packages) docker-cuda;
+    inherit (linuxOutputs.packages) docker;
     "hellas-rpc-wasm" = hellasRpcWasm;
   };
 
@@ -358,8 +395,6 @@ in
     // crossPackages
     // {
       default = nativePackages.cli;
-      "hf-cache-lfm2-350m" = hfCaches.lfm2_350MCache;
-      "hf-cache-qwen3-0_6b" = hfCaches.qwen3_0_6BCache;
       "hellas-rpc-wasm" = hellasRpcWasm;
     }
     // (linuxOutputs.packages or { });
@@ -401,7 +436,9 @@ in
   ci = { inherit (ci) checks builds; };
 
   # nixosTests are also surfaced under `checks` so `nix flake check` runs them.
-  checks = linuxOutputs.nixosTests or { };
+  checks = (linuxOutputs.nixosTests or { }) // {
+    "no-catgrad-lock" = noCatgradLock;
+  };
   nixosTests = linuxOutputs.nixosTests or { };
 
   hydraJobs = {

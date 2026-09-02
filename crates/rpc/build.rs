@@ -132,10 +132,10 @@ struct RpcService {
 }
 
 struct RpcMethod {
-    /// `QuotePrompt` (as it appears in the .proto).
+    /// `QuoteTokens` (as it appears in the .proto).
     proto_name: String,
     /// Fully-qualified proto request type with a leading dot, e.g.
-    /// `.hellas.courtesy.v1.QuotePromptRequest` — matching `SchemaIndex` keys.
+    /// `.hellas.courtesy.v1.QuoteTokensRequest` — matching `SchemaIndex` keys.
     request_proto_type: String,
     /// Fully-qualified proto response type with a leading dot.
     response_proto_type: String,
@@ -199,7 +199,7 @@ struct SchemaIndex {
 
 #[derive(Clone, Debug)]
 struct IndexedMessage {
-    /// Short proto name (`QuotePromptRequest`).
+    /// Short proto name (`QuoteTokensRequest`).
     short_name: String,
     fields: Vec<IndexedField>,
 }
@@ -432,7 +432,7 @@ fn classify_field(f: &FieldDescriptorProto) -> IndexedFieldType {
 
 /// Per-method render inputs.
 struct MethodPlan {
-    /// Marker type ident (`QuotePrompt`).
+    /// Marker type ident (`QuoteTokens`).
     marker: Ident,
     /// Client / handler method ident (`quote_prompt`).
     fn_name: Ident,
@@ -444,6 +444,12 @@ struct MethodPlan {
     /// Absolute Rust path of the prost response type.
     response: syn::Path,
     shape: Shape,
+    /// Whether the handler is handed the connection's own context.
+    connection_bound: bool,
+    /// Whether this is the bounded general transaction submission method.
+    bounded_submit_tx: bool,
+    /// Whether this is the separately bounded work-response method.
+    bounded_work_response: bool,
 }
 
 /// The RPC shapes the hellas wire protocol supports. Client-streaming
@@ -508,6 +514,13 @@ fn plan_service(service: &RpcService, index: &SchemaIndex) -> ServicePlan {
                 request: rust_path(&m.request_proto_type),
                 response: rust_path(&m.response_proto_type),
                 shape,
+                connection_bound: connection_bound(&service.package),
+                bounded_submit_tx: service.package == "hellas.chain.v1"
+                    && service.proto_name == "LightClient"
+                    && m.proto_name == "SubmitTx",
+                bounded_work_response: service.package == "hellas.chain.v1"
+                    && service.proto_name == "LightClient"
+                    && m.proto_name == "SubmitWorkResponse",
             }
         })
         .collect();
@@ -525,6 +538,22 @@ fn plan_service(service: &RpcService, index: &SchemaIndex) -> ServicePlan {
         methods,
         fqn,
     }
+}
+
+/// Whether a service's handlers are handed the transport's own context.
+///
+/// One package needs it, and it is not a convenience. `hellas.work.v1`
+/// releases paid plaintext and debits a client's credit for it, so its
+/// caller must prove on *this* connection that it is the client the
+/// channel names — and the value that proves it is the connection's TLS
+/// exporter, which no request field may carry because a request field
+/// is exactly what an attacker chooses.
+///
+/// Every other package authenticates what it is asked, not who is
+/// asking, and a context those handlers ignored would be a parameter
+/// that looked like a check.
+fn connection_bound(package: &str) -> bool {
+    package == "hellas.work.v1"
 }
 
 fn build_method_schema(service_fqn: &str, method: &RpcMethod, index: &SchemaIndex) -> MethodSchema {
@@ -638,6 +667,19 @@ fn render_service_block(plan: &ServicePlan) -> TokenStream {
         "emits a terminal trailer. Streaming methods are routed".to_string(),
         "through the matching stream helper.".to_string(),
     ]);
+    let server_definition = if plan.fqn == "hellas.chain.v1.LightClient" {
+        quote! {
+            pub struct #server<H>(
+                pub H,
+                pub ::std::sync::Arc<crate::call::WorkResponseRoute>,
+                pub ::std::sync::Arc<crate::call::GeneralSubmitRoute>,
+            );
+        }
+    } else {
+        quote! {
+            pub struct #server<H>(pub H);
+        }
+    };
 
     quote! {
         #[cfg(feature = #feature)]
@@ -681,7 +723,7 @@ fn render_service_block(plan: &ServicePlan) -> TokenStream {
             }
 
             #server_doc
-            pub struct #server<H>(pub H);
+            #server_definition
 
             impl<T, H> ::hellas_wire::Dispatcher<T> for #server<H>
             where
@@ -719,6 +761,11 @@ fn handler_signature(m: &MethodPlan) -> TokenStream {
         Shape::BidiStreaming => boxed_stream(request),
         _ => quote! { #request },
     };
+    let context = if (m.connection_bound || m.bounded_submit_tx) && m.shape == Shape::Unary {
+        quote! { , context: ::hellas_wire::TransportContext }
+    } else {
+        quote! {}
+    };
     // Unary handlers may return the bare response or `WithTrailer<R>`
     // (which carries response-side metadata like provenance); streaming
     // handlers return their response stream.
@@ -729,7 +776,8 @@ fn handler_signature(m: &MethodPlan) -> TokenStream {
     quote! {
         fn #fn_name(
             &self,
-            request: #request_ty,
+            request: #request_ty
+            #context,
         ) -> impl ::core::future::Future<
             Output = ::core::result::Result<#output, ::hellas_wire::WireStatus>,
         > + Send;
@@ -787,6 +835,54 @@ fn dispatch_arm(m: &MethodPlan) -> TokenStream {
     let MethodPlan {
         marker, fn_name, ..
     } = m;
+    if m.connection_bound && m.shape == Shape::Unary {
+        return quote! {
+            <#marker as ::hellas_wire::MethodMarker>::METHOD_ID => {
+                crate::call::dispatch_unary_with_context::<T, #marker, _, _, _>(
+                    inbound,
+                    |req, context| {
+                        let h = &self.0;
+                        async move { h.#fn_name(req, context).await }
+                    },
+                )
+                .await
+            }
+        };
+    }
+    if m.bounded_submit_tx {
+        assert!(m.shape == Shape::Unary, "raw request limits are unary-only");
+        return quote! {
+            <#marker as ::hellas_wire::MethodMarker>::METHOD_ID => {
+                crate::call::dispatch_general_submit_bounded::<T, #marker, _, _, _>(
+                    inbound,
+                    &self.2,
+                    crate::MAX_SUBMIT_TX_PROTO_BYTES,
+                    |req, context| {
+                        let h = &self.0;
+                        async move { h.#fn_name(req, context).await }
+                    },
+                )
+                .await
+            }
+        };
+    }
+    if m.bounded_work_response {
+        assert!(m.shape == Shape::Unary, "raw request limits are unary-only");
+        return quote! {
+            <#marker as ::hellas_wire::MethodMarker>::METHOD_ID => {
+                crate::call::dispatch_work_response_bounded::<T, #marker, _, _, _>(
+                    inbound,
+                    &self.1,
+                    crate::MAX_SUBMIT_WORK_RESPONSE_PROTO_BYTES,
+                    |req| {
+                        let h = &self.0;
+                        async move { h.#fn_name(req).await }
+                    },
+                )
+                .await
+            }
+        };
+    }
     let helper = match m.shape {
         Shape::Unary => quote! { dispatch_unary },
         Shape::ServerStreaming => quote! { dispatch_server_streaming },
@@ -841,6 +937,7 @@ fn feature_for_package(package: &str) -> &'static str {
         "hellas.swarm.v1" => "swarm",
         "hellas.evaluate.v1" => "evaluate",
         "hellas.chain.v1" => "chain",
+        "hellas.work.v1" => "work",
         _ => panic!("no rpc-crate feature defined for protobuf package {package}"),
     }
 }

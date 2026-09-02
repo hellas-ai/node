@@ -8,13 +8,28 @@
 // WebAuthn changes only the witness encoding. The invariant cares that the
 // same party key used for funds/terms authorized the open, with no separate
 // open-auth key namespace.
-// The kernel/crypto seam (`SigVerifier::verify_sig`,
-// `SealVerifier::verify_seal`) is ABSTRACTED AWAY here, not modelled:
-// this module has no `sigOk`/`sealOk` predicate, and `proofOk` below is
-// a height guard only. The model therefore cannot distinguish a valid
-// signature from a forged one — witness validity is an assumption
-// (`deps/assumptions.qnt`), and real signature behaviour is pinned by
-// the Rust tests (`tests/secp256k1.rs`, `tests/webauthn.rs`) instead.
+// The kernel/crypto seam (`SigVerifier::verify_auth`) is ABSTRACTED AWAY
+// here, not modelled: this module has no `sigOk` predicate, and
+// `proofOk` below is a height guard only. The model therefore cannot
+// distinguish a valid signature from a forged one — real signature
+// behaviour is pinned by the Rust tests (`tests/secp256k1.rs`,
+// `tests/webauthn.rs`) instead.
+//
+// ASSUMED OF THE VERIFIER, and established nowhere in this directory:
+//
+//   1. Soundness. It never admits a witness it should not. If
+//      `proofOk(p, h)` and `payoutsBound(p, mPay, tPay)` both hold, the
+//      abstract close is taken as valid; a verifier that admits an
+//      invalid signature or a non-canonical payout split lets an
+//      unauthorized close drain an edge, and every proof here would
+//      still pass. `openAuthOk` in `types.qnt` makes the same
+//      assumption for opens, abstracting native and WebAuthn witnesses
+//      alike as "the named party authorized this edge".
+//   2. Determinism. Same witness, same answer, every call. The kernel
+//      relies on it to avoid double-checking. `proofOk` and
+//      `payoutsBound` are pure predicates, so determinism holds here by
+//      construction and is therefore not evidence of anything about the
+//      Rust verifiers.
 //
 // Timeout closes need neither — their admissibility is purely
 // structural (terms-hash binding, height guard, payout shape) and lives
@@ -33,25 +48,22 @@ module verifier {
   // every conforming signature verifier admits a witness *only when*
   // both maker and taker signed the canonical payload — which at this
   // abstraction layer is just "the protocol's bound (MakerPayout,
-  // TakerPayout) split was committed to". The Violation case folds
-  // `sealOk` similarly. Mutual and Violation are pre-expiry paths; Timeout
-  // is the deterministic fallback once the paid lifetime has expired.
+  // TakerPayout) split was committed to". Mutual is the pre-expiry
+  // path; Timeout is the deterministic fallback once the paid lifetime
+  // has expired.
   pure def proofOk(p: Proof, height: int): bool =
     match p {
       | Mutual => height < TimeoutHeight
       | Timeout => height >= TimeoutHeight
-      | Violation => height < TimeoutHeight
     }
 
   // Per-proof payout binding. Every close witness binds the canonical
   // (MakerPayout, TakerPayout) split: Mutual via signed payload,
-  // Timeout via `terms.timeout_outputs` (kernel-enforced), Violation
-  // via the dispute seal's public inputs. There is no proof kind that
-  // admits an unbound split.
+  // Timeout via `terms.timeout_outputs` (kernel-enforced). There is no
+  // proof kind that admits an unbound split.
   pure def payoutsBound(p: Proof, makerPay: int, takerPay: int): bool =
     match p {
       | Mutual => payoutSplitOk(makerPay, takerPay)
       | Timeout => payoutSplitOk(makerPay, takerPay)
-      | Violation => payoutSplitOk(makerPay, takerPay)
     }
 }

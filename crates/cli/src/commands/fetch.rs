@@ -1,17 +1,22 @@
 use crate::commands::CliResult;
 use futures::StreamExt;
 use hellas_client::iroh::fetch_execution_stream;
-use hellas_client::{
-    ExecutionRoute, ExecutionRuntime, FetchExecutionEvent, FetchOutcome, ProducerTrust,
-};
-use hellas_rpc::fetch::build_input_events_with_retention;
+use hellas_client::{ExecutionRoute, ExecutionRuntime, FetchExecutionEvent, FetchOutcome};
+use hellas_rpc::fetch::{MAX_FETCH_REQUEST_BODY_BYTES, build_input_events_with_retention};
 use hellas_rpc::pb::fetch::FetchRequest;
 use hellas_rpc::stream::input_event_to_pb;
 use hellas_rpc::{Assurance, ContentId, ProducerSigningKey, Retention};
 use iroh::{EndpointId, SecretKey};
 use std::io::{self, Write};
 use std::net::SocketAddr;
+use std::path::Path;
 use tracing::trace;
+
+/// Load a Fetch body from an ordinary file without allowing a special file to
+/// block the CLI before the protocol's body bound is enforced.
+pub(crate) fn load_payload_file(path: &Path) -> CliResult<Vec<u8>> {
+    super::read_bounded_regular_file(path, "--payload-file", MAX_FETCH_REQUEST_BODY_BYTES)
+}
 
 pub struct ExecuteOptions {
     pub node_id: Option<EndpointId>,
@@ -23,7 +28,6 @@ pub struct ExecuteOptions {
     pub retries: usize,
     pub retain: bool,
     pub producer_key: ProducerSigningKey,
-    pub trusted_producer_public_keys: Vec<hellas_rpc::PublicKey>,
     pub expected_provider_genesis: Option<ContentId>,
     pub apple_app_attest_app_id: Option<String>,
     pub apple_app_attest_cdhashes: Vec<[u8; 32]>,
@@ -36,13 +40,6 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
 
     let caller_key = options.producer_key;
 
-    // Mirrors the producer-side default for trusted callers: with no keys
-    // configured, only output signed by our own producer key verifies.
-    let trust = if options.trusted_producer_public_keys.is_empty() {
-        ProducerTrust::keys([caller_key.public_key()])
-    } else {
-        ProducerTrust::keys(options.trusted_producer_public_keys.iter().copied())
-    };
     let caller_key = std::sync::Arc::new(caller_key);
 
     let provider_trust = crate::identity::provider_trust(
@@ -70,7 +67,7 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
             Retention::from_retain(options.retain),
         )?,
     };
-    let stream = fetch_execution_stream(runtime, request, route, trust, caller_key);
+    let stream = fetch_execution_stream(runtime, request, route, caller_key);
     tokio::pin!(stream);
 
     let mut completed = false;
@@ -123,4 +120,65 @@ pub(crate) fn signed_input_events(
         retention,
     )?;
     Ok(events.iter().map(input_event_to_pb).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn payload_file_accepts_the_exact_protocol_bound() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("request.json");
+        let mut payload = vec![b' '; MAX_FETCH_REQUEST_BODY_BYTES];
+        payload[..2].copy_from_slice(b"{}");
+        std::fs::write(&path, payload).unwrap();
+
+        let loaded = load_payload_file(&path).unwrap();
+        assert_eq!(loaded.len(), MAX_FETCH_REQUEST_BODY_BYTES);
+        serde_json::from_slice::<serde_json::Value>(&loaded).unwrap();
+    }
+
+    #[test]
+    fn payload_file_rejects_one_byte_over_the_protocol_bound() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("request.json");
+        std::fs::write(&path, vec![b' '; MAX_FETCH_REQUEST_BODY_BYTES + 1]).unwrap();
+
+        let error = load_payload_file(&path).expect_err("oversized payload must be refused");
+        assert!(error.to_string().contains("over the 1048576-byte limit"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn payload_file_rejects_a_fifo_without_waiting_for_a_writer() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("request.fifo");
+        let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c_path` is a live, NUL-terminated path for this call.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let thread_path = path.clone();
+        let thread = std::thread::spawn(move || {
+            sender.send(load_payload_file(&thread_path)).unwrap();
+        });
+        let error = receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("--payload-file blocked while opening a FIFO")
+            .expect_err("a FIFO must be refused");
+        assert!(format!("{error:#}").contains("not a regular file"));
+        thread.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn payload_file_rejects_a_device_before_reading_from_it() {
+        let error = load_payload_file(Path::new("/dev/zero"))
+            .expect_err("a device must not be accepted as a payload file");
+        assert!(format!("{error:#}").contains("not a regular file"));
+    }
 }

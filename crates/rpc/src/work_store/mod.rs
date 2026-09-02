@@ -1,0 +1,177 @@
+//! Durable endpoint state: what an endpoint may still do after it has
+//! crashed, and what it may not.
+//!
+//! # The one rule
+//!
+//! **The state that authorises a signature is on the disk before the
+//! signature leaves the process.** Everything here is an instance of
+//! that. A setup revision is fsynced before its signature is exported.
+//! An authorization is fsynced before its signature is sent. A result is
+//! fsynced before the plaintext goes out. A payment — the certificate
+//! and the binding that says what it bought, in one record — is fsynced
+//! before it is sent, and the provider's copy is fsynced before it
+//! acknowledges payment or lets any credit go.
+//!
+//! Reversing any one of those pairs is the same defect: the peer holds
+//! a signature the endpoint has no record of, and after the crash the
+//! endpoint's own state contradicts what it has already promised.
+//!
+//! What these types enforce is the half of that rule they can see. A
+//! commit returns only after `fsync`; a record the rules refuse writes
+//! nothing at all; and the records themselves are ordered, so a result
+//! cannot be journaled before the marker that says the backend was
+//! called, nor a payment before the result it pays for. What they
+//! cannot see is a caller that sends first and commits afterwards.
+//! Nothing in a store can catch that, and no doc sentence here should
+//! be read as claiming it does.
+//!
+//! # Three files, one primitive
+//!
+//! - [`setup::SetupStore`] — the two-Open handshake, its retained
+//!   revisions, and the recovery decision that resumes it. Keyed by
+//!   `(network, bond edge)`, because the bond edge is the first thing
+//!   both parties can name.
+//! - [`channel::ChannelStore`] — one channel's one job, its credit, and
+//!   its one certificate. Keyed by the channel id, which binds the
+//!   network, both edges, and both terms bodies.
+//!
+//! Both are the same append-only fsynced [`journal::Journal`], with one
+//! exclusive lock each and one replay each.
+//!
+//! # Why here
+//!
+//! The provider and the client share every transition rule and share no
+//! database. Writing the rules twice — once under `crates/executor` and
+//! once under `crates/client`, as an earlier plan had it — is two
+//! implementations of "has this job been paid for", which is the defect
+//! this phase exists to prevent. They live beside the records they are
+//! about, in the neutral protocol crate both endpoints already depend
+//! on, and the two databases are two *files*.
+//!
+//! # What none of it claims
+//!
+//! Not rollback resistance. An exclusive lock stops two processes on
+//! one live path; it does nothing about a storage snapshot restored
+//! behind a signer's back. This milestone has no externally retained
+//! monotone store generation, so a restored older journal is an
+//! accepted operational residual and is named as one here rather than
+//! being quietly counted as covered.
+//!
+//! Not that a backend was invoked exactly once. A running marker says
+//! an invocation may have happened; after a crash between the marker
+//! and the result, recovery reports indeterminate and refuses to
+//! resolve it, because nothing local can tell the two cases apart.
+
+pub mod channel;
+pub mod journal;
+pub mod setup;
+
+mod cursor;
+
+pub use channel::{
+    ChannelRecord, ChannelState, ChannelStateError, ChannelStore, CloseSettlement, JobPhase,
+    JobState, JobTerminal, OpenContest, PaidCertificate, RespondedContest, TerminalOutcome,
+};
+pub use journal::{JournalError, Role};
+pub use setup::{
+    DiscoveredSetup, ObservedSetup, SetupAbort, SetupDecision, SetupDiscovery, SetupDiscoveryError,
+    SetupEnd, SetupFault, SetupHistoryBatch, SetupHistoryBlock, SetupOrigin, SetupRecord,
+    SetupScan, SetupState, SetupStateError, SetupStore, UnidentifiedSetup, discover_setups,
+};
+
+/// Why a durable step could not be taken.
+#[derive(Debug, thiserror::Error)]
+pub enum WorkStoreError {
+    /// The file could not be opened, replayed, or appended to.
+    #[error(transparent)]
+    Journal(#[from] JournalError),
+    /// The setup step is not one this handshake may take.
+    #[error(transparent)]
+    Setup(#[from] SetupStateError),
+    /// The channel step is not one this state may take.
+    #[error(transparent)]
+    Channel(#[from] ChannelStateError),
+}
+
+/// Whether applying a record changed anything.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Applied {
+    /// The state moved, so the record must be journaled.
+    Changed,
+    /// The state already held exactly this. Nothing is written, and the
+    /// retry returns what the first call did.
+    Redundant,
+}
+
+pub(crate) fn put_u64(out: &mut Vec<u8>, value: u64) {
+    out.extend_from_slice(&value.to_be_bytes());
+}
+
+/// Writes one optional body behind a presence byte.
+pub(crate) fn put_option<T>(
+    out: &mut Vec<u8>,
+    value: Option<&T>,
+    body: impl FnOnce(&mut Vec<u8>, &T),
+) {
+    match value {
+        None => out.push(0),
+        Some(value) => {
+            out.push(1);
+            body(out, value);
+        }
+    }
+}
+
+/// Reads back exactly what [`put_option`] wrote.
+pub(crate) fn take_option<T, E>(
+    cursor: &mut cursor::Cursor<'_>,
+    malformed: E,
+    body: impl FnOnce(&mut cursor::Cursor<'_>) -> Result<T, E>,
+) -> Result<Option<T>, E> {
+    match cursor.byte() {
+        Some(0) => Ok(None),
+        Some(1) => body(cursor).map(Some),
+        _ => Err(malformed),
+    }
+}
+
+/// Writes a variable-width body behind its own length.
+pub(crate) fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+    put_u64(out, bytes.len() as u64);
+    out.extend_from_slice(bytes);
+}
+
+/// Reads back exactly what [`put_bytes`] wrote.
+pub(crate) fn take_bytes<'a, E>(
+    cursor: &mut cursor::Cursor<'a>,
+    malformed: E,
+) -> Result<&'a [u8], E> {
+    let Some(len) = cursor.u64().and_then(|len| usize::try_from(len).ok()) else {
+        return Err(malformed);
+    };
+    cursor.take(len).ok_or(malformed)
+}
+
+/// Reads one byte that may only be a boolean.
+pub(crate) fn take_bool<E>(cursor: &mut cursor::Cursor<'_>, malformed: E) -> Result<bool, E> {
+    match cursor.byte() {
+        Some(0) => Ok(false),
+        Some(1) => Ok(true),
+        _ => Err(malformed),
+    }
+}
+
+/// Renders a journal key as the lowercase hex a file is named with.
+///
+/// One spelling for both journals: a key rendered two ways is two
+/// file names for one journal, and the second one is a store with no
+/// history in it.
+pub(crate) fn hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(char::from(HEX[usize::from(byte >> 4)]));
+        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    out
+}

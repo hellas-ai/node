@@ -11,12 +11,15 @@ use tokio::sync::{mpsc, oneshot};
 use crate::metadata::Trailer;
 use crate::status::WireCode;
 
-use super::slot::SlotIndex;
 use super::state::MuxError;
 use super::transport::Command;
+use super::wire::StreamKey;
 
+/// A stream carries the key that names it, not just the slot index it
+/// happens to occupy. Indices are recycled; the key is what the driver
+/// checks a command against before acting on it.
 pub struct MuxStream {
-    slot: SlotIndex,
+    key: StreamKey,
     cmd_tx: mpsc::UnboundedSender<Command>,
     recv_rx: Option<mpsc::UnboundedReceiver<Result<Bytes, std::io::Error>>>,
     trailer_rx: Option<oneshot::Receiver<Trailer>>,
@@ -24,13 +27,13 @@ pub struct MuxStream {
 
 impl MuxStream {
     pub(crate) fn new(
-        slot: SlotIndex,
+        key: StreamKey,
         cmd_tx: mpsc::UnboundedSender<Command>,
         recv_rx: mpsc::UnboundedReceiver<Result<Bytes, std::io::Error>>,
         trailer_rx: oneshot::Receiver<Trailer>,
     ) -> Self {
         Self {
-            slot,
+            key,
             cmd_tx,
             recv_rx: Some(recv_rx),
             trailer_rx: Some(trailer_rx),
@@ -58,11 +61,11 @@ impl crate::transport::Stream for MuxStream {
         let trailer_rx = self.trailer_rx.take().expect("trailer already taken");
         (
             MuxSendHalf {
-                slot: self.slot,
+                key: self.key,
                 cmd_tx: self.cmd_tx.clone(),
             },
             MuxRecvHalf {
-                slot: self.slot,
+                key: self.key,
                 cmd_tx: self.cmd_tx,
                 recv_rx,
                 trailer_rx: Some(trailer_rx),
@@ -74,14 +77,14 @@ impl crate::transport::Stream for MuxStream {
 
     fn reset(&mut self, code: WireCode) {
         let _ = self.cmd_tx.send(Command::Reset {
-            slot: self.slot,
+            key: self.key,
             code,
         });
     }
 }
 
 pub struct MuxSendHalf {
-    slot: SlotIndex,
+    key: StreamKey,
     cmd_tx: mpsc::UnboundedSender<Command>,
 }
 
@@ -92,7 +95,7 @@ impl crate::transport::SendHalf for MuxSendHalf {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
             .send(Command::SendBody {
-                slot: self.slot,
+                key: self.key,
                 payload,
                 reply: tx,
             })
@@ -106,7 +109,7 @@ impl crate::transport::SendHalf for MuxSendHalf {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
             .send(Command::CloseSend {
-                slot: self.slot,
+                key: self.key,
                 trailer,
                 reply: tx,
             })
@@ -118,14 +121,14 @@ impl crate::transport::SendHalf for MuxSendHalf {
 
     fn reset(&mut self, code: WireCode) {
         let _ = self.cmd_tx.send(Command::Reset {
-            slot: self.slot,
+            key: self.key,
             code,
         });
     }
 }
 
 pub struct MuxRecvHalf {
-    slot: SlotIndex,
+    key: StreamKey,
     cmd_tx: mpsc::UnboundedSender<Command>,
     recv_rx: mpsc::UnboundedReceiver<Result<Bytes, std::io::Error>>,
     trailer_rx: Option<oneshot::Receiver<Trailer>>,
@@ -137,7 +140,7 @@ impl Drop for MuxRecvHalf {
     fn drop(&mut self) {
         if !self.done {
             let _ = self.cmd_tx.send(Command::Reset {
-                slot: self.slot,
+                key: self.key,
                 code: WireCode::Cancelled,
             });
         }
@@ -156,7 +159,7 @@ impl FuturesStream for MuxRecvHalf {
             Poll::Ready(Some(Ok(bytes))) => {
                 let consumed = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
                 let _ = this.cmd_tx.send(Command::Consumed {
-                    slot: this.slot,
+                    key: this.key,
                     bytes: consumed,
                 });
                 Poll::Ready(Some(Ok(bytes)))
@@ -186,7 +189,7 @@ impl crate::transport::RecvHalf for MuxRecvHalf {
 
     fn reset(&mut self, code: WireCode) {
         let _ = self.cmd_tx.send(Command::Reset {
-            slot: self.slot,
+            key: self.key,
             code,
         });
         self.done = true;
@@ -203,7 +206,7 @@ mod tests {
         let (_recv_tx, recv_rx) = mpsc::unbounded_channel();
         let (_trailer_tx, trailer_rx) = oneshot::channel();
         let recv = MuxRecvHalf {
-            slot: 6,
+            key: StreamKey::new(6, 3),
             cmd_tx,
             recv_rx,
             trailer_rx: Some(trailer_rx),
@@ -215,7 +218,10 @@ mod tests {
         assert!(matches!(
             cmd_rx.try_recv(),
             Ok(Command::Reset {
-                slot: 6,
+                key: StreamKey {
+                    stream_id: 6,
+                    generation: 3,
+                },
                 code: WireCode::Cancelled,
             })
         ));

@@ -8,7 +8,7 @@
 mod support;
 
 use support::{
-    FAKE_VERIFIER, FixedStore,
+    CANARY_REGISTRY_SLOTS, FAKE_VERIFIER, FixedStore, canary_registry_slots,
     l1::{self, EdgeKey, OpenKey, ProofKey},
 };
 
@@ -19,8 +19,8 @@ use hellas_kernel::{
 };
 use stateright::{Checker, Model, Property};
 
-type ModelView = View<4, 4>;
-type ChannelStore = FixedStore<4, 4>;
+type ModelView = View<4, 4, CANARY_REGISTRY_SLOTS>;
+type ChannelStore = FixedStore<4, 4, CANARY_REGISTRY_SLOTS>;
 
 #[derive(Clone, Copy)]
 struct ChannelModel;
@@ -49,7 +49,6 @@ impl Model for ChannelModel {
         if view.edge(l1::open_case_id(OpenKey::Full)).is_some() {
             actions.push(Action::Close(ProofKey::Mutual));
             actions.push(Action::Close(ProofKey::Timeout));
-            actions.push(Action::Close(ProofKey::Violation));
             actions.push(Action::Close(ProofKey::EarlyTimeout));
             actions.push(Action::InvalidClose);
             actions.push(Action::InvalidProof);
@@ -83,7 +82,7 @@ impl Model for ChannelModel {
             // acceptance yields a canonical-looking state no shape or
             // value property can distinguish from a legitimate close.
             match state.apply(context, &FAKE_VERIFIER, &op) {
-                Ok(event) => panic!("kernel accepted {action:?}: {event:?}"),
+                Ok(outcome) => panic!("kernel accepted {action:?}: {outcome:?}"),
                 Err(error) => {
                     assert_eq!(error, expected, "wrong rejection for {action:?}");
                     assert_eq!(state, *last_state, "rejection of {action:?} mutated state");
@@ -92,7 +91,18 @@ impl Model for ChannelModel {
             return Some(state);
         }
 
-        let event = state.apply(context, &FAKE_VERIFIER, &op).ok()?;
+        let outcome = state.apply(context, &FAKE_VERIFIER, &op).ok()?;
+        // Every action this model offers moves an edge, so a silent
+        // outcome or a registry write is a transition bug, not a state
+        // to explore.
+        assert!(
+            outcome.registry().is_empty(),
+            "{action:?} wrote registry state: {:?}",
+            outcome.registry(),
+        );
+        let event = outcome
+            .public_event()
+            .unwrap_or_else(|| panic!("{action:?} applied without announcing itself"));
         Self::valid_state(&state, action, context, &op, event.kind())
     }
 
@@ -105,6 +115,19 @@ impl Model for ChannelModel {
             Property::always(
                 "channel objects have one live shape",
                 |_, state: &State<ChannelStore>| channel_shape(&state.view()),
+            ),
+            // Registry state is reachable in this model — the store
+            // declares two slots — so "no chunk is ever live" is a
+            // property the checker can violate, not a type-level
+            // tautology. Opens and closes are edge transitions; the
+            // moment one starts staging a record, every explored state
+            // here reports it.
+            Property::always(
+                "no channel transition writes registry state",
+                |_, state: &State<ChannelStore>| {
+                    let view: ModelView = state.view();
+                    view.registry_len() == 0
+                },
             ),
         ]
     }
@@ -265,7 +288,7 @@ fn channel_state() -> State<ChannelStore> {
 }
 
 fn empty_channel() -> ChannelStore {
-    FixedStore::empty(
+    FixedStore::empty_with_registry(
         [
             l1::MAKER_ID,
             l1::TAKER_ID,
@@ -278,6 +301,7 @@ fn empty_channel() -> ChannelStore {
             l1::open_case_id(OpenKey::TakerOnly),
             l1::open_case_id(OpenKey::Empty),
         ],
+        canary_registry_slots(),
     )
 }
 

@@ -9,9 +9,6 @@ let
   modelTestModules = [
     "l1.qnt"
     "l1_fees.qnt"
-    "l1_stake.qnt"
-    "lifetime.qnt"
-    "proof_lifetime.qnt"
   ];
 
   runSpecs = [
@@ -65,70 +62,6 @@ let
         "nonTimeoutProofsExpire"
       ];
     }
-    {
-      model = "l1_stake.qnt";
-      maxSamples = 1000;
-      maxSteps = 8;
-      invariants = [
-        "valueConserved"
-        "noNegativeValue"
-        "liveCoinsAreKnown"
-        "deadSlotsAreZero"
-        "liveBondIsWellFormed"
-        "liveBondHoldsCommittedStake"
-        "slashRoutingPinned"
-        "timeoutReturnsStakeOnly"
-        "timeoutOnlyAfterCommittedHeight"
-        "heightAtLeastGenesis"
-      ];
-    }
-    {
-      model = "lifetime.qnt";
-      maxSamples = 500;
-      maxSteps = 8;
-      invariants = [
-        "valueAccounted"
-        "noNegativeBucket"
-        "closeReserveCoversCommittedFee"
-        "closeAlwaysAvailableWhenLive"
-        "liveCloseReserveIsNotRent"
-        "expiredLiveHasCleanup"
-        "termsCoherentForLiveState"
-        "escapeHatchBoundsNonNegative"
-        "escapeHatchTotalMatchesRecoverableValue"
-        "collectorRewardsOnlySlotValue"
-        "policyBucketsConsistent"
-        "currentCloseFeeKnown"
-        "heightAtLeastGenesis"
-      ];
-    }
-    {
-      model = "proof_lifetime.qnt";
-      maxSamples = 500;
-      maxSteps = 8;
-      invariants = [
-        "valueAccounted"
-        "noNegativeBucket"
-        "lifetimeFeePrepaid"
-        "noMarginalCloseFee"
-        "liveWithinPaidLifetime"
-        "liveHasLatestProofPath"
-        "closeReserveCoversCommittedFee"
-        "latestTermsCoherent"
-        "timeoutTermsCoherent"
-        "staleTermsCoherent"
-        "staleReceiptNotAdmissible"
-        "bareSignedReceiptNotAdmissible"
-        "closedByAdmissibleProofOnly"
-        "latestProofPreservesLatestBound"
-        "timeoutCloseUsesTimeoutTerms"
-        "closeProofTimingValid"
-        "closedAtConsistent"
-        "expiryClosesByTimeout"
-        "currentCloseFeeKnown"
-        "heightAtLeastGenesis"
-      ];
-    }
   ];
 
   verifySpecs = [
@@ -180,63 +113,6 @@ let
         "nonTimeoutProofsExpire"
       ];
     }
-    {
-      model = "l1_stake.qnt";
-      maxSteps = 5;
-      invariants = [
-        "valueConserved"
-        "noNegativeValue"
-        "deadSlotsAreZero"
-        "liveBondIsWellFormed"
-        "liveBondHoldsCommittedStake"
-        "slashRoutingPinned"
-        "timeoutReturnsStakeOnly"
-        "timeoutOnlyAfterCommittedHeight"
-      ];
-    }
-    {
-      model = "lifetime.qnt";
-      invariants = [
-        "valueAccounted"
-        "noNegativeBucket"
-        "closeReserveCoversCommittedFee"
-        "closeAlwaysAvailableWhenLive"
-        "liveCloseReserveIsNotRent"
-        "expiredLiveHasCleanup"
-        "termsCoherentForLiveState"
-        "escapeHatchBoundsNonNegative"
-        "escapeHatchTotalMatchesRecoverableValue"
-        "collectorRewardsOnlySlotValue"
-        "policyBucketsConsistent"
-        "currentCloseFeeKnown"
-        "heightAtLeastGenesis"
-      ];
-    }
-    {
-      model = "proof_lifetime.qnt";
-      invariants = [
-        "valueAccounted"
-        "noNegativeBucket"
-        "lifetimeFeePrepaid"
-        "noMarginalCloseFee"
-        "liveWithinPaidLifetime"
-        "liveHasLatestProofPath"
-        "closeReserveCoversCommittedFee"
-        "latestTermsCoherent"
-        "timeoutTermsCoherent"
-        "staleTermsCoherent"
-        "staleReceiptNotAdmissible"
-        "bareSignedReceiptNotAdmissible"
-        "closedByAdmissibleProofOnly"
-        "latestProofPreservesLatestBound"
-        "timeoutCloseUsesTimeoutTerms"
-        "closeProofTimingValid"
-        "closedAtConsistent"
-        "expiryClosesByTimeout"
-        "currentCloseFeeKnown"
-        "heightAtLeastGenesis"
-      ];
-    }
   ];
 
   modelPath = model: "models/${model}";
@@ -263,7 +139,6 @@ let
     mkdir -p models/traces
     quint test models/l1.qnt --out-itf 'models/traces/l1_{test}.itf.json' --verbosity=0
     quint test models/l1_fees.qnt --out-itf 'models/traces/l1_fees_{test}.itf.json' --verbosity=0
-    quint test models/l1_stake.qnt --out-itf 'models/traces/l1_stake_{test}.itf.json' --verbosity=0
   '';
 
   modelRuntimePackages = with pkgs; [
@@ -288,7 +163,6 @@ let
       name,
       command,
       needsJvm ? false,
-      crate ? "kernel",
     }:
     pkgs.writeShellApplication {
       inherit name;
@@ -302,7 +176,7 @@ let
       ++ lib.optionals needsJvm [ pkgs.temurin-bin ];
       text = ''
         repo_root="$(git rev-parse --show-toplevel)"
-        cd "$repo_root/crates/${crate}"
+        cd "$repo_root/crates/kernel"
         ${lib.optionalString needsJvm ''
           export LD_LIBRARY_PATH="${pkgs.stdenv.cc.cc.lib}/lib''${LD_LIBRARY_PATH:+:''${LD_LIBRARY_PATH}}"
         ''}
@@ -326,36 +200,6 @@ let
     needsJvm = true;
   };
 
-  chainModelCommand = ''
-    quint typecheck models/staked_channel.qnt
-    quint test models/staked_channel.qnt --verbosity=2
-    quint run models/staked_channel.qnt --max-samples=1000 --max-steps=10 \
-      --invariants=atMostOneActiveJob --invariants=frontierWithinCapacity \
-      --invariants=admittedJobsAreCovered --invariants=activeJobIsFunded \
-      --verbosity=1
-  '';
-
-  chainModelTest = mkModelApp {
-    name = "hellas-chain-model-test";
-    command = chainModelCommand;
-    crate = "chain";
-  };
-
-  chainModelFixtures = mkModelApp {
-    name = "hellas-chain-model-fixtures";
-    command = ''
-      rm -f models/traces/*.itf.json
-      mkdir -p models/traces
-      quint test models/staked_channel.qnt --out-itf 'models/traces/staked_channel_{test}.itf.json' --verbosity=0
-    '';
-    crate = "chain";
-  };
-
-  # Committed ITF traces are what the Rust replays read. If a model
-  # changes and the traces are not regenerated, the replay keeps
-  # asserting the OLD abstract behaviour and CI stays green — the
-  # correspondence silently becomes fiction. This check regenerates
-  # into a scratch tree and fails on any drift.
   # Committed ITF traces are what the Rust replays read. If a model
   # changes and the traces are not regenerated, the replay keeps
   # asserting the OLD abstract behaviour and CI stays green — the
@@ -369,6 +213,8 @@ let
     scratch="$(mktemp -d)"
     trap 'rm -rf "$scratch"' EXIT
     committed="$repo_root/crates/${crate}/models/traces"
+    regenerated="$scratch/traces"
+    mkdir -p "$regenerated"
     canon() {
       for f in "$1"/*.itf.json; do
         printf '== %s\n' "$(basename "$f")"
@@ -377,9 +223,9 @@ let
     }
     canon "$committed" > "$scratch/committed.txt"
     ${lib.concatMapStringsSep "\n" (m: ''
-      quint test models/${m}.qnt --out-itf "models/traces/${m}_{test}.itf.json" --verbosity=0
+      quint test models/${m}.qnt --out-itf "$regenerated/${m}_{test}.itf.json" --verbosity=0
     '') models}
-    canon "$committed" > "$scratch/regenerated.txt"
+    canon "$regenerated" > "$scratch/regenerated.txt"
     if ! diff -u "$scratch/committed.txt" "$scratch/regenerated.txt"; then
       echo "ITF traces are stale: regenerate with 'nix run .#update-${crate}-model-fixtures'" >&2
       exit 1
@@ -388,13 +234,10 @@ let
 
   kernelFixtureFreshness = mkModelApp {
     name = "hellas-kernel-fixture-freshness";
-    command = freshnessCommand "kernel" [ "l1" "l1_fees" "l1_stake" ];
-  };
-
-  chainFixtureFreshness = mkModelApp {
-    name = "hellas-chain-fixture-freshness";
-    command = freshnessCommand "chain" [ "staked_channel" ];
-    crate = "chain";
+    command = freshnessCommand "kernel" [
+      "l1"
+      "l1_fees"
+    ];
   };
 
   modelFixtures = mkModelApp {
@@ -413,9 +256,7 @@ in
     kernel-models = modelTest;
     kernel-model-run = modelRun;
     kernel-model-verify = modelVerify;
-    chain-models = chainModelTest;
     kernel-fixture-freshness = kernelFixtureFreshness;
-    chain-fixture-freshness = chainFixtureFreshness;
   };
 
   apps = {
@@ -438,11 +279,6 @@ in
       type = "app";
       program = lib.getExe modelFixtures;
       meta.description = "Regenerate hellas-kernel Quint ITF fixtures";
-    };
-    "update-chain-model-fixtures" = {
-      type = "app";
-      program = lib.getExe chainModelFixtures;
-      meta.description = "Regenerate hellas-chain Quint ITF fixtures";
     };
   };
 }

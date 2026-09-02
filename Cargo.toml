@@ -8,9 +8,8 @@ members = [
     "crates/executor",
     "crates/gateway",
     "crates/genesis",
-    "crates/jobs",
     "crates/kernel",
-    "crates/models",
+    "crates/presentation",
     "crates/rpc",
     "crates/store",
     "crates/wire",
@@ -30,14 +29,9 @@ documentation = "https://docs.rs"
 axum = "0.8"
 base64 = "0.22"
 bytes = "1"
+catena-lang = { path = "../catena-lang/catena-lang", default-features = false }
 cc = "1"
 ciborium = "0.2"
-catgrad = { git = "https://github.com/hellas-ai/catgrad", branch = "master", default-features = false, features = [
-    "serde",
-] }
-catgrad-llm = { git = "https://github.com/hellas-ai/catgrad", branch = "master", default-features = false }
-catgrad-llm-models = { git = "https://github.com/hellas-ai/catgrad", branch = "master", default-features = false }
-clap = { version = "4", features = ["derive"] }
 commonware-actor = { git = "https://github.com/commonwarexyz/monorepo", rev = "4c3ebe4274d908557d91b637240e8b93609fb32f" }
 commonware-broadcast = { git = "https://github.com/commonwarexyz/monorepo", rev = "4c3ebe4274d908557d91b637240e8b93609fb32f" }
 commonware-codec = { git = "https://github.com/commonwarexyz/monorepo", rev = "4c3ebe4274d908557d91b637240e8b93609fb32f", default-features = false }
@@ -53,7 +47,6 @@ commonware-utils = { git = "https://github.com/commonwarexyz/monorepo", rev = "4
 dirs = "6"
 ed25519-dalek = { version = "3.0.0", default-features = false }
 futures = "0.3"
-half = "2.7.1"
 hellas-adaptors = { path = "crates/adaptors", default-features = false }
 hellas-attestation = { path = "crates/attestation", default-features = false }
 hellas-chain = { path = "crates/chain", default-features = false }
@@ -62,15 +55,13 @@ hellas-executor = { path = "crates/executor", default-features = false }
 hellas-gateway = { path = "crates/gateway", default-features = false }
 hellas-genesis = { path = "crates/genesis", default-features = false }
 hellas-kernel = { path = "crates/kernel", default-features = false }
-hellas-models = { path = "crates/models", default-features = false }
+hellas-presentation = { path = "crates/presentation", default-features = false }
 hellas-rpc = { path = "crates/rpc", default-features = false }
-hellas-wire = { path = "crates/wire", default-features = false }
 hellas-store = { path = "crates/store", default-features = false }
+hellas-wire = { path = "crates/wire", default-features = false }
 hellas-xet = { path = "crates/xet", default-features = false }
 hex = "0.4"
-hf-hub = { version = "0.5", default-features = false, features = ["ureq"] }
 iroh = { version = "1", default-features = false }
-iroh-base = { version = "1", default-features = false }
 k256 = { version = "0.13", features = ["ecdsa"] }
 opentelemetry = "0.31"
 opentelemetry-otlp = { version = "0.31", default-features = false, features = [
@@ -89,7 +80,6 @@ reqwest = { version = "0.13", default-features = false, features = [
     "webpki-roots",
     "stream",
 ] }
-rustls-webpki = { version = "0.103.9", default-features = false }
 rustls-pki-types = "1"
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
@@ -97,7 +87,6 @@ serde_ipld_dagcbor = "=0.6.4"
 serde_json = "1"
 sha2 = { version = "0.11", default-features = false }
 thiserror = "2"
-x509-cert = { version = "0.2", default-features = false }
 tokio = { version = "1", features = [
     "rt-multi-thread",
     "macros",
@@ -111,3 +100,5 @@ toml = "1.1"
 tracing = "0.1"
 tracing-opentelemetry = "0.32"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+webpki = { package = "rustls-webpki", version = "0.103.9", default-features = false }
+x509-cert = { version = "0.2", default-features = false }

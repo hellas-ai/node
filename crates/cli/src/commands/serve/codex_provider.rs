@@ -1,62 +1,59 @@
 use std::path::Path;
+
+use hellas_executor::{
+    FetchProvider, FetchProviderError, FetchProviderFuture, FetchProviderResponse,
+    PreparedFetchRequest,
+};
+use hellas_rpc::CODEX_RESPONSES_ENDPOINT;
+use reqwest::Url;
+use reqwest::header::{ACCEPT, HeaderMap, HeaderValue};
 use std::time::Duration;
 
-use anyhow::Context;
-use hellas_executor::{
-    FetchProvider, FetchProviderError, FetchProviderFuture, FetchProviderRequest,
-    FetchProviderStream,
-};
-use reqwest::Url;
-
 use crate::commands::codex_auth::CodexAuthStore;
-use crate::commands::http_client;
 
-use super::DEFAULT_CODEX_BASE_URL;
 use super::responses_fetch::execute_responses_request;
+
+const CODEX_ORIGINATOR: &str = "codex_cli_rs";
 
 #[derive(Clone)]
 pub(super) struct CodexResponsesFetchProvider {
     client: reqwest::Client,
     auth: CodexAuthStore,
-    base_url: Url,
+    endpoint: Url,
 }
 
 impl CodexResponsesFetchProvider {
-    pub(super) fn new(base_url: &str, auth_path: Option<&Path>) -> anyhow::Result<Self> {
-        let base_url = if base_url.trim().is_empty() {
-            DEFAULT_CODEX_BASE_URL
-        } else {
-            base_url.trim()
-        };
-        let base_url = Url::parse(base_url)
-            .with_context(|| format!("invalid Codex Responses base URL: {base_url}"))?;
+    pub(super) fn new(auth_path: Option<&Path>) -> anyhow::Result<Self> {
+        let auth = CodexAuthStore::new(auth_path)?;
+        let account_id = auth.account_id()?;
         Ok(Self {
-            client: http_client(Duration::from_secs(20 * 60)),
-            auth: CodexAuthStore::new(auth_path)?,
-            base_url,
+            client: codex_http_client(&account_id)?,
+            auth,
+            endpoint: Url::parse(CODEX_RESPONSES_ENDPOINT)
+                .expect("built-in Codex Responses endpoint is valid"),
         })
     }
 
     #[cfg(test)]
-    fn with_store(client: reqwest::Client, base_url: Url, auth: CodexAuthStore) -> Self {
+    fn with_store(endpoint: Url, auth: CodexAuthStore) -> Self {
         Self {
-            client,
+            client: codex_http_client(&auth.account_id().expect("test account id"))
+                .expect("Codex HTTP client"),
             auth,
-            base_url,
+            endpoint,
         }
     }
 
     async fn execute(
         &self,
-        request: FetchProviderRequest,
-    ) -> Result<FetchProviderStream, FetchProviderError> {
+        request: PreparedFetchRequest,
+    ) -> Result<FetchProviderResponse, FetchProviderError> {
         let access_token = self.auth.access_token().await.map_err(|err| {
             FetchProviderError::failed(format!("Codex authentication failed: {err}"))
         })?;
-        let endpoint = responses_endpoint(&self.base_url);
         execute_responses_request(
             &self.client,
-            endpoint,
+            self.endpoint.clone(),
             &access_token,
             request.body.as_bytes().to_vec(),
             &request.idempotency_key(),
@@ -66,19 +63,30 @@ impl CodexResponsesFetchProvider {
     }
 }
 
-impl FetchProvider for CodexResponsesFetchProvider {
-    fn run(&self, request: FetchProviderRequest) -> FetchProviderFuture<'_> {
-        Box::pin(async move { self.execute(request).await })
-    }
+fn codex_http_client(account_id: &str) -> anyhow::Result<reqwest::Client> {
+    let mut headers = HeaderMap::new();
+    headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
+    headers.insert(
+        "ChatGPT-Account-ID",
+        HeaderValue::from_str(account_id).expect("Codex auth store validates account id"),
+    );
+    headers.insert("Originator", HeaderValue::from_static(CODEX_ORIGINATOR));
+    Ok(reqwest::Client::builder()
+        .default_headers(headers)
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(20 * 60))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?)
 }
 
-fn responses_endpoint(base_url: &Url) -> Url {
-    let mut base = base_url.clone();
-    if !base.path().ends_with('/') {
-        let path = format!("{}/", base.path().trim_end_matches('/'));
-        base.set_path(&path);
+impl FetchProvider for CodexResponsesFetchProvider {
+    fn execution_environment(&self) -> hellas_rpc::ContentId {
+        hellas_rpc::FetchEnvironment::CodexResponses.manifest_id()
     }
-    base.join("responses").expect("valid Codex Responses URL")
+
+    fn run(&self, request: PreparedFetchRequest) -> FetchProviderFuture<'_> {
+        Box::pin(async move { self.execute(request).await })
+    }
 }
 
 #[cfg(test)]
@@ -96,7 +104,14 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::oneshot;
 
-    type CapturedRequest = (Option<String>, Option<String>, Bytes);
+    type CapturedRequest = (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Bytes,
+    );
 
     #[derive(Clone)]
     struct Capture {
@@ -116,10 +131,23 @@ mod tests {
             .get("Idempotency-Key")
             .and_then(|value| value.to_str().ok())
             .map(ToString::to_string);
+        let accept = headers
+            .get(axum::http::header::ACCEPT)
+            .and_then(|value| value.to_str().ok())
+            .map(ToString::to_string);
+        let account_id = headers
+            .get("ChatGPT-Account-ID")
+            .and_then(|value| value.to_str().ok())
+            .map(ToString::to_string);
+        let originator = headers
+            .get("Originator")
+            .and_then(|value| value.to_str().ok())
+            .map(ToString::to_string);
         if let Some(tx) = capture.tx.lock().await.take() {
-            let _ = tx.send((auth, idempotency_key, body));
+            let _ = tx.send((auth, idempotency_key, accept, account_id, originator, body));
         }
         Response::builder()
+            .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
             .body(Body::from(
                 r#"event: response.created
 data: {"type":"response.created","response":{"id":"resp_codex_up","object":"response","created_at":42,"status":"in_progress"}}
@@ -138,13 +166,14 @@ data: {"type":"response.completed","response":{"id":"resp_codex_up","object":"re
             .unwrap()
     }
 
-    fn request(body: &[u8]) -> FetchProviderRequest {
-        FetchProviderRequest::new(
+    fn request(body: &[u8]) -> PreparedFetchRequest {
+        let call = hellas_executor::FetchCall::new(
             "codex",
             "responses",
             JsonBytes::new(body.to_vec()),
             hellas_rpc::InputCommitment::from_digest(hellas_rpc::Digest::from_bytes([7; 32])),
-        )
+        );
+        PreparedFetchRequest::new(&call, call.body.clone())
     }
 
     #[tokio::test]
@@ -168,26 +197,33 @@ data: {"type":"response.completed","response":{"id":"resp_codex_up","object":"re
         );
         let access_token = non_expiring_token();
         auth.save(&crate::commands::codex_auth::CodexAuthState::new(
-            crate::commands::codex_auth::test_tokens(&access_token, "refresh"),
+            crate::commands::codex_auth::test_tokens_with_account_id(
+                &access_token,
+                "refresh",
+                "acct-1",
+            ),
             None,
         ))
         .unwrap();
         let provider = CodexResponsesFetchProvider::with_store(
-            reqwest::Client::new(),
-            Url::parse(&format!("http://{addr}/codex")).unwrap(),
+            Url::parse(&format!("http://{addr}/codex/responses")).unwrap(),
             auth,
         );
 
         let body = br#"{"model":"gpt-5.5-codex","input":"hello","stream":true}"#;
-        let mut stream = provider.run(request(body)).await.unwrap();
+        let mut stream = provider.run(request(body)).await.unwrap().stream;
         let mut output = Vec::new();
         while let Some(event) = stream.next().await {
             output.push(event.unwrap());
         }
-        let (auth, idempotency_key, forwarded_body) = rx.await.unwrap();
+        let (auth, idempotency_key, accept, account_id, originator, forwarded_body) =
+            rx.await.unwrap();
 
         assert_eq!(auth, Some(format!("Bearer {access_token}")));
         assert_eq!(idempotency_key, Some(request(body).idempotency_key()));
+        assert_eq!(accept.as_deref(), Some("text/event-stream"));
+        assert_eq!(account_id.as_deref(), Some("acct-1"));
+        assert_eq!(originator.as_deref(), Some(CODEX_ORIGINATOR));
         assert_eq!(forwarded_body.as_ref(), body);
         let joined = String::from_utf8(output.concat()).unwrap();
         assert!(joined.contains("event: response.created"));
@@ -197,10 +233,21 @@ data: {"type":"response.completed","response":{"id":"resp_codex_up","object":"re
     }
 
     #[test]
-    fn joins_responses_endpoint_to_codex_base_url() {
+    fn refuses_chatgpt_route_without_account_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("codex-auth.json");
+        std::fs::write(
+            &path,
+            br#"{"version":1,"tokens":{"access_token":"access","refresh_token":"refresh"},"last_refresh":null,"refresh_token_blocked":null}"#,
+        )
+        .unwrap();
+        assert!(CodexResponsesFetchProvider::new(Some(&path)).is_err());
+    }
+
+    #[test]
+    fn production_endpoint_is_the_manifest_endpoint() {
         assert_eq!(
-            responses_endpoint(&Url::parse("https://chatgpt.com/backend-api/codex").unwrap())
-                .as_str(),
+            Url::parse(CODEX_RESPONSES_ENDPOINT).unwrap().as_str(),
             "https://chatgpt.com/backend-api/codex/responses"
         );
     }

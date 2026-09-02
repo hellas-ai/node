@@ -7,19 +7,15 @@ license.workspace = true
 [features]
 default = []
 # Chain/light-client domain vocabulary: addresses, transactions,
-# WebAuthn signature policy, challenge derivation (`domain` module), and
-# the staked fraud-game protocol (`staked` module — Channel, vouchers,
-# job contexts). Staking is integral to the chain, not an opt-in: the
-# k256-backed kernel verifier builds on every target, so `domain` (and
-# thus the wasm light client) carries it unconditionally.
+# WebAuthn signature policy, and challenge derivation (`domain` module).
 domain = [
     "dep:base64ct",
     "dep:bs58",
     "dep:bytes",
     "dep:commonware-codec",
     "dep:commonware-cryptography",
-    "dep:hellas-kernel",
     "dep:hellas-genesis",
+    "dep:hellas-kernel",
     "dep:p256",
     "dep:serde_json",
     "dep:sha2",
@@ -45,9 +41,26 @@ client-core = [
     "dep:p256",
     "dep:rand",
     "dep:thiserror",
+    # `client.rs` samples what one validator's RPC cost; the sample's one
+    # channel out is `tracing`.
+    "dep:tracing",
     "domain",
 ]
+# The finalized-block codec and accepted-transaction view, without a
+# database, a mempool, or consensus participation. This is what an
+# endpoint enables to read the block its channel was opened in.
+block-view = [
+    "client-core",
+    "domain-consensus",
+    "dep:bytes",
+    "dep:commonware-codec",
+    "dep:commonware-consensus",
+    "dep:commonware-cryptography",
+    "dep:commonware-storage",
+    "dep:commonware-utils",
+]
 indexer = [
+    "block-view",
     "client",
     "dep:bytes",
     "dep:commonware-actor",
@@ -94,13 +107,6 @@ server = [
     "tokio/time",
     "tokio-stream/sync",
 ]
-# Dev-chain seal verification: staked opens are admitted and violation
-# seals verify against a preverified fraud-artifact cache. Never enable
-# on a production chain, and never on a multi-validator network: the
-# cache is process-local trusted input, not consensus state — two
-# validators with different cache contents would fork on a violation
-# close. Single-node dev chains only.
-preverified-seals = ["validator"]
 validator = [
     "indexer",
     "server",
@@ -117,9 +123,13 @@ validator = [
     "hellas-kernel/webauthn",
 ]
 wasm-client = ["client-core", "hellas-wire/ws-wasm"]
+# The block source a paid endpoint's settlement watcher reads. It is its
+# own feature because the work protocol is the only thing in `hellas-rpc`
+# that needs the consensus kernel's types, and a chain client that only
+# serves coins has no use for them.
+work-watcher = ["block-view", "hellas-rpc/work"]
 
 [dependencies]
-hellas-xet = { workspace = true }
 axum = { workspace = true, optional = true }
 base64ct = { version = "1", optional = true, features = ["alloc"] }
 bs58 = { version = "0.5", optional = true }
@@ -143,8 +153,8 @@ futures = { workspace = true, optional = true }
 futures-util = { version = "0.3", optional = true, default-features = false, features = [
     "sink",
 ] }
-hellas-kernel = { workspace = true, optional = true, default-features = false }
 hellas-genesis = { workspace = true, optional = true }
+hellas-kernel = { workspace = true, optional = true, default-features = false }
 hellas-rpc = { workspace = true, optional = true, features = ["chain"] }
 hellas-wire = { workspace = true, optional = true }
 hex = { workspace = true, optional = true }
@@ -180,10 +190,19 @@ url = { version = "2", optional = true }
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 commonware-consensus = { workspace = true, features = ["mocks"] }
 commonware-cryptography = { workspace = true, features = ["mocks"] }
-hellas-kernel = { workspace = true, features = ["test-support"] }
 ed25519-dalek.workspace = true
-itf = "0.4"
-proptest = "1.11"
+# The end-to-end money test signs a payment only after the client's own
+# re-execution reproduced the provider's answer, and that gate — the
+# `Reproducer` seam and the matched/refuted journal transition around it
+# — lives in `hellas-client`. Re-deriving it here would be a second
+# opinion about the very thing under test. `hellas-client` does not
+# depend on `hellas-chain`, so this edge is test-only and acyclic.
+hellas-client = { workspace = true, features = ["work"] }
+hellas-kernel = { workspace = true, features = ["test-support"] }
+# The settlement test drives the endpoint's own close builders against a
+# real database, so the bytes a provider would submit are the bytes
+# consensus is asked to accept. As a runtime dependency `hellas-rpc`
+# arrives without the work protocol; the settlement suite needs it.
+hellas-rpc = { workspace = true, features = ["work"] }
 serde = { workspace = true, features = ["derive"] }
 tempfile = "3"
-test-log = { version = "0.2", features = ["trace"] }

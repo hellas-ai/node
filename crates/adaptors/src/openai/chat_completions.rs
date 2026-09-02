@@ -1,13 +1,15 @@
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
 
+use super::{finish_reason_json, project_response_format, usage_json};
+
 use crate::{
     AdaptorError, AdaptorResult, CanonicalExecution, ExecutionRequest, ExecutionResult, Input,
     InputItem, ModelRef, OutputEvent, OutputItem, RawRequest, ReasoningOptions, RenderContext,
-    ResponseFormat, StopReason, TextChannel, ToolChoice, ToolKind, ToolSpec, Usage, WireAdaptor,
-    WireEventData, WireResponse, WireStreamEvent,
+    TextChannel, ToolChoice, ToolKind, ToolSpec, Usage, WireAdaptor, WireEventData, WireResponse,
+    WireStreamEvent,
     json::{
-        json_to_wire_string, optional_array, optional_bool, optional_f32, optional_string,
-        optional_u32, provenance_json, required_array, required_string,
+        attach_hellas, json_to_wire_string, optional_array, optional_bool, optional_f32,
+        optional_string, optional_u32, required_array, required_string, structured_delta_string,
     },
 };
 
@@ -202,6 +204,9 @@ impl WireAdaptor for OpenAiChatCompletionsAdaptor {
                     None,
                 ),
             )]),
+            OutputEvent::Adaptor(_) => Err(AdaptorError::unsupported(
+                "Chat Completions cannot render adaptor-specific events",
+            )),
             OutputEvent::Usage(usage) => {
                 state.usage = Some(usage);
                 Ok(Vec::new())
@@ -451,28 +456,6 @@ fn project_tool_choice(value: &JsonValue) -> ToolChoice {
     }
 }
 
-fn project_response_format(value: &JsonValue) -> ResponseFormat {
-    match value.get("type").and_then(JsonValue::as_str) {
-        Some("text") => ResponseFormat::Text,
-        Some("json_object") => ResponseFormat::JsonObject,
-        Some("json_schema") => {
-            let schema_object = value.get("json_schema").unwrap_or(value);
-            ResponseFormat::JsonSchema {
-                name: schema_object
-                    .get("name")
-                    .and_then(JsonValue::as_str)
-                    .map(ToString::to_string),
-                schema: schema_object
-                    .get("schema")
-                    .cloned()
-                    .unwrap_or_else(|| schema_object.clone()),
-                strict: schema_object.get("strict").and_then(JsonValue::as_bool),
-            }
-        }
-        _ => ResponseFormat::Raw(value.clone()),
-    }
-}
-
 fn output_message_json(output: &[OutputItem]) -> AdaptorResult<JsonValue> {
     if let [OutputItem::Raw(value)] = output
         && value.get("role").and_then(JsonValue::as_str).is_some()
@@ -603,41 +586,6 @@ fn chat_chunk_json(
     attach_hellas(body, state.provenance.as_ref())
 }
 
-fn attach_hellas(mut body: JsonValue, provenance: Option<&crate::Provenance>) -> JsonValue {
-    if let Some(hellas) = provenance.and_then(provenance_json) {
-        body["hellas"] = hellas;
-    }
-    body
-}
-
-fn usage_json(usage: Usage) -> JsonValue {
-    let prompt_tokens = usage.input_tokens.unwrap_or(0);
-    let completion_tokens = usage.output_tokens.unwrap_or(0);
-    json!({
-        "prompt_tokens": prompt_tokens,
-        "completion_tokens": completion_tokens,
-        "total_tokens": usage.total_tokens.unwrap_or_else(|| {
-            prompt_tokens.saturating_add(completion_tokens)
-        }),
-    })
-}
-
-fn finish_reason_json(stop_reason: StopReason) -> JsonValue {
-    let value = match stop_reason {
-        StopReason::EndOfText | StopReason::StopSequence | StopReason::Cancelled => "stop",
-        StopReason::MaxOutputTokens => "length",
-        StopReason::ToolCall => "tool_calls",
-    };
-    JsonValue::String(value.to_string())
-}
-
-fn structured_delta_string(delta: crate::StructuredDelta) -> String {
-    match delta {
-        crate::StructuredDelta::Text(text) => text,
-        crate::StructuredDelta::Json(value) => json_to_wire_string(&value),
-    }
-}
-
 fn stream_include_usage(object: &JsonMap<String, JsonValue>) -> AdaptorResult<bool> {
     let Some(value) = object.get("stream_options") else {
         return Ok(false);
@@ -684,7 +632,7 @@ fn stop_strings(object: &JsonMap<String, JsonValue>) -> AdaptorResult<Vec<String
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Provenance, StopReason, WireEventData};
+    use crate::{Provenance, ResponseFormat, StopReason, WireEventData};
 
     fn adaptor() -> OpenAiChatCompletionsAdaptor {
         OpenAiChatCompletionsAdaptor

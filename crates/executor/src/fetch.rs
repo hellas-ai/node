@@ -1,11 +1,16 @@
-use std::collections::HashMap;
-use std::fs::{self, OpenOptions};
+use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
+use std::fs::{self, OpenOptions, TryLockError};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use hellas_rpc::fetch::{
-    FetchInput, FetchProtocolError, verify_input_events, verify_output_events,
+    FetchInput, FetchProtocolError, MAX_FETCH_OUTPUT_EVENTS, MAX_FETCH_OUTPUT_PAYLOAD_BYTES,
+    MAX_FETCH_REQUEST_BODY_BYTES, verify_input_events, verify_output_events,
 };
 use hellas_rpc::{
     InputCommitment, InputEventEnvelope, OutputEventEnvelope, ProducerId, PublicKey,
@@ -14,11 +19,32 @@ use hellas_rpc::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::state::{MAX_OUTSTANDING_QUOTES, QUOTE_TTL};
+
+pub(crate) const MAX_FETCH_IN_MEMORY_TICKETS: usize = MAX_OUTSTANDING_QUOTES;
+pub(crate) const MAX_FETCH_IN_MEMORY_INPUT_BYTES: usize = 32 * 1024 * 1024;
+const FETCH_CAPACITY_LOCK_WAIT: Duration = Duration::from_millis(100);
+const MAX_FETCH_CAPACITY_METADATA_BYTES: usize = 32;
+/// Persisted DAG-CBOR contains at most eight input and 4,096 output envelopes.
+/// One KiB of structural/signature headroom per envelope is deliberately
+/// generous beside the protocol's bounded three MiB of signed payload.
+const MAX_FETCH_TRANSCRIPT_BYTES: usize = MAX_FETCH_REQUEST_BODY_BYTES
+    + MAX_FETCH_OUTPUT_PAYLOAD_BYTES
+    + (MAX_FETCH_OUTPUT_EVENTS + 8) * 1024;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FetchTranscript {
     input_commitment: InputCommitment,
     input: Vec<InputEventEnvelope>,
     output: Vec<OutputEventEnvelope>,
+}
+
+/// A retained transcript whose input and output signatures, producer, and
+/// caller policy have already been checked together.
+#[derive(Debug)]
+pub(crate) struct VerifiedFetchReplay {
+    pub(crate) transcript: FetchTranscript,
+    pub(crate) input: FetchInput,
 }
 
 impl FetchTranscript {
@@ -38,8 +64,22 @@ impl FetchTranscript {
         self.input_commitment
     }
 
+    #[cfg(test)]
     pub fn output_events(&self) -> &[OutputEventEnvelope] {
         &self.output
+    }
+
+    pub fn into_output_events(self) -> Vec<OutputEventEnvelope> {
+        self.output
+    }
+
+    /// The caller key claimed by persisted, not-yet-verified input bytes.
+    ///
+    /// This is safe only as a negative prefilter. Authorization still comes
+    /// from [`Self::verify`], which proves that this key signed the complete
+    /// fixed-shape input transcript.
+    fn claimed_caller_key(&self) -> Option<&PublicKey> {
+        self.input.first().map(|event| event.event().public_key())
     }
 
     pub fn from_quote(quote: &FetchQuote, output: Vec<OutputEventEnvelope>) -> Self {
@@ -81,6 +121,20 @@ impl FetchQuote {
             input,
             retention: verified.retention,
         }
+    }
+}
+
+/// An input transcript whose signatures and caller authorization were checked
+/// by the state machine. Its fields are private so quote insertion cannot
+/// accidentally accept a merely decoded `FetchInput` and skip either check.
+pub(crate) struct VerifiedFetchQuoteInput {
+    verified: FetchInput,
+    input: Vec<InputEventEnvelope>,
+}
+
+impl VerifiedFetchQuoteInput {
+    pub(crate) const fn input(&self) -> &FetchInput {
+        &self.verified
     }
 }
 
@@ -127,20 +181,27 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FetchTicketState {
-    Quoted(FetchQuote),
-    Queued(FetchQuote),
-    Running(FetchQuote),
-    Completed(FetchTranscript),
-    Failed(String),
+struct FetchTicketEntry {
+    quote: FetchQuote,
+    expires_at: Instant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FetchTicketState {
+    Quoted(FetchTicketEntry),
+    Queued(FetchTicketEntry),
+    Running(FetchTicketEntry),
 }
 
 pub trait FetchTranscriptStore {
     fn put_completed(&self, transcript: &FetchTranscript) -> Result<(), FetchStoreError>;
+    fn has_completed(&self, input: InputCommitment) -> Result<bool, FetchStoreError>;
     fn get_completed(
         &self,
         input: InputCommitment,
     ) -> Result<Option<FetchTranscript>, FetchStoreError>;
+    #[cfg(test)]
+    fn record_replay_verification(&self) {}
     /// Durably mark this input as having (possibly) reached the provider.
     /// Written before the provider call is issued; a marker without a
     /// completed transcript means the work is indeterminate after a crash
@@ -159,39 +220,125 @@ pub trait FetchTranscriptStore {
     fn remove_running(&self, input: InputCommitment) -> Result<(), FetchStoreError>;
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Debug)]
+struct MemoryFetchTranscriptState {
+    transcripts: HashMap<InputCommitment, FetchTranscript>,
+    running: HashMap<InputCommitment, FetchRunningRecord>,
+    max_retained_transcripts: usize,
+}
+
+impl MemoryFetchTranscriptState {
+    fn retained_transcripts(&self) -> usize {
+        self.transcripts.len().saturating_add(
+            self.running
+                .keys()
+                .filter(|input| !self.transcripts.contains_key(input))
+                .count(),
+        )
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct MemoryFetchTranscriptStore {
-    transcripts: Arc<Mutex<HashMap<InputCommitment, FetchTranscript>>>,
-    running: Arc<Mutex<HashMap<InputCommitment, FetchRunningRecord>>>,
+    state: Arc<Mutex<MemoryFetchTranscriptState>>,
+    #[cfg(test)]
+    completed_loads: Arc<AtomicUsize>,
+    #[cfg(test)]
+    replay_verifications: Arc<AtomicUsize>,
+    #[cfg(test)]
+    running_removals: Arc<AtomicUsize>,
+    #[cfg(test)]
+    fail_running_put_after_write: Arc<AtomicBool>,
+}
+
+impl MemoryFetchTranscriptStore {
+    pub fn with_capacity(max_retained_transcripts: usize) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(MemoryFetchTranscriptState {
+                transcripts: HashMap::new(),
+                running: HashMap::new(),
+                max_retained_transcripts,
+            })),
+            #[cfg(test)]
+            completed_loads: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            replay_verifications: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            running_removals: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            fail_running_put_after_write: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn completed_loads(&self) -> usize {
+        self.completed_loads.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replay_verifications(&self) -> usize {
+        self.replay_verifications.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn running_removals(&self) -> usize {
+        self.running_removals.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_running_put_after_write(&self) {
+        self.fail_running_put_after_write
+            .store(true, Ordering::SeqCst);
+    }
+}
+
+impl Default for MemoryFetchTranscriptStore {
+    fn default() -> Self {
+        Self::with_capacity(hellas_rpc::DEFAULT_FETCH_RETAINED_TRANSCRIPT_CAPACITY)
+    }
 }
 
 impl FetchTranscriptStore for MemoryFetchTranscriptStore {
     fn put_completed(&self, transcript: &FetchTranscript) -> Result<(), FetchStoreError> {
-        let mut transcripts = self
-            .transcripts
-            .lock()
-            .map_err(|_| FetchStoreError::Poisoned)?;
-        match transcripts.get(&transcript.input_commitment()) {
+        let mut state = self.state.lock().map_err(|_| FetchStoreError::Poisoned)?;
+        match state.transcripts.get(&transcript.input_commitment()) {
             Some(existing) if existing == transcript => Ok(()),
             Some(_) => Err(FetchStoreError::Conflict {
                 input: transcript.input_commitment(),
             }),
             None => {
-                transcripts.insert(transcript.input_commitment(), transcript.clone());
+                let input = transcript.input_commitment();
+                if !state.running.contains_key(&input)
+                    && state.retained_transcripts() >= state.max_retained_transcripts
+                {
+                    return Err(FetchStoreError::Capacity {
+                        capacity: state.max_retained_transcripts,
+                    });
+                }
+                state.transcripts.insert(input, transcript.clone());
                 Ok(())
             }
         }
+    }
+
+    fn has_completed(&self, input: InputCommitment) -> Result<bool, FetchStoreError> {
+        let state = self.state.lock().map_err(|_| FetchStoreError::Poisoned)?;
+        Ok(state.transcripts.contains_key(&input))
     }
 
     fn get_completed(
         &self,
         input: InputCommitment,
     ) -> Result<Option<FetchTranscript>, FetchStoreError> {
-        let transcripts = self
-            .transcripts
-            .lock()
-            .map_err(|_| FetchStoreError::Poisoned)?;
-        Ok(transcripts.get(&input).cloned())
+        #[cfg(test)]
+        self.completed_loads.fetch_add(1, Ordering::Relaxed);
+        let state = self.state.lock().map_err(|_| FetchStoreError::Poisoned)?;
+        Ok(state.transcripts.get(&input).cloned())
+    }
+
+    #[cfg(test)]
+    fn record_replay_verification(&self) {
+        self.replay_verifications.fetch_add(1, Ordering::Relaxed);
     }
 
     fn put_running(
@@ -199,24 +346,38 @@ impl FetchTranscriptStore for MemoryFetchTranscriptStore {
         input: InputCommitment,
         record: &FetchRunningRecord,
     ) -> Result<(), FetchStoreError> {
-        let mut running = self.running.lock().map_err(|_| FetchStoreError::Poisoned)?;
-        match running.entry(input) {
-            std::collections::hash_map::Entry::Occupied(_) => Err(FetchStoreError::AlreadyExists),
-            std::collections::hash_map::Entry::Vacant(vacant) => {
-                vacant.insert(record.clone());
-                Ok(())
-            }
+        let mut state = self.state.lock().map_err(|_| FetchStoreError::Poisoned)?;
+        if state.transcripts.contains_key(&input) || state.running.contains_key(&input) {
+            return Err(FetchStoreError::AlreadyExists);
         }
+        if state.retained_transcripts() >= state.max_retained_transcripts {
+            return Err(FetchStoreError::Capacity {
+                capacity: state.max_retained_transcripts,
+            });
+        }
+        state.running.insert(input, record.clone());
+        #[cfg(test)]
+        if self
+            .fail_running_put_after_write
+            .swap(false, Ordering::SeqCst)
+        {
+            return Err(FetchStoreError::Io(io::Error::other(
+                "injected running-marker post-write failure",
+            )));
+        }
+        Ok(())
     }
 
     fn has_running(&self, input: InputCommitment) -> Result<bool, FetchStoreError> {
-        let running = self.running.lock().map_err(|_| FetchStoreError::Poisoned)?;
-        Ok(running.contains_key(&input))
+        let state = self.state.lock().map_err(|_| FetchStoreError::Poisoned)?;
+        Ok(state.running.contains_key(&input))
     }
 
     fn remove_running(&self, input: InputCommitment) -> Result<(), FetchStoreError> {
-        let mut running = self.running.lock().map_err(|_| FetchStoreError::Poisoned)?;
-        running.remove(&input);
+        let mut state = self.state.lock().map_err(|_| FetchStoreError::Poisoned)?;
+        state.running.remove(&input);
+        #[cfg(test)]
+        self.running_removals.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 }
@@ -232,14 +393,31 @@ impl FetchTranscriptStoreBackend {
         Self::Memory(MemoryFetchTranscriptStore::default())
     }
 
+    pub fn memory_with_capacity(max_retained_transcripts: usize) -> Self {
+        Self::Memory(MemoryFetchTranscriptStore::with_capacity(
+            max_retained_transcripts,
+        ))
+    }
+
     pub fn fs(root: impl Into<PathBuf>) -> Self {
         Self::Fs(FsFetchTranscriptStore::new(root))
+    }
+
+    pub fn fs_with_capacity(root: impl Into<PathBuf>, max_retained_transcripts: usize) -> Self {
+        Self::Fs(FsFetchTranscriptStore::with_capacity(
+            root,
+            max_retained_transcripts,
+        ))
     }
 
     pub fn init(&self) -> Result<(), FetchStoreError> {
         match self {
             Self::Memory(_) => Ok(()),
-            Self::Fs(store) => store.init(),
+            Self::Fs(store) => {
+                let store = store.clone();
+                crate::private_fs::run_blocking_io(move || store.init())
+                    .map_err(FetchStoreError::Io)?
+            }
         }
     }
 }
@@ -248,7 +426,23 @@ impl FetchTranscriptStore for FetchTranscriptStoreBackend {
     fn put_completed(&self, transcript: &FetchTranscript) -> Result<(), FetchStoreError> {
         match self {
             Self::Memory(store) => store.put_completed(transcript),
-            Self::Fs(store) => store.put_completed(transcript),
+            Self::Fs(store) => {
+                let store = store.clone();
+                let transcript = transcript.clone();
+                crate::private_fs::run_blocking_io(move || store.put_completed(&transcript))
+                    .map_err(FetchStoreError::Io)?
+            }
+        }
+    }
+
+    fn has_completed(&self, input: InputCommitment) -> Result<bool, FetchStoreError> {
+        match self {
+            Self::Memory(store) => store.has_completed(input),
+            Self::Fs(store) => {
+                let store = store.clone();
+                crate::private_fs::run_blocking_io(move || store.has_completed(input))
+                    .map_err(FetchStoreError::Io)?
+            }
         }
     }
 
@@ -258,7 +452,19 @@ impl FetchTranscriptStore for FetchTranscriptStoreBackend {
     ) -> Result<Option<FetchTranscript>, FetchStoreError> {
         match self {
             Self::Memory(store) => store.get_completed(input),
-            Self::Fs(store) => store.get_completed(input),
+            Self::Fs(store) => {
+                let store = store.clone();
+                crate::private_fs::run_blocking_io(move || store.get_completed(input))
+                    .map_err(FetchStoreError::Io)?
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn record_replay_verification(&self) {
+        match self {
+            Self::Memory(store) => store.record_replay_verification(),
+            Self::Fs(store) => store.record_replay_verification(),
         }
     }
 
@@ -269,21 +475,34 @@ impl FetchTranscriptStore for FetchTranscriptStoreBackend {
     ) -> Result<(), FetchStoreError> {
         match self {
             Self::Memory(store) => store.put_running(input, record),
-            Self::Fs(store) => store.put_running(input, record),
+            Self::Fs(store) => {
+                let store = store.clone();
+                let record = record.clone();
+                crate::private_fs::run_blocking_io(move || store.put_running(input, &record))
+                    .map_err(FetchStoreError::Io)?
+            }
         }
     }
 
     fn has_running(&self, input: InputCommitment) -> Result<bool, FetchStoreError> {
         match self {
             Self::Memory(store) => store.has_running(input),
-            Self::Fs(store) => store.has_running(input),
+            Self::Fs(store) => {
+                let store = store.clone();
+                crate::private_fs::run_blocking_io(move || store.has_running(input))
+                    .map_err(FetchStoreError::Io)?
+            }
         }
     }
 
     fn remove_running(&self, input: InputCommitment) -> Result<(), FetchStoreError> {
         match self {
             Self::Memory(store) => store.remove_running(input),
-            Self::Fs(store) => store.remove_running(input),
+            Self::Fs(store) => {
+                let store = store.clone();
+                crate::private_fs::run_blocking_io(move || store.remove_running(input))
+                    .map_err(FetchStoreError::Io)?
+            }
         }
     }
 }
@@ -313,11 +532,19 @@ impl FetchCallerPolicy {
 #[derive(Debug, Clone)]
 pub struct FsFetchTranscriptStore {
     root: PathBuf,
+    max_retained_transcripts: usize,
 }
 
 impl FsFetchTranscriptStore {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self::with_capacity(root, hellas_rpc::DEFAULT_FETCH_RETAINED_TRANSCRIPT_CAPACITY)
+    }
+
+    pub fn with_capacity(root: impl Into<PathBuf>, max_retained_transcripts: usize) -> Self {
+        Self {
+            root: root.into(),
+            max_retained_transcripts,
+        }
     }
 
     /// Create the store root and make its existence durable before any
@@ -325,20 +552,10 @@ impl FsFetchTranscriptStore {
     /// startup so `put_running` only ever links into an already-durable
     /// directory.
     pub fn init(&self) -> Result<(), FetchStoreError> {
-        fs::create_dir_all(&self.root).map_err(FetchStoreError::Io)?;
-        // `create_dir_all` may have created any suffix of the ancestor
-        // chain; sync every ancestor so the chain survives power loss.
-        // Once at startup, bounded by path depth.
-        #[cfg(unix)]
-        {
-            let mut dir = Some(self.root.as_path());
-            while let Some(path) = dir {
-                fs::File::open(path)
-                    .and_then(|handle| handle.sync_all())
-                    .map_err(FetchStoreError::Io)?;
-                dir = path.parent();
-            }
-        }
+        crate::private_fs::create_private_dir_all(&self.root).map_err(FetchStoreError::Io)?;
+        let _lock = self.capacity_lock()?;
+        crate::private_fs::make_directory_private(&_lock).map_err(FetchStoreError::Io)?;
+        self.ensure_capacity_metadata_locked()?;
         Ok(())
     }
 
@@ -349,6 +566,120 @@ impl FsFetchTranscriptStore {
     fn running_path(&self, input: InputCommitment) -> PathBuf {
         self.root.join(format!("{}.running", input.digest()))
     }
+
+    fn capacity_metadata_path(&self) -> PathBuf {
+        self.root.join(".retained-transcript-capacity")
+    }
+
+    fn capacity_lock(&self) -> Result<fs::File, FetchStoreError> {
+        // This advisory inode lock serializes cooperating stores that resolve
+        // the same stable path. Later child access remains path-based, so the
+        // root's ancestors must be trusted and must not be renamed or replaced;
+        // same-user malicious code is outside this lock's protection.
+        let directory =
+            crate::private_fs::open_directory(&self.root).map_err(FetchStoreError::Io)?;
+        let deadline = Instant::now() + FETCH_CAPACITY_LOCK_WAIT;
+        loop {
+            match directory.try_lock() {
+                Ok(()) => break,
+                Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(TryLockError::WouldBlock) => {
+                    return Err(FetchStoreError::Io(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "timed out waiting for the fetch transcript capacity lock",
+                    )));
+                }
+                Err(TryLockError::Error(error)) => return Err(FetchStoreError::Io(error)),
+            }
+        }
+        Ok(directory)
+    }
+
+    fn ensure_capacity_metadata_locked(&self) -> Result<(), FetchStoreError> {
+        // The limit is a property of the shared root, not of one process.
+        // Persisting it makes a second process with a different CLI value fail
+        // closed instead of racing the same evidence under another bound. An
+        // operator may remove/change it only after stopping every sharer;
+        // existing evidence is left untouched and may already exceed the new
+        // value, in which case only new distinct retention is refused.
+        let path = self.capacity_metadata_path();
+        let expected = format!("{}\n", self.max_retained_transcripts);
+        let bytes = match crate::private_fs::read_bounded_regular_file(
+            &path,
+            MAX_FETCH_CAPACITY_METADATA_BYTES,
+        ) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                match atomic_create_no_clobber(&path, expected.as_bytes()) {
+                    Ok(()) => return Ok(()),
+                    Err(FetchStoreError::AlreadyExists) => {
+                        crate::private_fs::read_bounded_regular_file(
+                            &path,
+                            MAX_FETCH_CAPACITY_METADATA_BYTES,
+                        )
+                        .map_err(FetchStoreError::Io)?
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+            Err(err) => return Err(FetchStoreError::Io(err)),
+        };
+        let persisted = std::str::from_utf8(&bytes)
+            .ok()
+            .and_then(|value| value.strip_suffix('\n'))
+            .and_then(|value| value.parse::<usize>().ok())
+            .ok_or_else(|| {
+                FetchStoreError::Decode(format!(
+                    "invalid retained transcript capacity metadata at {}",
+                    path.display()
+                ))
+            })?;
+        if persisted == self.max_retained_transcripts {
+            Ok(())
+        } else {
+            Err(FetchStoreError::CapacityConfiguration {
+                configured: self.max_retained_transcripts,
+                persisted,
+                metadata_path: path,
+                root: self.root.clone(),
+            })
+        }
+    }
+
+    fn retained_transcripts_locked(&self) -> Result<usize, FetchStoreError> {
+        let mut commitments = HashSet::<OsString>::new();
+        for entry in fs::read_dir(&self.root).map_err(FetchStoreError::Io)? {
+            let path = entry.map_err(FetchStoreError::Io)?.path();
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "running" || extension == "dagcbor")
+                && let Some(stem) = path.file_stem()
+            {
+                commitments.insert(stem.to_owned());
+            }
+        }
+        Ok(commitments.len())
+    }
+
+    fn exists(path: &Path) -> Result<bool, FetchStoreError> {
+        match fs::metadata(path) {
+            Ok(_) => Ok(true),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(err) => Err(FetchStoreError::Io(err)),
+        }
+    }
+
+    fn check_capacity_locked(&self) -> Result<(), FetchStoreError> {
+        if self.retained_transcripts_locked()? >= self.max_retained_transcripts {
+            Err(FetchStoreError::Capacity {
+                capacity: self.max_retained_transcripts,
+            })
+        } else {
+            Ok(())
+        }
+    }
 }
 
 impl FetchTranscriptStore for FsFetchTranscriptStore {
@@ -356,11 +687,36 @@ impl FetchTranscriptStore for FsFetchTranscriptStore {
         let bytes = canonical_dag_cbor(transcript).map_err(|err| {
             FetchStoreError::Encode(format!("transcript DAG-CBOR encode failed: {err}"))
         })?;
+        if bytes.len() > MAX_FETCH_TRANSCRIPT_BYTES {
+            return Err(FetchStoreError::Encode(format!(
+                "transcript DAG-CBOR is {} bytes, over the {MAX_FETCH_TRANSCRIPT_BYTES}-byte persistence limit",
+                bytes.len()
+            )));
+        }
         let path = self.path(transcript.input_commitment());
+        let _lock = self.capacity_lock()?;
+        self.ensure_capacity_metadata_locked()?;
+        if Self::exists(&path)? {
+            let existing =
+                crate::private_fs::read_bounded_regular_file(&path, MAX_FETCH_TRANSCRIPT_BYTES)
+                    .map_err(FetchStoreError::Io)?;
+            return if existing == bytes {
+                Ok(())
+            } else {
+                Err(FetchStoreError::Conflict {
+                    input: transcript.input_commitment(),
+                })
+            };
+        }
+        if !Self::exists(&self.running_path(transcript.input_commitment()))? {
+            self.check_capacity_locked()?;
+        }
         match atomic_create_no_clobber(&path, &bytes) {
             Ok(()) => Ok(()),
             Err(FetchStoreError::AlreadyExists) => {
-                let existing = fs::read(&path).map_err(FetchStoreError::Io)?;
+                let existing =
+                    crate::private_fs::read_bounded_regular_file(&path, MAX_FETCH_TRANSCRIPT_BYTES)
+                        .map_err(FetchStoreError::Io)?;
                 if existing == bytes {
                     Ok(())
                 } else {
@@ -373,16 +729,21 @@ impl FetchTranscriptStore for FsFetchTranscriptStore {
         }
     }
 
+    fn has_completed(&self, input: InputCommitment) -> Result<bool, FetchStoreError> {
+        Self::exists(&self.path(input))
+    }
+
     fn get_completed(
         &self,
         input: InputCommitment,
     ) -> Result<Option<FetchTranscript>, FetchStoreError> {
         let path = self.path(input);
-        let bytes = match fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(err) => return Err(FetchStoreError::Io(err)),
-        };
+        let bytes =
+            match crate::private_fs::read_bounded_regular_file(&path, MAX_FETCH_TRANSCRIPT_BYTES) {
+                Ok(bytes) => bytes,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(err) => return Err(FetchStoreError::Io(err)),
+            };
         let transcript = decode_dag_cbor(&bytes).map_err(|err| {
             FetchStoreError::Decode(format!("transcript DAG-CBOR decode failed: {err}"))
         })?;
@@ -396,6 +757,12 @@ impl FetchTranscriptStore for FsFetchTranscriptStore {
     ) -> Result<(), FetchStoreError> {
         let bytes = serde_json::to_vec_pretty(record)
             .map_err(|err| FetchStoreError::Encode(format!("running record encode: {err}")))?;
+        let _lock = self.capacity_lock()?;
+        self.ensure_capacity_metadata_locked()?;
+        if Self::exists(&self.running_path(input))? || Self::exists(&self.path(input))? {
+            return Err(FetchStoreError::AlreadyExists);
+        }
+        self.check_capacity_locked()?;
         atomic_create_no_clobber(&self.running_path(input), &bytes)
     }
 
@@ -408,9 +775,19 @@ impl FetchTranscriptStore for FsFetchTranscriptStore {
     }
 
     fn remove_running(&self, input: InputCommitment) -> Result<(), FetchStoreError> {
+        let _lock = self.capacity_lock()?;
+        self.ensure_capacity_metadata_locked()?;
         match fs::remove_file(self.running_path(input)) {
-            Ok(()) => Ok(()),
-            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+            Ok(()) => {
+                #[cfg(unix)]
+                crate::private_fs::sync_directory(&self.root).map_err(FetchStoreError::Io)?;
+                Ok(())
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                #[cfg(unix)]
+                crate::private_fs::sync_directory(&self.root).map_err(FetchStoreError::Io)?;
+                Ok(())
+            }
             Err(err) => Err(FetchStoreError::Io(err)),
         }
     }
@@ -445,9 +822,7 @@ fn atomic_create_no_clobber(path: &Path, bytes: &[u8]) -> Result<(), FetchStoreE
                 // process crash. This matters for the running marker, which
                 // is the only record that a paid provider call may exist.
                 #[cfg(unix)]
-                fs::File::open(parent)
-                    .and_then(|dir| dir.sync_all())
-                    .map_err(FetchStoreError::Io)?;
+                crate::private_fs::sync_directory(parent).map_err(FetchStoreError::Io)?;
                 Ok(())
             }
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
@@ -465,6 +840,8 @@ pub struct FetchStateMachine<S> {
     store: S,
     caller_policy: FetchCallerPolicy,
     tickets: HashMap<InputCommitment, FetchTicketState>,
+    max_tickets: usize,
+    max_input_bytes: usize,
 }
 
 impl<S> FetchStateMachine<S>
@@ -476,40 +853,108 @@ where
             store,
             caller_policy,
             tickets: HashMap::new(),
+            max_tickets: MAX_FETCH_IN_MEMORY_TICKETS,
+            max_input_bytes: MAX_FETCH_IN_MEMORY_INPUT_BYTES,
         }
     }
 
-    fn insert_quote(&mut self, quote: FetchQuote) -> Result<(), FetchStateError> {
-        if !self.caller_policy.is_authorized(&quote.caller_key) {
-            return Err(FetchStateError::UnauthorizedCaller);
+    #[cfg(test)]
+    fn with_limits(
+        store: S,
+        caller_policy: FetchCallerPolicy,
+        max_tickets: usize,
+        max_input_bytes: usize,
+    ) -> Self {
+        Self {
+            store,
+            caller_policy,
+            tickets: HashMap::new(),
+            max_tickets,
+            max_input_bytes,
         }
+    }
+
+    fn insert_quote(
+        &mut self,
+        quote: FetchQuote,
+        expires_at: Instant,
+    ) -> Result<(), FetchStateError> {
         let input = quote.input_commitment;
-        match self.tickets.get(&input) {
-            Some(FetchTicketState::Quoted(_))
-            | Some(FetchTicketState::Queued(_))
-            | Some(FetchTicketState::Running(_)) => Err(FetchStateError::AlreadyExists),
-            Some(FetchTicketState::Completed(_)) => Err(FetchStateError::AlreadyCompleted),
-            Some(FetchTicketState::Failed(_)) => Err(FetchStateError::Failed),
-            None => {
-                self.tickets.insert(input, FetchTicketState::Quoted(quote));
-                Ok(())
-            }
+        if self.tickets.contains_key(&input) {
+            return Err(FetchStateError::AlreadyExists);
         }
+        if self.tickets.len() >= self.max_tickets {
+            return Err(FetchStateError::TicketCapacity {
+                capacity: self.max_tickets,
+            });
+        }
+        let requested = self
+            .in_memory_input_bytes()?
+            .checked_add(accounted_input_bytes(&quote)?)
+            .ok_or(FetchStateError::InputLengthOverflow)?;
+        if requested > self.max_input_bytes {
+            return Err(FetchStateError::InputCapacity {
+                requested,
+                capacity: self.max_input_bytes,
+            });
+        }
+        self.tickets.insert(
+            input,
+            FetchTicketState::Quoted(FetchTicketEntry { quote, expires_at }),
+        );
+        Ok(())
     }
 
-    pub fn quote_input(
+    #[cfg(test)]
+    pub(crate) fn quote_input(
         &mut self,
         input: Vec<InputEventEnvelope>,
     ) -> Result<(FetchQuote, FetchInput), FetchStateError> {
-        let verified = verify_input_events(&input)?;
-        let quote = FetchQuote::from_verified(&verified, input);
-        if !self.caller_policy.is_authorized(&quote.caller_key) {
+        self.quote_input_at(input, Instant::now())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn quote_input_at(
+        &mut self,
+        input: Vec<InputEventEnvelope>,
+        now: Instant,
+    ) -> Result<(FetchQuote, FetchInput), FetchStateError> {
+        let authorized = self.verify_authorized_input(input)?;
+        let verified = authorized.verified.clone();
+        let quote = self.quote_verified_input_at(authorized, now)?;
+        Ok((quote, verified))
+    }
+
+    pub(crate) fn verify_authorized_input(
+        &self,
+        input: Vec<InputEventEnvelope>,
+    ) -> Result<VerifiedFetchQuoteInput, FetchStateError> {
+        // Reject an unknown claimed key before spending eight signature
+        // verifications. `verify_input_events` subsequently proves that this
+        // key signed the exact fixed-shape transcript.
+        if input
+            .first()
+            .is_some_and(|event| !self.caller_policy.is_authorized(event.event().public_key()))
+        {
             return Err(FetchStateError::UnauthorizedCaller);
         }
-        if quote.retention.should_retain()
-            && self.store.get_completed(quote.input_commitment)?.is_some()
-        {
-            return Ok((quote, verified));
+        let verified = verify_input_events(&input)?;
+        if !self.caller_policy.is_authorized(&verified.caller_key) {
+            return Err(FetchStateError::UnauthorizedCaller);
+        }
+        Ok(VerifiedFetchQuoteInput { verified, input })
+    }
+
+    pub(crate) fn quote_verified_input_at(
+        &mut self,
+        authorized: VerifiedFetchQuoteInput,
+        now: Instant,
+    ) -> Result<FetchQuote, FetchStateError> {
+        let VerifiedFetchQuoteInput { verified, input } = authorized;
+        let quote = FetchQuote::from_verified(&verified, input);
+        self.prune_expired_quotes(now);
+        if quote.retention.should_retain() && self.store.has_completed(quote.input_commitment)? {
+            return Ok(quote);
         }
         // A durable running marker without a completed transcript means a
         // previous process may have reached the paid provider before
@@ -517,20 +962,48 @@ where
         if quote.retention.should_retain() && self.store.has_running(quote.input_commitment)? {
             return Err(FetchStateError::Indeterminate);
         }
-        self.insert_quote(quote.clone())?;
-        Ok((quote, verified))
+        self.insert_quote(quote.clone(), now + QUOTE_TTL)?;
+        Ok(quote)
+    }
+
+    pub(crate) fn rollback_quote(&mut self, input: InputCommitment) -> bool {
+        if matches!(self.tickets.get(&input), Some(FetchTicketState::Quoted(_))) {
+            self.tickets.remove(&input);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn prune_expired_quotes(&mut self, now: Instant) -> usize {
+        let before = self.tickets.len();
+        self.tickets.retain(
+            |_, state| !matches!(state, FetchTicketState::Quoted(entry) if entry.expires_at <= now),
+        );
+        before - self.tickets.len()
+    }
+
+    fn in_memory_input_bytes(&self) -> Result<usize, FetchStateError> {
+        self.tickets.values().try_fold(0_usize, |total, state| {
+            let quote = match state {
+                FetchTicketState::Quoted(entry)
+                | FetchTicketState::Queued(entry)
+                | FetchTicketState::Running(entry) => &entry.quote,
+            };
+            total
+                .checked_add(accounted_input_bytes(quote)?)
+                .ok_or(FetchStateError::InputLengthOverflow)
+        })
     }
 
     pub fn queue(&mut self, input: InputCommitment) -> Result<FetchQuote, FetchStateError> {
         let retention = match self.tickets.get(&input) {
-            Some(FetchTicketState::Quoted(quote))
-            | Some(FetchTicketState::Queued(quote))
-            | Some(FetchTicketState::Running(quote)) => quote.retention,
-            Some(FetchTicketState::Completed(_)) => return Err(FetchStateError::AlreadyCompleted),
-            Some(FetchTicketState::Failed(_)) => return Err(FetchStateError::Failed),
+            Some(FetchTicketState::Quoted(entry))
+            | Some(FetchTicketState::Queued(entry))
+            | Some(FetchTicketState::Running(entry)) => entry.quote.retention,
             None => return Err(FetchStateError::NotFound),
         };
-        if retention.should_retain() && self.store.get_completed(input)?.is_some() {
+        if retention.should_retain() && self.store.has_completed(input)? {
             return Err(FetchStateError::AlreadyCompleted);
         }
         let state = self
@@ -538,25 +1011,22 @@ where
             .get_mut(&input)
             .ok_or(FetchStateError::NotFound)?;
         match state {
-            FetchTicketState::Quoted(quote) => {
-                let quote = quote.clone();
-                *state = FetchTicketState::Queued(quote.clone());
+            FetchTicketState::Quoted(entry) => {
+                let entry = entry.clone();
+                let quote = entry.quote.clone();
+                *state = FetchTicketState::Queued(entry);
                 Ok(quote)
             }
             FetchTicketState::Queued(_) => Err(FetchStateError::AlreadyQueued),
             FetchTicketState::Running(_) => Err(FetchStateError::AlreadyRunning),
-            FetchTicketState::Completed(_) => Err(FetchStateError::AlreadyCompleted),
-            FetchTicketState::Failed(_) => Err(FetchStateError::Failed),
         }
     }
 
     pub fn quoted(&self, input: InputCommitment) -> Result<FetchQuote, FetchStateError> {
         match self.tickets.get(&input) {
-            Some(FetchTicketState::Quoted(quote)) => Ok(quote.clone()),
+            Some(FetchTicketState::Quoted(entry)) => Ok(entry.quote.clone()),
             Some(FetchTicketState::Queued(_)) => Err(FetchStateError::AlreadyQueued),
             Some(FetchTicketState::Running(_)) => Err(FetchStateError::AlreadyRunning),
-            Some(FetchTicketState::Completed(_)) => Err(FetchStateError::AlreadyCompleted),
-            Some(FetchTicketState::Failed(_)) => Err(FetchStateError::Failed),
             None => Err(FetchStateError::NotFound),
         }
     }
@@ -567,27 +1037,35 @@ where
             .get_mut(&input)
             .ok_or(FetchStateError::NotFound)?;
         match state {
-            FetchTicketState::Queued(quote) => {
-                *state = FetchTicketState::Quoted(quote.clone());
+            FetchTicketState::Queued(entry) => {
+                *state = FetchTicketState::Quoted(entry.clone());
                 Ok(())
             }
             FetchTicketState::Quoted(_) => Ok(()),
             FetchTicketState::Running(_) => Err(FetchStateError::AlreadyRunning),
-            FetchTicketState::Completed(_) => Err(FetchStateError::AlreadyCompleted),
-            FetchTicketState::Failed(_) => Err(FetchStateError::Failed),
+        }
+    }
+
+    /// Drop a queued ticket after dispatch failed before any provider call.
+    /// Unlike [`Self::cancel_queued`], this releases the in-memory ticket and
+    /// its signed input because no caller remains attached to retry it.
+    pub(crate) fn discard_queued(&mut self, input: InputCommitment) -> bool {
+        if matches!(self.tickets.get(&input), Some(FetchTicketState::Queued(_))) {
+            self.tickets.remove(&input);
+            true
+        } else {
+            false
         }
     }
 
     pub fn start(&mut self, input: InputCommitment) -> Result<FetchQuote, FetchStateError> {
         let retention = match self.tickets.get(&input) {
-            Some(FetchTicketState::Quoted(quote))
-            | Some(FetchTicketState::Queued(quote))
-            | Some(FetchTicketState::Running(quote)) => quote.retention,
-            Some(FetchTicketState::Completed(_)) => return Err(FetchStateError::AlreadyCompleted),
-            Some(FetchTicketState::Failed(_)) => return Err(FetchStateError::Failed),
+            Some(FetchTicketState::Quoted(entry))
+            | Some(FetchTicketState::Queued(entry))
+            | Some(FetchTicketState::Running(entry)) => entry.quote.retention,
             None => return Err(FetchStateError::NotFound),
         };
-        if retention.should_retain() && self.store.get_completed(input)?.is_some() {
+        if retention.should_retain() && self.store.has_completed(input)? {
             return Err(FetchStateError::AlreadyCompleted);
         }
         let state = self
@@ -595,8 +1073,9 @@ where
             .get_mut(&input)
             .ok_or(FetchStateError::NotFound)?;
         match state {
-            FetchTicketState::Quoted(quote) | FetchTicketState::Queued(quote) => {
-                let quote = quote.clone();
+            FetchTicketState::Quoted(entry) | FetchTicketState::Queued(entry) => {
+                let entry = entry.clone();
+                let quote = entry.quote.clone();
                 // Exclusive durable acquisition before the in-memory
                 // transition: the provider can never be called without a
                 // record that the call may have happened, and two processes
@@ -610,16 +1089,49 @@ where
                         Err(FetchStoreError::AlreadyExists) => {
                             return Err(FetchStateError::Indeterminate);
                         }
-                        Err(err) => return Err(err.into()),
+                        Err(err) => {
+                            if let Err(cleanup) = self.store.remove_running(input) {
+                                return Err(FetchStateError::StartMarkerRollback {
+                                    start: err.to_string(),
+                                    cleanup: cleanup.to_string(),
+                                });
+                            }
+                            return Err(err.into());
+                        }
                     }
                 }
-                *state = FetchTicketState::Running(quote.clone());
+                *state = FetchTicketState::Running(entry);
                 Ok(quote)
             }
             FetchTicketState::Running(_) => Err(FetchStateError::AlreadyRunning),
-            FetchTicketState::Completed(_) => Err(FetchStateError::AlreadyCompleted),
-            FetchTicketState::Failed(_) => Err(FetchStateError::Failed),
         }
+    }
+
+    /// Roll back a successful [`Self::start`] before any provider task exists.
+    ///
+    /// Removing the durable marker comes first. If that fails, the Running
+    /// ticket remains in memory and startup recovery can retry from the paired
+    /// Pending quota entry; the caller must never invoke the provider.
+    pub(crate) fn abort_before_dispatch(
+        &mut self,
+        input: InputCommitment,
+    ) -> Result<(), FetchStateError> {
+        let retention = match self.tickets.get(&input) {
+            Some(FetchTicketState::Quoted(entry))
+            | Some(FetchTicketState::Queued(entry))
+            | Some(FetchTicketState::Running(entry)) => entry.quote.retention,
+            None => {
+                // The durable removal is idempotent. This lets a retry retire
+                // an ambiguous acknowledgement without resurrecting a ticket.
+                self.store.remove_running(input)?;
+                return Ok(());
+            }
+        };
+        if retention.should_retain() {
+            self.store.remove_running(input)?;
+        }
+        self.tickets.remove(&input);
+        Ok(())
     }
 
     pub fn complete_output(
@@ -629,12 +1141,10 @@ where
         producer_key: &PublicKey,
     ) -> Result<FetchTranscript, FetchStateError> {
         let quote = match self.tickets.get(&input) {
-            Some(FetchTicketState::Running(quote)) => quote.clone(),
+            Some(FetchTicketState::Running(entry)) => entry.quote.clone(),
             Some(FetchTicketState::Quoted(_)) | Some(FetchTicketState::Queued(_)) => {
                 return Err(FetchStateError::NotRunning);
             }
-            Some(FetchTicketState::Completed(_)) => return Err(FetchStateError::AlreadyCompleted),
-            Some(FetchTicketState::Failed(_)) => return Err(FetchStateError::Failed),
             None => return Err(FetchStateError::NotFound),
         };
         let transcript = FetchTranscript::from_quote(&quote, output);
@@ -649,12 +1159,10 @@ where
     ) -> Result<(), FetchStateError> {
         let input = transcript.input_commitment();
         let quote = match self.tickets.get(&input) {
-            Some(FetchTicketState::Running(quote)) => quote,
+            Some(FetchTicketState::Running(entry)) => &entry.quote,
             Some(FetchTicketState::Quoted(_)) | Some(FetchTicketState::Queued(_)) => {
                 return Err(FetchStateError::NotRunning);
             }
-            Some(FetchTicketState::Completed(_)) => return Err(FetchStateError::AlreadyCompleted),
-            Some(FetchTicketState::Failed(_)) => return Err(FetchStateError::Failed),
             None => return Err(FetchStateError::NotFound),
         };
         if transcript.input != quote.input {
@@ -672,32 +1180,22 @@ where
             // behavior.
             let _ = self.store.remove_running(input);
         }
-        self.tickets
-            .insert(input, FetchTicketState::Completed(transcript));
+        self.tickets.remove(&input);
         Ok(())
     }
 
-    /// The running marker is deliberately kept on failure: the provider may
-    /// have been reached and billed, so after a restart the only honest
-    /// state for this input is indeterminate.
+    /// A retained running marker is deliberately kept on failure: the provider
+    /// may have been reached and billed, so the only honest state for this
+    /// input is indeterminate. Ephemeral work has no replay/crash barrier.
     pub fn fail(
         &mut self,
         input: InputCommitment,
-        reason: impl Into<String>,
+        _reason: impl Into<String>,
     ) -> Result<(), FetchStateError> {
-        let state = self
-            .tickets
-            .get_mut(&input)
-            .ok_or(FetchStateError::NotFound)?;
-        match state {
-            FetchTicketState::Running(_)
-            | FetchTicketState::Queued(_)
-            | FetchTicketState::Quoted(_) => {
-                *state = FetchTicketState::Failed(reason.into());
-                Ok(())
-            }
-            FetchTicketState::Completed(_) => Err(FetchStateError::AlreadyCompleted),
-            FetchTicketState::Failed(_) => Err(FetchStateError::Failed),
+        if self.tickets.remove(&input).is_some() {
+            Ok(())
+        } else {
+            Err(FetchStateError::NotFound)
         }
     }
 
@@ -705,37 +1203,72 @@ where
     /// transcript: a previous process may have reached the provider before
     /// crashing, and the work must not be re-run automatically.
     pub fn is_indeterminate(&self, input: InputCommitment) -> Result<bool, FetchStateError> {
-        if self.store.get_completed(input)?.is_some() {
+        if self.store.has_completed(input)? {
             return Ok(false);
         }
         Ok(self.store.has_running(input)?)
+    }
+
+    pub(crate) fn has_completed(&self, input: InputCommitment) -> Result<bool, FetchStateError> {
+        Ok(self.store.has_completed(input)?)
     }
 
     pub fn replay_completed(
         &self,
         input: InputCommitment,
         producer_key: &PublicKey,
-    ) -> Result<FetchTranscript, FetchStateError> {
+        runner_key: &PublicKey,
+    ) -> Result<VerifiedFetchReplay, FetchStateError> {
         let transcript = match self.store.get_completed(input)? {
             Some(transcript) => transcript,
-            None => match self.tickets.get(&input) {
-                Some(FetchTicketState::Completed(transcript)) => transcript.clone(),
-                Some(FetchTicketState::Failed(_)) => return Err(FetchStateError::Failed),
-                Some(FetchTicketState::Quoted(_))
-                | Some(FetchTicketState::Queued(_))
-                | Some(FetchTicketState::Running(_)) => return Err(FetchStateError::NotCompleted),
-                None => return Err(FetchStateError::NotFound),
-            },
+            None if self.tickets.contains_key(&input) => {
+                return Err(FetchStateError::NotCompleted);
+            }
+            None => return Err(FetchStateError::NotFound),
         };
         if transcript.input_commitment() != input {
             return Err(FetchStateError::QuoteMismatch);
         }
+        // Persisted transcript bytes are not trusted. Their claimed key can
+        // cheaply reject the wrong run-ticket signer, but can never grant
+        // access: a matching claim still pays for full signature verification
+        // below before any replay is returned.
+        if transcript
+            .claimed_caller_key()
+            .is_some_and(|claimed| claimed != runner_key)
+        {
+            return Err(FetchStateError::UnauthorizedRunner);
+        }
+        #[cfg(test)]
+        self.store.record_replay_verification();
         let verified = transcript.verify(producer_key)?;
+        if verified.caller_key != *runner_key {
+            return Err(FetchStateError::UnauthorizedRunner);
+        }
         if !self.caller_policy.is_authorized(&verified.caller_key) {
             return Err(FetchStateError::UnauthorizedCaller);
         }
-        Ok(transcript)
+        Ok(VerifiedFetchReplay {
+            transcript,
+            input: verified,
+        })
     }
+}
+
+fn accounted_input_bytes(quote: &FetchQuote) -> Result<usize, FetchStateError> {
+    let duplicated_route_bytes = quote
+        .service
+        .len()
+        .checked_add(quote.method.len())
+        .ok_or(FetchStateError::InputLengthOverflow)?;
+    quote
+        .input
+        .iter()
+        .try_fold(duplicated_route_bytes, |total, event| {
+            total
+                .checked_add(event.payload().len())
+                .ok_or(FetchStateError::InputLengthOverflow)
+        })
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -760,6 +1293,10 @@ pub enum FetchStateError {
     AlreadyRunning,
     #[error("fetch ticket is not running")]
     NotRunning,
+    #[error(
+        "fetch running-marker creation failed ({start}) and its pre-dispatch rollback also failed ({cleanup})"
+    )]
+    StartMarkerRollback { start: String, cleanup: String },
     #[error("fetch ticket is not completed")]
     NotCompleted,
     #[error("fetch ticket already completed")]
@@ -770,10 +1307,18 @@ pub enum FetchStateError {
         "fetch ticket is indeterminate: a previous run may have reached the provider before a crash; refusing to re-run automatically"
     )]
     Indeterminate,
-    #[error("fetch ticket failed")]
-    Failed,
+    #[error("fetch in-memory ticket capacity of {capacity} is exhausted")]
+    TicketCapacity { capacity: usize },
+    #[error(
+        "fetch in-memory signed-input payload would reach {requested} bytes, over the {capacity}-byte capacity"
+    )]
+    InputCapacity { requested: usize, capacity: usize },
+    #[error("fetch signed-input payload length exceeds usize range")]
+    InputLengthOverflow,
     #[error("fetch caller key is not authorized")]
     UnauthorizedCaller,
+    #[error("run ticket signer is not authorized for this fetch transcript")]
+    UnauthorizedRunner,
     #[error("fetch store error: {0}")]
     Store(#[from] FetchStoreError),
     #[error("fetch transcript verification failed: {0}")]
@@ -786,6 +1331,17 @@ pub enum FetchStateError {
 pub enum FetchStoreError {
     #[error("fetch transcript already exists")]
     AlreadyExists,
+    #[error("retained Fetch transcript capacity of {capacity} is exhausted")]
+    Capacity { capacity: usize },
+    #[error(
+        "retained Fetch transcript capacity {configured} does not match persisted capacity {persisted} at {metadata_path}; stop every process sharing store root {root} before changing or removing that metadata (stored transcripts and running markers are never deleted)"
+    )]
+    CapacityConfiguration {
+        configured: usize,
+        persisted: usize,
+        metadata_path: PathBuf,
+        root: PathBuf,
+    },
     #[error("conflicting completed transcript for input {input:?}")]
     Conflict { input: InputCommitment },
     #[error("I/O error: {0}")]
@@ -811,16 +1367,34 @@ mod tests {
     }
 
     fn root(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "hellas-fetch-test-{name}-{}",
-            Uuid::new_v4().simple()
-        ))
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/hellas-fetch-tests")
+            .join(format!("{name}-{}", Uuid::new_v4().simple()))
     }
 
     fn fs_store(dir: &Path) -> FsFetchTranscriptStore {
         let store = FsFetchTranscriptStore::new(dir);
         store.init().unwrap();
         store
+    }
+
+    fn fs_store_with_capacity(dir: &Path, capacity: usize) -> FsFetchTranscriptStore {
+        let store = FsFetchTranscriptStore::with_capacity(dir, capacity);
+        store.init().unwrap();
+        store
+    }
+
+    fn retained_file_count(dir: &Path) -> usize {
+        fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "running" || extension == "dagcbor")
+            })
+            .count()
     }
 
     fn sample_transcript() -> (FetchQuote, FetchTranscript, PublicKey, PublicKey) {
@@ -872,6 +1446,586 @@ mod tests {
         )
     }
 
+    fn signed_input(
+        caller: &ProducerSigningKey,
+        retention: hellas_rpc::Retention,
+        body: &[u8],
+    ) -> Vec<InputEventEnvelope> {
+        build_input_events_with_retention(
+            "openai",
+            "responses",
+            body,
+            hellas_rpc::ContentId::from_bytes([9; 32]),
+            hellas_rpc::Assurance::ProducerSigned,
+            caller,
+            retention,
+        )
+        .unwrap()
+    }
+
+    fn transcript_for(
+        caller: &ProducerSigningKey,
+        producer: &ProducerSigningKey,
+        retention: hellas_rpc::Retention,
+        body: &[u8],
+    ) -> (FetchQuote, FetchTranscript) {
+        let body = serde_json::to_vec(&String::from_utf8_lossy(body)).unwrap();
+        let input = signed_input(caller, retention, &body);
+        let verified = verify_input_events(&input).unwrap();
+        let quote = FetchQuote::from_verified(&verified, input);
+        let output = build_output_events(
+            quote.input_commitment,
+            quote.assurance,
+            br#"{"status":"completed"}"#,
+            producer,
+        )
+        .unwrap();
+        let transcript = FetchTranscript::from_quote(&quote, output);
+        (quote, transcript)
+    }
+
+    fn exercise_retained_capacity<S>(store: S)
+    where
+        S: FetchTranscriptStore + Clone,
+    {
+        let caller = key(21);
+        let producer = key(22);
+        let (first, first_transcript) =
+            transcript_for(&caller, &producer, hellas_rpc::Retention::Retain, b"first");
+        let (second, _) =
+            transcript_for(&caller, &producer, hellas_rpc::Retention::Retain, b"second");
+        let (ephemeral, _) = transcript_for(
+            &caller,
+            &producer,
+            hellas_rpc::Retention::Ephemeral,
+            b"ephemeral",
+        );
+        let first_input = first.input_commitment;
+        let second_input = second.input_commitment;
+        let ephemeral_input = ephemeral.input_commitment;
+        let mut state =
+            FetchStateMachine::new(store.clone(), FetchCallerPolicy::new([caller.public_key()]));
+
+        state.quote_input(first.input).unwrap();
+        state.start(first_input).unwrap();
+        state.quote_input(second.input).unwrap();
+        assert!(matches!(
+            state.start(second_input).unwrap_err(),
+            FetchStateError::Store(FetchStoreError::Capacity { capacity: 1 })
+        ));
+
+        // Ephemeral work never reserves durable transcript capacity.
+        state.quote_input(ephemeral.input).unwrap();
+        state.start(ephemeral_input).unwrap();
+        state.fail(ephemeral_input, "test cleanup").unwrap();
+
+        // A running marker already owns this distinct-input slot, so its
+        // running -> completed transition is allowed even while full.
+        state
+            .complete_output(
+                first_input,
+                first_transcript.output_events().to_vec(),
+                &producer.public_key(),
+            )
+            .unwrap();
+        store.put_completed(&first_transcript).unwrap();
+        assert!(matches!(
+            state.start(second_input).unwrap_err(),
+            FetchStateError::Store(FetchStoreError::Capacity { capacity: 1 })
+        ));
+    }
+
+    fn exercise_zero_retained_capacity<S>(store: S)
+    where
+        S: FetchTranscriptStore,
+    {
+        let caller = key(23);
+        let producer = key(24);
+        let (retained, _) = transcript_for(
+            &caller,
+            &producer,
+            hellas_rpc::Retention::Retain,
+            b"retained",
+        );
+        let (ephemeral, _) = transcript_for(
+            &caller,
+            &producer,
+            hellas_rpc::Retention::Ephemeral,
+            b"ephemeral",
+        );
+        let retained_input = retained.input_commitment;
+        let ephemeral_input = ephemeral.input_commitment;
+        let mut state =
+            FetchStateMachine::new(store, FetchCallerPolicy::new([caller.public_key()]));
+
+        state.quote_input(retained.input).unwrap();
+        assert!(matches!(
+            state.start(retained_input).unwrap_err(),
+            FetchStateError::Store(FetchStoreError::Capacity { capacity: 0 })
+        ));
+        state.quote_input(ephemeral.input).unwrap();
+        state.start(ephemeral_input).unwrap();
+    }
+
+    #[test]
+    fn memory_retained_capacity_counts_running_and_completed_once() {
+        exercise_retained_capacity(MemoryFetchTranscriptStore::with_capacity(1));
+    }
+
+    #[test]
+    fn filesystem_retained_capacity_counts_running_and_completed_once() {
+        let dir = root("fs-retained-capacity");
+        exercise_retained_capacity(fs_store_with_capacity(&dir, 1));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn zero_retained_capacity_disables_new_memory_retention() {
+        exercise_zero_retained_capacity(MemoryFetchTranscriptStore::with_capacity(0));
+    }
+
+    #[test]
+    fn zero_retained_capacity_disables_new_filesystem_retention() {
+        let dir = root("fs-zero-retained-capacity");
+        exercise_zero_retained_capacity(fs_store_with_capacity(&dir, 0));
+        assert_eq!(retained_file_count(&dir), 0);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn failed_running_marker_still_consumes_memory_capacity() {
+        let caller = key(25);
+        let producer = key(26);
+        let (first, _) =
+            transcript_for(&caller, &producer, hellas_rpc::Retention::Retain, b"first");
+        let (second, _) =
+            transcript_for(&caller, &producer, hellas_rpc::Retention::Retain, b"second");
+        let first_input = first.input_commitment;
+        let second_input = second.input_commitment;
+        let store = MemoryFetchTranscriptStore::with_capacity(1);
+        let mut state =
+            FetchStateMachine::new(store.clone(), FetchCallerPolicy::new([caller.public_key()]));
+        state.quote_input(first.input).unwrap();
+        state.start(first_input).unwrap();
+        state.fail(first_input, "provider outcome unknown").unwrap();
+
+        let mut recovered =
+            FetchStateMachine::new(store, FetchCallerPolicy::new([caller.public_key()]));
+        recovered.quote_input(second.input).unwrap();
+        assert!(matches!(
+            recovered.start(second_input).unwrap_err(),
+            FetchStateError::Store(FetchStoreError::Capacity { capacity: 1 })
+        ));
+    }
+
+    #[test]
+    fn failed_running_marker_still_consumes_filesystem_capacity_after_reload() {
+        let dir = root("fs-failed-capacity-reload");
+        let caller = key(27);
+        let producer = key(28);
+        let (first, _) =
+            transcript_for(&caller, &producer, hellas_rpc::Retention::Retain, b"first");
+        let (second, _) =
+            transcript_for(&caller, &producer, hellas_rpc::Retention::Retain, b"second");
+        let first_input = first.input_commitment;
+        let second_input = second.input_commitment;
+        {
+            let mut state = FetchStateMachine::new(
+                fs_store_with_capacity(&dir, 1),
+                FetchCallerPolicy::new([caller.public_key()]),
+            );
+            state.quote_input(first.input).unwrap();
+            state.start(first_input).unwrap();
+            state.fail(first_input, "provider outcome unknown").unwrap();
+        }
+
+        let mut recovered = FetchStateMachine::new(
+            fs_store_with_capacity(&dir, 1),
+            FetchCallerPolicy::new([caller.public_key()]),
+        );
+        recovered.quote_input(second.input).unwrap();
+        assert!(matches!(
+            recovered.start(second_input).unwrap_err(),
+            FetchStateError::Store(FetchStoreError::Capacity { capacity: 1 })
+        ));
+        assert!(
+            dir.join(format!("{}.running", first_input.digest()))
+                .is_file()
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn filesystem_capacity_metadata_rejects_disagreeing_processes() {
+        let dir = root("fs-capacity-mismatch");
+        fs_store_with_capacity(&dir, 1);
+        let mismatched = FsFetchTranscriptStore::with_capacity(&dir, 2);
+        let error = mismatched.init().unwrap_err();
+        assert!(matches!(
+            &error,
+            FetchStoreError::CapacityConfiguration {
+                configured: 2,
+                persisted: 1,
+                ..
+            }
+        ));
+        assert!(error.to_string().contains(&dir.display().to_string()));
+        assert!(
+            error
+                .to_string()
+                .contains("stop every process sharing store root")
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn filesystem_store_narrows_an_existing_root_to_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = root("fs-private-root");
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o777)).unwrap();
+
+        fs_store(&dir);
+
+        assert_eq!(
+            fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn filesystem_capacity_directory_lock_wait_is_bounded_after_child_replacement() {
+        let dir = root("fs-bounded-capacity-lock");
+        let store = fs_store(&dir);
+        assert!(!dir.join(".retained-transcript-capacity.lock").exists());
+        let held = crate::private_fs::open_directory(&dir).unwrap();
+        held.lock().unwrap();
+        // This was the old lock name. Removing and recreating it must have no
+        // bearing on a transaction lock held on the root directory inode.
+        let obsolete_child = dir.join(".retained-transcript-capacity.lock");
+        fs::write(&obsolete_child, b"replacement").unwrap();
+        fs::remove_file(&obsolete_child).unwrap();
+        let started = Instant::now();
+
+        let error = store.capacity_lock().unwrap_err();
+
+        assert_eq!(
+            match error {
+                FetchStoreError::Io(error) => error.kind(),
+                other => panic!("unexpected lock error: {other}"),
+            },
+            io::ErrorKind::WouldBlock
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn filesystem_capacity_metadata_rejects_a_fifo_without_blocking() {
+        let dir = root("fs-capacity-fifo");
+        fs::create_dir_all(&dir).unwrap();
+        let metadata = dir.join(".retained-transcript-capacity");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&metadata)
+            .status()
+            .unwrap();
+        assert!(status.success(), "the fixture needs a FIFO");
+        let store = FsFetchTranscriptStore::new(&dir);
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(store.init());
+        });
+        let error = receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("Fetch capacity metadata open blocked on a FIFO")
+            .expect_err("capacity metadata must be a regular file");
+        assert!(
+            matches!(error, FetchStoreError::Io(error) if error.kind() == io::ErrorKind::InvalidInput)
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completed_transcript_rejects_a_fifo_without_blocking() {
+        let dir = root("fs-transcript-fifo");
+        let store = fs_store(&dir);
+        let caller = key(92);
+        let producer = key(93);
+        let (quote, _) = transcript_for(
+            &caller,
+            &producer,
+            hellas_rpc::Retention::Retain,
+            b"request",
+        );
+        let status = std::process::Command::new("mkfifo")
+            .arg(store.path(quote.input_commitment))
+            .status()
+            .unwrap();
+        assert!(status.success(), "the fixture needs a FIFO");
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(store.get_completed(quote.input_commitment));
+        });
+        let error = receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("completed transcript open blocked on a FIFO")
+            .expect_err("completed transcript must be a regular file");
+        assert!(
+            matches!(error, FetchStoreError::Io(error) if error.kind() == io::ErrorKind::InvalidInput)
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn legacy_over_capacity_filesystem_store_starts_and_replays_without_eviction() {
+        let dir = root("fs-legacy-over-capacity");
+        fs::create_dir_all(&dir).unwrap();
+        let caller = key(29);
+        let producer = key(30);
+        let (first, first_transcript) =
+            transcript_for(&caller, &producer, hellas_rpc::Retention::Retain, b"first");
+        let (second, second_transcript) =
+            transcript_for(&caller, &producer, hellas_rpc::Retention::Retain, b"second");
+        for transcript in [&first_transcript, &second_transcript] {
+            let bytes = canonical_dag_cbor(transcript).unwrap();
+            atomic_create_no_clobber(
+                &dir.join(format!(
+                    "{}.dagcbor",
+                    transcript.input_commitment().digest()
+                )),
+                &bytes,
+            )
+            .unwrap();
+        }
+
+        // This models upgrading an existing evidence directory while setting
+        // a lower cap than the evidence already present. Startup and reads are
+        // allowed; the cap applies only to a new distinct retained input.
+        let store = fs_store_with_capacity(&dir, 1);
+        let state =
+            FetchStateMachine::new(store.clone(), FetchCallerPolicy::new([caller.public_key()]));
+        assert_eq!(
+            state
+                .replay_completed(
+                    first.input_commitment,
+                    &producer.public_key(),
+                    &caller.public_key(),
+                )
+                .unwrap()
+                .transcript,
+            first_transcript
+        );
+        assert_eq!(
+            state
+                .replay_completed(
+                    second.input_commitment,
+                    &producer.public_key(),
+                    &caller.public_key(),
+                )
+                .unwrap()
+                .transcript,
+            second_transcript
+        );
+        let (third, _) =
+            transcript_for(&caller, &producer, hellas_rpc::Retention::Retain, b"third");
+        let third_input = third.input_commitment;
+        let mut state =
+            FetchStateMachine::new(store, FetchCallerPolicy::new([caller.public_key()]));
+        state.quote_input(third.input).unwrap();
+        assert!(matches!(
+            state.start(third_input).unwrap_err(),
+            FetchStateError::Store(FetchStoreError::Capacity { capacity: 1 })
+        ));
+        assert_eq!(retained_file_count(&dir), 2);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn concurrent_distinct_filesystem_starts_share_one_capacity_reservation() {
+        use std::sync::Barrier;
+
+        let dir = root("fs-concurrent-capacity");
+        let caller = key(31);
+        let producer = key(32);
+        let (first, _) =
+            transcript_for(&caller, &producer, hellas_rpc::Retention::Retain, b"first");
+        let (second, _) =
+            transcript_for(&caller, &producer, hellas_rpc::Retention::Retain, b"second");
+        let first_input = first.input_commitment;
+        let second_input = second.input_commitment;
+        let policy = FetchCallerPolicy::new([caller.public_key()]);
+        let mut first_state =
+            FetchStateMachine::new(fs_store_with_capacity(&dir, 1), policy.clone());
+        let mut second_state = FetchStateMachine::new(fs_store_with_capacity(&dir, 1), policy);
+        first_state.quote_input(first.input).unwrap();
+        second_state.quote_input(second.input).unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let first_barrier = Arc::clone(&barrier);
+        let first = std::thread::spawn(move || {
+            first_barrier.wait();
+            first_state.start(first_input)
+        });
+        let second = std::thread::spawn(move || {
+            barrier.wait();
+            second_state.start(second_input)
+        });
+        let results = [first.join().unwrap(), second.join().unwrap()];
+
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(
+                    result,
+                    Err(FetchStateError::Store(FetchStoreError::Capacity {
+                        capacity: 1
+                    }))
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(retained_file_count(&dir), 1);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn unique_nonce_quote_flood_is_bounded_by_ticket_count() {
+        let caller = key(1);
+        let mut state = FetchStateMachine::with_limits(
+            MemoryFetchTranscriptStore::default(),
+            FetchCallerPolicy::new([caller.public_key()]),
+            2,
+            usize::MAX,
+        );
+        let first = signed_input(&caller, hellas_rpc::Retention::Retain, b"{}");
+        let second = signed_input(&caller, hellas_rpc::Retention::Retain, b"{}");
+        let third = signed_input(&caller, hellas_rpc::Retention::Retain, b"{}");
+
+        let first = state.quote_input(first).unwrap().0.input_commitment;
+        let second = state.quote_input(second).unwrap().0.input_commitment;
+        assert_ne!(first, second, "fresh nonces must produce distinct tickets");
+        assert!(matches!(
+            state.quote_input(third).unwrap_err(),
+            FetchStateError::TicketCapacity { capacity: 2 }
+        ));
+        assert_eq!(state.tickets.len(), 2);
+    }
+
+    #[test]
+    fn signed_input_payloads_have_a_hard_aggregate_bound() {
+        let caller = key(1);
+        let inputs = [
+            signed_input(
+                &caller,
+                hellas_rpc::Retention::Retain,
+                br#"{"input":"one"}"#,
+            ),
+            signed_input(
+                &caller,
+                hellas_rpc::Retention::Retain,
+                br#"{"input":"two"}"#,
+            ),
+            signed_input(
+                &caller,
+                hellas_rpc::Retention::Retain,
+                br#"{"input":"tri"}"#,
+            ),
+        ];
+        let one_quote = {
+            let verified = verify_input_events(&inputs[0]).unwrap();
+            FetchQuote::from_verified(&verified, inputs[0].clone())
+        };
+        let one_input_bytes = accounted_input_bytes(&one_quote).unwrap();
+        let capacity = one_input_bytes * 2;
+        let mut state = FetchStateMachine::with_limits(
+            MemoryFetchTranscriptStore::default(),
+            FetchCallerPolicy::new([caller.public_key()]),
+            10,
+            capacity,
+        );
+
+        state.quote_input(inputs[0].clone()).unwrap();
+        state.quote_input(inputs[1].clone()).unwrap();
+        assert!(matches!(
+            state.quote_input(inputs[2].clone()).unwrap_err(),
+            FetchStateError::InputCapacity {
+                requested,
+                capacity: actual_capacity,
+            } if requested > actual_capacity && actual_capacity == capacity
+        ));
+        assert_eq!(state.tickets.len(), 2);
+        assert_eq!(MAX_FETCH_IN_MEMORY_INPUT_BYTES, 32 * 1024 * 1024);
+    }
+
+    #[test]
+    fn quote_admission_prunes_only_expired_quoted_state() {
+        let caller = key(1);
+        let now = Instant::now();
+        let first = signed_input(&caller, hellas_rpc::Retention::Ephemeral, b"{}");
+        let second = signed_input(&caller, hellas_rpc::Retention::Ephemeral, b"{}");
+        let mut state = FetchStateMachine::with_limits(
+            MemoryFetchTranscriptStore::default(),
+            FetchCallerPolicy::new([caller.public_key()]),
+            1,
+            usize::MAX,
+        );
+
+        let first = state.quote_input_at(first, now).unwrap().0.input_commitment;
+        let second = state
+            .quote_input_at(second, now + QUOTE_TTL)
+            .unwrap()
+            .0
+            .input_commitment;
+
+        assert!(matches!(
+            state.quoted(first),
+            Err(FetchStateError::NotFound)
+        ));
+        assert_eq!(state.quoted(second).unwrap().input_commitment, second);
+    }
+
+    #[test]
+    fn queued_and_running_state_never_expires_under_admission_pruning() {
+        let caller = key(1);
+        let now = Instant::now();
+        let first = signed_input(&caller, hellas_rpc::Retention::Ephemeral, b"{}");
+        let second = signed_input(&caller, hellas_rpc::Retention::Ephemeral, b"{}");
+        let first_input = verify_input_events(&first).unwrap().input_commitment;
+        let mut state = FetchStateMachine::with_limits(
+            MemoryFetchTranscriptStore::default(),
+            FetchCallerPolicy::new([caller.public_key()]),
+            1,
+            usize::MAX,
+        );
+
+        state.quote_input_at(first, now).unwrap();
+        state.queue(first_input).unwrap();
+        assert!(matches!(
+            state
+                .quote_input_at(second.clone(), now + QUOTE_TTL)
+                .unwrap_err(),
+            FetchStateError::TicketCapacity { capacity: 1 }
+        ));
+        state.start(first_input).unwrap();
+        assert!(matches!(
+            state
+                .quote_input_at(second.clone(), now + QUOTE_TTL + QUOTE_TTL)
+                .unwrap_err(),
+            FetchStateError::TicketCapacity { capacity: 1 }
+        ));
+        state.fail(first_input, "test cleanup").unwrap();
+        state
+            .quote_input_at(second, now + QUOTE_TTL + QUOTE_TTL)
+            .unwrap();
+    }
+
     #[test]
     fn transcript_verifies_both_directions() {
         let (_quote, transcript, caller, producer) = sample_transcript();
@@ -892,12 +2046,18 @@ mod tests {
 
         state.quote_input(quote.input).unwrap();
         state.start(input).unwrap();
-        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+        assert_eq!(retained_file_count(&dir), 0);
         state
             .complete_output(input, transcript.output_events().to_vec(), &producer)
             .unwrap();
-        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
-        assert!(state.replay_completed(input, &producer).is_ok());
+        assert_eq!(retained_file_count(&dir), 0);
+        assert!(state.tickets.is_empty());
+        assert!(matches!(
+            state
+                .replay_completed(input, &producer, &caller)
+                .unwrap_err(),
+            FetchStateError::NotFound
+        ));
 
         let (quote, transcript, caller, producer) = sample_transcript();
         let input = quote.input_commitment;
@@ -999,8 +2159,10 @@ mod tests {
         let mut recovered = trusted_state(store, caller);
         // Re-quoting a completed input succeeds so the caller can replay.
         recovered.quote_input(quote.input.clone()).unwrap();
-        let replayed = recovered.replay_completed(input, &producer).unwrap();
-        assert_eq!(replayed.input_commitment(), input);
+        let replayed = recovered
+            .replay_completed(input, &producer, &caller)
+            .unwrap();
+        assert_eq!(replayed.transcript.input_commitment(), input);
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -1014,8 +2176,9 @@ mod tests {
             state.quote_input(quote.input.clone()).unwrap();
             state.start(input).unwrap();
             state.fail(input, "provider exploded").unwrap();
-            // In-process the ticket is Failed; after a crash the provider
-            // call's billing outcome is unknown, so recovery must refuse.
+            // The transient state is gone, but the durable running marker
+            // still makes the provider call indeterminate.
+            assert!(state.tickets.is_empty());
         }
 
         let mut recovered = trusted_state(fs_store(&dir), caller);
@@ -1076,7 +2239,10 @@ mod tests {
 
         assert_eq!(completed, transcript);
         assert_eq!(
-            state.replay_completed(input, &producer).unwrap(),
+            state
+                .replay_completed(input, &producer, &caller)
+                .unwrap()
+                .transcript,
             transcript
         );
         let _ = fs::remove_dir_all(dir);
@@ -1097,7 +2263,10 @@ mod tests {
 
         assert_eq!(repeated.input_commitment, input);
         assert_eq!(
-            state.replay_completed(input, &producer).unwrap(),
+            state
+                .replay_completed(input, &producer, &caller)
+                .unwrap()
+                .transcript,
             transcript
         );
     }
@@ -1170,9 +2339,9 @@ mod tests {
 
         assert!(matches!(
             state
-                .replay_completed(input, &key(2).public_key())
+                .replay_completed(input, &key(2).public_key(), &caller)
                 .unwrap_err(),
-            FetchStateError::Failed
+            FetchStateError::NotFound
         ));
         let _ = fs::remove_dir_all(dir);
     }

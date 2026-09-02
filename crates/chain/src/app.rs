@@ -1,8 +1,8 @@
-mod block;
+pub use crate::block::HellasBlock;
 
-pub use block::HellasBlock;
-
-use crate::domain::{Activity, PublicKey, Scheme, SettlementKey, Transaction};
+#[cfg(feature = "validator")]
+use crate::domain::Transaction;
+use crate::domain::{Activity, PublicKey, Scheme, SettlementKey};
 #[cfg(feature = "validator")]
 use crate::domain::{KERNEL_FEES, MAX_BLOCK_TX_BYTES, MAX_TXS_PER_BLOCK};
 use crate::execution::store::empty_state;
@@ -15,6 +15,8 @@ use crate::owner_index::OwnerIndex;
 use commonware_actor::Feedback;
 use commonware_codec::Encode;
 #[cfg(feature = "validator")]
+use commonware_codec::EncodeSize;
+#[cfg(feature = "validator")]
 use commonware_consensus::simplex::types::Context;
 #[cfg(feature = "validator")]
 use commonware_consensus::{Block as _, CertifiableBlock, Heightable, types::Height};
@@ -24,7 +26,11 @@ use commonware_consensus::{
 };
 #[cfg(feature = "validator")]
 use commonware_cryptography::Digestible;
+#[cfg(feature = "validator")]
+use commonware_cryptography::Hasher;
 use commonware_cryptography::sha256::Digest;
+#[cfg(feature = "validator")]
+use commonware_cryptography::sha256::Sha256;
 #[cfg(feature = "validator")]
 use commonware_glue::stateful::{
     Application as StatefulApplication, Proposed,
@@ -41,12 +47,19 @@ use commonware_utils::{SystemTimeExt, non_empty_range};
 #[cfg(feature = "validator")]
 use futures::{Stream, StreamExt};
 use hellas_kernel::NetworkId;
+#[cfg(all(test, feature = "validator"))]
+use hellas_rpc::SubmitTxOutcome;
 #[cfg(feature = "validator")]
 use prometheus_client::metrics::gauge::Gauge;
 #[cfg(feature = "validator")]
 use rand::Rng;
-use std::{collections::VecDeque, sync::Arc};
-use tokio::sync::{Mutex, broadcast};
+#[cfg(feature = "validator")]
+use std::collections::{BTreeMap, VecDeque};
+#[cfg(feature = "validator")]
+use std::sync::Arc;
+#[cfg(feature = "validator")]
+use tokio::sync::Mutex;
+use tokio::sync::broadcast;
 #[cfg(feature = "validator")]
 use tracing::{error, info, warn};
 
@@ -68,34 +81,160 @@ impl Default for ApplicationConfig {
     }
 }
 
-#[derive(Clone, Default)]
-pub struct Mempool {
-    inner: Arc<Mutex<VecDeque<Transaction>>>,
+// A mempool is a validator's, so all of it compiles for one.
+//
+// The two things that put a transaction in it are `rpc.rs`, the submit
+// path, and `server.rs`, the socket in front of that path; the one thing
+// that takes transactions out is `StatefulApplication::propose` below.
+// All three are `validator`. A follower forwards what it is handed
+// upstream through its light client and proposes no block, so on an
+// `indexer` build this held nothing and nobody read it — the same reason
+// `Application` above keeps no `network` and no height gauge there.
+
+/// Maximum number of general transactions resident in the mempool.
+#[cfg(feature = "validator")]
+pub const GENERAL_MEMPOOL_CAPACITY: usize = 120;
+/// Maximum number of finalized-contest response slots resident at once.
+#[cfg(feature = "validator")]
+pub const RESPONSE_MEMPOOL_CAPACITY: usize = 64;
+/// Canonical chain encoding of one `PaymentCloseResponse` transaction.
+#[cfg(feature = "validator")]
+pub const RESPONSE_TRANSACTION_BYTES: usize = 274;
+
+#[cfg(feature = "validator")]
+#[derive(Clone)]
+pub(crate) struct MempoolEntry {
+    pub(crate) digest: Digest,
+    pub(crate) transaction: Transaction,
 }
 
+#[cfg(feature = "validator")]
+impl MempoolEntry {
+    pub(crate) fn new(transaction: Transaction) -> Self {
+        let digest = Sha256::hash(&transaction.encode());
+        Self {
+            digest,
+            transaction,
+        }
+    }
+}
+
+#[cfg(feature = "validator")]
+pub(crate) type ResponseSlot = (hellas_kernel::EdgeId, hellas_kernel::StartId);
+
+#[cfg(feature = "validator")]
+#[derive(Default)]
+pub(crate) struct MempoolState {
+    pub(crate) general: VecDeque<MempoolEntry>,
+    pub(crate) responses: BTreeMap<ResponseSlot, MempoolEntry>,
+}
+
+#[cfg(feature = "validator")]
+struct MempoolSnapshot {
+    transactions: Vec<Transaction>,
+    general_digests: Vec<Digest>,
+    response_digests: BTreeMap<ResponseSlot, Digest>,
+}
+
+#[cfg(feature = "validator")]
+#[derive(Clone, Default)]
+pub struct Mempool {
+    pub(crate) inner: Arc<Mutex<MempoolState>>,
+}
+
+#[cfg(feature = "validator")]
 impl Mempool {
-    pub async fn submit(&self, tx: Transaction) {
-        self.inner.lock().await.push_back(tx);
-    }
-
-    /// Proposal-time only. A follower accepts submissions (`submit`) so it
-    /// can forward them upstream, but it never drains its own mempool into
-    /// a block: that is `StatefulApplication::propose`, which is
-    /// `validator`-gated.
-    #[cfg(feature = "validator")]
-    pub(crate) async fn snapshot(&self) -> Vec<Transaction> {
-        self.inner.lock().await.iter().cloned().collect()
-    }
-
-    #[cfg(feature = "validator")]
-    async fn commit_snapshot(&self, snapshot_len: usize, retained: Vec<Transaction>) {
+    #[cfg(test)]
+    pub(crate) async fn test_submit(&self, tx: Transaction) -> SubmitTxOutcome {
+        let entry = MempoolEntry::new(tx);
         let mut mempool = self.inner.lock().await;
-        let split_at = snapshot_len.min(mempool.len());
-        let tail = mempool.split_off(split_at);
-        mempool.clear();
-        mempool.extend(retained);
-        mempool.extend(tail);
+        if mempool
+            .general
+            .iter()
+            .any(|resident| resident.digest == entry.digest)
+        {
+            return SubmitTxOutcome::Duplicate;
+        }
+        if mempool.general.len() >= GENERAL_MEMPOOL_CAPACITY {
+            return SubmitTxOutcome::Full;
+        }
+        mempool.general.push_back(entry);
+        SubmitTxOutcome::Enqueued
     }
+
+    #[cfg(test)]
+    pub(crate) async fn test_transactions(&self) -> Vec<Transaction> {
+        let mempool = self.inner.lock().await;
+        mempool
+            .responses
+            .values()
+            .chain(mempool.general.iter())
+            .map(|entry| entry.transaction.clone())
+            .collect()
+    }
+
+    /// Proposal-time only. The one caller is
+    /// `StatefulApplication::propose`, which is what makes this whole
+    /// file's mempool a validator's.
+    async fn snapshot(&self) -> MempoolSnapshot {
+        let mempool = self.inner.lock().await;
+        let response_digests = mempool
+            .responses
+            .iter()
+            .map(|(slot, entry)| (*slot, entry.digest))
+            .collect();
+        let general_digests = mempool.general.iter().map(|entry| entry.digest).collect();
+        let transactions = mempool
+            .responses
+            .values()
+            .chain(mempool.general.iter())
+            .map(|entry| entry.transaction.clone())
+            .collect();
+        MempoolSnapshot {
+            transactions,
+            general_digests,
+            response_digests,
+        }
+    }
+
+    async fn commit_snapshot(&self, snapshot: MempoolSnapshot, retained: Vec<Transaction>) {
+        let mut mempool = self.inner.lock().await;
+        for (slot, digest) in snapshot.response_digests {
+            if mempool
+                .responses
+                .get(&slot)
+                .is_some_and(|entry| entry.digest == digest)
+            {
+                mempool.responses.remove(&slot);
+            }
+        }
+        mempool
+            .general
+            .retain(|entry| !snapshot.general_digests.contains(&entry.digest));
+
+        let mut retained_general = VecDeque::new();
+        for transaction in retained {
+            let entry = MempoolEntry::new(transaction);
+            if let Some(slot) = response_slot(&entry.transaction) {
+                mempool.responses.entry(slot).or_insert(entry);
+            } else {
+                retained_general.push_back(entry);
+            }
+        }
+        retained_general.append(&mut mempool.general);
+        mempool.general = retained_general;
+    }
+}
+
+#[cfg(feature = "validator")]
+pub(crate) fn response_slot(transaction: &Transaction) -> Option<ResponseSlot> {
+    let Transaction::Kernel(hellas_kernel::Tx::Move {
+        action: hellas_kernel::Move::RespondPaymentClose(response),
+    }) = transaction
+    else {
+        return None;
+    };
+    Some((response.payment_edge(), response.start_id()))
 }
 
 #[derive(Clone)]
@@ -229,11 +368,35 @@ where
         let (runtime, consensus_context) = context;
         let mut ancestry = Box::pin(ancestry);
         let parent = ancestry.next().await?;
-        let candidates = input.snapshot().await;
-        let snapshot_len = candidates.len();
+        let snapshot = input.snapshot().await;
+        let response_count = snapshot.response_digests.len();
+        let response_bytes = response_count.saturating_mul(RESPONSE_TRANSACTION_BYTES);
+        let general_count_budget = MAX_TXS_PER_BLOCK.saturating_sub(response_count);
+        let general_byte_budget = MAX_BLOCK_TX_BYTES.saturating_sub(response_bytes);
+        let (responses, general) = snapshot.transactions.split_at(response_count);
+        debug_assert!(responses.iter().all(|transaction| {
+            crate::light_client::canonical_submission_size(transaction)
+                == RESPONSE_TRANSACTION_BYTES
+        }));
+        let mut candidates = responses.to_vec();
+        let mut deferred_general = Vec::new();
+        let mut general_bytes = 0_usize;
+        let mut general = general.iter().cloned();
+        while let Some(transaction) = general.next() {
+            let next_bytes = general_bytes.saturating_add(transaction.encode_size());
+            if candidates.len().saturating_sub(response_count) >= general_count_budget
+                || next_bytes > general_byte_budget
+            {
+                deferred_general.push(transaction);
+                deferred_general.extend(general);
+                break;
+            }
+            general_bytes = next_bytes;
+            candidates.push(transaction);
+        }
         let block_height = Height::new(parent.height().get() + 1);
         let block_parent = parent.digest();
-        let (batches, txs, retained) = match execute_proposal(
+        let (batches, txs, mut retained) = match execute_proposal(
             kernel_context(self.network, block_height, block_parent),
             self.verifier.as_ref(),
             candidates,
@@ -250,8 +413,9 @@ where
                 return None;
             }
         };
+        retained.extend(deferred_general);
         let merkleized = batches.merkleize().await.expect("UTXO merkleize failed");
-        input.commit_snapshot(snapshot_len, retained).await;
+        input.commit_snapshot(snapshot, retained).await;
 
         let timestamp = runtime.current().epoch_millis().max(parent.timestamp());
         let block = HellasBlock::new(
@@ -477,7 +641,7 @@ mod tests {
     ) -> (Proposed<Application, tokio::Context>, Vec<Transaction>) {
         let mut mempool = Mempool::default();
         for tx in candidates {
-            mempool.submit(tx).await;
+            mempool.test_submit(tx).await;
         }
         let proposed = app
             .propose(
@@ -488,7 +652,7 @@ mod tests {
             )
             .await
             .expect("application proposal");
-        (proposed, mempool.snapshot().await)
+        (proposed, mempool.snapshot().await.transactions)
     }
 
     async fn verifies_from(

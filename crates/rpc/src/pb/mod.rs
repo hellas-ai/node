@@ -56,6 +56,14 @@ pub mod hellas {
             include!(concat!(env!("OUT_DIR"), "/hellas.chain.v1.rs"));
         }
     }
+
+    #[cfg(feature = "work")]
+    #[allow(dead_code)]
+    pub mod work {
+        pub mod v1 {
+            include!(concat!(env!("OUT_DIR"), "/hellas.work.v1.rs"));
+        }
+    }
 }
 
 /// Re-exports of the Hellas core execution types (`hellas.v1`).
@@ -94,6 +102,12 @@ pub mod chain {
     pub use crate::pb::hellas::chain::v1::*;
 }
 
+/// Re-exports of `hellas.work.v1`.
+#[cfg(feature = "work")]
+pub mod work {
+    pub use crate::pb::hellas::work::v1::*;
+}
+
 /// Service / method markers, typed client traits, and server dispatchers.
 /// Emitted by `build.rs`. Each block is `#[cfg(feature = "<pkg>")]`-gated
 /// so unused services don't compile.
@@ -115,13 +129,11 @@ mod id_pins {
     #[cfg(feature = "execute")]
     #[test]
     fn execute_ids_are_stable() {
-        use super::services::execute::{Execute, Receipt, RunTicket, Settle};
+        use super::services::execute::{Execute, RunTicket};
         assert_eq!(super::execute::Assurance::ProducerSigned as i32, 0);
         assert_eq!(super::execute::Assurance::AppleAppAttest as i32, 1);
-        assert_eq!(<Execute as ServiceMarker>::SERVICE_ID, 0xb19f1af1);
-        assert_eq!(<RunTicket as MethodMarker>::METHOD_ID, 0x15fc7c7c);
-        assert_eq!(<Receipt as MethodMarker>::METHOD_ID, 0x2f653b89);
-        assert_eq!(<Settle as MethodMarker>::METHOD_ID, 0x7720bf9e);
+        assert_eq!(<Execute as ServiceMarker>::SERVICE_ID, 0x2a0f_bee1);
+        assert_eq!(<RunTicket as MethodMarker>::METHOD_ID, 0xc808_8d01);
     }
 
     #[cfg(feature = "evaluate")]
@@ -144,21 +156,49 @@ mod id_pins {
     #[cfg(feature = "courtesy")]
     #[test]
     fn courtesy_ids_are_stable() {
-        use super::services::courtesy::{
-            Courtesy, Open, QuoteChatPrompt, QuotePreparedText, QuotePrompt,
-        };
-        assert_eq!(<Courtesy as ServiceMarker>::SERVICE_ID, 0xfcc334c3);
+        use super::services::courtesy::{Courtesy, Open, QuoteTokens};
+        assert_eq!(<Courtesy as ServiceMarker>::SERVICE_ID, 0xa842_0437);
         assert_eq!(<Open as MethodMarker>::METHOD_ID, 0x18351e7d);
-        assert_eq!(<QuotePreparedText as MethodMarker>::METHOD_ID, 0x58689a09);
-        assert_eq!(<QuotePrompt as MethodMarker>::METHOD_ID, 0x6174018e);
-        assert_eq!(<QuoteChatPrompt as MethodMarker>::METHOD_ID, 0xae272694);
+        assert_eq!(<QuoteTokens as MethodMarker>::METHOD_ID, 0x4186_3eda);
+    }
+
+    #[cfg(feature = "work")]
+    #[test]
+    fn work_ids_are_stable() {
+        use super::services::work::{AcceptWork, AdmitCertificate, DeliverResult, Work};
+        assert_eq!(<Work as ServiceMarker>::SERVICE_ID, 0x4784_f9a3);
+        assert_eq!(<AcceptWork as MethodMarker>::METHOD_ID, 0xaae4_0060);
+        assert_eq!(<DeliverResult as MethodMarker>::METHOD_ID, 0xf15a_a80e);
+        assert_eq!(<AdmitCertificate as MethodMarker>::METHOD_ID, 0x0ffb_b4f9);
+    }
+
+    /// The handshake carrier is its own service, so its ids are its own.
+    ///
+    /// Pinned separately from `Work` above for the reason both are
+    /// pinned at all: these two services are mounted on different ALPNs
+    /// and answered by different handlers, and a build that rotated one
+    /// would otherwise be caught only by whichever of them a test
+    /// happened to dial.
+    #[cfg(feature = "work")]
+    #[test]
+    fn work_setup_ids_are_stable() {
+        use super::services::work_setup::{ExchangeSetup, WorkSetup};
+        assert_eq!(<WorkSetup as ServiceMarker>::SERVICE_ID, 0x0235_ddf0);
+        assert_eq!(<ExchangeSetup as MethodMarker>::METHOD_ID, 0x1cde_46e8);
     }
 
     #[cfg(feature = "chain")]
     #[test]
     fn chain_ids_are_stable() {
-        use super::services::light_client::{GetStateRoot, LightClient};
-        assert_eq!(<LightClient as ServiceMarker>::SERVICE_ID, 0xee55032a);
+        use super::services::light_client::{
+            GetStateRoot, GetWorkChannelSnapshot, LightClient, SubmitWorkResponse,
+        };
+        assert_eq!(<LightClient as ServiceMarker>::SERVICE_ID, 0x74f1_0f92);
         assert_eq!(<GetStateRoot as MethodMarker>::METHOD_ID, 0xb484a429);
+        assert_eq!(
+            <GetWorkChannelSnapshot as MethodMarker>::METHOD_ID,
+            0xadea_9964
+        );
+        assert_eq!(<SubmitWorkResponse as MethodMarker>::METHOD_ID, 0x78ea_f3a0);
     }
 }

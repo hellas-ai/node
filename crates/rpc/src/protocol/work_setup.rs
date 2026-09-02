@@ -1,0 +1,1235 @@
+//! Which channel this endpoint will work over, and whether it may.
+//!
+//! # What a configured channel is
+//!
+//! [`WorkChannelDescriptor`] is everything an endpoint was told about
+//! one paid channel: the network, both edge ids, the complete tag-2
+//! payment terms — which embed the complete tag-4 bond — the private
+//! policy body and its salt, the execution policy, and the three
+//! measurements the omission contest's economics depend on. It is
+//! configuration, and none of it is evidence.
+//!
+//! [`WorkChannelDescriptor::check_ready`] is what turns it into
+//! evidence, by comparing it against one finalized read the caller
+//! supplies. What it establishes is that at that read: both edges are
+//! live, both hash to the configured terms, both name the parties those
+//! terms fix, the bond is leased to *this* payment edge, no contest is
+//! open, the funded edge still clears the omission inequality, and the
+//! height is inside the admission horizon.
+//!
+//! That the read is coherent — one block, one state root, one database
+//! snapshot — is the caller's, not this module's. See
+//! [`ObservedChannel`].
+//!
+//! # Why the terms are hashed locally
+//!
+//! A finalized edge carries a terms *hash*, not a terms body. Nothing
+//! read off the chain says what shape the terms have, who the parties
+//! are, or what the bond covers. So the descriptor's own bodies are
+//! hashed here and compared with the edge's commitment; the shape is
+//! never inferred from the lookup. That is also why the payment terms
+//! are carried whole rather than as a hash: the bond edge, the parties,
+//! the admission horizon, and the policy commitment are all read out of
+//! them, and a hash answers none of those questions.
+//!
+//! # What readiness does not claim
+//!
+//! Not that the objects were authenticated. In this milestone's trusted
+//! mode the values come from a chain process inside the endpoint's trust
+//! boundary and carry no membership proof; readiness is a statement
+//! about what was reported, and the report's provenance is the
+//! operator's.
+//!
+//! Not that a correctness game is available. This profile has no
+//! challenge path, so the section-7 provider-deterrence inequality is
+//! not checked and is not claimed. What *is* checked is the omission
+//! contest's economics, because that contest is implemented
+//! ([`check_omission_economics`]).
+//!
+//! Not that a job may be signed. That is a per-signature question with
+//! its own deadlines, and it is [`ReadyChannel::check_signable`].
+
+use hellas_kernel::{
+    BlockHeight, Decode, DecodeError, Edge, EdgeId, EdgeValues, Encode, Fees, LeaseSlots,
+    NetworkId, PendingSlot, Terms, TermsHash, TermsProfile, WorkPaymentSettlement,
+    WorkPaymentTerms, work_payment_settlement,
+};
+
+use crate::protocol::mount::{FloorError, MountFloor};
+use crate::protocol::work::{
+    PaidChannel, PaidChannelPolicyV1, PaidExecutionPolicyV1, PaidWorkError, PrivateRecord,
+    check_execution_policy,
+};
+
+/// Denominator of the omission-contest probability `q`.
+///
+/// `q` is a measured availability, and a measured availability is a
+/// ratio. Fixing the denominator here rather than carrying a pair means
+/// the two sides of the inequality below cannot be computed against two
+/// different scales.
+pub const OMISSION_PROBABILITY_SCALE: u64 = 1_000_000;
+
+/// Why a configured channel is not one this endpoint may work over.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum WorkSetupError {
+    /// A record, policy, or price rule of the private protocol failed.
+    #[error(transparent)]
+    Record(#[from] PaidWorkError),
+    /// An object the channel is made of was not present at the
+    /// finalized block that was read.
+    #[error("{object} is not live at the finalized state that was read")]
+    NotLive {
+        /// Which object was missing.
+        object: &'static str,
+    },
+    /// A live object does not commit to the configured terms.
+    #[error("{object} commits to other terms than the ones configured for this channel")]
+    TermsMismatch {
+        /// Which object disagreed.
+        object: &'static str,
+    },
+    /// A live edge names other parties than its terms fix.
+    #[error("{object} names other parties than its terms fix")]
+    PartiesMismatch {
+        /// Which object disagreed.
+        object: &'static str,
+    },
+    /// The bond is not leased to this channel.
+    #[error("the bond's lease is {found}, not this channel's lease")]
+    Lease {
+        /// What the lease slots held.
+        found: LeaseState,
+    },
+    /// A contest is open, or the slot that would say so is unreadable.
+    /// Either way the channel admits no new work.
+    #[error("the payment edge's pending-close slot is {found}, so no new work is admitted")]
+    PendingClose {
+        /// What the pending slot held.
+        found: PendingState,
+    },
+    /// The payment edge's reserve does not price both of its exits, so
+    /// nothing it could settle is bounded.
+    #[error("the payment edge's reserve does not price both of its close routes")]
+    Unsettleable,
+    /// An omission-economics gate failed.
+    #[error("omission economics: {0}")]
+    Omission(#[from] OmissionError),
+    /// The finalized height is at or past the admission horizon.
+    #[error("finalized height {height} is at or past the admission horizon {horizon}")]
+    HorizonPassed {
+        /// Finalized height the refusal is anchored at: the height the
+        /// snapshot was read at, or the height a signature is being
+        /// asked for at.
+        height: u64,
+        /// Height at and after which no work is admitted.
+        horizon: u64,
+    },
+    /// The endpoint's finalized cursor has not reached the snapshot the
+    /// decision is being made from.
+    #[error("cursor is at height {cursor}, behind the snapshot at {height}")]
+    CursorBehind {
+        /// Height the endpoint has processed blocks through.
+        cursor: u64,
+        /// Height the snapshot was read at.
+        height: u64,
+    },
+    /// The deadlines a job would carry do not fit the margins the
+    /// policy measured.
+    #[error(
+        "height {height} plus dispatch {dispatch} and delivery {delivery} margins \
+         exceeds the terminal deadline {terminal}"
+    )]
+    TerminalUnreachable {
+        /// Finalized height the job would be signed at.
+        height: u64,
+        /// Blocks the policy allows to dispatch.
+        dispatch: u64,
+        /// Blocks the policy allows to deliver.
+        delivery: u64,
+        /// Deadline the authorization carries.
+        terminal: u64,
+    },
+    /// The measured delivery margin no longer fits before the terminal
+    /// deadline, so plaintext released now would not arrive in time.
+    #[error(
+        "height {height} plus the delivery margin {delivery} exceeds \
+         the terminal deadline {terminal}"
+    )]
+    DeliveryUnreachable {
+        /// Finalized height the release would begin at.
+        height: u64,
+        /// Blocks the policy allows to deliver.
+        delivery: u64,
+        /// Deadline the authorization carries.
+        terminal: u64,
+    },
+    /// The gap between terminal and payment deadlines is under the
+    /// oracle grace the policy measured.
+    #[error(
+        "terminal {terminal} to payment {payment} leaves {actual} blocks, \
+         under the measured oracle grace {grace}"
+    )]
+    OracleGraceTooShort {
+        /// Deadline a terminal result is owed by.
+        terminal: u64,
+        /// Deadline payment is owed by.
+        payment: u64,
+        /// Blocks the two deadlines actually leave.
+        actual: u64,
+        /// Blocks the policy measured as necessary.
+        grace: u64,
+    },
+    /// A persisted close descriptor was not its one canonical encoding.
+    #[error("the close descriptor is not canonical")]
+    DescriptorMalformed,
+    /// §4's measured floor does not hold for this deployment or these
+    /// terms.
+    #[error(transparent)]
+    Floor(#[from] FloorError),
+}
+
+/// What the bond's two lease slots held, without the record itself.
+///
+/// The lease body is not carried into the error: what a refusal needs to
+/// say is which of the three answers came back, and a `Faulty` lease has
+/// no body to report.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LeaseState {
+    /// Both slots were empty.
+    Absent,
+    /// A readable lease, over another payment channel.
+    AnotherChannel,
+    /// The slots held something that is not a whole lease.
+    Faulty,
+}
+
+impl core::fmt::Display for LeaseState {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Absent => "absent",
+            Self::AnotherChannel => "held by another payment channel",
+            Self::Faulty => "not a readable lease",
+        })
+    }
+}
+
+/// What the payment edge's pending-close slot held.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PendingState {
+    /// A readable live contest.
+    Live,
+    /// Something that is not this edge's readable record.
+    Faulty,
+}
+
+impl core::fmt::Display for PendingState {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Live => "a live contest",
+            Self::Faulty => "not a readable record",
+        })
+    }
+}
+
+/// Why the omission contest's economics do not hold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum OmissionError {
+    /// The measured response probability is outside `1..=M`.
+    #[error("measured response probability {q} is outside 1..={OMISSION_PROBABILITY_SCALE}")]
+    ProbabilityOutOfRange {
+        /// Probability numerator that was configured.
+        q: u64,
+    },
+    /// The terms give the watcher less time to answer than the window
+    /// the response probability was measured over.
+    #[error(
+        "the terms admit {window} blocks to answer a contest, under the {measured} blocks \
+         the response probability was measured over"
+    )]
+    ResponseWindowUnderMeasured {
+        /// `omit_response_blocks`, as the terms fix it.
+        window: u64,
+        /// Blocks the measurement allowed for the response.
+        measured: u64,
+    },
+    /// The funded bond does not exceed the measured cost of responding.
+    #[error("omission bond {bond} does not exceed the measured response cost cap {cap}")]
+    BondBelowResponseCost {
+        /// Bond the payment terms fund.
+        bond: u64,
+        /// Measured cost of answering one contest.
+        cap: u64,
+    },
+    /// Omitting a response is not loss-making at this bond, probability,
+    /// and capacity.
+    #[error(
+        "q*bond = {responded} does not exceed (M-q)*capacity = {omitted}, \
+         so omission is not loss-making"
+    )]
+    OmissionNotLossMaking {
+        /// `q * omission_bond`.
+        responded: u128,
+        /// `(M - q) * payment_capacity`.
+        omitted: u128,
+    },
+}
+
+/// What one operator measured about its own watcher.
+///
+/// The window travels with the probability because the probability is
+/// only ever a number about *that* window. "Answers a contest in time"
+/// is not a property of a watcher alone; it is a property of a watcher
+/// and a deadline, and the deadline is the terms'
+/// `omit_response_blocks`. A `q` measured over sixty blocks says nothing
+/// about a channel whose terms admit six, and
+/// [`check_omission_economics`] would otherwise spend it as though it
+/// did — which is why the check is here and not in a provider-side floor
+/// beside it. A floor is a second number with its own justification; the
+/// measurement window is the justification the first number already had.
+///
+/// The comparison is one-sided on purpose: a window *longer* than the one
+/// measured is admitted. The measured probability is the chance of
+/// answering within `response_blocks`, and more blocks cannot make that
+/// answer less likely, so `q` is a lower bound for every longer window
+/// and the inequality it feeds stays conservative.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OmissionMeasurements {
+    /// Probability, out of [`OMISSION_PROBABILITY_SCALE`], that this
+    /// provider's watcher answers a contest within
+    /// [`Self::response_blocks`].
+    pub response_probability: u64,
+    /// Blocks the measurement above allowed the watcher to answer in.
+    pub response_blocks: u64,
+    /// Measured cost cap of answering one contest.
+    pub response_cost_cap: u64,
+}
+
+/// What an operator configured for one paid channel, before anything
+/// has been checked.
+///
+/// A plain record with public fields: this is the shape a CLI or a
+/// config file fills in. It is also why [`WorkChannelDescriptor::open`]
+/// takes one argument — nine positional arguments, four of them `u64`,
+/// is a signature whose mistakes compile.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkChannelConfig {
+    /// The network every signature on this channel is bound to.
+    pub network: NetworkId,
+    /// The tag-2 payment edge work is paid from.
+    pub payment_edge: EdgeId,
+    /// The complete payment terms, which embed the complete bond.
+    pub payment_terms: WorkPaymentTerms,
+    /// Salt of the private credit-policy commitment.
+    pub policy_salt: [u8; 32],
+    /// The credit policy those terms commit to.
+    pub channel_policy: PaidChannelPolicyV1,
+    /// The execution policy in force on this channel.
+    pub execution_policy: PaidExecutionPolicyV1,
+    /// The payment edge's value, reserve, and close fees as the
+    /// operator expects them to be funded.
+    pub expected_payment_values: EdgeValues,
+    /// What the provider measured about its own watcher.
+    pub omission: OmissionMeasurements,
+}
+
+/// Everything a provider fixes about a channel before a client names the
+/// two things it does not.
+///
+/// A [`WorkChannelConfig`] is this plus the client's own two choices —
+/// the payment terms and the edge they derive — which is exactly the
+/// split the handshake has: the provider proposes a bond, and the client
+/// answers by naming the channel it wants over it. Holding the
+/// provider's half as its own value is what lets
+/// [`Self::admit`] run the same gates on proposed terms that
+/// [`WorkChannelDescriptor::open`] runs on configured ones, before the
+/// countersignature that makes those terms executable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderChannelPolicy {
+    /// The network every signature on this channel is bound to.
+    pub network: NetworkId,
+    /// Salt of the private credit-policy commitment.
+    pub policy_salt: [u8; 32],
+    /// The credit policy this provider will work under.
+    pub channel_policy: PaidChannelPolicyV1,
+    /// The execution policy this provider will run jobs under.
+    pub execution_policy: PaidExecutionPolicyV1,
+    /// The payment edge's value, reserve, and close fees as the provider
+    /// requires them to be funded.
+    pub expected_payment_values: EdgeValues,
+    /// What the provider measured about its own watcher.
+    pub omission: OmissionMeasurements,
+    /// §4's measured floor for this deployment, over the artifact's raw
+    /// samples.
+    ///
+    /// Here and not in [`WorkChannelConfig`] because it is a statement
+    /// about the *node*, not about the channel: the same floor governs
+    /// every channel this provider admits, and §4 puts it at startup and
+    /// at provider admission — both of which are this type — rather than
+    /// at every place a configured descriptor is opened.
+    pub floor: MountFloor,
+}
+
+impl ProviderChannelPolicy {
+    /// Builds the close-only descriptor a client must arm before exporting
+    /// revision 2.
+    ///
+    /// This checks the committed policy body, execution-policy shape, and
+    /// expected settleability because recovery needs those values to be
+    /// coherent. It deliberately does not run omission economics: those are
+    /// the provider's new-work admission judgement, made before revision 3,
+    /// and a client must retain recovery data even when the provider later
+    /// refuses its proposed terms.
+    pub fn describe_close(
+        &self,
+        payment_edge: EdgeId,
+        payment_terms: WorkPaymentTerms,
+    ) -> Result<CloseDescriptor, WorkSetupError> {
+        let bond_edge = payment_terms.bond_edge;
+        let channel = PaidChannel::new(
+            self.network,
+            payment_edge,
+            payment_terms,
+            &self.policy_salt,
+            self.channel_policy,
+        )?;
+        check_execution_policy(&self.execution_policy)?;
+        if work_payment_settlement(
+            self.expected_payment_values,
+            channel.payment_terms().omission_bond,
+        )
+        .is_none()
+        {
+            return Err(WorkSetupError::Unsettleable);
+        }
+        Ok(CloseDescriptor {
+            channel,
+            bond_edge,
+            policy_salt: self.policy_salt,
+            execution_policy: self.execution_policy,
+            expected_payment_values: self.expected_payment_values,
+        })
+    }
+
+    /// Opens the descriptor for terms a client has proposed, or says why
+    /// this provider will not work over them.
+    ///
+    /// Every gate is [`WorkChannelDescriptor::open`]'s, reached by
+    /// filling in the two fields the client chose and the six this
+    /// provider fixed. In particular `private_policy_commitment` stops
+    /// being the client's free choice here: [`PaidChannel::new`] opens it
+    /// against *this* provider's salt and credit policy, so terms
+    /// committing to any other policy are refused rather than signed.
+    ///
+    /// §4's floor is checked here and nowhere below, because it is the
+    /// provider's judgement about its own deployment and the terms it
+    /// is asked to sign: `64 ≥ T` first, so a node whose measured budget
+    /// cannot fit the fixed start span countersigns nothing whatever
+    /// terms it is offered; then the signed `start_validity_blocks` must
+    /// be exactly that fixed 64; and finally the proposed
+    /// `omit_response_blocks` is checked against
+    /// `F+POLL+G+I+S+R+1`. The last is strictly stronger than the kernel's own
+    /// `MIN_OMIT_RESPONSE_BLOCKS`, which is the same sum with `S` and
+    /// `R` left out — this deployment's measured seek and restart cost
+    /// are exactly what the kernel constant cannot know.
+    ///
+    /// # Errors
+    ///
+    /// [`WorkSetupError::Floor`] when the measured budget does not fit
+    /// the start span, the signed terms do not carry the fixed span, or
+    /// the terms leave less time to answer than it needs, and then
+    /// whatever [`WorkChannelDescriptor::open`] raises:
+    /// the commitment, the execution policy, the settleability of the
+    /// expected funding, and the omission economics.
+    pub fn admit(
+        &self,
+        payment_edge: EdgeId,
+        payment_terms: WorkPaymentTerms,
+    ) -> Result<WorkChannelDescriptor, WorkSetupError> {
+        self.floor
+            .check_terms_start_span(payment_terms.start_validity_blocks)?;
+        self.floor
+            .check_response_window(payment_terms.omit_response_blocks)?;
+        WorkChannelDescriptor::open(WorkChannelConfig {
+            network: self.network,
+            payment_edge,
+            payment_terms,
+            policy_salt: self.policy_salt,
+            channel_policy: self.channel_policy,
+            execution_policy: self.execution_policy,
+            expected_payment_values: self.expected_payment_values,
+            omission: self.omission,
+        })
+    }
+}
+
+/// A configured channel whose static gates have passed.
+///
+/// Constructed only through [`Self::open`], which is where the policy
+/// commitment is opened and those gates run. A descriptor in hand is
+/// therefore a channel whose policy body matches its terms and whose
+/// omission economics hold at the configured measurements — none of
+/// which says anything yet about what is on chain.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkChannelDescriptor {
+    channel: PaidChannel,
+    bond_edge: EdgeId,
+    bond_terms_hash: TermsHash,
+    policy_salt: [u8; 32],
+    execution_policy: PaidExecutionPolicyV1,
+    expected_payment_values: EdgeValues,
+    omission: OmissionMeasurements,
+}
+
+impl WorkChannelDescriptor {
+    /// Opens a configured channel: checks its policy commitment, its
+    /// execution policy, and its omission economics.
+    ///
+    /// The bond edge and its terms hash are read out of the payment
+    /// terms rather than configured separately, for the same reason
+    /// [`PaidChannel::new`] reads them there: the payment body already
+    /// embeds the complete bond, so a separately configured bond could
+    /// only ever be the wrong one.
+    ///
+    /// The capacity the omission inequality is checked against here is
+    /// the *configured* capacity, derived from the edge values the
+    /// operator expects. It is checked again against the finalized edge
+    /// in [`Self::check_ready`], because a configured expectation is not
+    /// a funded edge.
+    ///
+    /// # Errors
+    ///
+    /// [`WorkSetupError::Record`] when the policy commitment or the
+    /// execution policy is refused, [`WorkSetupError::Unsettleable`]
+    /// when the expected edge values do not price both close routes, and
+    /// [`WorkSetupError::Omission`] when the contest's economics do not
+    /// hold.
+    pub fn open(config: WorkChannelConfig) -> Result<Self, WorkSetupError> {
+        let bond_edge = config.payment_terms.bond_edge;
+        let bond_terms_hash = config.payment_terms.bond_terms_hash();
+        let omission_bond = config.payment_terms.omission_bond;
+        let omit_response_blocks = config.payment_terms.omit_response_blocks;
+        let channel = PaidChannel::new(
+            config.network,
+            config.payment_edge,
+            config.payment_terms,
+            &config.policy_salt,
+            config.channel_policy,
+        )?;
+        check_execution_policy(&config.execution_policy)?;
+
+        let settlement = work_payment_settlement(config.expected_payment_values, omission_bond)
+            .ok_or(WorkSetupError::Unsettleable)?;
+        check_omission_economics(
+            config.omission,
+            omit_response_blocks,
+            omission_bond,
+            settlement.capacity(),
+        )?;
+
+        Ok(Self {
+            channel,
+            bond_edge,
+            bond_terms_hash,
+            policy_salt: config.policy_salt,
+            execution_policy: config.execution_policy,
+            expected_payment_values: config.expected_payment_values,
+            omission: config.omission,
+        })
+    }
+
+    /// Returns the channel these records are bound to.
+    pub const fn channel(&self) -> &PaidChannel {
+        &self.channel
+    }
+
+    /// Returns the bond edge insuring this channel.
+    pub const fn bond_edge(&self) -> EdgeId {
+        self.bond_edge
+    }
+
+    /// Returns the execution policy in force on this channel.
+    pub const fn execution_policy(&self) -> &PaidExecutionPolicyV1 {
+        &self.execution_policy
+    }
+
+    /// Returns the height at and after which the channel admits no work.
+    pub const fn admission_horizon(&self) -> BlockHeight {
+        self.channel.payment_terms().admission_horizon()
+    }
+
+    /// Returns the self-contained descriptor recovery needs after an
+    /// executable setup revision has escaped this process.
+    #[must_use]
+    pub fn close_descriptor(&self) -> CloseDescriptor {
+        CloseDescriptor {
+            channel: self.channel.clone(),
+            bond_edge: self.bond_edge,
+            policy_salt: self.policy_salt,
+            execution_policy: self.execution_policy,
+            expected_payment_values: self.expected_payment_values,
+        }
+    }
+
+    /// Decides whether this configured channel is the channel on chain.
+    ///
+    /// Every check is against the one read it is handed, and every one
+    /// of them can refuse: a live payment edge whose bond is gone is not
+    /// a channel, a live pair under other terms is not this channel, and
+    /// a live pair with an open contest is a channel that admits no new
+    /// work even though both edges are perfectly healthy.
+    ///
+    /// Whether that read is *coherent* is not established here and
+    /// cannot be: five fields assembled from five point queries satisfy
+    /// [`ObservedChannel`] exactly as well as one database snapshot
+    /// does, and the difference is the caller's to owe.
+    ///
+    /// # Errors
+    ///
+    /// One [`WorkSetupError`] naming the first fact that failed.
+    pub fn check_ready(
+        &self,
+        observed: &ObservedChannel<'_>,
+    ) -> Result<ReadyChannel, WorkSetupError> {
+        let terms = self.channel.payment_terms();
+
+        let bond = observed.bond.ok_or(WorkSetupError::NotLive {
+            object: "the bond edge",
+        })?;
+        let payment = observed.payment.ok_or(WorkSetupError::NotLive {
+            object: "the payment edge",
+        })?;
+
+        // The terms body is what says who the parties are and what the
+        // bond covers, and the edge carries only a hash of it. Locally
+        // hashing the configured body is the only thing that makes the
+        // rest of these checks about this channel.
+        if bond.terms() != self.bond_terms_hash {
+            return Err(WorkSetupError::TermsMismatch {
+                object: "the bond edge",
+            });
+        }
+        if payment.terms() != self.channel.payment_terms_hash() {
+            return Err(WorkSetupError::TermsMismatch {
+                object: "the payment edge",
+            });
+        }
+        // The kernel fixes both pairings at open, so a disagreement here
+        // is a hash collision or a wrongly assembled snapshot rather
+        // than a channel in an unexpected state. It is checked because a
+        // wrongly assembled snapshot is the reachable one: these two
+        // edges arrive as two `Option`s of the same type.
+        if bond.parties() != terms.bond_terms.parties {
+            return Err(WorkSetupError::PartiesMismatch {
+                object: "the bond edge",
+            });
+        }
+        if payment.parties() != terms.parties() {
+            return Err(WorkSetupError::PartiesMismatch {
+                object: "the payment edge",
+            });
+        }
+
+        match observed.lease {
+            LeaseSlots::Present(lease) if lease.payment_edge() == self.channel.payment_edge() => {}
+            LeaseSlots::Present(_) => {
+                return Err(WorkSetupError::Lease {
+                    found: LeaseState::AnotherChannel,
+                });
+            }
+            LeaseSlots::Absent => {
+                return Err(WorkSetupError::Lease {
+                    found: LeaseState::Absent,
+                });
+            }
+            LeaseSlots::Faulty(_) => {
+                return Err(WorkSetupError::Lease {
+                    found: LeaseState::Faulty,
+                });
+            }
+        }
+
+        match observed.pending {
+            PendingSlot::Absent => {}
+            PendingSlot::Present(_) => {
+                return Err(WorkSetupError::PendingClose {
+                    found: PendingState::Live,
+                });
+            }
+            PendingSlot::Faulty(_) => {
+                return Err(WorkSetupError::PendingClose {
+                    found: PendingState::Faulty,
+                });
+            }
+        }
+
+        // The capacity every later amount is bounded by, taken from the
+        // edge that will pay rather than from the operator's
+        // expectation. The economics are re-checked against it for the
+        // same reason: a channel funded below what was configured has
+        // different economics than the ones that were approved.
+        let settlement = work_payment_settlement(payment.values(), terms.omission_bond)
+            .ok_or(WorkSetupError::Unsettleable)?;
+        check_omission_economics(
+            self.omission,
+            terms.omit_response_blocks,
+            terms.omission_bond,
+            settlement.capacity(),
+        )?;
+
+        let horizon = terms.admission_horizon().get();
+        if observed.height >= horizon {
+            return Err(WorkSetupError::HorizonPassed {
+                height: observed.height,
+                horizon,
+            });
+        }
+
+        Ok(ReadyChannel {
+            channel: self.channel.clone(),
+            execution_policy: self.execution_policy,
+            settlement,
+            finalized_height: observed.height,
+            admission_horizon: horizon,
+        })
+    }
+}
+
+/// Everything close-only recovery cannot reconstruct after configuration
+/// loss.
+///
+/// The complete payment terms inside [`PaidChannel`] also carry the complete
+/// bond terms and the private-policy commitment.  The opened policy body and
+/// its salt travel beside them, as do the execution policy and expected
+/// payment funding.  The latter has one interpretation, exposed by
+/// [`Self::expected_settlement`].
+///
+/// The provider's revision-3 value comes from a [`WorkChannelDescriptor`]
+/// whose new-work admission gates passed. The client's revision-2 value is
+/// armed earlier, after its policy commitment, execution-policy shape, and
+/// expected settleability have been checked but before the provider decides
+/// omission economics. Funded recovery deliberately does not run those gates
+/// again: [`Self::funded_settlement`] checks the coherent payment edge and
+/// derives the settlement consensus will use directly from that edge.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CloseDescriptor {
+    channel: PaidChannel,
+    bond_edge: EdgeId,
+    policy_salt: [u8; 32],
+    execution_policy: PaidExecutionPolicyV1,
+    expected_payment_values: EdgeValues,
+}
+
+/// First byte of the close descriptor stored in an armed setup record.
+const CLOSE_DESCRIPTOR_VERSION: u8 = 1;
+
+impl CloseDescriptor {
+    /// Returns the payment channel, including both complete terms bodies and
+    /// the opened private credit-policy body.
+    #[must_use]
+    pub const fn channel(&self) -> &PaidChannel {
+        &self.channel
+    }
+
+    /// Returns the bond edge the payment terms insure through.
+    #[must_use]
+    pub const fn bond_edge(&self) -> EdgeId {
+        self.bond_edge
+    }
+
+    /// Returns the execution policy the armed endpoint accepted.
+    #[must_use]
+    pub const fn execution_policy(&self) -> &PaidExecutionPolicyV1 {
+        &self.execution_policy
+    }
+
+    /// Returns what the provider expected the configured payment funding to
+    /// settle when it admitted the setup.
+    pub fn expected_settlement(&self) -> Result<WorkPaymentSettlement, WorkSetupError> {
+        work_payment_settlement(
+            self.expected_payment_values,
+            self.channel.payment_terms().omission_bond,
+        )
+        .ok_or(WorkSetupError::Unsettleable)
+    }
+
+    /// Derives the actual close settlement from one funded payment edge.
+    ///
+    /// This is the recovery path.  It checks only that the coherent edge is
+    /// this descriptor's edge under these terms and parties, then runs the
+    /// kernel's settlement arithmetic over the edge values.  It does not
+    /// rerun policy commitment, execution-envelope, horizon, or omission
+    /// admission gates: those decide new work, not whether already-exported
+    /// Opens must be closed.
+    pub fn funded_settlement(
+        &self,
+        payment: &Edge,
+    ) -> Result<WorkPaymentSettlement, WorkSetupError> {
+        if payment.terms() != self.channel.payment_terms_hash() {
+            return Err(WorkSetupError::TermsMismatch {
+                object: "the armed payment edge",
+            });
+        }
+        if payment.parties() != self.channel.payment_terms().parties() {
+            return Err(WorkSetupError::PartiesMismatch {
+                object: "the armed payment edge",
+            });
+        }
+        work_payment_settlement(payment.values(), self.channel.payment_terms().omission_bond)
+            .ok_or(WorkSetupError::Unsettleable)
+    }
+
+    /// Returns the descriptor's canonical journal bytes.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = vec![CLOSE_DESCRIPTOR_VERSION];
+        push_kernel(&mut out, &self.channel.network());
+        push_kernel(&mut out, &self.channel.payment_edge());
+        push_kernel(
+            &mut out,
+            &Terms::work_payment(self.channel.payment_terms().clone()),
+        );
+        out.extend_from_slice(&self.policy_salt);
+        out.extend_from_slice(&self.channel.channel_policy().encode());
+        out.extend_from_slice(&self.execution_policy.encode());
+        out.extend_from_slice(&self.expected_payment_values.value().to_be_bytes());
+        out.extend_from_slice(&self.expected_payment_values.reserve().to_be_bytes());
+        push_kernel(&mut out, &self.expected_payment_values.close_fees());
+        out
+    }
+
+    /// Reads one descriptor from exactly its canonical journal bytes.
+    ///
+    /// The policy commitment and execution policy are checked while the
+    /// value is rebuilt.  Omission economics and readiness are intentionally
+    /// absent: they are new-work decisions and funded recovery must not
+    /// rerun them.
+    pub fn decode(bytes: &[u8]) -> Result<Self, WorkSetupError> {
+        let mut cursor = CloseCursor { bytes };
+        if cursor.byte()? != CLOSE_DESCRIPTOR_VERSION {
+            return Err(WorkSetupError::DescriptorMalformed);
+        }
+        let network = cursor.network()?;
+        let payment_edge: EdgeId = cursor.field()?;
+        let payment_terms = match cursor.field::<Terms>()?.profile() {
+            TermsProfile::WorkPayment(terms) => terms.clone(),
+            _ => return Err(WorkSetupError::DescriptorMalformed),
+        };
+        let policy_salt = cursor.array::<32>()?;
+        let channel_policy =
+            PaidChannelPolicyV1::decode(cursor.take(PaidChannelPolicyV1::ENCODED_SIZE)?)
+                .map_err(|_| WorkSetupError::DescriptorMalformed)?;
+        let execution_policy =
+            PaidExecutionPolicyV1::decode(cursor.take(PaidExecutionPolicyV1::ENCODED_SIZE)?)
+                .map_err(|_| WorkSetupError::DescriptorMalformed)?;
+        let expected_payment_values =
+            EdgeValues::new(cursor.u64()?, cursor.u64()?, cursor.field::<Fees>()?);
+        if !cursor.bytes.is_empty() {
+            return Err(WorkSetupError::DescriptorMalformed);
+        }
+
+        let channel = PaidChannel::new(
+            network,
+            payment_edge,
+            payment_terms,
+            &policy_salt,
+            channel_policy,
+        )?;
+        check_execution_policy(&execution_policy)?;
+        if work_payment_settlement(
+            expected_payment_values,
+            channel.payment_terms().omission_bond,
+        )
+        .is_none()
+        {
+            return Err(WorkSetupError::Unsettleable);
+        }
+        Ok(Self {
+            bond_edge: channel.payment_terms().bond_edge,
+            channel,
+            policy_salt,
+            execution_policy,
+            expected_payment_values,
+        })
+    }
+}
+
+fn push_kernel<E: Encode>(out: &mut Vec<u8>, value: &E) {
+    let mut bytes = vec![0_u8; E::MAX_ENCODED_SIZE];
+    let written = value.write_to(&mut bytes);
+    out.extend_from_slice(&bytes[..written]);
+}
+
+struct CloseCursor<'a> {
+    bytes: &'a [u8],
+}
+
+impl CloseCursor<'_> {
+    fn byte(&mut self) -> Result<u8, WorkSetupError> {
+        let (byte, rest) = self
+            .bytes
+            .split_first()
+            .ok_or(WorkSetupError::DescriptorMalformed)?;
+        self.bytes = rest;
+        Ok(*byte)
+    }
+
+    fn take(&mut self, len: usize) -> Result<&[u8], WorkSetupError> {
+        let (value, rest) = self
+            .bytes
+            .split_at_checked(len)
+            .ok_or(WorkSetupError::DescriptorMalformed)?;
+        self.bytes = rest;
+        Ok(value)
+    }
+
+    fn array<const N: usize>(&mut self) -> Result<[u8; N], WorkSetupError> {
+        self.take(N)?
+            .try_into()
+            .map_err(|_| WorkSetupError::DescriptorMalformed)
+    }
+
+    fn u64(&mut self) -> Result<u64, WorkSetupError> {
+        self.array::<8>().map(u64::from_be_bytes)
+    }
+
+    fn network(&mut self) -> Result<NetworkId, WorkSetupError> {
+        let len = usize::from(self.byte()?);
+        let bytes = self.take(len)?;
+        let id = core::str::from_utf8(bytes).map_err(|_| WorkSetupError::DescriptorMalformed)?;
+        NetworkId::new(id).ok_or(WorkSetupError::DescriptorMalformed)
+    }
+
+    fn field<T: Decode>(&mut self) -> Result<T, WorkSetupError> {
+        let (value, consumed) =
+            T::decode(self.bytes).map_err(|_: DecodeError| WorkSetupError::DescriptorMalformed)?;
+        self.bytes = self
+            .bytes
+            .get(consumed..)
+            .ok_or(WorkSetupError::DescriptorMalformed)?;
+        Ok(value)
+    }
+}
+
+/// One finalized read of a channel's four objects.
+///
+/// A struct rather than five arguments because two of the five are
+/// `Option<&Edge>` and would otherwise be silently swappable. Every
+/// field is named at the call site that builds it, so a bond passed as a
+/// payment edge is a visible mistake rather than a subtle one.
+///
+/// Nothing here proves the five fields came from one block, and nothing
+/// downstream can: whoever fills this in owes the coherence.
+/// `hellas_chain::WorkChannelSnapshot` is what supplies it in this
+/// milestone, by reading every object under one database snapshot at one
+/// finalized block; five separate point queries would satisfy the type
+/// and not the requirement.
+#[derive(Clone, Copy, Debug)]
+pub struct ObservedChannel<'a> {
+    /// Finalized height every field below was read at.
+    pub height: u64,
+    /// The bond edge, or its absence.
+    pub bond: Option<&'a Edge>,
+    /// The payment edge, or its absence.
+    pub payment: Option<&'a Edge>,
+    /// What the bond's lease slots held.
+    pub lease: LeaseSlots,
+    /// What the payment edge's pending-close slot held.
+    pub pending: PendingSlot,
+}
+
+/// A channel this endpoint has established is live, leased, uncontested,
+/// and inside its horizon at one finalized height.
+///
+/// It can only be built by [`WorkChannelDescriptor::check_ready`], so
+/// holding one is holding that decision — and holding it *only at*
+/// [`Self::finalized_height`]. Liveness, the lease, and the absence of a
+/// contest are facts about that one block, and nothing on this type
+/// refreshes them: a close opened one block later is invisible to every
+/// method here, because the objects it would have to re-read are not
+/// carried.
+///
+/// So the obligation is the holder's, in the same way [`ObservedChannel`]
+/// owes coherence: run [`WorkChannelDescriptor::check_ready`] again
+/// against a fresh snapshot before each signature, and sign against the
+/// `ReadyChannel` that read produced. [`Self::check_signable`] is the
+/// per-signature *arithmetic* — the horizon and the deadline margins,
+/// against the height the endpoint has actually reached. It is not a
+/// substitute for the refresh, and it does not claim to be one: no
+/// arithmetic over a stale read can see a contest that opened after it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReadyChannel {
+    channel: PaidChannel,
+    execution_policy: PaidExecutionPolicyV1,
+    settlement: WorkPaymentSettlement,
+    finalized_height: u64,
+    admission_horizon: u64,
+}
+
+impl ReadyChannel {
+    /// Returns the channel every private record is bound to.
+    pub const fn channel(&self) -> &PaidChannel {
+        &self.channel
+    }
+
+    /// Returns what this edge can settle, at the funding it actually
+    /// has.
+    pub const fn settlement(&self) -> WorkPaymentSettlement {
+        self.settlement
+    }
+
+    /// Returns the execution policy this readiness was decided under.
+    ///
+    /// The policy an endpoint checks a proposal against must be the one
+    /// whose margins [`Self::check_signable`] measures against and whose
+    /// digest the authorization names. Carrying it here is what stops
+    /// those three from being three copies.
+    pub const fn execution_policy(&self) -> &PaidExecutionPolicyV1 {
+        &self.execution_policy
+    }
+
+    /// Returns the finalized height this readiness was decided at.
+    pub const fn finalized_height(&self) -> u64 {
+        self.finalized_height
+    }
+
+    /// Checks that a job with these deadlines may be signed now.
+    ///
+    /// Readiness was decided at a height; this is decided at a
+    /// signature, which is a different moment and a different question.
+    /// `cursor_height` is that moment: how far the endpoint has actually
+    /// processed finalized blocks. An endpoint that has read a snapshot
+    /// it has not caught up to has seen a state it cannot yet act on,
+    /// because the blocks between are where a contest it must not sign
+    /// over would appear.
+    ///
+    /// Every bound below is therefore anchored at `cursor_height` and
+    /// not at [`Self::finalized_height`]. The readiness height is the
+    /// past; the chain has moved since, and a horizon or a deadline
+    /// measured from the past is measured from a moment the signature
+    /// will not be made at. Anchored at the readiness height, the whole
+    /// interval `[finalized_height + margins, cursor_height + margins)`
+    /// passes — and that interval is exactly the deadlines already
+    /// missed by the time the signature is made.
+    ///
+    /// The two margins are the policy's measured ones, so this refuses a
+    /// deadline that is legal, ordered, and unreachable — which is the
+    /// only kind of deadline an honest provider signs and then misses.
+    ///
+    /// The ordering of the four deadlines is not re-derived here:
+    /// [`crate::protocol::work::check_authorization`] fixes
+    /// `acceptance < terminal < payment < horizon` against the same
+    /// terms, and a second spelling of that chain is a second chance to
+    /// spell it differently.
+    ///
+    /// # Errors
+    ///
+    /// [`WorkSetupError::CursorBehind`] when the endpoint has not
+    /// processed blocks through the height this was decided at,
+    /// [`WorkSetupError::HorizonPassed`] when the channel admits no more
+    /// work, [`WorkSetupError::TerminalUnreachable`] when the measured
+    /// margins do not fit before the terminal deadline, and
+    /// [`WorkSetupError::OracleGraceTooShort`] when the payment deadline
+    /// leaves less than the measured oracle grace.
+    pub fn check_signable(
+        &self,
+        cursor_height: u64,
+        terminal_deadline: u64,
+        payment_deadline: u64,
+    ) -> Result<(), WorkSetupError> {
+        self.check_caught_up(cursor_height)?;
+        if cursor_height >= self.admission_horizon {
+            return Err(WorkSetupError::HorizonPassed {
+                height: cursor_height,
+                horizon: self.admission_horizon,
+            });
+        }
+
+        let policy = &self.execution_policy;
+        let reachable = cursor_height
+            .checked_add(policy.dispatch_margin_blocks)
+            .and_then(|sum| sum.checked_add(policy.delivery_margin_blocks))
+            .ok_or(PaidWorkError::Overflow {
+                field: "dispatch and delivery margins",
+            })?;
+        if reachable > terminal_deadline {
+            return Err(WorkSetupError::TerminalUnreachable {
+                height: cursor_height,
+                dispatch: policy.dispatch_margin_blocks,
+                delivery: policy.delivery_margin_blocks,
+                terminal: terminal_deadline,
+            });
+        }
+
+        let grace =
+            payment_deadline
+                .checked_sub(terminal_deadline)
+                .ok_or(PaidWorkError::Overflow {
+                    field: "oracle grace interval",
+                })?;
+        if grace < policy.oracle_grace_blocks {
+            return Err(WorkSetupError::OracleGraceTooShort {
+                terminal: terminal_deadline,
+                payment: payment_deadline,
+                actual: grace,
+                grace: policy.oracle_grace_blocks,
+            });
+        }
+        Ok(())
+    }
+
+    /// Checks that this endpoint has processed finalized blocks through
+    /// the height this readiness was decided at.
+    ///
+    /// Every decision taken against a `ReadyChannel` needs this and
+    /// only this in common: a snapshot the endpoint has not caught up
+    /// to is a state it cannot yet act on, because the blocks between
+    /// are where the fact that would change the decision would appear.
+    /// It is written once here and called by each of them.
+    ///
+    /// # Errors
+    ///
+    /// [`WorkSetupError::CursorBehind`] when the cursor is behind.
+    pub const fn check_caught_up(&self, cursor_height: u64) -> Result<(), WorkSetupError> {
+        if cursor_height < self.finalized_height {
+            return Err(WorkSetupError::CursorBehind {
+                cursor: cursor_height,
+                height: self.finalized_height,
+            });
+        }
+        Ok(())
+    }
+
+    /// Checks that plaintext released now can still reach the client
+    /// before the deadline it was promised by.
+    ///
+    /// The dispatch margin is deliberately absent: by the time there is
+    /// plaintext to release it has already been spent, and charging it
+    /// again would refuse a delivery that is in fact on time. What
+    /// remains is the transfer the policy measured for the largest
+    /// legal result.
+    ///
+    /// The admission horizon is likewise absent, and does not need to be
+    /// here: `check_authorization` fixes `terminal < payment < horizon`
+    /// for every signed job, so a height inside the terminal deadline is
+    /// inside the horizon.
+    ///
+    /// # Errors
+    ///
+    /// [`WorkSetupError::CursorBehind`] when the endpoint has not
+    /// processed blocks through the height this was decided at,
+    /// [`WorkSetupError::DeliveryUnreachable`] when the measured margin
+    /// no longer fits, and [`WorkSetupError::Record`] when that
+    /// arithmetic would overflow.
+    pub fn check_releasable(
+        &self,
+        cursor_height: u64,
+        terminal_deadline: u64,
+    ) -> Result<(), WorkSetupError> {
+        self.check_caught_up(cursor_height)?;
+        let delivery = self.execution_policy.delivery_margin_blocks;
+        let arrives = cursor_height
+            .checked_add(delivery)
+            .ok_or(PaidWorkError::Overflow {
+                field: "delivery margin",
+            })?;
+        if arrives > terminal_deadline {
+            return Err(WorkSetupError::DeliveryUnreachable {
+                height: cursor_height,
+                delivery,
+                terminal: terminal_deadline,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Checks that understating a payment close costs the client more than
+/// it stands to keep.
+///
+/// The thief the implemented contest admits is the *client*, and the
+/// theft is an understatement: the client opens a close naming less than
+/// it has already signed for, and if this provider's watcher is offline
+/// for `omit_response_blocks` that understated start settles and the
+/// client keeps the difference. The provider's omission is the
+/// opportunity; it is not the profit, and a provider that stays offline
+/// only loses. The kernel's rule is `WorkPaymentTerms::omission_bond` —
+/// "amount the client forfeits to the provider when a close reveals the
+/// client understated" — charged on a `Party::Maker` opener, and the
+/// payment edge's maker is the client.
+///
+/// What deters it is that bond, and what makes the bond sufficient is an
+/// inequality over three measured quantities. With `M` =
+/// [`OMISSION_PROBABILITY_SCALE`]:
+///
+/// - `1 <= q <= M`, where `q/M` is the measured probability that this
+///   provider's watcher answers a contest within
+///   [`OmissionMeasurements::response_blocks`];
+/// - `omit_response_blocks >= response_blocks`, so the deadline the
+///   terms actually impose is one `q` was measured against. Without it
+///   `q` is a number about a window this channel does not have, and the
+///   third inequality spends it anyway;
+/// - `omission_bond > response_cost_cap`, so answering pays the
+///   provider more than answering costs it, and the response the whole
+///   deterrence rests on is one the provider actually wants to make;
+/// - `q * omission_bond > (M - q) * payment_capacity`, so the client's
+///   expected forfeit exceeds its expected theft.
+///
+/// The products are `u128` because both factors are `u64` and their
+/// product is not. The `q > M` half of the range check is load-bearing:
+/// `M - q` below would underflow without it. The `q == 0` half is not —
+/// `q = 0` makes the third inequality `0 > M * capacity`, which is false
+/// for *every* capacity, zero included, because the comparison is
+/// strict. It is kept for the answer it gives rather than the refusal:
+/// `ProbabilityOutOfRange` names the configuration mistake, where
+/// `OmissionNotLossMaking { responded: 0, .. }` would report an
+/// arithmetic result that says nothing about what to change.
+///
+/// These are bilateral policy gates, not kernel facts. The kernel checks
+/// that the bond is funded and that a proved understatement forfeits it.
+/// Nothing on chain checks that a provider is actually online, and no
+/// hash can make one respond.
+///
+/// # Errors
+///
+/// One [`OmissionError`] naming the inequality that failed.
+pub fn check_omission_economics(
+    measured: OmissionMeasurements,
+    omit_response_blocks: u64,
+    omission_bond: u64,
+    payment_capacity: u64,
+) -> Result<(), OmissionError> {
+    let q = measured.response_probability;
+    if q == 0 || q > OMISSION_PROBABILITY_SCALE {
+        return Err(OmissionError::ProbabilityOutOfRange { q });
+    }
+    if omit_response_blocks < measured.response_blocks {
+        return Err(OmissionError::ResponseWindowUnderMeasured {
+            window: omit_response_blocks,
+            measured: measured.response_blocks,
+        });
+    }
+    if omission_bond <= measured.response_cost_cap {
+        return Err(OmissionError::BondBelowResponseCost {
+            bond: omission_bond,
+            cap: measured.response_cost_cap,
+        });
+    }
+    let responded = u128::from(q) * u128::from(omission_bond);
+    let omitted = u128::from(OMISSION_PROBABILITY_SCALE - q) * u128::from(payment_capacity);
+    if responded <= omitted {
+        return Err(OmissionError::OmissionNotLossMaking { responded, omitted });
+    }
+    Ok(())
+}
+
+/// Returns the terms hash of one payment body, as the edge commits to
+/// it.
+///
+/// One line, and it exists so no caller writes
+/// `Terms::work_payment(..).hash()` for itself: the edge's commitment is
+/// over the tagged `Terms` envelope, not over the body, and a caller
+/// that hashed the body would compare a value no edge carries.
+#[must_use]
+pub fn payment_terms_hash(terms: WorkPaymentTerms) -> TermsHash {
+    Terms::work_payment(terms).hash()
+}

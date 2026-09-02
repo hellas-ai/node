@@ -4,12 +4,15 @@
 //! model-checking tests: two genesis coins (maker 10, taker 5), one
 //! bilateral terms shape, and up to two chained edges.
 
-use super::{FixedStore, coin_id, list, open_tx, placeholder_mutual, placeholder_seal, state};
+use super::{
+    CANARY_REGISTRY_SLOTS, FixedStore, canary_registry_slots, coin_id, list, open_tx,
+    placeholder_mutual, state,
+};
 
 use hellas_kernel::{
-    BlockHash, BlockHeight, CloseKind, CoinId, Context, Edge, EdgeId, Funding, Genesis, Key, List,
-    MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, Parties, Payout, Proof, ProtocolCode, Seal, State, Terms,
-    Tx, View,
+    BlockHash, BlockHeight, CoinId, Context, Edge, EdgeId, Funding, Genesis, Key, List,
+    MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, Parties, Payout, Proof, ProtocolCode, State, Terms, Tx,
+    View,
 };
 
 pub(crate) const CONTEXT: Context = Context::new(
@@ -48,8 +51,8 @@ pub(crate) fn other_terms() -> Terms {
     Terms::basic(OTHER_PROTOCOL, PARTIES, TIMEOUT, payouts())
 }
 
-pub(crate) type TraceState = State<FixedStore<6, 2>>;
-pub(crate) type TraceView = View<6, 2>;
+pub(crate) type TraceState = State<FixedStore<6, 2, CANARY_REGISTRY_SLOTS>>;
+pub(crate) type TraceView = View<6, 2, CANARY_REGISTRY_SLOTS>;
 
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 pub(crate) enum EdgeKey {
@@ -69,15 +72,13 @@ pub(crate) enum OpenKey {
 pub(crate) enum ProofKey {
     Mutual,
     Timeout,
-    Violation,
     EarlyTimeout,
     WrongTerms,
-    BadSeal,
 }
 
 pub(crate) fn initial_state() -> TraceState {
     state(
-        FixedStore::empty(
+        FixedStore::empty_with_registry(
             [
                 MAKER_ID,
                 TAKER_ID,
@@ -87,6 +88,7 @@ pub(crate) fn initial_state() -> TraceState {
                 taker_out(EdgeKey::Second),
             ],
             [edge_id(EdgeKey::First), edge_id(EdgeKey::Second)],
+            canary_registry_slots(),
         ),
         [
             Genesis::coin(MAKER_ID, MAKER, MAKER_VALUE),
@@ -95,9 +97,9 @@ pub(crate) fn initial_state() -> TraceState {
     )
 }
 
-pub(crate) fn genesis<const C: usize, const E: usize>(
-    store: FixedStore<C, E>,
-) -> State<FixedStore<C, E>> {
+pub(crate) fn genesis<const C: usize, const E: usize, const R: usize>(
+    store: FixedStore<C, E, R>,
+) -> State<FixedStore<C, E, R>> {
     state(
         store,
         [
@@ -170,7 +172,9 @@ pub(crate) const fn edge_value(edge: Edge) -> u64 {
     edge.value()
 }
 
-pub(crate) fn live_value<const C: usize, const E: usize>(view: &View<C, E>) -> u64 {
+pub(crate) fn live_value<const C: usize, const E: usize, const R: usize>(
+    view: &View<C, E, R>,
+) -> u64 {
     let mut total = 0_u64;
     for (_, coin) in view.coins() {
         total = total.saturating_add(coin.value());
@@ -228,16 +232,9 @@ fn proof_for(edge: EdgeKey, proof: ProofKey, outputs: &List<Payout, MAX_EDGE_OUT
     match proof {
         ProofKey::Mutual => placeholder_mutual(edge_id(edge), terms.hash(), outputs, MAKER, TAKER),
         ProofKey::Timeout | ProofKey::EarlyTimeout => Proof::timeout(terms),
-        ProofKey::Violation => {
-            let seal = placeholder_seal(edge_id(edge), &terms, outputs);
-            Proof::violation(terms, seal)
-        }
         // Submitting a Timeout proof whose terms don't match the edge's terms
         // commitment triggers `TermsMismatch` in the verifier.
         ProofKey::WrongTerms => Proof::timeout(other_terms()),
-        // Bind the seal to a payload that does not match the canonical close
-        // payload, so the verifier rejects it with `BadSeal`.
-        ProofKey::BadSeal => Proof::violation(terms, bad_seal(edge, outputs)),
     }
 }
 
@@ -258,18 +255,4 @@ fn open_terms(key: OpenKey) -> Terms {
         OpenKey::Empty => (0, 0),
     };
     Terms::basic(PROTOCOL, PARTIES, TIMEOUT, payouts_with(maker, taker))
-}
-
-/// Seal bound to a non-canonical close payload (uses `other_terms()` for the
-/// terms-hash binding), so the verifier rejects with `BadSeal` rather than
-/// `TermsMismatch`.
-fn bad_seal(edge: EdgeKey, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> Seal {
-    let bad_hash = Tx::payload_hash(
-        super::NETWORK,
-        edge_id(edge),
-        CloseKind::Violation,
-        other_terms().hash(),
-        outputs,
-    );
-    Seal::placeholder(terms().protocol(), CloseKind::Violation, bad_hash)
 }

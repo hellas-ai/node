@@ -1,15 +1,12 @@
-use std::time::Duration;
-
 use anyhow::{Context, bail};
 use hellas_executor::{
-    FetchProvider, FetchProviderError, FetchProviderFuture, FetchProviderRequest,
-    FetchProviderStream,
+    FetchProvider, FetchProviderError, FetchProviderFuture, FetchProviderResponse,
+    PreparedFetchRequest,
 };
+use hellas_rpc::OPENAI_RESPONSES_ENDPOINT;
 use reqwest::Url;
 
-use crate::commands::http_client;
-
-use super::responses_fetch::execute_responses_request;
+use super::responses_fetch::{execute_responses_request, responses_http_client};
 
 #[derive(Clone)]
 pub(super) struct OpenAiResponsesFetchProvider {
@@ -19,9 +16,9 @@ pub(super) struct OpenAiResponsesFetchProvider {
 }
 
 impl OpenAiResponsesFetchProvider {
-    pub(super) fn new(endpoint: &str, api_key_env: &str) -> anyhow::Result<Self> {
-        let endpoint = Url::parse(endpoint)
-            .with_context(|| format!("invalid OpenAI Responses endpoint: {endpoint}"))?;
+    pub(super) fn new(api_key_env: &str) -> anyhow::Result<Self> {
+        let endpoint = Url::parse(OPENAI_RESPONSES_ENDPOINT)
+            .expect("built-in OpenAI Responses endpoint is valid");
         let bearer_token = std::env::var(api_key_env)
             .with_context(|| format!("environment variable {api_key_env} is not set"))?;
         let bearer_token = bearer_token.trim().to_string();
@@ -29,7 +26,7 @@ impl OpenAiResponsesFetchProvider {
             bail!("environment variable {api_key_env} is empty");
         }
         Ok(Self::with_client(
-            http_client(Duration::from_secs(20 * 60)),
+            responses_http_client(),
             endpoint,
             bearer_token,
         ))
@@ -45,8 +42,8 @@ impl OpenAiResponsesFetchProvider {
 
     async fn execute(
         &self,
-        request: FetchProviderRequest,
-    ) -> Result<FetchProviderStream, FetchProviderError> {
+        request: PreparedFetchRequest,
+    ) -> Result<FetchProviderResponse, FetchProviderError> {
         execute_responses_request(
             &self.client,
             self.endpoint.clone(),
@@ -60,7 +57,11 @@ impl OpenAiResponsesFetchProvider {
 }
 
 impl FetchProvider for OpenAiResponsesFetchProvider {
-    fn run(&self, request: FetchProviderRequest) -> FetchProviderFuture<'_> {
+    fn execution_environment(&self) -> hellas_rpc::ContentId {
+        hellas_rpc::FetchEnvironment::OpenAiResponses.manifest_id()
+    }
+
+    fn run(&self, request: PreparedFetchRequest) -> FetchProviderFuture<'_> {
         Box::pin(async move { self.execute(request).await })
     }
 }
@@ -140,17 +141,18 @@ data: {"type":"response.completed","response":{"id":"resp_up","object":"response
         InputCommitment::from_digest(Digest::from_bytes([7; 32]))
     }
 
-    fn request(body: &[u8]) -> FetchProviderRequest {
-        FetchProviderRequest::new(
+    fn request(body: &[u8]) -> PreparedFetchRequest {
+        let call = hellas_executor::FetchCall::new(
             "openai",
             "responses",
             JsonBytes::new(body.to_vec()),
             test_commitment(),
-        )
+        );
+        PreparedFetchRequest::new(&call, call.body.clone())
     }
 
     async fn collect(provider: &OpenAiResponsesFetchProvider, body: &[u8]) -> Vec<Vec<u8>> {
-        let mut stream = provider.run(request(body)).await.unwrap();
+        let mut stream = provider.run(request(body)).await.unwrap().stream;
         let mut output = Vec::new();
         while let Some(chunk) = stream.next().await {
             output.push(chunk.unwrap());

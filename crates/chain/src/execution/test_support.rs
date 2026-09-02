@@ -35,7 +35,17 @@ pub(crate) struct ConsensusFixture {
 }
 
 pub(crate) fn consensus_fixture(seed: u64) -> ConsensusFixture {
-    let private_keys = (0..4)
+    consensus_fixture_of(seed, 4)
+}
+
+/// The same committee, at a caller-chosen size.
+///
+/// The count is a parameter because the shipped devnet document names
+/// six validators and the suites written before it named four; a
+/// fixture that could only be four would make "the shipped validator
+/// count" untestable.
+pub(crate) fn consensus_fixture_of(seed: u64, validators: u64) -> ConsensusFixture {
+    let private_keys = (0..validators)
         .map(|offset| ed25519::PrivateKey::from_seed(seed + offset))
         .collect::<Vec<_>>();
     let leaders = private_keys
@@ -255,7 +265,8 @@ pub(crate) fn kernel_fixture_at(
         ),
         outputs.clone(),
     );
-    let timeout_close = Tx::timeout_close(edge, &terms);
+    let timeout_close =
+        Tx::timeout_close(edge, &terms).expect("basic terms commit a timeout payout");
 
     Ok(KernelFixture {
         allocations: vec![(maker, 40), (taker, 60)],

@@ -8,22 +8,29 @@
 
 mod auth;
 mod funding;
+mod open;
 mod payout;
 mod proof;
+mod work;
 
 use hellas_xet::SingleChunkHasher;
 
 pub use self::{
     auth::{Auth, WebAuthnAssertion, WebAuthnData},
     funding::Funding,
+    open::{OpenFunding, OpenProjection, open_projection},
     payout::Payout,
-    proof::{CloseKind, CloseKindSet, Proof, Seal},
+    proof::{CloseKind, CloseKindSet, PaymentContestCommitment, Proof},
+    work::check_response,
 };
 
+use self::open::{
+    check_timeout_payout, check_work_profile_open, open_cost, open_debits, requires_native_auth,
+};
 use crate::{
     canonical::{
         Decode, DecodeError, ENVELOPE_SIZE, Encode, Writer, decode_envelope, decode_field,
-        encode_envelope, tag,
+        encode_envelope, peek_envelope_tag, tag,
     },
     consts::{MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS},
     context::{Context, Cost},
@@ -31,15 +38,18 @@ use crate::{
     event::Change,
     list::List,
     network::NetworkId,
-    object::{Coin, Edge},
+    object::Coin,
     primitive::{CoinId, EdgeId, PayloadHash, TermsHash},
+    registry::{RegistryDiff, RegistryMutation},
     store::Batch,
-    terms::Terms,
-    verifier::{SealPublicInputs, SealVerifier, SigVerifier},
+    terms::{Terms, TermsProfile},
+    verifier::SigVerifier,
+    work::{PaymentCloseResponse, PaymentCloseStart, work_payment_close_cost},
 };
 
 const OPEN_TAG: u8 = 0;
 const CLOSE_TAG: u8 = 1;
+const MOVE_TAG: u8 = 2;
 
 type PartyCoins = List<CoinId, MAX_PARTY_INPUTS>;
 type OpenCoins = List<(CoinId, Coin), MAX_EDGE_INPUTS>;
@@ -80,6 +90,99 @@ pub enum Tx {
         /// Coin payouts produced by the close.
         outputs: Payouts,
     },
+
+    /// Advance the consensus state of a live edge without consuming it.
+    ///
+    /// The third shape, and the one that owns no coin: a move settles
+    /// nothing and produces nothing spendable. It stages the registry
+    /// state a later close reads — which is why it announces no public
+    /// event, and why the whole of it is bounded by the registry diff a
+    /// single operation may write.
+    Move {
+        /// The action this move performs.
+        action: Move,
+    },
+}
+
+/// One action under [`Tx::Move`].
+///
+/// Dispatched on the nested envelope tag rather than on a variant byte:
+/// each action body is already a complete tagged composite, and a second
+/// discriminant beside its tag would be a redundant encoding with two
+/// ways to disagree.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "a close start carries the revealed payment terms inline in this no-alloc kernel"
+)]
+#[derive(Debug, Clone, Eq, Hash, PartialEq)]
+pub enum Move {
+    /// Opens the bounded payment-close contest.
+    StartPaymentClose(PaymentCloseStart),
+
+    /// The beneficiary's one bounded answer to an open contest.
+    RespondPaymentClose(PaymentCloseResponse),
+}
+
+impl Move {
+    /// Returns the deterministic resource cost of this action.
+    #[must_use]
+    pub const fn cost(&self) -> Cost {
+        match self {
+            Self::StartPaymentClose(start) => start.cost(),
+            Self::RespondPaymentClose(response) => response.cost(),
+        }
+    }
+
+    fn apply<B, V>(&self, context: Context, verifier: &V, batch: &B) -> KernelResult<Change>
+    where
+        B: Batch,
+        V: SigVerifier + ?Sized,
+    {
+        match self {
+            Self::StartPaymentClose(start) => work::apply_start(start, context, verifier, batch),
+            Self::RespondPaymentClose(response) => {
+                work::apply_response(response, context, verifier, batch)
+            }
+        }
+    }
+}
+
+impl Encode for Move {
+    const MAX_ENCODED_SIZE: usize = {
+        let start = PaymentCloseStart::MAX_ENCODED_SIZE;
+        let response = PaymentCloseResponse::MAX_ENCODED_SIZE;
+        if start > response { start } else { response }
+    };
+
+    fn encoded_size(&self) -> usize {
+        match self {
+            Self::StartPaymentClose(start) => start.encoded_size(),
+            Self::RespondPaymentClose(response) => response.encoded_size(),
+        }
+    }
+
+    fn encode_to<W: Writer + ?Sized>(&self, writer: &mut W) {
+        match self {
+            Self::StartPaymentClose(start) => start.encode_to(writer),
+            Self::RespondPaymentClose(response) => response.encode_to(writer),
+        }
+    }
+}
+
+impl Decode for Move {
+    fn decode(buf: &[u8]) -> Result<(Self, usize), DecodeError> {
+        match peek_envelope_tag(buf)? {
+            tag::PAYMENT_CLOSE_START => {
+                let (start, consumed) = PaymentCloseStart::decode(buf)?;
+                Ok((Self::StartPaymentClose(start), consumed))
+            }
+            tag::PAYMENT_CLOSE_RESPONSE => {
+                let (response, consumed) = PaymentCloseResponse::decode(buf)?;
+                Ok((Self::RespondPaymentClose(response), consumed))
+            }
+            tag => Err(DecodeError::InvalidTag { tag }),
+        }
+    }
 }
 
 impl Tx {
@@ -109,6 +212,12 @@ impl Tx {
         }
     }
 
+    /// Creates a move transaction.
+    #[must_use]
+    pub const fn move_action(action: Move) -> Self {
+        Self::Move { action }
+    }
+
     /// Creates the unilateral timeout close of `edge` under `terms`:
     /// a `Timeout` proof paying the terms' own committed
     /// `timeout_outputs`.
@@ -116,13 +225,14 @@ impl Tx {
     /// The only close whose payload is fixed at open, so it is the one
     /// close that needs no negotiation and no signature — either party
     /// may submit it once the committed height has passed.
+    ///
+    /// `None` for a terms shape that commits no timeout payout: there
+    /// is no payload to construct, and inventing one (an empty payout
+    /// list, say) would burn the edge's whole value.
     #[must_use]
-    pub fn timeout_close(edge: EdgeId, terms: &Terms) -> Self {
-        Self::close(
-            edge,
-            Proof::timeout(terms.clone()),
-            terms.timeout_outputs().clone(),
-        )
+    pub fn timeout_close(edge: EdgeId, terms: &Terms) -> Option<Self> {
+        let outputs = terms.timeout_outputs()?.clone();
+        Some(Self::close(edge, Proof::timeout(terms.clone()), outputs))
     }
 
     /// Predicts the edge id that [`Tx::open`] would produce for `funding` and
@@ -200,8 +310,9 @@ impl Tx {
     #[must_use]
     pub fn cost(&self) -> Cost {
         match self {
-            Self::Open { funding, .. } => open_cost(funding),
-            Self::Close { proof, outputs, .. } => close_cost(outputs.len(), proof.kind()),
+            Self::Open { funding, terms, .. } => open_cost(funding.len(), terms),
+            Self::Close { proof, outputs, .. } => close_cost(outputs.len(), proof),
+            Self::Move { action } => action.cost(),
         }
     }
 
@@ -213,7 +324,7 @@ impl Tx {
     ) -> KernelResult<Change>
     where
         B: Batch,
-        V: SigVerifier + SealVerifier + ?Sized,
+        V: SigVerifier + ?Sized,
     {
         match self {
             Self::Open {
@@ -229,6 +340,7 @@ impl Tx {
                 proof,
                 outputs,
             } => apply_close(*input, proof, outputs, context, verifier, batch),
+            Self::Move { action } => action.apply(context, verifier, batch),
         }
     }
 }
@@ -237,7 +349,10 @@ impl Encode for Tx {
     const MAX_ENCODED_SIZE: usize = {
         let open = Funding::MAX_ENCODED_SIZE + Terms::MAX_ENCODED_SIZE + 2 * Auth::MAX_ENCODED_SIZE;
         let close = EdgeId::MAX_ENCODED_SIZE + Proof::MAX_ENCODED_SIZE + Payouts::MAX_ENCODED_SIZE;
-        let max_body = if open > close { open } else { close };
+        let mut max_body = if open > close { open } else { close };
+        if Move::MAX_ENCODED_SIZE > max_body {
+            max_body = Move::MAX_ENCODED_SIZE;
+        }
         ENVELOPE_SIZE + u8::MAX_ENCODED_SIZE + max_body
     };
 
@@ -261,6 +376,7 @@ impl Encode for Tx {
                     proof,
                     outputs,
                 } => input.encoded_size() + proof.encoded_size() + outputs.encoded_size(),
+                Self::Move { action } => action.encoded_size(),
             }
     }
 
@@ -289,6 +405,10 @@ impl Encode for Tx {
                 proof.encode_to(writer);
                 outputs.encode_to(writer);
             }
+            Self::Move { action } => {
+                MOVE_TAG.encode_to(writer);
+                action.encode_to(writer);
+            }
         }
     }
 }
@@ -311,26 +431,70 @@ impl Decode for Tx {
                 let outputs = decode_field(buf, &mut consumed)?;
                 Ok((Self::close(input, proof, outputs), consumed))
             }
+            MOVE_TAG => {
+                let action = decode_field(buf, &mut consumed)?;
+                Ok((Self::move_action(action), consumed))
+            }
             tag => Err(DecodeError::InvalidTag { tag }),
         }
     }
 }
 
-fn open_cost(funding: &Funding) -> Cost {
-    let inputs = units(funding.len());
-    Cost::new(1, inputs.saturating_add(1), 0)
+/// Slots a tag-4 timeout touches beyond its payouts: the edge it
+/// consumes plus both lease chunks. Every tag-4 timeout reads the lease
+/// — that read is what decides whether the immediate exit is open — so
+/// the price does not depend on what it finds.
+const WORK_BOND_TIMEOUT_EXTRA_SLOTS: u64 = 3;
+
+/// One slot per payout output plus one for the consumed edge — except
+/// for the work-payment exits, whose slot count is fixed by profile.
+///
+/// The close kind is what selects between them, and it can: `Freeze` and
+/// `Adjudicated` are members of exactly one committed close-kind set, so
+/// a proof of either kind names a work-payment edge structurally. The
+/// fixed count is what lets an open commit a capacity every close route
+/// honours.
+fn close_cost(outputs: usize, proof: &Proof) -> Cost {
+    match proof {
+        // Only the timeout's price depends on the profile, and only a
+        // timeout reveals the terms that name one. Every other kind is
+        // priced by its kind alone.
+        Proof::Timeout { terms } => timeout_close_cost(outputs, is_work_bond(terms)),
+        Proof::Mutual { .. } | Proof::Freeze { .. } | Proof::Adjudicated { .. } => {
+            kind_close_cost(outputs, proof.kind())
+        }
+    }
 }
 
-fn open_reserve_cost() -> Cost {
-    // Reserve covers the worst-case close: the close kind with the most
-    // proof units, applied at the maximum payout fanout.
-    close_cost(MAX_EDGE_OUTPUTS, CloseKind::Mutual)
+/// True when `terms` are a tag-4 work bond, whose timeout reads lease
+/// state no other shape has.
+const fn is_work_bond(terms: &Terms) -> bool {
+    matches!(terms.profile(), TermsProfile::WorkStakeBond(_))
 }
 
-/// One slot per payout output plus one for the consumed edge.
-fn close_cost(outputs: usize, kind: CloseKind) -> Cost {
-    let outputs = units(outputs);
-    Cost::new(1, outputs.saturating_add(1), kind.proofs())
+/// A timeout's slots: its payouts, the edge it consumes, and — for a
+/// tag-4 bond — both chunks of the lease it has to read before it can
+/// know which height rule governs it.
+fn timeout_close_cost(outputs: usize, work_bond: bool) -> Cost {
+    let extra = if work_bond {
+        WORK_BOND_TIMEOUT_EXTRA_SLOTS
+    } else {
+        1
+    };
+    Cost::new(
+        1,
+        units(outputs).saturating_add(extra),
+        CloseKind::Timeout.proofs(),
+    )
+}
+
+fn kind_close_cost(outputs: usize, kind: CloseKind) -> Cost {
+    match kind {
+        CloseKind::Freeze | CloseKind::Adjudicated => work_payment_close_cost(kind),
+        CloseKind::Mutual | CloseKind::Timeout => {
+            Cost::new(1, units(outputs).saturating_add(1), kind.proofs())
+        }
+    }
 }
 
 fn apply_open<B, V>(
@@ -364,25 +528,27 @@ where
     // cheaply on owner-match or insufficient funding to also pay for
     // crypto.
     check_funding_ownership(output, &coins, funding.maker_len(), parties)?;
-    let open_fee = context
-        .fee(open_cost(funding))
-        .ok_or_else(|| invalid_open(output, InvalidOpenReason::FeeOverflow))?;
-    let lifetime_fee =
-        open_lifetime_fee(context, terms).map_err(|reason| invalid_open(output, reason))?;
-    let reserve = context
-        .fee(open_reserve_cost())
-        .ok_or_else(|| invalid_open(output, InvalidOpenReason::ReserveOverflow))?;
-    let edge = Edge::open(
-        &coins,
-        parties,
-        terms.hash(),
-        (open_fee, lifetime_fee, reserve, context.fees()),
-        terms.timeout(),
-        terms.allowed_closes(),
+    // The same arithmetic `open_projection` performs for an endpoint
+    // holding no store, and the only implementation of it.
+    let debits = open_debits(
+        context.block_height(),
+        context.fees(),
+        funding.len(),
+        coins.checked_sum(|(_, coin)| coin.value()),
+        terms,
     )
     .map_err(|reason| invalid_open(output, reason))?;
-    check_open_terms(output, &edge, terms)?;
-    check_stake_bond_open(output, &edge, terms)?;
+    let edge = debits.edge;
+    check_timeout_payout(&debits, terms).map_err(|reason| invalid_open(output, reason))?;
+    if requires_native_auth(&terms.profile()) {
+        check_native_open_auth(output, maker_auth, taker_auth)?;
+    }
+    check_work_profile_open(&edge, !funding.taker().is_empty(), terms)
+        .map_err(|reason| invalid_open(output, reason))?;
+    // Before the verifier, like every other structural check: a payment
+    // naming a bond that is absent, wrong, or already leased must not
+    // also pay for signature verification.
+    let registry = work::open_bond_lease(output, terms, context, batch)?;
     check_open_auth(
         context.network(),
         output,
@@ -392,49 +558,22 @@ where
         taker_auth,
         verifier,
     )?;
-    Ok(Change::open(&coins, (output, edge)))
+    // One `Change`, so the edge and the lease it takes out commit or
+    // fail together. A block that persisted the payment edge without
+    // its lease would have created exactly the unbonded channel this
+    // path exists to refuse.
+    Ok(Change::open(&coins, (output, edge)).with_registry(&registry))
 }
 
-/// Stake-bond opens additionally commit the slash arithmetic. The stake
-/// must be the value this open actually locks, and the award must be
-/// positive, within the stake, and at least `max_job_price +
-/// max_dispute_cost` — otherwise a later slash could not reimburse the
-/// client for the worst job this bond admits.
-fn check_stake_bond_open(output: EdgeId, edge: &Edge, terms: &Terms) -> KernelResult<()> {
-    let Some(bond) = terms.as_stake_bond() else {
-        return Ok(());
-    };
-    if bond.stake != edge.value() {
-        return Err(invalid_open(output, InvalidOpenReason::StakeMismatch));
+/// Work profiles admit native keys only. Their later moves are signed
+/// with the parties' own secp256k1 keys, so an open authorized by a
+/// passkey would commit a channel neither party could operate.
+const fn check_native_open_auth(output: EdgeId, maker: &Auth, taker: &Auth) -> KernelResult<()> {
+    if maker.is_native() && taker.is_native() {
+        Ok(())
+    } else {
+        Err(invalid_open(output, InvalidOpenReason::WorkAuthNotNative))
     }
-    if bond.award == 0 || bond.award > bond.stake {
-        return Err(invalid_open(output, InvalidOpenReason::AwardOutOfRange));
-    }
-    // A party-controlled treasury would collapse the slash penalty from
-    // S to A: the provider would recover S − A through its own key.
-    if bond.treasury == bond.parties.maker() || bond.treasury == bond.parties.taker() {
-        return Err(invalid_open(output, InvalidOpenReason::TreasuryIsParty));
-    }
-    // A zero job-price cap covers no job (p_j ≥ 1) and would let the
-    // award floor degenerate to A = max_dispute_cost, breaking the
-    // strict dispute incentive A > C_disp.
-    if bond.max_job_price == 0 {
-        return Err(invalid_open(output, InvalidOpenReason::JobPriceCapZero));
-    }
-    // A zero challenge margin leaves no block between an honest job's
-    // terminal deadline and the bond timeout for a challenge to land,
-    // so no job could ever be covered (`covered_by` is unsatisfiable).
-    if bond.challenge_margin == 0 {
-        return Err(invalid_open(output, InvalidOpenReason::ChallengeMarginZero));
-    }
-    let floor = bond
-        .max_job_price
-        .checked_add(bond.max_dispute_cost)
-        .ok_or_else(|| invalid_open(output, InvalidOpenReason::AwardFloorOverflow))?;
-    if bond.award < floor {
-        return Err(invalid_open(output, InvalidOpenReason::AwardBelowFloor));
-    }
-    Ok(())
 }
 
 /// Every coin in `funding.maker` must be owned by `parties.maker()`;
@@ -458,41 +597,6 @@ fn check_funding_ownership(
         }
     }
     Ok(())
-}
-
-/// Timeout-vs-height rejection happens earlier, in [`open_lifetime_fee`]:
-/// a non-future timeout cannot price a lifetime fee. By the time this
-/// runs, `terms.timeout() > context.block_height()` already holds.
-fn check_open_terms(output: EdgeId, edge: &Edge, terms: &Terms) -> KernelResult<()> {
-    let Some(timeout_value) = payout_total(terms.timeout_outputs()) else {
-        return Err(invalid_open(output, InvalidOpenReason::TermsPayoutOverflow));
-    };
-    let timeout_cost = close_cost(terms.timeout_outputs().len(), CloseKind::Timeout);
-    let Some(expected_timeout_value) = edge.close_value(timeout_cost) else {
-        return Err(invalid_open(output, InvalidOpenReason::ReserveOverflow));
-    };
-    if timeout_value != expected_timeout_value {
-        return Err(invalid_open(output, InvalidOpenReason::TermsValueMismatch));
-    }
-    Ok(())
-}
-
-fn open_lifetime_fee(context: Context, terms: &Terms) -> Result<u64, InvalidOpenReason> {
-    let Some(blocks) = terms
-        .timeout()
-        .get()
-        .checked_sub(context.block_height().get())
-    else {
-        return Err(InvalidOpenReason::TimeoutNotFuture);
-    };
-    if blocks == 0 {
-        return Err(InvalidOpenReason::TimeoutNotFuture);
-    }
-    context
-        .fees()
-        .lifetime()
-        .checked_mul(blocks)
-        .ok_or(InvalidOpenReason::LifetimeFeeOverflow)
 }
 
 fn check_open_auth<V: SigVerifier + ?Sized>(
@@ -524,7 +628,7 @@ fn apply_close<B, V>(
 ) -> KernelResult<Change>
 where
     B: Batch,
-    V: SigVerifier + SealVerifier + ?Sized,
+    V: SigVerifier + ?Sized,
 {
     check_close_outputs(input, outputs, batch)?;
 
@@ -538,34 +642,67 @@ where
     // Cheap structural checks first: output freshness and value conservation.
     // Close has no marginal monetary fee: the reserve was committed when the
     // edge opened, while `Tx::cost()` still counts close resources for block
-    // admission. Verifier comes last because real `SealVerifier` impls may
-    // resolve and check expensive ZK artifacts, and we don't want to pay for
-    // that on closes that fail trivial checks.
-    edge.closes(&coins, close_cost(outputs.len(), proof.kind()))
+    // admission. Signature verification comes last so a close that fails a
+    // trivial check never pays for it.
+    let total = edge
+        .closes(&coins, close_cost(outputs.len(), proof))
         .map_err(|reason| invalid_close(input, reason))?;
-    check_proof(input, &edge, outputs, proof, context, verifier)
+    let subject = work::CloseSubject {
+        input,
+        edge: &edge,
+        total,
+        outputs,
+    };
+    let staged = check_proof(subject, proof, context, verifier, batch)
         .map_err(|reason| ApplyError::InvalidProof { input, reason })?;
 
-    Ok(Change::close((input, edge), &coins))
+    // Every close that touches registry state retires state belonging
+    // to the edge it just consumed: the work-payment exits retire the
+    // contest they settled, and a leased bond's timeout retires the
+    // lease. Anything left behind would be a record about an edge that
+    // no longer exists.
+    let mut registry = RegistryDiff::empty();
+    for mutation in staged.into_iter().flatten() {
+        registry
+            .push(mutation)
+            .map_err(|reason| ApplyError::RegistryDiffRejected { reason })?;
+    }
+    Ok(Change::close((input, edge), &coins).with_registry(&registry))
 }
 
-fn payout_total<const N: usize>(outputs: &List<Payout, N>) -> Option<u64> {
-    outputs.checked_sum(|output| output.value())
-}
+/// Registry writes one close stages.
+///
+/// Two is the widest any close in this kernel makes: a leased tag-4
+/// bond's timeout deletes both chunks of the lease. The work-payment
+/// exits stage one, and the rest stage none.
+type StagedCloseRegistry = [Option<RegistryMutation>; 2];
 
-// Timeout is checked structurally because none of its rules — terms-hash
-// binding, height guard, payout shape — need cryptography.
-fn check_proof<V>(
-    input: EdgeId,
-    edge: &Edge,
-    outputs: &Payouts,
+/// Checks the close witness and returns the registry slots the close
+/// writes, if it writes any.
+///
+/// Timeout is checked structurally because none of its rules — terms-hash
+/// binding, height guard, payout shape — need cryptography. It does read
+/// the staged batch for one profile: a tag-4 bond's height rule is
+/// decided by whether a lease exists. The two work-payment kinds read it
+/// too — their payout is derived from the contest record, not carried by
+/// the transaction.
+fn check_proof<B, V>(
+    close: work::CloseSubject<'_>,
     proof: &Proof,
     context: Context,
     verifier: &V,
-) -> Result<(), InvalidProofReason>
+    batch: &B,
+) -> Result<StagedCloseRegistry, InvalidProofReason>
 where
-    V: SigVerifier + SealVerifier + ?Sized,
+    B: Batch,
+    V: SigVerifier + ?Sized,
 {
+    let work::CloseSubject {
+        input,
+        edge,
+        outputs,
+        ..
+    } = close;
     match proof {
         Proof::Mutual { maker, taker } => {
             if context.block_height() >= edge.timeout() {
@@ -582,7 +719,7 @@ where
             if verifier.verify_auth(maker, parties.maker(), hash)
                 && verifier.verify_auth(taker, parties.taker(), hash)
             {
-                Ok(())
+                Ok(NO_STAGED_REGISTRY)
             } else {
                 Err(InvalidProofReason::BadSignature)
             }
@@ -591,64 +728,79 @@ where
             if terms.hash() != edge.terms() {
                 return Err(InvalidProofReason::TermsMismatch);
             }
-            if context.block_height() < edge.timeout() {
+            // Only a tag-4 bond has lease state, so only a tag-4 bond
+            // pays to read it. Both slots are consulted, and anything
+            // that is not exactly a whole lease or exactly nothing is a
+            // rejection: reading a half-written record as "unleased"
+            // would open the immediate exit under a live channel's
+            // recourse.
+            let lease = if is_work_bond(terms) {
+                crate::lease::read_bond_lease(batch, context.network(), input)
+                    .map_err(|fault| InvalidProofReason::BondLeaseFault { fault })?
+            } else {
+                None
+            };
+            // An unleased bond is the one shape whose timeout does not
+            // wait. Nobody holds recourse against it, so there is
+            // nothing for the horizon to protect — and consuming it is
+            // what makes a delayed payment open fail its live-bond
+            // check instead of leasing stake the provider has already
+            // given up on. Every other shape, this one leased and every
+            // edge that is not a tag-4 bond at all, waits.
+            if !(is_work_bond(terms) && lease.is_none()) && context.block_height() < edge.timeout()
+            {
                 return Err(InvalidProofReason::TimeoutNotReached);
             }
-            if outputs != terms.timeout_outputs() {
+            // Shapes with no committed timeout payout do not admit this
+            // close at all, so this is unreachable through a live edge;
+            // it stays a rejection rather than a payout of the caller's
+            // choosing.
+            if terms.timeout_outputs() != Some(outputs) {
                 return Err(InvalidProofReason::PayoutMismatch);
             }
-            Ok(())
+            // A leased bond's timeout takes the lease with it. The
+            // channel it insured keeps its own exits — a payment edge
+            // outlives the admission horizon — but nothing may still be
+            // reached through a bond that no longer exists.
+            Ok(lease.map_or(NO_STAGED_REGISTRY, |_| {
+                crate::lease::delete_mutations(context.network(), input).map(Some)
+            }))
         }
-        Proof::Violation { terms, seal } => {
-            let terms_hash = terms.hash();
-            if terms_hash != edge.terms() {
-                return Err(InvalidProofReason::TermsMismatch);
-            }
-            if context.block_height() >= edge.timeout() {
-                return Err(InvalidProofReason::ProofExpired);
-            }
-            check_violation_payouts(terms, outputs)?;
-            let public = SealPublicInputs {
-                network: context.network(),
-                edge_id: input,
-                terms,
-                payouts: outputs,
-            };
-            if verifier.verify_seal(*seal, &public) {
-                Ok(())
-            } else {
-                Err(InvalidProofReason::BadSeal)
-            }
+        // Neither work-payment exit expires at the admission horizon. That
+        // horizon buys admission and rent, not a refund, and a channel
+        // that stopped being settleable once it stopped admitting jobs
+        // would strand every amount already earned against it.
+        Proof::Freeze {
+            earned,
+            valid_from_height,
+            valid_through_height,
+            maker,
+            taker,
+        } => work::check_freeze(
+            close,
+            (
+                *earned,
+                (*valid_from_height, *valid_through_height),
+                *maker,
+                *taker,
+            ),
+            context,
+            verifier,
+            batch,
+        )
+        .map(one_staged),
+        Proof::Adjudicated { contest_commitment } => {
+            work::check_adjudicated(close, *contest_commitment, context, batch).map(one_staged)
         }
     }
 }
 
-/// A stake-bond violation pays out exactly `[(client, award + surplus),
-/// (treasury, stake − award)]`, where client = the bond's taker. The
-/// routing is enforced here, structurally, from the terms revealed by
-/// the proof — the seal verifier only decides whether the fraud
-/// artifact is genuine, and can never redirect the payout. Output 0's
-/// value follows from conservation (`Edge::closes` pins the total to
-/// `stake + surplus`), so checking output 1's exact value pins both.
-fn check_violation_payouts(terms: &Terms, outputs: &Payouts) -> Result<(), InvalidProofReason> {
-    let Some(bond) = terms.as_stake_bond() else {
-        return Ok(());
-    };
-    let [client, treasury] = outputs.as_slice() else {
-        return Err(InvalidProofReason::PayoutMismatch);
-    };
-    // Open-time checks guarantee award ≤ stake; a violated subtraction
-    // here means the terms did not pass this kernel's open path.
-    let Some(remainder) = bond.stake.checked_sub(bond.award) else {
-        return Err(InvalidProofReason::PayoutMismatch);
-    };
-    if client.owner() != bond.parties.taker()
-        || treasury.owner() != bond.treasury
-        || treasury.value() != remainder
-    {
-        return Err(InvalidProofReason::PayoutMismatch);
-    }
-    Ok(())
+/// A close that stages nothing.
+const NO_STAGED_REGISTRY: StagedCloseRegistry = [None, None];
+
+/// Widens the one mutation a work-payment exit stages, or none.
+const fn one_staged(mutation: Option<RegistryMutation>) -> StagedCloseRegistry {
+    [mutation, None]
 }
 
 fn open_inputs(funding: &Funding) -> List<CoinId, MAX_EDGE_INPUTS> {
@@ -722,21 +874,85 @@ fn duplicate<T: Copy + Eq>(items: &[T]) -> Option<T> {
 
 #[cfg(test)]
 mod tests {
+    use super::open::open_reserve_cost;
     use super::*;
+    use crate::{primitive::Key, terms::WorkStakeBondTerms};
 
-    /// `open_reserve_cost` assumes `Mutual` at max fanout is the most
-    /// expensive close. If a future `CloseKind` breaks that, already-open
-    /// edges become uncloseable (`ReserveTooSmall`); fail here instead.
+    /// A profile's reserve has to cover every close its *own* set
+    /// admits, at every fanout. A kind an edge can admit but its reserve
+    /// cannot pay for is a stranded edge (`ReserveTooSmall`); fail here
+    /// instead.
+    ///
+    /// Enumerated from [`CloseKind::ALL`] against each profile's set
+    /// rather than from a list written here: a kind added to a set
+    /// without being priced is exactly the kind that would strand one.
+    /// The `work_bond` flag is carried alongside the set because one
+    /// kind — `Timeout` — costs a different number of slots on a tag-4
+    /// bond than on any other shape, and a reserve checked against the
+    /// cheaper spelling would pass while the edge stranded.
     #[test]
-    fn reserve_covers_every_close_kind_at_every_fanout() {
-        let reserve = open_reserve_cost();
-        for kind in [CloseKind::Mutual, CloseKind::Timeout, CloseKind::Violation] {
-            for outputs in 0..=MAX_EDGE_OUTPUTS {
-                assert!(
-                    close_cost(outputs, kind).fits(reserve),
-                    "close_cost({outputs}, {kind:?}) exceeds the open-time reserve",
-                );
+    fn every_profile_reserve_covers_its_own_close_set_at_every_fanout() {
+        let profiles = [
+            (
+                CloseKindSet::BASIC,
+                kind_close_cost(MAX_EDGE_OUTPUTS, CloseKind::Mutual),
+                false,
+            ),
+            (
+                CloseKindSet::WORK_STAKE_BOND,
+                open_reserve_cost(&work_bond_terms()),
+                true,
+            ),
+            (
+                CloseKindSet::WORK_PAYMENT,
+                crate::work::work_payment_reserve_cost(),
+                false,
+            ),
+        ];
+
+        for (set, reserve, work_bond) in profiles {
+            for kind in CloseKind::ALL {
+                if !set.contains(kind) {
+                    continue;
+                }
+                for outputs in 0..=MAX_EDGE_OUTPUTS {
+                    let cost = if matches!(kind, CloseKind::Timeout) {
+                        timeout_close_cost(outputs, work_bond)
+                    } else {
+                        kind_close_cost(outputs, kind)
+                    };
+                    assert!(
+                        cost.fits(reserve),
+                        "close_cost({outputs}, {kind:?}) exceeds the {set:?} reserve",
+                    );
+                }
             }
         }
+    }
+
+    /// Basic keeps the generic maximum. The two work profiles each
+    /// reserve their own — the payment its fixed four-slot exits, the
+    /// bond its lease-reading timeout.
+    #[test]
+    fn each_profile_reserves_its_own_worst_close() {
+        let generic = kind_close_cost(MAX_EDGE_OUTPUTS, CloseKind::Mutual);
+        assert_eq!(generic, Cost::new(1, 5, 2));
+        assert_eq!(open_reserve_cost(&work_bond_terms()), Cost::new(1, 7, 2));
+        assert_eq!(crate::work::work_payment_reserve_cost(), Cost::new(1, 4, 2));
+    }
+
+    /// A tag-4 bond, in the least interesting shape that is one: these
+    /// tests read only its profile, and the reserve rule they check is
+    /// the profile's, not this bond's.
+    fn work_bond_terms() -> Terms {
+        Terms::work_stake_bond(WorkStakeBondTerms {
+            parties: crate::object::Parties::new(
+                Key::from_bytes([1; Key::LENGTH]),
+                Key::from_bytes([2; Key::LENGTH]),
+            ),
+            timeout: crate::context::BlockHeight::new(10),
+            timeout_outputs: List::take([Payout::default(); MAX_EDGE_OUTPUTS], 0),
+            max_job_price: 1,
+        })
     }
 }

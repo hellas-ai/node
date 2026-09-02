@@ -220,6 +220,13 @@ impl State {
     /// holds — so the pair of maps *is* the kind table. A third map
     /// maintained alongside them adds no information and one more way
     /// for the three to fall out of step.
+    ///
+    /// This index answers "what does this owner hold", and registry
+    /// chunks have no owner, so it never stores one and this never
+    /// returns [`ObjectKind::RegistryChunk`]. Callers still name that
+    /// kind explicitly rather than folding it into a wildcard, so
+    /// indexing a further kind later is a compile error here instead of
+    /// a silent "no such object".
     fn kind_of(&self, id: &ObjectId) -> Option<ObjectKind> {
         if self.coins.contains_key(id) {
             Some(ObjectKind::Coin)
@@ -235,11 +242,13 @@ impl State {
             return Ok(Some(*coin));
         }
         match self.kind_of(id) {
-            Some(actual @ ObjectKind::Edge) => Err(OwnerIndexError::WrongObjectKind {
-                id: *id,
-                expected: ObjectKind::Coin,
-                actual,
-            }),
+            Some(actual @ (ObjectKind::Edge | ObjectKind::RegistryChunk)) => {
+                Err(OwnerIndexError::WrongObjectKind {
+                    id: *id,
+                    expected: ObjectKind::Coin,
+                    actual,
+                })
+            }
             Some(ObjectKind::Coin) | None => Ok(None),
         }
     }
@@ -332,6 +341,11 @@ impl State {
                 }
                 Ok(())
             }
+            // A move owns nothing. It consumes no coin, produces no
+            // coin, and leaves the edge it addresses exactly where it
+            // was — the state it writes is registry state, which this
+            // index does not project.
+            hellas_kernel::Tx::Move { .. } => Ok(()),
         }
     }
 
@@ -508,11 +522,13 @@ impl State {
             Some(edge) => edge,
             None => {
                 return match self.kind_of(id) {
-                    Some(actual @ ObjectKind::Coin) => Err(OwnerIndexError::WrongObjectKind {
-                        id: *id,
-                        expected: ObjectKind::Edge,
-                        actual,
-                    }),
+                    Some(actual @ (ObjectKind::Coin | ObjectKind::RegistryChunk)) => {
+                        Err(OwnerIndexError::WrongObjectKind {
+                            id: *id,
+                            expected: ObjectKind::Edge,
+                            actual,
+                        })
+                    }
                     Some(ObjectKind::Edge) | None => {
                         Err(OwnerIndexError::ObjectNotFound { id: *id })
                     }
@@ -556,7 +572,7 @@ mod tests {
     use commonware_utils::non_empty_range;
     use hellas_kernel::SoftPasskey;
     use hellas_kernel::{
-        Auth, CloseKind, List, MAX_EDGE_OUTPUTS, Parties, Payout, Proof, Terms, Tx,
+        Auth, CloseKind, List, MAX_EDGE_OUTPUTS, Parties, Payout, Proof, ProtocolCode, Terms, Tx,
     };
 
     fn block(parent: &HellasBlock, txs: Vec<Transaction>) -> HellasBlock {
@@ -766,7 +782,7 @@ mod tests {
         *payout_values.get_mut(1).expect("second payout slot") = Payout::new(party, 60);
         let outputs = List::take(payout_values, 2);
         let terms = Terms::basic(
-            template.terms.protocol(),
+            ProtocolCode::new(1),
             Parties::new(party, party),
             template.terms.timeout(),
             outputs.clone(),

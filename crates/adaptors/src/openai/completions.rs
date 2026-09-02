@@ -1,10 +1,12 @@
 use serde_json::{Value as JsonValue, json};
 
+use super::{finish_reason_json, usage_json};
+
 use crate::{
     AdaptorError, AdaptorResult, CanonicalExecution, ExecutionRequest, ExecutionResult, Input,
     ModelRef, OutputEvent, OutputItem, RawRequest, RenderContext, StopReason, TextChannel,
     WireAdaptor, WireEventData, WireResponse, WireStreamEvent,
-    json::{json_to_wire_string, optional_bool, optional_u32, provenance_json, required_string},
+    json::{attach_hellas, json_to_wire_string, optional_bool, optional_u32, required_string},
 };
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -122,8 +124,9 @@ impl WireAdaptor for OpenAiCompletionsAdaptor {
             }
             OutputEvent::ToolCallStart(_)
             | OutputEvent::ToolCallArgumentsDelta(_)
-            | OutputEvent::ToolCallEnd(_) => Err(AdaptorError::unsupported(
-                "text completions cannot render tool-call deltas",
+            | OutputEvent::ToolCallEnd(_)
+            | OutputEvent::Adaptor(_) => Err(AdaptorError::unsupported(
+                "text completions cannot render tool or adaptor-specific events",
             )),
             OutputEvent::Usage(_) => Ok(Vec::new()),
             OutputEvent::Provenance(provenance) => {
@@ -224,34 +227,6 @@ fn completion_chunk_json(
         }),
         state.provenance.as_ref(),
     )
-}
-
-fn attach_hellas(mut body: JsonValue, provenance: Option<&crate::Provenance>) -> JsonValue {
-    if let Some(hellas) = provenance.and_then(provenance_json) {
-        body["hellas"] = hellas;
-    }
-    body
-}
-
-fn usage_json(usage: crate::Usage) -> JsonValue {
-    let prompt_tokens = usage.input_tokens.unwrap_or(0);
-    let completion_tokens = usage.output_tokens.unwrap_or(0);
-    json!({
-        "prompt_tokens": prompt_tokens,
-        "completion_tokens": completion_tokens,
-        "total_tokens": usage.total_tokens.unwrap_or_else(|| {
-            prompt_tokens.saturating_add(completion_tokens)
-        }),
-    })
-}
-
-fn finish_reason_json(stop_reason: StopReason) -> JsonValue {
-    let value = match stop_reason {
-        StopReason::EndOfText | StopReason::StopSequence | StopReason::Cancelled => "stop",
-        StopReason::MaxOutputTokens => "length",
-        StopReason::ToolCall => "tool_calls",
-    };
-    JsonValue::String(value.to_string())
 }
 
 #[cfg(test)]

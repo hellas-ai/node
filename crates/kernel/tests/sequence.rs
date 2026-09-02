@@ -39,12 +39,12 @@ impl Step {
             5 => Self::Close(EdgeKey::Second, ProofKey::Timeout),
             6 => Self::Close(EdgeKey::First, ProofKey::EarlyTimeout),
             7 => Self::Close(EdgeKey::Second, ProofKey::EarlyTimeout),
-            8 => Self::Close(EdgeKey::First, ProofKey::Violation),
-            9 => Self::Close(EdgeKey::Second, ProofKey::Violation),
-            10 => Self::Close(EdgeKey::First, ProofKey::WrongTerms),
-            11 => Self::Close(EdgeKey::Second, ProofKey::BadSeal),
-            12 => Self::BadPayout(EdgeKey::First),
-            13 => Self::BadPayout(EdgeKey::Second),
+            8 => Self::Close(EdgeKey::First, ProofKey::WrongTerms),
+            9 => Self::Close(EdgeKey::Second, ProofKey::WrongTerms),
+            10 => Self::BadPayout(EdgeKey::First),
+            11 => Self::BadPayout(EdgeKey::Second),
+            12 => Self::Open(EdgeKey::First),
+            13 => Self::Open(EdgeKey::Second),
             14 => Self::Open(EdgeKey::First),
             _ => Self::Open(EdgeKey::Second),
         }
@@ -84,7 +84,16 @@ proptest! {
             if result.is_err() {
                 prop_assert_eq!(state, before);
             }
-            if let Ok(event) = result {
+            if let Ok(outcome) = result {
+                prop_assert!(
+                    outcome.registry().is_empty(),
+                    "{:?} wrote registry state",
+                    step,
+                );
+                let Some(event) = outcome.public_event() else {
+                    prop_assert!(false, "{:?} applied without announcing itself", step);
+                    unreachable!()
+                };
                 assert_event_matches(step, event.kind())?;
             }
             assert_invariants(&state)?;
@@ -133,9 +142,9 @@ fn assert_event_matches(
 
 const fn proof_accepts(proof: ProofKey) -> bool {
     match proof {
-        // FAKE_VERIFIER accepts every placeholder-shaped sig/seal, so
-        // Mutual/Violation pass under both feature configs.
-        ProofKey::Mutual | ProofKey::Timeout | ProofKey::Violation => true,
-        ProofKey::EarlyTimeout | ProofKey::WrongTerms | ProofKey::BadSeal => false,
+        // FAKE_VERIFIER accepts every placeholder-shaped signature, so
+        // Mutual passes under both feature configs.
+        ProofKey::Mutual | ProofKey::Timeout => true,
+        ProofKey::EarlyTimeout | ProofKey::WrongTerms => false,
     }
 }

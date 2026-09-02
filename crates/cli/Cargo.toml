@@ -14,20 +14,38 @@ default = []
 # always present because remote confidential-open supports Apple providers.
 apple-app-attest = []
 
-node = ["dep:hellas-executor"]
+# The node serves paid work, and paid work is a chain: the work config's
+# threshold identity is decoded by consensus's own constructor, and the
+# settlement watcher reads finalized blocks. So `node` reaches
+# `hellas-chain` through the feature graph rather than through a second
+# dependency. `work-watcher` is the adapter that pairs a light client
+# with the block source, the sink and the finalized read a paid endpoint
+# is driven from; without it the runner has a chain and no way to ask it
+# anything.
+node = [
+    "chain",
+    "dep:async-stream",
+    "dep:axum",
+    "dep:hellas-executor",
+    "dep:prometheus-client",
+    "dep:qrcode",
+    "hellas-chain/work-watcher",
+    "hellas-client/work",
+]
+# Token-native remote execution and its local text-presentation boundary.
+# This deliberately does not pull Catena into a client that only dials a node.
+llm = ["dep:hellas-gateway", "dep:hellas-presentation"]
 # HTTP gateway front-end (OpenAI/Anthropic/plain APIs).
-gateway = ["dep:hellas-gateway"]
+gateway = ["llm"]
 evaluate = [
     "node",
     "gateway",
+    "dep:catena-lang",
     "dep:commonware-runtime",
     "hellas-gateway/evaluate",
     "hellas-executor/evaluate",
-    "dep:hellas-models",
+    "dep:hellas-presentation",
 ]
-candle = ["evaluate", "hellas-executor/candle"]
-candle-cuda = ["candle", "hellas-executor/candle-cuda"]
-candle-metal = ["candle", "hellas-executor/candle-metal"]
 chain = [
     "dep:hellas-chain",
     "dep:hellas-kernel",
@@ -56,9 +74,10 @@ libc = "0.2"
 [dependencies]
 
 anyhow = "1"
-async-stream = "0.3"
-axum = "0.8"
+async-stream = { version = "0.3", optional = true }
+axum = { version = "0.8", optional = true }
 base64.workspace = true
+catena-lang = { workspace = true, optional = true }
 clap = { version = "4", features = ["derive"] }
 commonware-runtime = { workspace = true, optional = true }
 futures = "0.3"
@@ -69,17 +88,18 @@ hellas-client = { workspace = true, features = ["iroh"] }
 hellas-executor = { workspace = true, default-features = false, optional = true }
 hellas-gateway = { workspace = true, optional = true }
 hellas-kernel = { workspace = true, default-features = false, optional = true }
-hellas-models = { workspace = true, optional = true }
-hellas-store = { workspace = true }
-hellas-xet = { workspace = true }
+hellas-presentation = { workspace = true, optional = true }
 hellas-rpc = { workspace = true, default-features = false, features = [
     "all-protocols",
+    "work",
 ] }
+hellas-store = { workspace = true }
 hellas-wire = { workspace = true, features = [
     "iroh",
     "discovery-dht",
     "discovery-mdns",
 ] }
+hellas-xet = { workspace = true }
 hex.workspace = true
 iroh = { workspace = true, features = ["tls-ring", "metrics"] }
 iroh-mdns-address-lookup = "0.4"
@@ -89,8 +109,8 @@ iroh-metrics = { version = "1", default-features = false, features = [
 opentelemetry = { workspace = true, optional = true }
 opentelemetry-otlp = { workspace = true, optional = true }
 opentelemetry_sdk = { workspace = true, optional = true }
-prometheus-client = { workspace = true }
-qrcode = { version = "0.14", default-features = false }
+prometheus-client = { workspace = true, optional = true }
+qrcode = { version = "0.14", default-features = false, optional = true }
 rand.workspace = true
 reqwest.workspace = true
 serde.workspace = true
@@ -98,7 +118,7 @@ serde_json.workspace = true
 tempfile = "3"
 thiserror.workspace = true
 tokio.workspace = true
-tokio-stream = { workspace = true }
+toml.workspace = true
 tracing.workspace = true
 tracing-opentelemetry = { workspace = true, optional = true }
 tracing-subscriber.workspace = true
