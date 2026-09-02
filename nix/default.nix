@@ -61,6 +61,39 @@ let
   };
   bufLintCommand = "buf lint --config ${lib.escapeShellArg bufLintConfig}";
 
+  denyConfig = pkgs.writeText "hellas-deny.toml" ''
+    [advisories]
+    ignore = [
+      { id = "RUSTSEC-2024-0436", reason = "Transitive through commonware/gemm; no safe upgrade is available." },
+    ]
+
+    [licenses]
+    allow = [
+      "Apache-2.0",
+      "Apache-2.0 WITH LLVM-exception",
+      "BSD-1-Clause",
+      "BSD-2-Clause",
+      "BSD-3-Clause",
+      "BSL-1.0",
+      "CC0-1.0",
+      "CDLA-Permissive-2.0",
+      "ISC",
+      "MIT",
+      "MIT-0",
+      "MPL-2.0",
+      "Unicode-3.0",
+      "Unlicense",
+      "Zlib",
+    ]
+
+    [bans]
+    multiple-versions = "allow"
+
+    [sources]
+    allow-git = ["https://github.com/commonwarexyz/monorepo"]
+  '';
+  denyCommand = "cargo deny check --config ${denyConfig}";
+
   kernel = import ./kernel.nix {
     inherit
       pkgs
@@ -104,6 +137,7 @@ let
   ci = import ./ci.nix {
     inherit
       bufLintCommand
+      denyCommand
       pkgs
       lib
       rustToolchain

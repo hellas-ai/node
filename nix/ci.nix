@@ -1,5 +1,6 @@
 {
   bufLintCommand,
+  denyCommand,
   pkgs,
   lib,
   rustToolchain,
@@ -27,6 +28,10 @@ let
       pkgs.coreutils
       pkgs.stdenv.cc
     ]
+    # Native build scripts run in this deliberately minimal wrapper too.
+    # Catena's libffi-sys configure step needs the ordinary stdenv shell and
+    # POSIX utilities even though the Rust compiler itself does not.
+    ++ pkgs.stdenv.initialPath
     ++ workspaceNativeBuildInputs;
 
   # CI-gating checks. These surface as `apps.<sys>.check-<name>` for local and
@@ -135,7 +140,7 @@ let
           pkgs.taplo
         ];
     buf = mk "check-buf" bufLintCommand [ pkgs.buf ];
-    deny = mk "check-deny" "cargo deny check" (
+    deny = mk "check-deny" denyCommand (
       (cargoEnv rustToolchain)
       ++ [
         pkgs.cargo-deny
