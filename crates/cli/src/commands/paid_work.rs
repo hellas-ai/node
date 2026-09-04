@@ -13,8 +13,8 @@ use anyhow::{Context as _, bail};
 use clap::{Args, Subcommand};
 use hellas_chain::client::{RemoteLightClient, VerifiedRemoteLightClient};
 use hellas_chain::{
-    ConsensusInfo, ConsensusVerifier, FinalizedBlockQuery, FinalizedWorkView as _,
-    LightClient as _, WorkBlocks, WorkChannelQuery,
+    ConsensusInfo, ConsensusVerifier, FinalizedBlockQuery, FinalizedBlockView,
+    FinalizedWorkView as _, LightClient as _, WorkBlocks, WorkChannelQuery,
 };
 use hellas_client::work::payment::pay_for_result;
 use hellas_client::work::{CollectResultOutcome, collect_result};
@@ -321,13 +321,29 @@ async fn inspect_chain(validators: &[String]) -> CliResult<()> {
             .get_consensus_info()
             .await
             .with_context(|| format!("failed to read consensus info from {url}"))?;
-        let genesis = client
-            .get_finalized_block(FinalizedBlockQuery::Height(0))
+        let first = client
+            .get_finalized_block(FinalizedBlockQuery::Height(1))
             .await
-            .with_context(|| format!("failed to read genesis block from {url}"))?
-            .ok_or_else(|| anyhow::anyhow!("validator {url} has no finalized genesis block"))?;
+            .with_context(|| format!("failed to read finalized block 1 from {url}"))?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "validator {url} has no finalized block 1; genesis cannot be authenticated until block 1 is finalized",
+                )
+            })?;
+        ConsensusVerifier::new(&info)
+            .with_context(|| format!("validator {url} reported an unusable threshold identity"))?
+            .verify_snapshot(&first.snapshot)
+            .with_context(|| format!("validator {url} returned an unauthenticated block 1"))?;
+        let first = FinalizedBlockView::decode(&first)
+            .with_context(|| format!("validator {url} returned malformed finalized block 1"))?;
+        anyhow::ensure!(
+            first.height() == 1,
+            "validator {url} answered the height-1 query with finalized height {}",
+            first.height(),
+        );
+        let genesis: [u8; 32] = first.parent().into();
         match &observed {
-            None => observed = Some((info, genesis.snapshot.payload.into())),
+            None => observed = Some((info, genesis)),
             Some((expected, payload)) => {
                 anyhow::ensure!(
                     info.network_id == expected.network_id
@@ -335,7 +351,7 @@ async fn inspect_chain(validators: &[String]) -> CliResult<()> {
                     "validator {url} reports a different consensus identity",
                 );
                 anyhow::ensure!(
-                    genesis.snapshot.payload == (*payload).into(),
+                    genesis == *payload,
                     "validator {url} reports a different genesis payload",
                 );
             }
@@ -762,15 +778,24 @@ async fn check_genesis(
     config: &WorkConfig,
     chain: &WorkBlocks<VerifiedRemoteLightClient>,
 ) -> CliResult<()> {
-    let genesis = chain
-        .block_at(0)
+    let first = chain
+        .block_at(1)
         .await?
-        .context("configured validator has no finalized genesis block")?;
+        .context(
+            "configured validator has no finalized block 1; genesis cannot be authenticated until block 1 is finalized",
+        )?;
+    check_genesis_payload(
+        config.chain.genesis_payload_digest.as_bytes(),
+        &first.parent,
+    )
+}
+
+fn check_genesis_payload(expected: &[u8; 32], actual: &[u8; 32]) -> CliResult<()> {
     anyhow::ensure!(
-        genesis.payload.as_slice() == config.chain.genesis_payload_digest.as_bytes(),
+        actual == expected,
         "validator genesis payload {} does not match configured {}",
-        hex::encode(genesis.payload),
-        hex::encode(config.chain.genesis_payload_digest.as_bytes()),
+        hex::encode(actual),
+        hex::encode(expected),
     );
     Ok(())
 }
@@ -906,6 +931,19 @@ mod tests {
     fn fixed_hex_names_wrong_widths() {
         let error = fixed_hex::<32>("--bond", "00").unwrap_err().to_string();
         assert!(error.contains("1 bytes; expected 32"), "{error}");
+    }
+
+    #[test]
+    fn genesis_check_compares_the_configured_digest_with_block_ones_parent() {
+        let configured = [0x31; 32];
+        assert!(check_genesis_payload(&configured, &configured).is_ok());
+
+        let observed_parent = [0x32; 32];
+        let error = check_genesis_payload(&configured, &observed_parent)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(&hex::encode(observed_parent)), "{error}");
+        assert!(error.contains(&hex::encode(configured)), "{error}");
     }
 
     #[test]
