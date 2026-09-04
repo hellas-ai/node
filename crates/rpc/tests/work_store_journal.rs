@@ -23,11 +23,11 @@ use hellas_rpc::work_store::journal::{Journal, JournalId, JournalKind};
 /// generation, key.
 const HEADER_BYTES: usize = 65;
 
-/// `hellas.work-journal.v1`, then `05` version, `02` channel, `02`
+/// `hellas.work-journal.v1`, then `06` version, `02` channel, `02`
 /// provider, the eight-byte generation, then the 32-byte key.
 const GOLDEN_HEADER: &str = concat!(
     "68656c6c61732e776f726b2d6a6f75726e616c2e7631",
-    "05",
+    "06",
     "02",
     "02",
     "0000000000000000",
@@ -39,7 +39,7 @@ const GOLDEN_HEADER: &str = concat!(
 const GOLDEN_FRAME: &str = concat!(
     "0000000a",
     "6f6e65207265636f7264",
-    "4607087f3e8fbd8481bde856d457cd51c4110826e0a2ecb8b61085f91ffac1a4",
+    "c954ab65afded981062cd1f8f0cbee864c20ae9c01104104ee7a9081c743b5bd",
 );
 
 fn hex(bytes: &[u8]) -> String {
@@ -80,11 +80,55 @@ fn a_v1_journal_is_refused() {
             error,
             hellas_rpc::work_store::JournalError::OldVersion {
                 found: 1,
-                expected: 5,
+                expected: 6,
                 ..
             }
         ),
         "unexpected error: {error}",
+    );
+}
+
+/// Version 5 journals encode one implicit job and therefore cannot be
+/// replayed as the version 6 format, where every follow-on record names
+/// its job.
+#[test]
+fn a_v5_single_job_journal_is_refused() {
+    let Ok(dir) = tempfile::tempdir() else {
+        panic!("a temporary directory");
+    };
+    let path = dir.path().join("v5.0000000000000000.journal");
+    let id = JournalId {
+        kind: JournalKind::Channel,
+        role: Role::Provider,
+        key: [0x11; 32],
+        generation: 0,
+    };
+    {
+        let Ok((journal, _)) = Journal::open(&path, id) else {
+            panic!("the current journal opens");
+        };
+        drop(journal);
+    }
+    let Ok(mut bytes) = std::fs::read(&path) else {
+        panic!("the current journal reads");
+    };
+    bytes[b"hellas.work-journal.v1".len()] = 5;
+    if let Err(error) = std::fs::write(&path, bytes) {
+        panic!("the old header writes: {error}");
+    }
+    let error = Journal::open(&path, id).expect_err("v5 has no per-record work IDs");
+    let hellas_rpc::work_store::JournalError::OldVersion {
+        found,
+        expected,
+        retirement,
+    } = error
+    else {
+        panic!("unexpected error: {error}");
+    };
+    assert_eq!((found, expected), (5, 6));
+    assert!(
+        retirement.contains("single-job"),
+        "the reason given is v5's own: {retirement}",
     );
 }
 
@@ -164,7 +208,7 @@ fn a_v2_channel_journal_is_refused_not_misread() {
             error,
             hellas_rpc::work_store::JournalError::OldVersion {
                 found: 2,
-                expected: 5,
+                expected: 6,
                 ..
             }
         ),
@@ -248,7 +292,7 @@ fn a_v3_channel_journal_is_refused_for_the_answer_it_cannot_hold() {
     else {
         panic!("unexpected error: {error}");
     };
-    assert_eq!((found, expected), (3, 5));
+    assert_eq!((found, expected), (3, 6));
     assert!(
         retirement.contains("answered contest"),
         "the reason given is v3's own, not v2's: {retirement}",

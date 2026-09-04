@@ -1155,9 +1155,13 @@ const fn retirement(found: u8) -> &'static str {
         3 => {
             "pre-response channel journals cannot record an answered contest, so a fixed answer replays as one never given"
         }
-        _ => {
+        4 => {
             "pre-rotation journals bind no generation, so a predecessor's frames verify in its successor and a retired file opens as the live one"
         }
+        5 => {
+            "single-job journals do not identify follow-on records and cannot be replayed as concurrent-job journals"
+        }
+        _ => "unknown retired journal format",
     }
 }
 
