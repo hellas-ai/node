@@ -17,6 +17,8 @@ pub mod identity;
 #[cfg(feature = "llm")]
 pub mod llm;
 pub mod monitor;
+#[cfg(feature = "node")]
+pub mod paid_work;
 pub mod rpc;
 #[cfg(feature = "node")]
 pub mod serve;

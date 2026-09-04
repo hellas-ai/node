@@ -136,6 +136,7 @@ fn load_command_identity(
             work_config_file: Some(_),
             ..
         } | Commands::Provision { .. }
+            | Commands::PaidWork { .. }
     );
     #[cfg(not(feature = "node"))]
     let settles_paid_work = false;
@@ -632,6 +633,12 @@ enum Commands {
         #[command(subcommand)]
         command: commands::artifact::ArtifactCommand,
     },
+    /// Inspect or run the durable paid-work client path.
+    #[cfg(feature = "node")]
+    PaidWork {
+        #[command(subcommand)]
+        command: commands::paid_work::PaidWorkCommand,
+    },
     /// Inspect and fill the content store
     Store {
         #[command(subcommand)]
@@ -882,6 +889,8 @@ fn validate_identity_options(
             ..
         }
         | Commands::Provision { .. } => true,
+        #[cfg(feature = "node")]
+        Commands::PaidWork { .. } => true,
         _ => false,
     };
     if software_root && reads_existing_identity {
@@ -1323,6 +1332,15 @@ async fn async_main() {
             node_addrs,
         } => commands::rpc::run(node_id, node_addrs, secret_key).await,
         Commands::Artifact { command } => commands::artifact::run(command, secret_key).await,
+        #[cfg(feature = "node")]
+        Commands::PaidWork { command } => {
+            commands::paid_work::run(
+                command,
+                secret_key,
+                identity::settlement_signer(&local_identity),
+            )
+            .await
+        }
         #[cfg(feature = "chain")]
         Commands::Chain { .. } => unreachable!("chain commands handled before identity load"),
         Commands::Store { .. } => unreachable!("store commands handled before identity load"),
