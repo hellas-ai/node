@@ -172,6 +172,12 @@ async fn run_with_store(
             settlement_party = %hex::encode(options.settlement_key.party_key().to_bytes()),
             "loaded the paid-work configuration",
         );
+        if work.unsafe_devnet_admits_assumed_measurements() {
+            warn!(
+                network = %work.chain.network,
+                "UNSAFE DEVNET MODE: assumed paid-work measurements will be admitted",
+            );
+        }
         let duties = work_config::load_paid_work_duties(work)?;
         if duties.admits_paid_work() {
             info!("{}", duties.summary());

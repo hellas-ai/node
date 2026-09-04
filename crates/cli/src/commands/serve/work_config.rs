@@ -47,8 +47,12 @@
 //! flattering bound; it can only report what it saw.
 //!
 //! Every number in the artifact carries `measured` or `assumed`; one
-//! `assumed` field is a node that countersigns no new channel; and no
-//! number is invented to fill a gap. [`load_paid_work_duties`] is how
+//! `assumed` field is a node that countersigns no new channel by default;
+//! and no number is invented to fill a gap. The sole exception is the
+//! explicitly unsafe, exact-network devnet escape hatch used to bootstrap an
+//! isolated demo. It remains a distinct duty variant and an alarming startup
+//! warning, so it cannot be reported as measured evidence.
+//! [`load_paid_work_duties`] is how
 //! the serve path asks which of §4's evidence cases it started in, and
 //! every one of them still answers a contest.
 
@@ -85,6 +89,13 @@ use crate::commands::CliResult;
 /// node can never win, and one naming seven names something this
 /// deployment does not have.
 pub const VALIDATOR_COUNT: usize = 6;
+
+/// The only network on which assumed measurements may be admitted.
+///
+/// This is deliberately the full, shipped network id rather than a suffix or
+/// substring check. A production network whose operator happened to put
+/// "devnet" in its name must not acquire this escape hatch.
+const UNSAFE_ASSUMED_ADMISSION_NETWORK: &str = "hellas-devnet-1";
 
 /// One operator's complete paid-work configuration, loaded and structurally
 /// checked.
@@ -123,6 +134,13 @@ pub struct WorkConfig {
     pub response_alarm_margin_blocks: u64,
     /// The measured artifact this node's admission would rest on.
     pub artifact: Option<ArtifactIdentity>,
+    /// Explicit, devnet-only escape hatch for admitting an artifact with
+    /// `assumed` fields.
+    ///
+    /// The loader refuses this setting on every network except the shipped
+    /// devnet. Missing, changed, malformed, or arithmetically refused
+    /// artifacts remain fail-closed even there.
+    pub unsafe_devnet_admit_assumed_measurements: bool,
 }
 
 /// One bilateral setup route written in the paid-work configuration.
@@ -203,6 +221,12 @@ impl WorkConfig {
         self.artifact.as_ref()
     }
 
+    /// Whether the explicit devnet-only assumed-measurement bypass is armed.
+    #[must_use]
+    pub const fn unsafe_devnet_admits_assumed_measurements(&self) -> bool {
+        self.unsafe_devnet_admit_assumed_measurements
+    }
+
     /// The provider policy this configuration and one read artifact
     /// make together, or the floor's refusal.
     ///
@@ -275,6 +299,9 @@ impl WorkConfig {
         });
         Ok(match artifact.evidence {
             Evidence::Measured => PaidWorkDuties::Admits(evidence),
+            Evidence::Assumed if self.unsafe_devnet_admit_assumed_measurements => {
+                PaidWorkDuties::UnsafeDevnetAdmitsAssumed(evidence)
+            }
             Evidence::Assumed => PaidWorkDuties::Assumed(evidence),
         })
     }
@@ -311,13 +338,14 @@ pub struct ArtifactIdentity {
 /// What one node's evidence lets it do with paid work, decided once at
 /// startup.
 ///
-/// These are §4's four cases, and its rule is what separates them:
+/// These are §4's evidence cases plus one conspicuous demo-only exception,
+/// and its rule is what separates them:
 /// missing, changed or `assumed` evidence disables setup and new work,
 /// and never disables recovery or the close duty. So *every* variant
 /// below is a node that still answers a contest — the close half is
 /// built from a journal and a key and asks for no policy at all
-/// ([`CloseEndpoint`]) — and only [`Self::Admits`] countersigns a new
-/// channel.
+/// ([`CloseEndpoint`]). Only [`Self::Admits`] and the explicit
+/// [`Self::UnsafeDevnetAdmitsAssumed`] exception countersign a new channel.
 ///
 /// [`CloseEndpoint`]: hellas_rpc::work::CloseEndpoint
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -330,6 +358,12 @@ pub enum PaidWorkDuties {
     /// This node countersigns new paid channels over the policy it
     /// makes.
     Admits(Box<MeasuredEvidence>),
+    /// An explicitly unsafe node on the shipped devnet countersigns using an
+    /// artifact that still contains `assumed` fields.
+    ///
+    /// This variant is kept distinct from [`Self::Admits`] so no status or
+    /// operator output can mistake the demo bypass for measured evidence.
+    UnsafeDevnetAdmitsAssumed(Box<MeasuredEvidence>),
     /// The pinned artifact was read and at least one field in it is
     /// `assumed`. The policy is still made, because setup journals and
     /// close descriptors are derived from it, and no payment is ever
@@ -355,8 +389,9 @@ impl PaidWorkDuties {
     /// What a setup endpoint over this evidence will countersign, or
     /// `None` when there is no policy to build one from.
     ///
-    /// [`PaymentAdmission::Admits`] only under a fully measured
-    /// artifact. Under an assumed one the same policy is handed over as
+    /// [`PaymentAdmission::Admits`] under a fully measured artifact, or
+    /// under the separately named unsafe devnet bypass. Under an assumed
+    /// artifact in the normal fail-closed mode the same policy is handed over as
     /// [`PaymentAdmission::Proposes`], which is the admission that holds
     /// a policy, derives close state from it through
     /// [`ProviderChannelPolicy::describe_close`], and countersigns
@@ -376,7 +411,7 @@ impl PaidWorkDuties {
     )]
     pub fn payment_admission(&self) -> Option<PaymentAdmission> {
         match self {
-            Self::Admits(evidence) => {
+            Self::Admits(evidence) | Self::UnsafeDevnetAdmitsAssumed(evidence) => {
                 Some(PaymentAdmission::Admits(Box::new(evidence.policy.clone())))
             }
             Self::Assumed(evidence) => Some(PaymentAdmission::Proposes(Box::new(
@@ -394,7 +429,9 @@ impl PaidWorkDuties {
     )]
     pub const fn evidence(&self) -> Option<&MeasuredEvidence> {
         match self {
-            Self::Admits(evidence) | Self::Assumed(evidence) => Some(evidence),
+            Self::Admits(evidence)
+            | Self::UnsafeDevnetAdmitsAssumed(evidence)
+            | Self::Assumed(evidence) => Some(evidence),
             Self::NotConfigured | Self::NotFound | Self::Changed | Self::Refused(_) => None,
         }
     }
@@ -402,7 +439,7 @@ impl PaidWorkDuties {
     /// Whether this node countersigns new paid channels.
     #[must_use]
     pub const fn admits_paid_work(&self) -> bool {
-        matches!(self, Self::Admits(_))
+        matches!(self, Self::Admits(_) | Self::UnsafeDevnetAdmitsAssumed(_))
     }
 
     /// The one line the operator gets at startup, naming the case.
@@ -411,13 +448,18 @@ impl PaidWorkDuties {
     /// node says is the same thing a test can read back. Every line that
     /// is not the admitting one opens with the same four words, because
     /// that is the fact an operator is looking for, and then says which
-    /// of the four cases produced it.
+    /// evidence case produced it.
     #[must_use]
     pub fn summary(&self) -> String {
         match self {
             Self::Admits(evidence) => format!(
                 "paid admission is on: every field of the pinned artifact is measured, \
                  and its floor needs T={} of the 64-block start span",
+                evidence.floor.t(),
+            ),
+            Self::UnsafeDevnetAdmitsAssumed(evidence) => format!(
+                "UNSAFE DEVNET paid admission is on: the pinned artifact contains assumed \
+                 measurements; its floor needs T={} of the 64-block start span",
                 evidence.floor.t(),
             ),
             Self::Assumed(_) => {
@@ -612,8 +654,8 @@ pub(super) fn validate_work_routes(config: &WorkConfig) -> CliResult<()> {
 /// Reads the artifact a configuration pins, and decides what this node's
 /// evidence lets it do.
 ///
-/// Three of the five answers are answers and not errors, which is §4's
-/// rule rather than a leniency: a node whose artifact is absent, or is
+/// The non-admitting evidence states are answers and not errors, which is
+/// §4's rule rather than a leniency: a node whose artifact is absent, or is
 /// not the pinned one, still owes every open contest a response, and
 /// refusing to start is the one thing that guarantees the response is
 /// never made. So missing and changed evidence turn admission off and
@@ -697,6 +739,10 @@ struct WorkConfigFile {
     response_alarm_margin_blocks: u64,
     #[serde(default)]
     artifact: Option<ArtifactFile>,
+    /// Demo-only escape hatch. It is intentionally long and alarming in the
+    /// operator-owned file, and absent means false.
+    #[serde(default)]
+    unsafe_devnet_admit_assumed_measurements: bool,
 }
 
 impl WorkConfigFile {
@@ -731,6 +777,15 @@ impl WorkConfigFile {
         if self.response_alarm_margin_blocks == 0 {
             bail!("response_alarm_margin_blocks must be greater than zero");
         }
+        if self.unsafe_devnet_admit_assumed_measurements
+            && network.as_str() != UNSAFE_ASSUMED_ADMISSION_NETWORK
+        {
+            bail!(
+                "unsafe_devnet_admit_assumed_measurements may only be enabled for network_id \
+                 {UNSAFE_ASSUMED_ADMISSION_NETWORK:?}; configured network is {:?}",
+                network.as_str(),
+            );
+        }
 
         Ok(WorkConfig {
             chain: ChainCrossCheck {
@@ -750,6 +805,7 @@ impl WorkConfigFile {
             poll: Duration::from_millis(self.poll_ms),
             response_alarm_margin_blocks: self.response_alarm_margin_blocks,
             artifact: self.artifact.map(ArtifactFile::into_identity).transpose()?,
+            unsafe_devnet_admit_assumed_measurements: self.unsafe_devnet_admit_assumed_measurements,
         })
     }
 }
@@ -3001,6 +3057,87 @@ mod tests {
             duties.payment_admission(),
             Some(PaymentAdmission::Proposes(_)),
         ));
+    }
+
+    /// The demo bypass is both explicit and exact-network scoped. Merely
+    /// naming a network that sounds like a devnet must not arm it.
+    #[test]
+    fn unsafe_assumed_admission_is_refused_outside_the_shipped_devnet() {
+        for network in ["hellas-testnet-1", "someone-elses-devnet", "hellas-devnet"] {
+            let mut value = config();
+            value["chain"]["network_id"] = serde_json::json!(network);
+            value["unsafe_devnet_admit_assumed_measurements"] = serde_json::json!(true);
+
+            let error = format!(
+                "{:#}",
+                load(value).expect_err("only the exact shipped devnet may arm the bypass"),
+            );
+            assert!(
+                error.contains("unsafe_devnet_admit_assumed_measurements")
+                    && error.contains(UNSAFE_ASSUMED_ADMISSION_NETWORK),
+                "unexpected refusal for {network}: {error}",
+            );
+        }
+    }
+
+    /// The isolated demo may use honest written-down numbers while the
+    /// remaining probes are being built, without relabelling them measured.
+    #[test]
+    fn explicit_shipped_devnet_bypass_admits_an_assumed_artifact() {
+        let mut value = config();
+        value["chain"]["network_id"] = serde_json::json!(UNSAFE_ASSUMED_ADMISSION_NETWORK);
+        value["unsafe_devnet_admit_assumed_measurements"] = serde_json::json!(true);
+        let artifact = artifact_with("validation_ms", written_down(3));
+
+        let duties = duties_for_config(value, &artifact, None)
+            .expect("the explicit devnet bypass reads the pinned artifact");
+
+        assert!(matches!(
+            duties,
+            PaidWorkDuties::UnsafeDevnetAdmitsAssumed(_)
+        ));
+        assert!(duties.admits_paid_work());
+        assert!(matches!(
+            duties.payment_admission(),
+            Some(PaymentAdmission::Admits(_)),
+        ));
+        assert!(
+            duties.summary().starts_with("UNSAFE DEVNET"),
+            "the operator output must not resemble measured admission: {}",
+            duties.summary(),
+        );
+        assert_eq!(
+            duties
+                .evidence()
+                .expect("assumed evidence stays visible")
+                .samples,
+            0,
+        );
+    }
+
+    /// The bypass changes only the assumed-label decision. It never invents
+    /// an artifact or ignores the configured content pin.
+    #[test]
+    fn unsafe_devnet_bypass_still_requires_the_exact_pinned_artifact() {
+        let mut missing = config();
+        missing["chain"]["network_id"] = serde_json::json!(UNSAFE_ASSUMED_ADMISSION_NETWORK);
+        missing["unsafe_devnet_admit_assumed_measurements"] = serde_json::json!(true);
+        missing
+            .as_object_mut()
+            .expect("config is an object")
+            .remove("artifact");
+        let loaded = load(missing).expect("an artifact remains optional for recovery");
+        let duties = load_paid_work_duties(&loaded).expect("missing evidence is a state");
+        assert_eq!(duties, PaidWorkDuties::NotConfigured);
+        assert!(!duties.admits_paid_work());
+
+        let mut changed = config();
+        changed["chain"]["network_id"] = serde_json::json!(UNSAFE_ASSUMED_ADMISSION_NETWORK);
+        changed["unsafe_devnet_admit_assumed_measurements"] = serde_json::json!(true);
+        let duties = duties_for_config(changed, &artifact(), Some(hex32(0xff)))
+            .expect("a changed pin is an evidence state");
+        assert_eq!(duties, PaidWorkDuties::Changed);
+        assert!(!duties.admits_paid_work());
     }
 
     /// The probe writes an artifact this loader reads — and grades

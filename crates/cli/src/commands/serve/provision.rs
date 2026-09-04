@@ -50,10 +50,12 @@
 //! # Evidence gates the countersignature, not the journal
 //!
 //! §4's evidence rule is spelled once, in [`PaidWorkDuties`], and it is a
-//! rule about a signature: an assumed artifact yields
+//! rule about a signature: an assumed artifact normally yields
 //! [`PaymentAdmission::Proposes`], which declines every payment a client
 //! proposes, and the identical policy under a measured artifact yields
-//! `Admits`. This command does not ask that question a second time. It
+//! `Admits`. The one exception is the explicitly unsafe, exact-network
+//! devnet switch: it yields `Admits` from assumed evidence and remains named
+//! as unsafe in [`PaidWorkDuties`]. This command does not ask that question a second time. It
 //! refuses only where there is no policy at all — no artifact
 //! configured, none found, one that is not the pinned one, or one the
 //! measured floor refuses — because there is then no endpoint to build,

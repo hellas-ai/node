@@ -2938,6 +2938,7 @@ mod tests {
                 path,
                 digest: Digest::hash(&bytes),
             }),
+            unsafe_devnet_admit_assumed_measurements: false,
         };
         let duties = match load_paid_work_duties(&config) {
             Ok(duties) => duties,
