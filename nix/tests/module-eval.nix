@@ -125,6 +125,117 @@ let
         }
       ];
     };
+  validatorPackageFixture =
+    (pkgs.writeShellScriptBin "hellas-cli" ''
+      set -eu
+
+      test "$1" = chain
+      test "$2" = validator
+      action="$3"
+      shift 3
+
+      case "$action" in
+        config)
+          while [ "$#" -gt 0 ]; do
+            flag="$1"
+            value="$2"
+            shift 2
+            printf '%s=%s\n' "$flag" "$value"
+          done
+          ;;
+        check-config)
+          test "$1" = --config
+          test -s "$2"
+          ;;
+        *)
+          exit 64
+          ;;
+      esac
+    '').overrideAttrs
+      (_: {
+        meta.mainProgram = "hellas-cli";
+      });
+  evalValidators =
+    validator:
+    import (pkgs.path + "/nixos/lib/eval-config.nix") {
+      system = pkgs.stdenv.hostPlatform.system;
+      modules = [
+        self.nixosModules.validators
+        {
+          nixpkgs.pkgs = plainPkgs;
+          system.stateVersion = "26.05";
+          services.hellas-chain-validators.devnet = {
+            enable = true;
+            package = validatorPackageFixture;
+          }
+          // validator;
+        }
+      ];
+    };
+  paidWorkValidators = evalValidators {
+    nodes = 3;
+    totalValidators = 6;
+    nodeOffset = 2;
+    startPort = 31900;
+    metricsBasePort = 9090;
+    seed = 7;
+    lightClientRpc = {
+      enable = true;
+      bindAddress = "0.0.0.0";
+      basePort = 31246;
+      openFirewall = true;
+    };
+  };
+  loopbackValidators = evalValidators {
+    nodes = 1;
+    seed = 7;
+    lightClientRpc.enable = true;
+  };
+  validatorsWithoutRpc = evalValidators {
+    nodes = 1;
+    seed = 7;
+  };
+  overflowingValidatorRpc = evalValidators {
+    nodes = 2;
+    nodeOffset = 1;
+    seed = 7;
+    lightClientRpc = {
+      enable = true;
+      basePort = 65535;
+    };
+  };
+  collidingValidatorRpc = evalValidators {
+    nodes = 2;
+    seed = 7;
+    startPort = 31900;
+    lightClientRpc = {
+      enable = true;
+      basePort = 31900;
+    };
+  };
+  unconfiguredRuntimeRpc = evalValidators {
+    nodes = 1;
+    runtimeConfigFiles = [ "/run/hellas/validator.toml" ];
+    lightClientRpc.enable = true;
+  };
+  unopenedValidatorRpc = evalValidators {
+    nodes = 1;
+    seed = 7;
+    lightClientRpc.openFirewall = true;
+  };
+  validatorAssertion =
+    message: evaluation:
+    lib.findFirst (
+      assertion: lib.hasInfix message assertion.message
+    ) (throw "missing validator assertion containing: ${message}") evaluation.config.assertions;
+  validatorConfigPath =
+    service:
+    let
+      matched = builtins.match ".* --config (.*)" service.serviceConfig.ExecStart;
+    in
+    if matched == null then throw "validator ExecStart has no config" else builtins.head matched;
+  paidWorkValidatorServices = paidWorkValidators.config.systemd.services;
+  validatorConfig2 = validatorConfigPath paidWorkValidatorServices."hellas-validator-devnet-node2";
   executePolicyEvaluation =
     executePolicy:
     builtins.tryEval (
@@ -904,6 +1015,77 @@ in
       if ${runtimeEnvironmentWrapper} "$PWD/missing.env" ${pkgs.coreutils}/bin/true 2>/dev/null; then
         exit 1
       fi
+
+      touch "$out"
+    '';
+
+  validator-module-eval =
+    assert
+      paidWorkValidators.config.networking.firewall.interfaces.wg0.allowedTCPPorts == [
+        9092
+        9093
+        9094
+        31248
+        31249
+        31250
+        31902
+        31903
+        31904
+      ];
+    assert
+      loopbackValidators.config.networking.firewall.interfaces.wg0.allowedTCPPorts == [
+        9090
+        31900
+      ];
+    assert
+      validatorsWithoutRpc.config.networking.firewall.interfaces.wg0.allowedTCPPorts == [
+        9090
+        31900
+      ];
+    assert
+      !(validatorAssertion "lightClientRpc port range exceeds 65535" overflowingValidatorRpc).assertion;
+    assert !(validatorAssertion "lightClientRpc ports overlap" collidingValidatorRpc).assertion;
+    assert
+      !(validatorAssertion "requires generated validator configs" unconfiguredRuntimeRpc).assertion;
+    assert !(validatorAssertion "openFirewall requires" unopenedValidatorRpc).assertion;
+    assert lib.hasSuffix "chain validator run --config ${validatorConfig2}"
+      paidWorkValidatorServices."hellas-validator-devnet-node2".serviceConfig.ExecStart;
+    pkgs.runCommand "hellas-validator-module-eval" { } ''
+      command2=${
+        lib.escapeShellArg paidWorkValidatorServices."hellas-validator-devnet-node2".serviceConfig.ExecStart
+      }
+      command3=${
+        lib.escapeShellArg paidWorkValidatorServices."hellas-validator-devnet-node3".serviceConfig.ExecStart
+      }
+      command4=${
+        lib.escapeShellArg paidWorkValidatorServices."hellas-validator-devnet-node4".serviceConfig.ExecStart
+      }
+      loopback_command=${
+        lib.escapeShellArg
+          loopbackValidators.config.systemd.services."hellas-validator-devnet-node0".serviceConfig.ExecStart
+      }
+      disabled_command=${
+        lib.escapeShellArg
+          validatorsWithoutRpc.config.systemd.services."hellas-validator-devnet-node0".serviceConfig.ExecStart
+      }
+      config2="''${command2##*--config }"
+      config3="''${command3##*--config }"
+      config4="''${command4##*--config }"
+      loopback_config="''${loopback_command##*--config }"
+      disabled_config="''${disabled_command##*--config }"
+
+      ${pkgs.gnugrep}/bin/grep -Fx -- '--validator=2' "$config2"
+      ${pkgs.gnugrep}/bin/grep -Fx -- '--metrics-port=9092' "$config2"
+      ${pkgs.gnugrep}/bin/grep -Fx -- '--light-client-bind=0.0.0.0:31248' "$config2"
+
+      ${pkgs.gnugrep}/bin/grep -Fx -- '--validator=3' "$config3"
+      ${pkgs.gnugrep}/bin/grep -Fx -- '--light-client-bind=0.0.0.0:31249' "$config3"
+
+      ${pkgs.gnugrep}/bin/grep -Fx -- '--validator=4' "$config4"
+      ${pkgs.gnugrep}/bin/grep -Fx -- '--light-client-bind=0.0.0.0:31250' "$config4"
+
+      ${pkgs.gnugrep}/bin/grep -Fx -- '--light-client-bind=127.0.0.1:31246' "$loopback_config"
+      ! ${pkgs.gnugrep}/bin/grep -F -- '--light-client-bind' "$disabled_config"
 
       touch "$out"
     '';

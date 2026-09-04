@@ -27,6 +27,16 @@ let
 
   cfg = config.services.hellas-chain-validators;
 
+  localPorts = validator: basePort: genList (i: basePort + validator.nodeOffset + i) validator.nodes;
+
+  lightClientBind =
+    validator: index:
+    let
+      address = validator.lightClientRpc.bindAddress;
+      host = if lib.hasInfix ":" address then "[${address}]" else address;
+    in
+    "${host}:${toString (validator.lightClientRpc.basePort + index)}";
+
   mkOtelEnv =
     validator:
     optionalAttrs (validator.otel.endpoint != null) (
@@ -64,6 +74,9 @@ let
           "--genesis-allocation ${escapeShellArg "${allocation.address}:${toString allocation.balance}"}"
         ) validator.genesisAllocations
       );
+      lightClientFlag = optionalString validator.lightClientRpc.enable (
+        "--light-client-bind ${escapeShellArg (lightClientBind validator index)}"
+      );
     in
     pkgs.runCommand "hellas-validator-${toString index}.toml" { } ''
       ${cli} chain validator config \
@@ -74,6 +87,7 @@ let
         ${addressesFlag} \
         ${relayFlags} \
         --metrics-port ${toString (validator.metricsBasePort + index)} \
+        ${lightClientFlag} \
         ${genesisFlag} \
         ${allocationFlags} \
         > "$out"
@@ -114,6 +128,38 @@ let
           type = types.port;
           default = 9090;
           description = "Base Prometheus metrics port.";
+        };
+        lightClientRpc = {
+          enable = mkEnableOption "a direct light-client RPC listener for every validator";
+          bindAddress = mkOption {
+            type = types.strMatching "[0-9A-Fa-f:.]+";
+            default = "127.0.0.1";
+            example = "0.0.0.0";
+            description = ''
+              Numeric IPv4 or IPv6 address, without brackets, on which each
+              validator listens for direct light-client RPC connections.
+              Loopback is the safe default; use a private interface address
+              explicitly when workers run on another machine.
+            '';
+          };
+          basePort = mkOption {
+            type = types.port;
+            default = 31246;
+            description = ''
+              Base light-client RPC port. Validator index N listens on
+              basePort + N, so nodeOffset remains stable across machines.
+            '';
+          };
+          openFirewall = mkOption {
+            type = types.bool;
+            default = false;
+            description = ''
+              Open the generated light-client RPC ports on the wg0 firewall
+              interface. This is deliberately independent from enable and
+              defaults off; enable it only for validators serving workers
+              over the private deployment network.
+            '';
+          };
         };
         seed = mkOption {
           type = types.nullOr types.ints.unsigned;
@@ -248,14 +294,40 @@ in
             );
           message = "services.hellas-chain-validators.${name}.runtimeConfigFiles cannot be combined with generated-config options.";
         }
+        {
+          assertion = validator.runtimeConfigFiles == [ ] || !validator.lightClientRpc.enable;
+          message = "services.hellas-chain-validators.${name}.lightClientRpc.enable requires generated validator configs.";
+        }
+        {
+          assertion =
+            !validator.lightClientRpc.enable
+            || validator.lightClientRpc.basePort + validator.nodeOffset + validator.nodes - 1 <= 65535;
+          message = "services.hellas-chain-validators.${name}.lightClientRpc port range exceeds 65535.";
+        }
+        {
+          assertion =
+            !validator.lightClientRpc.enable
+            ||
+              lib.intersectLists (localPorts validator validator.lightClientRpc.basePort) (
+                localPorts validator validator.startPort ++ localPorts validator validator.metricsBasePort
+              ) == [ ];
+          message = "services.hellas-chain-validators.${name}.lightClientRpc ports overlap consensus or metrics ports.";
+        }
+        {
+          assertion = validator.lightClientRpc.enable || !validator.lightClientRpc.openFirewall;
+          message = "services.hellas-chain-validators.${name}.lightClientRpc.openFirewall requires lightClientRpc.enable.";
+        }
       ]) enabledValidators
     );
 
     networking.firewall.interfaces.wg0.allowedTCPPorts = concatLists (
       mapAttrsToList (
         _: validator:
-        genList (i: validator.metricsBasePort + validator.nodeOffset + i) validator.nodes
-        ++ genList (i: validator.startPort + validator.nodeOffset + i) validator.nodes
+        localPorts validator validator.metricsBasePort
+        ++ localPorts validator validator.startPort
+        ++ lib.optionals (validator.lightClientRpc.enable && validator.lightClientRpc.openFirewall) (
+          localPorts validator validator.lightClientRpc.basePort
+        )
       ) enabledValidators
     );
 
