@@ -471,7 +471,7 @@ struct Node {
     index: OwnerIndex,
     indexer: crate::indexer::ChainIndexer,
     mempool: Mempool,
-    _task: Handle<()>,
+    task: Handle<()>,
 }
 
 /// One runtime label per node. Static because `Supervisor::child` takes
@@ -563,7 +563,7 @@ impl Devnet {
                 index: OwnerIndex::new(TEST_NETWORK, &genesis, allocations.clone()),
                 indexer,
                 mempool: Mempool::default(),
-                _task: task,
+                task,
             });
         }
 
@@ -764,6 +764,15 @@ impl Devnet {
             .await
             .expect("a channel snapshot reads")
             .expect("finalized channel state exists")
+    }
+
+    /// Stops every follower indexer before the commonware runtime that
+    /// owns it is dropped.
+    async fn shutdown(self) {
+        for node in self.nodes {
+            node.task.abort();
+            let _ = node.task.await;
+        }
     }
 }
 
@@ -1651,6 +1660,9 @@ fn one_paid_job_earns_the_price_and_returns_the_stake_separately() {
             held.iter().map(|(_, value)| value).sum::<u64>(),
             PRICE + PROVIDER_STAKE,
         );
+
+        drop(opened);
+        devnet.shutdown().await;
     });
 }
 
@@ -1791,5 +1803,8 @@ fn an_understated_close_is_answered_and_pays_the_certificate() {
             Some(PROVIDER_STAKE),
             "RETURNED PRINCIPAL: still 12, still not earnings",
         );
+
+        drop(opened);
+        devnet.shutdown().await;
     });
 }
