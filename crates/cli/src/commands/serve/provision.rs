@@ -129,6 +129,8 @@ pub struct ProvisionOptions {
     pub timeout_payout: u64,
     /// The largest job price this bond covers.
     pub max_job_price: u64,
+    /// Print the deterministic bond edge and stop before any external read or write.
+    pub print_bond_only: bool,
 }
 
 /// Makes one offer, and says where it is.
@@ -141,8 +143,17 @@ pub struct ProvisionOptions {
 /// block to read a floor from, and whatever the setup journal says about the
 /// revision it refused or could not make durable.
 pub async fn run_provision(options: ProvisionOptions) -> CliResult<()> {
+    // The candidate is the one source of the bond edge for both preview and
+    // provisioning.  Keep this before evidence, routing, validators and the
+    // journal: the preview exists so an operator can put this value into the
+    // route table those later steps require.
+    let candidate = BondCandidate::plan(&options)?;
+    if options.print_bond_only {
+        println!("bond_edge: {}", hex::encode(candidate.bond_edge.to_bytes()));
+        return Ok(());
+    }
     let duties = load_paid_work_duties(&options.work_config)?;
-    let offer = Offer::plan(&options, &duties)?;
+    let offer = Offer::plan(&options, &duties, candidate)?;
     // Dialled after every refusal that can be made without a chain, and
     // before the journal exists: a floor is the first thing written into
     // it, so a run that cannot read one leaves no half-made offer behind.
@@ -178,30 +189,25 @@ struct Provisioned {
     floor: SetupScan,
 }
 
-/// One offer, decided before anything is dialled or written.
-struct Offer {
+/// The deterministic bond inputs, built without evidence, routing, a chain,
+/// or a journal.
+///
+/// Preview and real provisioning both pass through this value. In particular,
+/// the real path does not recompute the edge after printing it, so a preview
+/// cannot drift from the offer later signed.
+struct BondCandidate {
     network: NetworkId,
     journal_root: PathBuf,
     bond_edge: EdgeId,
     bond_funding: Funding,
     bond_terms: WorkStakeBondTerms,
-    admission: PaymentAdmission,
     settlement_key: Secp256k1Signer,
 }
 
-impl Offer {
-    /// Reads the operator's answers, and refuses everything refusable
-    /// without a chain.
-    fn plan(options: &ProvisionOptions, duties: &PaidWorkDuties) -> CliResult<Self> {
-        let Some(admission) = duties.payment_admission() else {
-            bail!(
-                "this configuration builds no provider policy, so it has no offer to make: {}",
-                duties.summary(),
-            );
-        };
+impl BondCandidate {
+    fn plan(options: &ProvisionOptions) -> CliResult<Self> {
         let network = options.work_config.chain.network;
         let journal_root = options.work_config.journal_root.clone();
-
         // Maker is the provider and taker is the client, which is what
         // makes this signature the maker's: `propose_bond` refuses a bond
         // whose staking party this key is not.
@@ -223,6 +229,50 @@ impl Offer {
             List::empty(CoinId::from_bytes([0; CoinId::LENGTH])),
         );
         let bond_edge = Tx::edge_id_of(&bond_funding, &Terms::work_stake_bond(bond_terms.clone()));
+        Ok(Self {
+            network,
+            journal_root,
+            bond_edge,
+            bond_funding,
+            bond_terms,
+            settlement_key: options.settlement_key.clone(),
+        })
+    }
+}
+
+/// One offer, decided before anything is dialled or written.
+struct Offer {
+    network: NetworkId,
+    journal_root: PathBuf,
+    bond_edge: EdgeId,
+    bond_funding: Funding,
+    bond_terms: WorkStakeBondTerms,
+    admission: PaymentAdmission,
+    settlement_key: Secp256k1Signer,
+}
+
+impl Offer {
+    /// Reads the operator's answers, and refuses everything refusable
+    /// without a chain.
+    fn plan(
+        options: &ProvisionOptions,
+        duties: &PaidWorkDuties,
+        candidate: BondCandidate,
+    ) -> CliResult<Self> {
+        let Some(admission) = duties.payment_admission() else {
+            bail!(
+                "this configuration builds no provider policy, so it has no offer to make: {}",
+                duties.summary(),
+            );
+        };
+        let BondCandidate {
+            network,
+            journal_root,
+            bond_edge,
+            bond_funding,
+            bond_terms,
+            settlement_key,
+        } = candidate;
         let route = route_for_candidate(&options.work_config, bond_edge, &bond_terms)?;
         refuse_offer_collisions(&options.work_config, route, &bond_funding)?;
         Ok(Self {
@@ -232,7 +282,7 @@ impl Offer {
             bond_funding,
             bond_terms,
             admission,
-            settlement_key: options.settlement_key.clone(),
+            settlement_key,
         })
     }
 
@@ -754,6 +804,7 @@ mod tests {
             bond_timeout: 500,
             timeout_payout: 64,
             max_job_price,
+            print_bond_only: false,
         }
     }
 
@@ -770,7 +821,8 @@ mod tests {
         options: &ProvisionOptions,
         duties: &PaidWorkDuties,
     ) -> CliResult<Provisioned> {
-        Offer::plan(options, duties)?.journal(floor())
+        let candidate = BondCandidate::plan(options)?;
+        Offer::plan(options, duties, candidate)?.journal(floor())
     }
 
     /// The bond the fixture inputs name, spelled out here rather than
@@ -809,6 +861,39 @@ mod tests {
 
     fn expected_bond(max_job_price: u64) -> EdgeId {
         expected_bond_for(client().party_key(), &[0xa1], max_job_price)
+    }
+
+    #[test]
+    fn preview_and_real_offer_use_the_identical_bond_candidate() {
+        let root = tempfile::tempdir().unwrap();
+        let options = options(root.path(), 40);
+        let preview = BondCandidate::plan(&options)
+            .unwrap_or_else(|error| panic!("the bond previews: {error:#}"));
+        let expected = preview.bond_edge;
+        let candidate = BondCandidate::plan(&options)
+            .unwrap_or_else(|error| panic!("the same bond plans: {error:#}"));
+        let offer = Offer::plan(&options, &admits(), candidate)
+            .unwrap_or_else(|error| panic!("the routed offer plans: {error:#}"));
+        assert_eq!(expected, expected_bond(40));
+        assert_eq!(offer.bond_edge, expected);
+    }
+
+    #[tokio::test]
+    async fn preview_needs_neither_a_route_nor_evidence_chain_or_journal() {
+        let root = tempfile::tempdir().unwrap();
+        let config = routed_work_config(root.path(), Vec::new())
+            .unwrap_or_else(|error| panic!("a route-free config loads: {error:#}"));
+        let mut options = options_for(config, client().party_key(), &[0xa1], 40);
+        options.print_bond_only = true;
+
+        run_provision(options)
+            .await
+            .unwrap_or_else(|error| panic!("the isolated preview succeeds: {error:#}"));
+        assert_eq!(
+            provider_setups(root.path()),
+            0,
+            "preview created no provider journal",
+        );
     }
 
     fn provider_setups(root: &Path) -> usize {
@@ -1202,7 +1287,7 @@ mod tests {
             .map(|byte| hex::encode([byte; 32]))
             .collect();
 
-        let Err(error) = Offer::plan(&options, &admits()) else {
+        let Err(error) = BondCandidate::plan(&options) else {
             panic!("an open funded by five coins is not one this stake can be");
         };
         assert!(

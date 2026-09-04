@@ -837,6 +837,10 @@ enum Commands {
         /// The largest job price this bond covers
         #[arg(long = "max-job-price")]
         max_job_price: u64,
+        /// Print the deterministic bond edge and exit before evidence,
+        /// routes, validators, or journals are opened.
+        #[arg(long = "print-bond-only")]
+        print_bond_only: bool,
     },
     /// Discover peers and log network events
     Monitor {
@@ -1201,6 +1205,7 @@ async fn async_main() {
             bond_timeout,
             timeout_payout,
             max_job_price,
+            print_bond_only,
         } => match commands::serve::load_work_config(&work_config) {
             Err(error) => Err(error),
             Ok(work_config) => {
@@ -1215,6 +1220,7 @@ async fn async_main() {
                     bond_timeout,
                     timeout_payout,
                     max_job_price,
+                    print_bond_only,
                 })
                 .await
             }
@@ -2603,6 +2609,7 @@ mod tests {
                 bond_timeout,
                 timeout_payout,
                 max_job_price,
+                print_bond_only,
             } => {
                 assert_eq!(work_config, PathBuf::from("/tmp/work.json"));
                 assert_eq!(client, "02aa");
@@ -2610,9 +2617,40 @@ mod tests {
                 assert_eq!(bond_timeout, 500);
                 assert_eq!(timeout_payout, 64);
                 assert_eq!(max_job_price, 40);
+                assert!(!print_bond_only);
             }
             _ => panic!("expected provision command"),
         }
+    }
+
+    #[cfg(feature = "node")]
+    #[test]
+    fn provision_accepts_a_bond_only_preview() {
+        let cli = Cli::try_parse_from([
+            "hellas",
+            "provision",
+            "--work-config",
+            "/tmp/work.json",
+            "--client",
+            "02aa",
+            "--stake-coin",
+            "a1",
+            "--bond-timeout",
+            "500",
+            "--timeout-payout",
+            "64",
+            "--max-job-price",
+            "40",
+            "--print-bond-only",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Provision {
+                print_bond_only: true,
+                ..
+            }
+        ));
     }
 
     /// A bond funded by no coin is not one, so the stake is required

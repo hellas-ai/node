@@ -264,7 +264,10 @@ fn inspect_prepared(
     let output = serde_json::json!({
         "client_transport_peer": hex::encode(transport_key.public().as_bytes()),
         "client_settlement_key": hex::encode(settlement_key.party_key().to_bytes()),
-        "allowed_environment": hex::encode(identities.allowed_environment.as_bytes()),
+        // ContentId's textual form is Xet's canonical per-limb hex spelling,
+        // which is what WorkConfig parses. Raw digest-byte hex is different
+        // for non-uniform hashes and would make the printed JSON unusable.
+        "allowed_environment": identities.allowed_environment.to_string(),
         "generation_policy_digest": hex::encode(identities.generation_policy_digest.as_bytes()),
         "identity_source_digest": hex::encode(identities.identity_source_digest.as_bytes()),
     });
