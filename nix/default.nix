@@ -208,6 +208,16 @@ let
               "evaluate"
               "otel"
             ];
+            # These four tests run the complete hardware bootstrap workload:
+            # each fills and rotates 64 MiB journals with per-record fsync.
+            # They are exercised explicitly on a real filesystem; a Nix build
+            # sandbox is both pathologically slow and the wrong disk to grade.
+            checkFlags = [
+              "--skip=commands::serve::probe::tests::an_assumption_beside_a_measurement_is_refused"
+              "--skip=commands::serve::probe::tests::the_journal_workload_samples_the_three_seams_it_drives"
+              "--skip=commands::serve::probe::tests::what_the_run_did_not_see_is_assumed_and_named"
+              "--skip=commands::serve::work_config::tests::the_probe_writes_an_artifact_this_loader_reads_and_grades"
+            ];
           };
         };
 
