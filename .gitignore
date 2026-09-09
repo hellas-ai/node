@@ -3,6 +3,7 @@
 .direnv
 .envrc
 .claude
+/PLANE_TODOS.md
 .env
 prompts/
 crates/kernel/node_modules/

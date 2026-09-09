@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use crate::commands::codex_auth::CodexAuthStore;
 
-use super::responses_fetch::execute_responses_request;
+use hellas_providers::execute_responses_request;
 
 const CODEX_ORIGINATOR: &str = "codex_cli_rs";
 

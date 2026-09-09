@@ -115,6 +115,14 @@ fn assertion(
     authenticator_data.push(0x40);
     authenticator_data.extend_from_slice(&counter.to_be_bytes());
     authenticator_data.extend_from_slice(&extension_bytes);
+    signed_assertion(signing_key, authenticator_data, client_data_hash)
+}
+
+fn signed_assertion(
+    signing_key: &SigningKey,
+    authenticator_data: Vec<u8>,
+    client_data_hash: &[u8; 32],
+) -> Vec<u8> {
     let digest = Sha256::digest([authenticator_data.as_slice(), client_data_hash].concat());
     let signature: Signature = signing_key.sign(&digest);
 
@@ -261,6 +269,28 @@ fn rejects_wrong_app_rp_id_and_cd_hash_outside_allowlist() {
     assert_eq!(
         verify_apple_assertion(&denied_build, &client_data_hash, &registered, &policy),
         Err(AttestationError::Credential)
+    );
+}
+
+#[test]
+fn rejects_signed_assertion_that_omits_cd_hash_evidence() {
+    let signing_key = signing_key();
+    let registered = registered(&signing_key);
+    let rp_id_hash = apple_app_id_hash(APP_ID);
+    let client_data_hash = [3; 32];
+    let policy = ApplePolicy {
+        expected_rp_id_hash: rp_id_hash,
+        allowed_cd_hashes: vec![[1; 32]],
+    };
+    let mut authenticator_data = Vec::new();
+    authenticator_data.extend_from_slice(&rp_id_hash);
+    authenticator_data.push(0x40);
+    authenticator_data.extend_from_slice(&1_u32.to_be_bytes());
+    let assertion = signed_assertion(&signing_key, authenticator_data, &client_data_hash);
+
+    assert_eq!(
+        verify_apple_assertion(&assertion, &client_data_hash, &registered, &policy),
+        Err(AttestationError::AppleCdHashMissing)
     );
 }
 

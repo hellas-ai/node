@@ -20,6 +20,9 @@ pub mod iroh;
 #[cfg(any(feature = "ws", feature = "ws-wasm"))]
 pub mod ws;
 
+#[cfg(all(feature = "unix", unix))]
+pub mod unix;
+
 pub use crate::canonical::{Encode, Writer};
 pub use crate::clock::{Clock, DefaultClock};
 pub use crate::error::TransportError;

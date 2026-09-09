@@ -74,9 +74,7 @@ let
           "--genesis-allocation ${escapeShellArg "${allocation.address}:${toString allocation.balance}"}"
         ) validator.genesisAllocations
       );
-      lightClientFlag = optionalString validator.lightClientRpc.enable (
-        "--light-client-bind ${escapeShellArg (lightClientBind validator index)}"
-      );
+      lightClientFlag = optionalString validator.lightClientRpc.enable "--light-client-bind ${escapeShellArg (lightClientBind validator index)}";
     in
     pkgs.runCommand "hellas-validator-${toString index}.toml" { } ''
       ${cli} chain validator config \

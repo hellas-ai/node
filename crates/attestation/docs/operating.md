@@ -10,26 +10,20 @@ There are two roles: the **provider** (serves inference on a Mac) and the
 
 Attestation only works on a genuine, locked-down Apple machine.
 
-1. **Build hardened.** Package and sign the app via `macos/package.sh`, which
-   refuses to sign if the provisioning profile carries any runtime-relaxation
-   entitlement (`get-task-allow`, dyld-environment, library-validation or
-   debugger exceptions). Run with SIP enabled and Full Security boot.
-2. **Enroll (automatic).** The first time a provider identity materializes with
-   the `apple-app-attest` feature, it runs App Attest (`attestKey`) in the
-   Secure Enclave and builds a `ProviderEnrollmentBundle` = signed genesis +
-   the original Apple attestation object. There is no separate enroll command;
-   it happens during identity creation (`crates/cli/src/identity.rs`).
+1. **Build hardened.** Package, provision, and sign Hellas Gate. The native App
+   Attest producer lives in Gate because DeviceCheck is an app capability, not
+   a portable protocol primitive. Run with SIP enabled and Full Security boot.
+2. **Enroll (automatic).** The first time Gate starts its provider, it runs App
+   Attest (`attestKey`) in the Secure Enclave and builds a
+   `ProviderEnrollmentBundle` = signed genesis + the original Apple
+   attestation object. Hellas core supplies only the generic `RootProver`
+   interface and the portable verifier.
 3. **Publish the pin.** The bundle's ContentId is the out-of-band trust anchor.
    Distribute it (and the bundle) to requesters through a channel you trust —
    this is the one thing that cannot be bootstrapped over the connection.
-4. **Serve with Apple assurance:**
-
-   ```
-   hellas-cli --assurance apple-app-attest serve ...
-   ```
-
-   `--assurance apple-app-attest` requires a Secure Enclave root; combining it
-   with `--software-root` is rejected at startup.
+4. **Serve with Apple assurance:** start the sealed-Fetch provider from Gate.
+   The command-line node intentionally no longer owns DeviceCheck enrollment
+   or native proof production.
 
 ## Requester
 

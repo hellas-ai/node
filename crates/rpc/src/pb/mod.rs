@@ -57,6 +57,14 @@ pub mod hellas {
         }
     }
 
+    #[cfg(feature = "host-control")]
+    #[allow(dead_code)]
+    pub mod host {
+        pub mod v1 {
+            include!(concat!(env!("OUT_DIR"), "/hellas.host.v1.rs"));
+        }
+    }
+
     #[cfg(feature = "work")]
     #[allow(dead_code)]
     pub mod work {
@@ -100,6 +108,12 @@ pub mod swarm {
 #[cfg(feature = "chain")]
 pub mod chain {
     pub use crate::pb::hellas::chain::v1::*;
+}
+
+/// Re-exports of the local-only `hellas.host.v1` package.
+#[cfg(feature = "host-control")]
+pub mod host {
+    pub use crate::pb::hellas::host::v1::*;
 }
 
 /// Re-exports of `hellas.work.v1`.

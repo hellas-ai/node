@@ -34,6 +34,10 @@ chain = []
 # (EvaluateRequest), so the feature must pull both forward.
 courtesy = ["execute", "evaluate"]
 swarm = []
+# Desktop-host lifecycle control. This package is intentionally omitted from
+# `all-protocols` and from the peer-service alias table: it is carried only by
+# an authenticated local transport.
+host-control = []
 all-protocols = ["swarm", "courtesy", "execute", "evaluate", "fetch", "chain"]
 # Paid private work: the canonical authorization, result, invoice, and
 # allocation records. Gated because it is the only protocol module that

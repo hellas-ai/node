@@ -25,7 +25,8 @@
 #![allow(clippy::similar_names)]
 #![allow(clippy::std_instead_of_alloc)]
 #![allow(clippy::std_instead_of_core)]
-#![allow(clippy::indexing_slicing)] // tests may index; the panic-freedom lock targets src
+// tests may index; the panic-freedom lock targets src
+#![allow(clippy::indexing_slicing)]
 
 mod support;
 

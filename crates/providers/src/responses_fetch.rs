@@ -16,7 +16,7 @@ const FETCH_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// HTTP client for attested Fetch egress. Redirects are disabled because the
 /// exact HTTPS destination is part of the quoted Fetch environment.
-pub(super) fn responses_http_client() -> reqwest::Client {
+pub fn responses_http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(20 * 60))
@@ -25,7 +25,7 @@ pub(super) fn responses_http_client() -> reqwest::Client {
         .expect("Fetch HTTP client configuration is valid")
 }
 
-pub(super) async fn execute_responses_request(
+pub async fn execute_responses_request(
     client: &reqwest::Client,
     endpoint: Url,
     bearer_token: &str,

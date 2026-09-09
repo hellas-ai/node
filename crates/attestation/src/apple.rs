@@ -51,6 +51,11 @@ pub fn apple_app_id_hash(team_id_and_bundle_id: &str) -> [u8; 32] {
     Sha256::digest(team_id_and_bundle_id.as_bytes()).into()
 }
 
+/// Apple App Attest's `clientDataHash` for protocol-owned statement bytes.
+pub fn apple_client_data_hash(data: &[u8]) -> [u8; 32] {
+    Sha256::digest(data).into()
+}
+
 pub struct AppleCredential {
     pub attestation: Vec<u8>,
     pub client_data_hash: [u8; 32],
@@ -334,7 +339,7 @@ fn attestation_auth_data(
 }
 
 fn assertion_auth_data(data: &[u8]) -> Result<AppleClaims, AttestationError> {
-    if data.len() <= 37 || data[32] != 0x40 {
+    if data.len() < 37 || data[32] != 0x40 {
         return Err(AttestationError::Binding);
     }
     let cd_hash = apple_cd_hash(&data[37..], "Apple authenticator extensions")?;
@@ -345,11 +350,14 @@ fn assertion_auth_data(data: &[u8]) -> Result<AppleClaims, AttestationError> {
 }
 
 fn apple_cd_hash(bytes: &[u8], name: &'static str) -> Result<[u8; 32], AttestationError> {
+    if bytes.is_empty() {
+        return Err(AttestationError::AppleCdHashMissing);
+    }
     let extensions: BTreeMap<String, ByteBuf> = cbor(bytes, name)?;
     let cd_hash: [u8; 32] = extensions
         .get("apple_cd_hash_hash_01")
         .and_then(|value| value.as_ref().try_into().ok())
-        .ok_or(AttestationError::Credential)?;
+        .ok_or(AttestationError::AppleCdHashMissing)?;
     if extensions.get("apple_cd_hash_type_01").map(ByteBuf::as_ref) != Some(&[2])
         || extensions
             .get("apple_validation_category_01")

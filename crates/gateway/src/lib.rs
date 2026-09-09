@@ -101,6 +101,25 @@ pub struct GatewayOptions {
     pub wrap_args: Vec<String>,
 }
 
+/// Minimal embedded gateway for a single verified Fetch-backed Responses
+/// route. It deliberately has no tokenizer, Catena environment, local
+/// evaluator, metrics server, or child-process wrapper.
+pub struct FetchGatewayOptions {
+    pub host: String,
+    pub port: Option<u16>,
+    pub node_id: Option<EndpointId>,
+    pub node_addrs: Vec<SocketAddr>,
+    pub retries: usize,
+    pub service: String,
+    pub method: String,
+    pub execution_environment: hellas_rpc::ContentId,
+    pub request_overrides: JsonMap<String, JsonValue>,
+    pub provider_trust: hellas_client::ProviderTrustAnchor,
+    pub caller_key: ProducerSigningKey,
+    pub assurance: hellas_rpc::Assurance,
+    pub secret_key: SecretKey,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResponsesBackend {
     Hellas,
@@ -108,7 +127,49 @@ pub enum ResponsesBackend {
     Fetch,
 }
 
-pub async fn run(options: GatewayOptions) -> anyhow::Result<()> {
+/// A running loopback HTTP gateway owned by its embedding process.
+pub struct GatewayHandle {
+    address: SocketAddr,
+    bearer: String,
+    shutdown: Arc<tokio::sync::Notify>,
+    task: tokio::task::JoinHandle<anyhow::Result<()>>,
+}
+
+impl GatewayHandle {
+    pub const fn address(&self) -> SocketAddr {
+        self.address
+    }
+
+    /// Return the ephemeral credential for an explicit local UI/control
+    /// surface. The value is never included in `Debug` or logs.
+    pub fn bearer(&self) -> &str {
+        &self.bearer
+    }
+
+    pub fn request_shutdown(&self) {
+        self.shutdown.notify_one();
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.task.is_finished()
+    }
+
+    pub async fn shutdown(mut self) -> anyhow::Result<()> {
+        self.request_shutdown();
+        (&mut self.task)
+            .await
+            .context("gateway task failed to join")?
+    }
+}
+
+impl Drop for GatewayHandle {
+    fn drop(&mut self) {
+        self.shutdown.notify_one();
+    }
+}
+
+/// Start a gateway without installing process signal handlers.
+pub async fn start(options: GatewayOptions) -> anyhow::Result<GatewayHandle> {
     let state = Arc::new(GatewayState::from_options(&options).await?);
 
     // Every route below reaches an executor, so every route below is
@@ -124,13 +185,6 @@ pub async fn run(options: GatewayOptions) -> anyhow::Result<()> {
         .with_state(state.clone())
         .layer(provenance_layer::ProvenanceLayer)
         .layer(access::BearerLayer::new(bearer.clone()));
-
-    let listener = bind_gateway(&options.host, options.port).await?;
-    let bound_addr = listener
-        .local_addr()
-        .context("listener has no local address")?;
-    info!("gateway listening on {bound_addr}");
-    bearer.announce();
 
     if let Some(metrics_port) = options.metrics_port {
         let registry = Arc::new(prometheus_client::registry::Registry::default());
@@ -159,20 +213,58 @@ pub async fn run(options: GatewayOptions) -> anyhow::Result<()> {
     }
 
     info!("timeout: {}s", state.inference_timeout.as_secs());
-    info!(
-        model = %state.model_name,
-        program_manifest = %state.causal_lm.manifest_id(),
-        "using configured causal-LM environment"
-    );
+    if let Some(causal_lm) = state.causal_lm.as_ref() {
+        info!(
+            model = %state.model_name,
+            program_manifest = %causal_lm.manifest_id(),
+            "using configured causal-LM environment"
+        );
+    }
 
-    let wrap_child = if let Some(cmd) = options.wrap.as_deref() {
-        // The listener is loopback by construction, so the address we
-        // bound is the address the wrapped command can dial.
+    launch_gateway(
+        app,
+        &options.host,
+        options.port,
+        bearer,
+        options.wrap.as_deref(),
+        &options.wrap_args,
+    )
+    .await
+}
+
+/// Start the small Responses-only gateway used by native hosts such as Gate.
+pub async fn start_fetch(options: FetchGatewayOptions) -> anyhow::Result<GatewayHandle> {
+    let state = Arc::new(GatewayState::from_fetch_options(&options).await?);
+    let bearer = Arc::new(access::Bearer::generate());
+    let app = Router::new()
+        .route("/v1/responses", post(responses::handle))
+        .with_state(state)
+        .layer(provenance_layer::ProvenanceLayer)
+        .layer(access::BearerLayer::new(bearer.clone()));
+    launch_gateway(app, &options.host, options.port, bearer, None, &[]).await
+}
+
+async fn launch_gateway(
+    app: Router,
+    host: &str,
+    port: Option<u16>,
+    bearer: Arc<access::Bearer>,
+    wrap_command: Option<&str>,
+    wrap_args: &[String],
+) -> anyhow::Result<GatewayHandle> {
+    let listener = bind_gateway(host, port).await?;
+    let bound_addr = listener
+        .local_addr()
+        .context("listener has no local address")?;
+    info!("gateway listening on {bound_addr}");
+    bearer.announce();
+
+    let wrap_child = if let Some(command) = wrap_command {
         let base = format!("http://{bound_addr}");
-        info!("wrapping `{cmd}` with gateway base {base}");
+        info!("wrapping `{command}` with gateway base {base}");
         Some(wrap::spawn(
-            cmd,
-            &options.wrap_args,
+            command,
+            wrap_args,
             &base,
             &bearer.child_credential(),
         )?)
@@ -180,42 +272,66 @@ pub async fn run(options: GatewayOptions) -> anyhow::Result<()> {
         None
     };
 
+    let bearer_value = bearer.child_credential();
     let shutdown = Arc::new(tokio::sync::Notify::new());
     let server_shutdown = shutdown.clone();
     let server = std::future::IntoFuture::into_future(
         axum::serve(listener, app).with_graceful_shutdown(async move {
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
-                _ = server_shutdown.notified() => {}
-            }
+            server_shutdown.notified().await;
         }),
     );
 
-    match wrap_child {
-        Some(mut child) => {
-            tokio::pin!(server);
-            tokio::select! {
-                res = &mut server => {
-                    // Gateway stopped (ctrl-c or error); kill_on_drop tears the
-                    // wrapped child down too.
-                    res.context("gateway server failed")?;
-                }
-                status = child.wait() => {
-                    let status = status.context("waiting on wrapped child failed")?;
-                    shutdown.notify_one();
-                    server.await.context("gateway server failed")?;
-                    if !status.success() {
-                        bail!("wrapped command exited with status {status}");
+    let task_shutdown = shutdown.clone();
+    let task = tokio::spawn(async move {
+        match wrap_child {
+            Some(mut child) => {
+                tokio::pin!(server);
+                tokio::select! {
+                    res = &mut server => {
+                        // Gateway stopped or errored; kill_on_drop tears the
+                        // wrapped child down too.
+                        res.context("gateway server failed")?;
+                    }
+                    status = child.wait() => {
+                        let status = status.context("waiting on wrapped child failed")?;
+                        task_shutdown.notify_one();
+                        server.await.context("gateway server failed")?;
+                        if !status.success() {
+                            bail!("wrapped command exited with status {status}");
+                        }
                     }
                 }
             }
+            None => {
+                server.await.context("gateway server failed")?;
+            }
         }
-        None => {
-            server.await.context("gateway server failed")?;
+        Ok(())
+    });
+
+    Ok(GatewayHandle {
+        address: bound_addr,
+        bearer: bearer_value,
+        shutdown,
+        task,
+    })
+}
+
+/// CLI lifecycle wrapper around [`start`].
+pub async fn run(options: GatewayOptions) -> anyhow::Result<()> {
+    let mut handle = start(options).await?;
+    tokio::select! {
+        signal = tokio::signal::ctrl_c() => {
+            signal.context("failed to listen for ctrl-c")?;
+            handle.request_shutdown();
+            (&mut handle.task)
+                .await
+                .context("gateway task failed to join")?
+        }
+        result = &mut handle.task => {
+            result.context("gateway task failed to join")?
         }
     }
-
-    Ok(())
 }
 
 /// Bind the gateway listener. The host is resolved and required to be

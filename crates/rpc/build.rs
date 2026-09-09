@@ -938,6 +938,7 @@ fn feature_for_package(package: &str) -> &'static str {
         "hellas.evaluate.v1" => "evaluate",
         "hellas.chain.v1" => "chain",
         "hellas.work.v1" => "work",
+        "hellas.host.v1" => "host-control",
         _ => panic!("no rpc-crate feature defined for protobuf package {package}"),
     }
 }

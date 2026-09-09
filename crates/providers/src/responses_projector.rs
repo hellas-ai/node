@@ -19,12 +19,12 @@ use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
 const MAX_FETCH_FAILURE_DIAGNOSTIC_BYTES: usize = 512;
 
 #[derive(Clone, Copy, Debug)]
-pub(super) struct ResponsesFetchAdaptorFactory {
+pub struct ResponsesFetchAdaptorFactory {
     environment: FetchEnvironment,
 }
 
 impl ResponsesFetchAdaptorFactory {
-    pub(super) const fn new(environment: FetchEnvironment) -> Self {
+    pub const fn new(environment: FetchEnvironment) -> Self {
         Self { environment }
     }
 }

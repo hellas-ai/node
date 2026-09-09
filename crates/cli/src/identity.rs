@@ -1,15 +1,5 @@
 use anyhow::{Context, bail};
-#[cfg(all(target_os = "macos", feature = "apple-app-attest"))]
-use hellas_attestation::{
-    AppleAppAttest, AppleCredential, apple_credential_identity, client_data_hash,
-};
-#[cfg(any(test, all(target_os = "macos", feature = "apple-app-attest")))]
-use hellas_attestation::{ApplePolicy, RegisteredAppleCredential, verify_apple_assertion};
 use hellas_attestation::{AssertionCounterStore, AttestationError};
-#[cfg(all(target_os = "macos", feature = "apple-app-attest"))]
-use hellas_rpc::AppleAppAttestEnrollment;
-#[cfg(all(target_os = "macos", feature = "apple-app-attest"))]
-use hellas_rpc::DagCborEncoder;
 use hellas_rpc::signature::verify_digest_signature;
 use hellas_rpc::{
     DagCborDecoder, Digest, PlatformCredential, ProducerSigningKey, ProviderGenesisStatement,
@@ -31,8 +21,6 @@ use std::fs;
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-#[cfg(all(target_os = "macos", feature = "apple-app-attest"))]
-use std::time::{SystemTime, UNIX_EPOCH};
 
 const IDENTITY_DIR: &str = ".hellas";
 const IDENTITY_FILE: &str = "identity";
@@ -126,29 +114,6 @@ impl AssertionCounterStore for FilesystemAssertionCounterStore {
     }
 }
 
-#[cfg(any(test, all(target_os = "macos", feature = "apple-app-attest")))]
-/// Revalidates the fixed enrollment assertion while materializing an identity.
-/// Stored assertions are historical evidence, so this path must not advance a counter.
-fn materialize_apple_genesis_root(
-    assertion: &[u8],
-    client_data_hash: &[u8; 32],
-    credential: &RegisteredAppleCredential,
-    rp_id_hash: [u8; 32],
-    cd_hash: [u8; 32],
-) -> anyhow::Result<RootProof> {
-    verify_apple_assertion(
-        assertion,
-        client_data_hash,
-        credential,
-        &ApplePolicy {
-            expected_rp_id_hash: rp_id_hash,
-            allowed_cd_hashes: vec![cd_hash],
-        },
-    )
-    .context("invalid provider genesis root assertion")?;
-    Ok(RootProof::AppleAppAttest(assertion.to_vec()))
-}
-
 pub(crate) struct LocalIdentity {
     pub(crate) transport_key: SecretKey,
     pub(crate) producer_key: ProducerSigningKey,
@@ -163,16 +128,12 @@ pub(crate) struct LocalIdentity {
 pub(crate) struct OpenIdentity {
     signer: OpenSigner,
     enrollment: ProviderEnrollmentBundle,
-    #[cfg(all(target_os = "macos", feature = "apple-app-attest"))]
-    apple_open_limit: Arc<tokio::sync::Semaphore>,
 }
 
 #[cfg(feature = "node")]
 #[derive(Clone)]
 enum OpenSigner {
     Software(ProducerSigningKey),
-    #[cfg(all(target_os = "macos", feature = "apple-app-attest"))]
-    AppleAppAttest(Arc<PlatformRoot>),
 }
 
 struct StoredIdentity {
@@ -185,56 +146,19 @@ struct StoredIdentity {
 
 enum StoredRoot {
     Software([u8; 32]),
-    #[cfg(all(target_os = "macos", feature = "apple-app-attest"))]
-    AppleAppAttest {
-        key: String,
-    },
 }
 
 enum PlatformRoot {
     Software(ProducerSigningKey),
-    #[cfg(all(target_os = "macos", feature = "apple-app-attest"))]
-    AppleAppAttest {
-        service: AppleAppAttest,
-        credential: AppleCredential,
-        public_key: [u8; 33],
-        rp_id_hash: [u8; 32],
-        cd_hash: [u8; 32],
-        validation_time: u64,
-    },
 }
 
 impl PlatformRoot {
     fn prove(&self, statement: &[u8]) -> anyhow::Result<RootProof> {
-        self.prove_prehashed(
-            Digest::hash(statement),
-            #[cfg(all(target_os = "macos", feature = "apple-app-attest"))]
-            client_data_hash(statement),
-        )
-    }
-
-    fn prove_prehashed(
-        &self,
-        software_digest: Digest,
-        #[cfg(all(target_os = "macos", feature = "apple-app-attest"))]
-        apple_client_data_hash: [u8; 32],
-    ) -> anyhow::Result<RootProof> {
         match self {
-            Self::Software(key) => Ok(RootProof::Software(key.sign_digest(software_digest)?)),
-            #[cfg(all(target_os = "macos", feature = "apple-app-attest"))]
-            Self::AppleAppAttest { service, .. } => Ok(RootProof::AppleAppAttest(
-                service.assertion(apple_client_data_hash)?,
+            Self::Software(key) => Ok(RootProof::Software(
+                key.sign_digest(Digest::hash(statement))?,
             )),
         }
-    }
-
-    #[cfg(all(feature = "node", target_os = "macos", feature = "apple-app-attest"))]
-    fn prove_open(&self, binding: Digest) -> anyhow::Result<RootProof> {
-        self.prove_prehashed(
-            binding,
-            #[cfg(all(target_os = "macos", feature = "apple-app-attest"))]
-            *binding.as_bytes(),
-        )
     }
 }
 
@@ -251,36 +175,6 @@ impl OpenIdentity {
                         tracing::warn!(%error, "confidential open proof generation failed");
                         WireStatus::internal("confidential open proof generation failed")
                     })
-            }
-            #[cfg(all(target_os = "macos", feature = "apple-app-attest"))]
-            OpenSigner::AppleAppAttest(root) => {
-                // Open is unauthenticated by design. Fail fast instead of
-                // queueing attacker-controlled native assertions, and keep
-                // App Attest's blocking run-loop wait off Tokio's workers.
-                let permit = self
-                    .apple_open_limit
-                    .clone()
-                    .try_acquire_owned()
-                    .map_err(|_| {
-                        WireStatus::new(
-                            WireCode::ResourceExhausted,
-                            "confidential open proof capacity is exhausted",
-                        )
-                    })?;
-                let root = root.clone();
-                tokio::task::spawn_blocking(move || {
-                    let _permit = permit;
-                    root.prove_open(binding)
-                })
-                .await
-                .map_err(|error| {
-                    tracing::warn!(%error, "confidential open proof task failed");
-                    WireStatus::internal("confidential open proof generation failed")
-                })?
-                .map_err(|error| {
-                    tracing::warn!(%error, "confidential open proof generation failed");
-                    WireStatus::internal("confidential open proof generation failed")
-                })
             }
         }
     }
@@ -354,14 +248,10 @@ fn build_open_identity(
         // The enrollment root authenticates the producer once. It is not an
         // online software key and must not survive identity materialization.
         PlatformRoot::Software(_) => OpenSigner::Software(producer_key.clone()),
-        #[cfg(all(target_os = "macos", feature = "apple-app-attest"))]
-        PlatformRoot::AppleAppAttest { .. } => OpenSigner::AppleAppAttest(root.clone()),
     };
     Arc::new(OpenIdentity {
         signer,
         enrollment: enrollment.clone(),
-        #[cfg(all(target_os = "macos", feature = "apple-app-attest"))]
-        apple_open_limit: Arc::new(tokio::sync::Semaphore::new(1)),
     })
 }
 
@@ -455,27 +345,6 @@ fn default_hellas_path(file: &str, flag: &str) -> anyhow::Result<PathBuf> {
 
 fn create_root(explicit: bool, _installation_nonce: [u8; 32]) -> anyhow::Result<PlatformRoot> {
     require_software_root(explicit)?;
-    #[cfg(all(target_os = "macos", feature = "apple-app-attest"))]
-    if !explicit {
-        let mut e = DagCborEncoder::new();
-        e.array(2);
-        e.str("hellas.apple.app-attest.enrollment.v1");
-        e.bytes(&_installation_nonce);
-        let (service, credential) = AppleAppAttest::create(client_data_hash(&e.into_bytes()))?;
-        let identity = apple_credential_identity(&credential.attestation)?;
-        let validation_time = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .context("system clock is before the Unix epoch")?
-            .as_secs();
-        return Ok(PlatformRoot::AppleAppAttest {
-            service,
-            credential,
-            public_key: identity.public_key,
-            rp_id_hash: identity.rp_id_hash,
-            cd_hash: identity.cd_hash,
-            validation_time,
-        });
-    }
     Ok(PlatformRoot::Software(ProducerSigningKey::generate()))
 }
 
@@ -492,10 +361,6 @@ fn create(path: &Path, software_root: bool) -> anyhow::Result<LocalIdentity> {
     let enrollment = enrollment_bundle(&root, genesis.clone());
     let stored_root = match root.as_ref() {
         PlatformRoot::Software(key) => StoredRoot::Software(key.to_secret_bytes()),
-        #[cfg(all(target_os = "macos", feature = "apple-app-attest"))]
-        PlatformRoot::AppleAppAttest { service, .. } => StoredRoot::AppleAppAttest {
-            key: service.key().into(),
-        },
     };
     let stored = StoredIdentity {
         version: VERSION,
@@ -535,25 +400,6 @@ fn materialize(stored: &StoredIdentity) -> anyhow::Result<LocalIdentity> {
         StoredRoot::Software(secret) => PlatformRoot::Software(
             ProducerSigningKey::from_secret_bytes(*secret).context("invalid software root key")?,
         ),
-        #[cfg(all(target_os = "macos", feature = "apple-app-attest"))]
-        StoredRoot::AppleAppAttest { key } => {
-            let PlatformEnrollment::AppleAppAttest(enrollment) = &stored.enrollment.platform else {
-                bail!("Apple App Attest root requires Apple enrollment");
-            };
-            let credential = AppleCredential {
-                attestation: enrollment.attestation_object.clone(),
-                client_data_hash: enrollment.client_data_hash,
-            };
-            let identity = apple_credential_identity(&enrollment.attestation_object)?;
-            PlatformRoot::AppleAppAttest {
-                service: AppleAppAttest::load(key.clone(), credential.content_id()),
-                credential,
-                public_key: identity.public_key,
-                rp_id_hash: identity.rp_id_hash,
-                cd_hash: identity.cd_hash,
-                validation_time: enrollment.validation_time,
-            }
-        }
     });
     let producer_key = ProducerSigningKey::from_secret_bytes(stored.producer_key)
         .context("invalid producer key")?;
@@ -576,30 +422,6 @@ fn materialize(stored: &StoredIdentity) -> anyhow::Result<LocalIdentity> {
             RootProof::Software(*signature)
         }
         (PlatformRoot::Software(_), _) => bail!("software root requires a software root proof"),
-        #[cfg(all(target_os = "macos", feature = "apple-app-attest"))]
-        (
-            PlatformRoot::AppleAppAttest {
-                credential,
-                public_key,
-                rp_id_hash,
-                cd_hash,
-                ..
-            },
-            RootProof::AppleAppAttest(assertion),
-        ) => materialize_apple_genesis_root(
-            assertion,
-            &client_data_hash(&statement.canonical_bytes()),
-            &RegisteredAppleCredential {
-                id: credential.content_id(),
-                public_key: *public_key,
-            },
-            *rp_id_hash,
-            *cd_hash,
-        )?,
-        #[cfg(all(target_os = "macos", feature = "apple-app-attest"))]
-        (PlatformRoot::AppleAppAttest { .. }, _) => {
-            bail!("Apple App Attest root requires an Apple App Attest proof")
-        }
     };
     #[cfg_attr(
         not(any(feature = "node", feature = "evaluate", test)),
@@ -632,16 +454,6 @@ fn enrollment_bundle(
 ) -> ProviderEnrollmentBundle {
     let platform = match root {
         PlatformRoot::Software(_) => PlatformEnrollment::Absent,
-        #[cfg(all(target_os = "macos", feature = "apple-app-attest"))]
-        PlatformRoot::AppleAppAttest {
-            credential,
-            validation_time,
-            ..
-        } => PlatformEnrollment::AppleAppAttest(AppleAppAttestEnrollment {
-            attestation_object: credential.attestation.clone(),
-            client_data_hash: credential.client_data_hash,
-            validation_time: *validation_time,
-        }),
     };
     ProviderEnrollmentBundle { genesis, platform }
 }
@@ -657,16 +469,6 @@ fn statement(
             RootKind::Software,
             key.public_key(),
             PlatformCredential::Absent,
-        ),
-        #[cfg(all(target_os = "macos", feature = "apple-app-attest"))]
-        PlatformRoot::AppleAppAttest {
-            credential,
-            public_key,
-            ..
-        } => (
-            RootKind::SecureEnclave,
-            PublicKey::P256(*public_key),
-            PlatformCredential::Registered(credential.content_id()),
         ),
     };
     ProviderGenesisStatement {
@@ -691,12 +493,6 @@ impl StoredIdentity {
                 encoder.u64(0);
                 encoder.bytes(secret);
             }
-            #[cfg(all(target_os = "macos", feature = "apple-app-attest"))]
-            StoredRoot::AppleAppAttest { key } => {
-                encoder.array(2);
-                encoder.u64(1);
-                encoder.str(key);
-            }
         }
         encoder.bytes(&self.producer_key);
         encoder.bytes(&self.transport_key);
@@ -716,11 +512,6 @@ impl StoredIdentity {
         }
         let root = match decoder.u64("identity root kind")? {
             0 => StoredRoot::Software(decoder.fixed_bytes("software root key")?),
-            #[cfg(all(target_os = "macos", feature = "apple-app-attest"))]
-            1 => StoredRoot::AppleAppAttest {
-                key: decoder.text("Apple App Attest key")?.to_owned(),
-            },
-            #[cfg(not(all(target_os = "macos", feature = "apple-app-attest")))]
             1 => bail!("Apple App Attest identity is not supported on this platform"),
             value => bail!("unknown identity root kind {value}"),
         };
@@ -842,60 +633,7 @@ fn create_dir_restricted(path: &Path) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use hellas_rpc::Signature;
-    use p256::ecdsa::signature::Signer as _;
-    use p256::ecdsa::{Signature as P256Signature, SigningKey as P256SigningKey};
-    use serde::Serialize;
-    use serde_bytes::ByteBuf;
-    use sha2::{Digest as _, Sha256};
-    use std::collections::BTreeMap;
     use std::env;
-
-    fn apple_assertion(
-        signing_key: &P256SigningKey,
-        rp_id_hash: [u8; 32],
-        cd_hash: [u8; 32],
-        counter: u32,
-        client_data_hash: &[u8; 32],
-    ) -> Vec<u8> {
-        let mut extensions = BTreeMap::new();
-        extensions.insert(
-            "apple_cd_hash_hash_01".to_owned(),
-            ByteBuf::from(cd_hash.to_vec()),
-        );
-        extensions.insert("apple_cd_hash_type_01".to_owned(), ByteBuf::from(vec![2]));
-        extensions.insert(
-            "apple_validation_category_01".to_owned(),
-            ByteBuf::from(vec![6, 0, 0, 0]),
-        );
-        let mut extension_bytes = Vec::new();
-        ciborium::into_writer(&extensions, &mut extension_bytes).unwrap();
-
-        let mut authenticator_data = Vec::new();
-        authenticator_data.extend_from_slice(&rp_id_hash);
-        authenticator_data.push(0x40);
-        authenticator_data.extend_from_slice(&counter.to_be_bytes());
-        authenticator_data.extend_from_slice(&extension_bytes);
-        let digest = Sha256::digest([authenticator_data.as_slice(), client_data_hash].concat());
-        let signature: P256Signature = signing_key.sign(&digest);
-
-        #[derive(Serialize)]
-        struct Assertion {
-            #[serde(rename = "authenticatorData")]
-            authenticator_data: ByteBuf,
-            signature: ByteBuf,
-        }
-
-        let mut encoded = Vec::new();
-        ciborium::into_writer(
-            &Assertion {
-                authenticator_data: ByteBuf::from(authenticator_data),
-                signature: ByteBuf::from(signature.to_der().as_bytes().to_vec()),
-            },
-            &mut encoded,
-        )
-        .unwrap();
-        encoded
-    }
 
     #[test]
     fn creates_and_reloads_one_identity() {
@@ -1094,43 +832,6 @@ mod tests {
         fs::write(store.counter_path(&public_key), [0, 1]).unwrap();
 
         assert_eq!(store.advance(&public_key, 3), Err(AttestationError::State));
-    }
-
-    #[test]
-    fn stored_apple_genesis_materialization_is_repeatable() {
-        let signing_key = P256SigningKey::from_bytes((&[7; 32]).into()).unwrap();
-        let credential = RegisteredAppleCredential {
-            id: hellas_rpc::ContentId::from_bytes([9; 32]),
-            public_key: signing_key
-                .verifying_key()
-                .to_sec1_point(true)
-                .as_bytes()
-                .try_into()
-                .unwrap(),
-        };
-        let cd_hash = [8; 32];
-        let rp_id_hash = [7; 32];
-        let client_data_hash = [3; 32];
-        let assertion = apple_assertion(&signing_key, rp_id_hash, cd_hash, 1, &client_data_hash);
-
-        let first = materialize_apple_genesis_root(
-            &assertion,
-            &client_data_hash,
-            &credential,
-            rp_id_hash,
-            cd_hash,
-        )
-        .unwrap();
-        let second = materialize_apple_genesis_root(
-            &assertion,
-            &client_data_hash,
-            &credential,
-            rp_id_hash,
-            cd_hash,
-        )
-        .unwrap();
-
-        assert_eq!(first, second);
     }
 
     #[test]

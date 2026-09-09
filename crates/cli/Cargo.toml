@@ -10,8 +10,8 @@ documentation.workspace = true
 [features]
 default = []
 
-# Enables macOS provider-side enrollment/signing. Client-side verification is
-# always present because remote confidential-open supports Apple providers.
+# Enables Apple App Attest verification for clients. Native enrollment and
+# proof production belong to the signed host application (Gate), not the CLI.
 apple-app-attest = []
 
 # The node serves paid work, and paid work is a chain: the work config's
@@ -72,7 +72,6 @@ otel = [
 libc = "0.2"
 
 [dependencies]
-
 anyhow = "1"
 async-stream = { version = "0.3", optional = true }
 axum = { version = "0.8", optional = true }
@@ -89,6 +88,7 @@ hellas-executor = { workspace = true, default-features = false, optional = true 
 hellas-gateway = { workspace = true, optional = true }
 hellas-kernel = { workspace = true, default-features = false, optional = true }
 hellas-presentation = { workspace = true, optional = true }
+hellas-providers.workspace = true
 hellas-rpc = { workspace = true, default-features = false, features = [
     "all-protocols",
     "work",

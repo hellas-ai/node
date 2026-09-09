@@ -9,22 +9,33 @@ use reqwest::Url;
 use super::responses_fetch::{execute_responses_request, responses_http_client};
 
 #[derive(Clone)]
-pub(super) struct OpenAiResponsesFetchProvider {
+pub struct OpenAiResponsesFetchProvider {
     client: reqwest::Client,
     endpoint: Url,
     bearer_token: String,
 }
 
 impl OpenAiResponsesFetchProvider {
-    pub(super) fn new(api_key_env: &str) -> anyhow::Result<Self> {
-        let endpoint = Url::parse(OPENAI_RESPONSES_ENDPOINT)
-            .expect("built-in OpenAI Responses endpoint is valid");
+    pub fn new(api_key_env: &str) -> anyhow::Result<Self> {
         let bearer_token = std::env::var(api_key_env)
             .with_context(|| format!("environment variable {api_key_env} is not set"))?;
         let bearer_token = bearer_token.trim().to_string();
         if bearer_token.is_empty() {
             bail!("environment variable {api_key_env} is empty");
         }
+        Self::with_bearer(bearer_token)
+    }
+
+    /// Construct from a secret supplied by an embedding host without routing
+    /// it through process-wide environment state.
+    pub fn with_bearer(bearer_token: impl Into<String>) -> anyhow::Result<Self> {
+        let bearer_token = bearer_token.into();
+        let bearer_token = bearer_token.trim().to_owned();
+        if bearer_token.is_empty() {
+            bail!("OpenAI API key is empty");
+        }
+        let endpoint = Url::parse(OPENAI_RESPONSES_ENDPOINT)
+            .expect("built-in OpenAI Responses endpoint is valid");
         Ok(Self::with_client(
             responses_http_client(),
             endpoint,

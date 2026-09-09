@@ -56,7 +56,7 @@ pub enum PaidWorkCommand {
     /// Read the chain identity and genesis payload from validator RPCs.
     InspectChain(InspectChainArgs),
     /// Open (or resume) a durable channel, run one job, and pay for it.
-    Run(RunArgs),
+    Run(Box<RunArgs>),
 }
 
 #[cfg(feature = "llm")]
@@ -179,7 +179,7 @@ pub async fn run(
                 "--timeout-secs must be greater than zero"
             );
             let timeout = Duration::from_secs(args.timeout_secs);
-            tokio::time::timeout(timeout, run_one(args, transport_key, settlement_key))
+            tokio::time::timeout(timeout, run_one(*args, transport_key, settlement_key))
                 .await
                 .map_err(|_| anyhow::anyhow!("paid-work run exceeded its {timeout:?} limit"))?
         }

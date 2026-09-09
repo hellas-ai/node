@@ -1,0 +1,25 @@
+[package]
+name = "hellas-providers"
+description = "Sealed upstream providers and response projectors for Hellas Fetch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation.workspace = true
+
+[dependencies]
+anyhow = "1"
+async-stream = "0.3"
+futures.workspace = true
+hellas-adaptors.workspace = true
+hellas-executor = { workspace = true, default-features = false }
+hellas-rpc = { workspace = true, features = ["fetch"] }
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

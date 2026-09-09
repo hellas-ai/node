@@ -1,8 +1,5 @@
 #[cfg(feature = "apple-app-attest")]
 mod apple;
-#[cfg(all(target_os = "macos", feature = "apple-app-attest"))]
-mod apple_macos;
-
 use std::future::Future;
 
 use hellas_rpc::pb::execute::AssuranceEvidence;
@@ -12,11 +9,9 @@ use hellas_rpc::{DagCborEncoder, Digest, EventCommitment};
 pub use apple::{
     AppleClaims, AppleCredential, AppleCredentialIdentity, ApplePolicy, AppleVerdict,
     AssertionCounterStore, RegisteredAppleCredential, apple_app_attest_root_ca, apple_app_id_hash,
-    apple_credential_identity, appraise_apple, register_apple, verify_apple,
-    verify_apple_assertion,
+    apple_client_data_hash, apple_credential_identity, appraise_apple, register_apple,
+    verify_apple, verify_apple_assertion,
 };
-#[cfg(all(target_os = "macos", feature = "apple-app-attest"))]
-pub use apple_macos::{AppleAppAttest, client_data_hash};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Binding(Digest);
@@ -43,6 +38,25 @@ pub trait Attester {
         &self,
         binding: Binding,
     ) -> impl Future<Output = Result<AssuranceEvidence, AttestationError>> + Send;
+}
+
+/// Produces the root proofs that bind a provider identity to its enrollment
+/// statement and to a live confidential transport.
+///
+/// The two inputs are deliberately separate. A software root signs Hellas's
+/// digest of a statement, while Apple App Attest signs SHA-256(statement).
+/// A confidential-open binding is already a protocol digest and must not be
+/// hashed a second time by this interface.
+pub trait RootProver {
+    fn prove_statement(
+        &self,
+        statement: &[u8],
+    ) -> impl Future<Output = Result<hellas_rpc::RootProof, AttestationError>> + Send;
+
+    fn prove_open_binding(
+        &self,
+        binding: hellas_rpc::Digest,
+    ) -> impl Future<Output = Result<hellas_rpc::RootProof, AttestationError>> + Send;
 }
 
 #[derive(Clone)]
@@ -79,7 +93,9 @@ pub enum AttestationError {
     #[cfg(feature = "apple-app-attest")]
     #[error("Apple attestation state is unavailable")]
     State,
-    #[cfg(all(target_os = "macos", feature = "apple-app-attest"))]
-    #[error("Apple App Attest failed: {0}")]
+    #[cfg(feature = "apple-app-attest")]
+    #[error("Apple App Attest omitted required CDHash evidence")]
+    AppleCdHashMissing,
+    #[error("platform attestation failed: {0}")]
     Platform(String),
 }

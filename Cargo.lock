@@ -2509,7 +2509,6 @@ name = "hellas-attestation"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
- "cc",
  "ciborium",
  "hellas-rpc",
  "hex",
@@ -2596,6 +2595,7 @@ dependencies = [
  "hellas-gateway",
  "hellas-kernel",
  "hellas-presentation",
+ "hellas-providers",
  "hellas-rpc",
  "hellas-store",
  "hellas-wire",
@@ -2748,6 +2748,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "hellas-providers"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "axum",
+ "futures",
+ "hellas-adaptors",
+ "hellas-executor",
+ "hellas-rpc",
+ "reqwest 0.13.1",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "hellas-rpc"
 version = "0.1.0"
 dependencies = [
@@ -2779,6 +2797,25 @@ dependencies = [
  "tokio",
  "tracing",
  "web-time",
+]
+
+[[package]]
+name = "hellas-sdk"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "futures-core",
+ "hellas-attestation",
+ "hellas-client",
+ "hellas-executor",
+ "hellas-gateway",
+ "hellas-providers",
+ "hellas-rpc",
+ "hellas-wire",
+ "iroh",
+ "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

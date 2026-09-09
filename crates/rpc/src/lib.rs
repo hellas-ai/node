@@ -131,6 +131,7 @@ pub use crate::pb::services;
 pub fn peer_service_aliases() -> Vec<peers::ServiceAlias> {
     crate::services::KNOWN_SERVICES
         .iter()
+        .filter(|entry| entry.name != "hellas.host.v1.HostControl")
         .flat_map(|entry| {
             [
                 peers::ServiceAlias::new(entry.alpn, entry.name),
@@ -138,6 +139,19 @@ pub fn peer_service_aliases() -> Vec<peers::ServiceAlias> {
             ]
         })
         .collect()
+}
+
+/// Local-control services must never become reachable through peer discovery,
+/// even in a binary that compiles both network and desktop-host features.
+#[cfg(all(test, feature = "host-control"))]
+mod local_service_tests {
+    #[test]
+    fn host_control_is_not_a_peer_alias() {
+        assert!(super::peer_service_aliases().iter().all(|alias| {
+            alias.query != "hellas.host.v1.HostControl"
+                && alias.service != "hellas.host.v1.HostControl"
+        }));
+    }
 }
 
 /// A [`peers::PeerDirectoryConfig`] preseeded with [`peer_service_aliases`].

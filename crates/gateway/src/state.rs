@@ -1,5 +1,5 @@
 use super::proxy::ResponsesProxy;
-use super::{GatewayOptions, ResponsesBackend, json_error};
+use super::{FetchGatewayOptions, GatewayOptions, ResponsesBackend, json_error};
 use crate::execution::{
     CausalLmExecutionEnvironment, CliRuntime, ExecutionRequest, ExecutionRequestOptions,
     ExecutionStrategy, PreparedExecution,
@@ -37,10 +37,10 @@ pub(super) struct GatewayState {
     pub(super) verify_node_id: Option<EndpointId>,
     default_max_tokens: u32,
     pub(super) model_name: String,
-    pub(super) causal_lm: CausalLmExecutionEnvironment,
+    pub(super) causal_lm: Option<CausalLmExecutionEnvironment>,
     pub(super) inference_timeout: Duration,
     runtime: CliRuntime,
-    presentation: Arc<TextPresentation>,
+    presentation: Option<Arc<TextPresentation>>,
     stop_token_ids: Vec<u32>,
     pub(super) responses_proxy: Option<Arc<ResponsesProxy>>,
     pub(super) responses_fetch: Option<Arc<super::fetch_backend::ResponsesFetchBackend>>,
@@ -232,16 +232,58 @@ impl GatewayState {
             verify_node_id: options.verify,
             default_max_tokens: options.default_max_tokens,
             model_name: options.model_name.clone(),
-            causal_lm: options.causal_lm.clone(),
+            causal_lm: Some(options.causal_lm.clone()),
             inference_timeout: DEFAULT_INFERENCE_TIMEOUT,
             runtime,
-            presentation,
+            presentation: Some(presentation),
             stop_token_ids: options.stop_token_ids.clone(),
             responses_proxy,
             responses_fetch,
             runner_key,
             assurance: options.assurance,
             strategy: configured_strategy(options),
+        })
+    }
+
+    pub(super) async fn from_fetch_options(options: &FetchGatewayOptions) -> anyhow::Result<Self> {
+        let runtime = CliRuntime::remote(options.secret_key.clone()).await?;
+        let runner_key = Arc::new(options.caller_key.clone());
+        let route = ExecutionRoute::remote(
+            options.node_id,
+            options.node_addrs.clone(),
+            options.retries,
+            options.provider_trust.clone(),
+        );
+        let responses_fetch = Arc::new(super::fetch_backend::ResponsesFetchBackend::new(
+            runtime.clone(),
+            route,
+            (
+                &options.service,
+                &options.method,
+                options.execution_environment,
+            ),
+            options.caller_key.clone(),
+            options.assurance,
+            options.request_overrides.clone(),
+        ));
+        Ok(Self {
+            #[cfg(feature = "evaluate")]
+            local: false,
+            #[cfg(feature = "evaluate")]
+            verify_local: false,
+            verify_node_id: None,
+            default_max_tokens: 1,
+            model_name: String::new(),
+            causal_lm: None,
+            inference_timeout: DEFAULT_INFERENCE_TIMEOUT,
+            runtime,
+            presentation: None,
+            stop_token_ids: Vec::new(),
+            responses_proxy: None,
+            responses_fetch: Some(responses_fetch),
+            runner_key,
+            assurance: options.assurance,
+            strategy: None,
         })
     }
 
@@ -266,9 +308,13 @@ impl GatewayState {
         retention: Retention,
     ) -> Result<PreparedGeneration, HttpError> {
         let prompt_tokens = input_ids.len() as u32;
+        let causal_lm = self.causal_lm.clone().ok_or_else(|| HttpError {
+            status: StatusCode::NOT_FOUND,
+            message: "this gateway exposes only the Fetch-backed Responses route".to_string(),
+        })?;
         let request = ExecutionRequest::new(
             self.runtime.clone(),
-            self.causal_lm.clone(),
+            causal_lm,
             input_ids,
             self.stop_token_ids.clone(),
             ExecutionRequestOptions {
@@ -290,7 +336,10 @@ impl GatewayState {
         let provenance = prepared.provenance().cloned();
 
         Ok(PreparedGeneration {
-            presentation: self.presentation.clone(),
+            presentation: self.presentation.clone().ok_or_else(|| HttpError {
+                status: StatusCode::NOT_FOUND,
+                message: "this gateway has no causal-LM presentation".to_string(),
+            })?,
             prepared,
             provenance,
             prompt_tokens,
@@ -312,13 +361,20 @@ impl GatewayState {
             Input::Text(prompt)
                 if req.canonical.tools.is_empty() && req.canonical.reasoning.is_none() =>
             {
-                self.presentation.encode(prompt).map_err(|err| HttpError {
-                    status: StatusCode::BAD_REQUEST,
-                    message: format!(
-                        "Failed to tokenize completion prompt: {}",
-                        format_error_causes(err.as_ref())
-                    ),
-                })?
+                self.presentation
+                    .as_ref()
+                    .ok_or_else(|| HttpError {
+                        status: StatusCode::NOT_FOUND,
+                        message: "this gateway has no causal-LM presentation".to_string(),
+                    })?
+                    .encode(prompt)
+                    .map_err(|err| HttpError {
+                        status: StatusCode::BAD_REQUEST,
+                        message: format!(
+                            "Failed to tokenize completion prompt: {}",
+                            format_error_causes(err.as_ref())
+                        ),
+                    })?
             }
             Input::Text(_) | Input::Messages(_) | Input::Items(_) => {
                 return Err(HttpError {

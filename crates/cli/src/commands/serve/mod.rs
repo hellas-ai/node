@@ -24,14 +24,10 @@ use tokio::time::{Duration, timeout};
 use tracing::warn;
 
 mod codex_provider;
-mod codex_responses;
 mod node;
 mod node_handler;
-mod openai_provider;
 pub mod probe;
 pub mod provision;
-mod responses_fetch;
-mod responses_projector;
 pub mod work_config;
 
 pub use probe::{ProbeOptions, run_probe};
@@ -390,12 +386,12 @@ impl FetchDestination {
                 ),
                 Self::OpenaiResponses { api_key_env } => (
                     FetchEnvironment::OpenAiResponses,
-                    Arc::new(openai_provider::OpenAiResponsesFetchProvider::new(
+                    Arc::new(hellas_providers::OpenAiResponsesFetchProvider::new(
                         &api_key_env,
                     )?),
                 ),
             };
-        let adaptor_factory = Arc::new(responses_projector::ResponsesFetchAdaptorFactory::new(
+        let adaptor_factory = Arc::new(hellas_providers::ResponsesFetchAdaptorFactory::new(
             environment,
         ));
         Ok(FetchRouteEntry::new(

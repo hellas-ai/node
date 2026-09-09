@@ -32,6 +32,9 @@ discovery-mdns = [
 # Mux is shared infrastructure for transports without native substreams.
 mux = []
 ws = ["mux", "dep:tokio-tungstenite"]
+# Local native transport. Unix sockets provide the byte stream; `mux` keeps
+# the RPC framing and service dispatch identical to WebSocket carriers.
+unix = ["mux", "tokio/net"]
 # Opt-in TLS for native WebSocket clients. Keeping this separate from `ws`
 # preserves a TLS-free transport build for constrained native targets.
 ws-rustls = ["ws", "dep:rustls", "tokio-tungstenite/rustls-tls-webpki-roots"]

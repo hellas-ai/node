@@ -1,0 +1,72 @@
+syntax = "proto3";
+
+package hellas.host.v1;
+
+// Local lifecycle control for an application hosting Hellas services. This
+// service is not a network protocol and must never be advertised over Iroh or
+// a relay.
+service HostControl {
+  rpc GetHostStatus(GetHostStatusRequest) returns (HostStatus);
+  rpc SetProviderState(SetProviderStateRequest) returns (HostStatus);
+  rpc SetGatewayState(SetGatewayStateRequest) returns (HostStatus);
+  rpc GetGatewayAccess(GetGatewayAccessRequest) returns (GatewayAccess);
+}
+
+message GetHostStatusRequest {}
+
+message SetProviderStateRequest {
+  bool enabled = 1;
+}
+
+message SetGatewayStateRequest {
+  bool enabled = 1;
+}
+
+message GetGatewayAccessRequest {}
+
+enum RuntimeState {
+  // An omitted state means stopped; preserve the host protocol's zero value.
+  // buf:lint:ignore ENUM_ZERO_VALUE_SUFFIX
+  RUNTIME_STATE_STOPPED = 0;
+  RUNTIME_STATE_STARTING = 1;
+  RUNTIME_STATE_RUNNING = 2;
+  RUNTIME_STATE_STOPPING = 3;
+  RUNTIME_STATE_FAILED = 4;
+}
+
+enum AttestationState {
+  // An omitted state makes no attestation claim.
+  // buf:lint:ignore ENUM_ZERO_VALUE_SUFFIX
+  ATTESTATION_STATE_UNAVAILABLE = 0;
+  ATTESTATION_STATE_SOFTWARE = 1;
+  ATTESTATION_STATE_ENROLLING = 2;
+  ATTESTATION_STATE_APPLE_APP_ATTEST = 3;
+  ATTESTATION_STATE_FAILED = 4;
+}
+
+message IdentityStatus {
+  string producer_id = 1;
+  string node_id = 2;
+  AttestationState attestation = 3;
+  string detail = 4;
+  // Compressed secp256k1 key callers can explicitly grant in Fetch policy.
+  string caller_public_key = 5;
+}
+
+message ServiceStatus {
+  RuntimeState state = 1;
+  string detail = 2;
+}
+
+message HostStatus {
+  string version = 1;
+  IdentityStatus identity = 2;
+  ServiceStatus provider = 3;
+  ServiceStatus gateway = 4;
+  string endpoint = 5;
+}
+
+message GatewayAccess {
+  string address = 1;
+  string bearer = 2;
+}

@@ -11,7 +11,6 @@ documentation.workspace = true
 default = []
 apple-app-attest = [
     "dep:base64",
-    "dep:cc",
     "dep:ciborium",
     "dep:p256",
     "dep:rustls-pki-types",
@@ -37,9 +36,6 @@ webpki = { workspace = true, default-features = false, features = [
     "std",
 ], optional = true }
 x509-cert = { workspace = true, optional = true }
-
-[build-dependencies]
-cc = { workspace = true, optional = true }
 
 [dev-dependencies]
 hex.workspace = true
