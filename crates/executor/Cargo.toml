@@ -15,7 +15,7 @@ evaluate = ["dep:catena-lang", "dep:commonware-runtime", "dep:hellas-store"]
 async-trait = "0.1"
 catena-lang = { workspace = true, optional = true }
 commonware-runtime = { workspace = true, optional = true }
-futures-core = "0.3"
+futures-core = { workspace = true }
 futures-util = "0.3"
 hellas-chain = { workspace = true, features = ["client"] }
 hellas-kernel = { workspace = true, features = ["secp256k1"] }

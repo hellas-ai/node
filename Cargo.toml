@@ -106,3 +106,12 @@ tracing-opentelemetry = "0.32"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 webpki = { package = "rustls-webpki", version = "0.103.9", default-features = false }
 x509-cert = { version = "0.2", default-features = false }
+
+anyhow = "1"
+async-stream = "0.3"
+futures-core = "0.3"
+iroh-mdns-address-lookup = "0.4"
+smol_str = "0.3"
+tempfile = "3"
+tokio-tungstenite = "0.29"
+web-time = "1"

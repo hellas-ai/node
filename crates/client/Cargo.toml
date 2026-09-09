@@ -29,7 +29,7 @@ evaluate = ["hellas-rpc/evaluate"]
 work = ["dep:hellas-kernel", "hellas-rpc/work"]
 
 [dependencies]
-async-stream = { version = "0.3", optional = true }
+async-stream = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 hellas-attestation = { workspace = true, features = [
     "apple-app-attest",
@@ -41,7 +41,7 @@ hellas-kernel = { workspace = true, optional = true }
 hellas-rpc = { workspace = true, features = ["execute", "fetch"] }
 hellas-wire.workspace = true
 iroh = { workspace = true, features = ["tls-ring"], optional = true }
-iroh-mdns-address-lookup = { version = "0.4", optional = true }
+iroh-mdns-address-lookup = { workspace = true, optional = true }
 rand.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, optional = true }
@@ -61,5 +61,5 @@ serde.workspace = true
 serde_bytes.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-tempfile = "3"
+tempfile = { workspace = true }
 tokio.workspace = true

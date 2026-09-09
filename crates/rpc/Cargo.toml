@@ -48,9 +48,9 @@ all-protocols = ["swarm", "courtesy", "execute", "evaluate", "fetch", "chain"]
 work = ["dep:hellas-kernel", "evaluate", "hellas-kernel/secp256k1"]
 
 [dependencies]
-bytes = "1"
+bytes = { workspace = true }
 ed25519-dalek = { workspace = true }
-futures-core = "0.3"
+futures-core = { workspace = true }
 futures-util = { version = "0.3", default-features = false }
 hellas-kernel = { workspace = true, optional = true }
 hellas-wire = { workspace = true }
@@ -62,12 +62,12 @@ serde = { workspace = true }
 serde_bytes = { workspace = true }
 serde_ipld_dagcbor = { workspace = true }
 serde_json = { workspace = true, optional = true }
-smol_str = "0.3"
+smol_str = { workspace = true }
 thiserror = { workspace = true }
 # The measurement seams' one channel out. Nothing here decides on a
 # sample, and a node with no subscriber pays one atomic load per seam.
 tracing = { workspace = true }
-web-time = "1"
+web-time = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.2", features = ["js"] }
@@ -91,5 +91,5 @@ hellas-kernel = { workspace = true, features = ["secp256k1"] }
 # rather than a handler call: framing, method routing, and trailers are
 # where a wire-shaped mistake actually shows up.
 hellas-wire = { workspace = true, features = ["mux"] }
-tempfile = "3"
+tempfile = { workspace = true }
 tokio.workspace = true

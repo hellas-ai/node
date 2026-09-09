@@ -25,7 +25,7 @@ k256 = { version = "0.13", default-features = false, features = [
     "ecdsa",
 ], optional = true }
 p256 = { workspace = true, optional = true }
-sha2 = { version = "0.11", default-features = false, optional = true }
+sha2 = { workspace = true, optional = true }
 
 [dev-dependencies]
 
@@ -42,7 +42,7 @@ proptest-state-machine = "0.8"
 # the independent Bitcoin implementation and verifying with the k256
 # production path cross-validates that the two agree byte-for-byte.
 secp256k1 = { version = "0.31", features = ["alloc"] }
-serde = { version = "1", features = ["derive"] }
+serde = { workspace = true }
 stateright = "0.31"
 
 [[bench]]

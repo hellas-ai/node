@@ -43,16 +43,16 @@ ws-wasm = ["mux", "dep:ws_stream_wasm", "dep:wasm-bindgen-futures"]
 [dependencies]
 
 # Discovery backend deps (gated behind discovery-{dht,mdns}).
-async-stream = { version = "0.3", optional = true }
-bytes = "1"
+async-stream = { workspace = true, optional = true }
+bytes = { workspace = true }
 data-encoding = { version = "2", optional = true }
-futures = "0.3"
-futures-core = "0.3"
+futures = { workspace = true }
+futures-core = { workspace = true }
 hellas-xet = { workspace = true, features = ["chunking"] }
 
 # Optional transport deps
 iroh = { workspace = true, optional = true }
-iroh-mdns-address-lookup = { version = "0.4", optional = true }
+iroh-mdns-address-lookup = { workspace = true, optional = true }
 mainline = { version = "7", optional = true }
 n0-future = { version = "0.3", default-features = false, optional = true }
 
@@ -68,15 +68,15 @@ postcard = { version = "1", default-features = false, features = [
 rustls = { version = "0.23", default-features = false, features = [
     "ring",
 ], optional = true }
-serde = { version = "1", features = ["derive"], optional = true }
-sha2 = { version = "0.11", optional = true }
-smol_str = "0.3"
+serde = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+smol_str = { workspace = true }
 thiserror = { workspace = true }
 tokio-stream = { workspace = true, optional = true }
-tokio-tungstenite = { version = "0.29", optional = true }
+tokio-tungstenite = { workspace = true, optional = true }
 tracing = { workspace = true }
 wasm-bindgen-futures = { version = "0.4", optional = true }
-web-time = "1"
+web-time = { workspace = true }
 ws_stream_wasm = { version = "0.7", optional = true }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]

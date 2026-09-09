@@ -17,10 +17,10 @@ evaluate = [
 ]
 
 [dependencies]
-anyhow = "1"
-async-stream = "0.3"
-axum = "0.8"
-futures = "0.3"
+anyhow = { workspace = true }
+async-stream = { workspace = true }
+axum = { workspace = true }
+futures = { workspace = true }
 hellas-adaptors.workspace = true
 hellas-client = { workspace = true, features = ["iroh", "evaluate"] }
 hellas-executor = { workspace = true, optional = true }

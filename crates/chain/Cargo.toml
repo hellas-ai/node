@@ -166,8 +166,8 @@ prometheus-client = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 rand_core = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
-serde_json = { version = "1", optional = true }
-sha2 = { version = "0.11", optional = true }
+serde_json = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
 thiserror = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true, features = [
     "net",
@@ -175,8 +175,8 @@ tokio = { workspace = true, optional = true, features = [
     "sync",
     "time",
 ] }
-tokio-stream = { version = "0.1", optional = true, features = ["sync"] }
-tokio-tungstenite = { version = "0.29", optional = true }
+tokio-stream = { workspace = true, optional = true, features = ["sync"] }
+tokio-tungstenite = { workspace = true, optional = true }
 toml = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }

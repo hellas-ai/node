@@ -8,6 +8,6 @@ repository.workspace = true
 documentation.workspace = true
 
 [dependencies]
-anyhow = "1"
+anyhow = { workspace = true }
 hellas-rpc = { workspace = true, features = ["execute"] }
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
