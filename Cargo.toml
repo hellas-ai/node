@@ -28,6 +28,9 @@ repository = "https://github.com/hellas-ai/hellas"
 documentation = "https://docs.rs"
 
 [workspace.dependencies]
+
+anyhow = "1"
+async-stream = "0.3"
 axum = "0.8"
 base64 = "0.22"
 bytes = "1"
@@ -49,6 +52,7 @@ commonware-utils = { git = "https://github.com/commonwarexyz/monorepo", rev = "4
 dirs = "6"
 ed25519-dalek = { version = "3.0.0", default-features = false }
 futures = "0.3"
+futures-core = "0.3"
 hellas-adaptors = { path = "crates/adaptors", default-features = false }
 hellas-attestation = { path = "crates/attestation", default-features = false }
 hellas-chain = { path = "crates/chain", default-features = false }
@@ -66,6 +70,7 @@ hellas-wire = { path = "crates/wire", default-features = false }
 hellas-xet = { path = "crates/xet", default-features = false }
 hex = "0.4"
 iroh = { version = "1", default-features = false }
+iroh-mdns-address-lookup = "0.4"
 k256 = { version = "0.13", features = ["ecdsa"] }
 opentelemetry = "0.31"
 opentelemetry-otlp = { version = "0.31", default-features = false, features = [
@@ -90,6 +95,8 @@ serde_bytes = "0.11"
 serde_ipld_dagcbor = "=0.6.4"
 serde_json = "1"
 sha2 = { version = "0.11", default-features = false }
+smol_str = "0.3"
+tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = [
     "rt-multi-thread",
@@ -100,18 +107,11 @@ tokio = { version = "1", features = [
     "process",
 ] }
 tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-tungstenite = "0.29"
 toml = "1.1"
 tracing = "0.1"
 tracing-opentelemetry = "0.32"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+web-time = "1"
 webpki = { package = "rustls-webpki", version = "0.103.9", default-features = false }
 x509-cert = { version = "0.2", default-features = false }
-
-anyhow = "1"
-async-stream = "0.3"
-futures-core = "0.3"
-iroh-mdns-address-lookup = "0.4"
-smol_str = "0.3"
-tempfile = "3"
-tokio-tungstenite = "0.29"
-web-time = "1"
