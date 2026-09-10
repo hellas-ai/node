@@ -53,13 +53,6 @@
 //! claiming `measured` on evidence like this is exactly the failure the
 //! whole gate exists to prevent.
 //!
-//! # The trials are the sharpest of these
-//!
-//! `q = 0.999` needs 2,995 independent contests answered in time
-//! ([`hellas_rpc::protocol::mount::TRIAL_FLOOR`]). This probe raises
-//! none, writes `trials: 0`, and the grading turns that into `assumed`
-//! without being asked to. Nothing here lowers that threshold and
-//! nothing here invents a trial.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -68,7 +61,6 @@ use std::sync::Arc;
 use anyhow::{Context as _, bail};
 use hellas_rpc::observe::{Samples, unix_ms};
 use hellas_rpc::protocol::Digest;
-use hellas_rpc::protocol::mount::clopper_pearson_upper_ppb;
 use hellas_rpc::work_store::Role;
 use hellas_rpc::work_store::journal::{Journal, JournalId, JournalKind};
 use serde::Deserialize;
@@ -122,18 +114,8 @@ pub struct ProbeOptions {
 struct AssumptionsFile {
     /// `term: value`, for any of §4's fourteen budget terms.
     budget: BTreeMap<String, u64>,
-    /// The three omission numbers, which need funded contests.
-    omission: AssumedOmission,
     /// The six expected payment values, which need a funded edge.
     expected_payment_values: AssumedPaymentValues,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct AssumedOmission {
-    response_probability: u64,
-    response_blocks: u64,
-    response_cost_cap: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -177,7 +159,7 @@ const TERMS: [&str; 14] = [
 /// every judgement about what was collected is made by the artifact
 /// reader, not here. In particular this does not reduce, average, or
 /// grade — [`Self::into_artifact`] copies raw samples out and leaves
-/// `max6` and the Clopper–Pearson bound to the node that will read them.
+/// `max6` to the node that will read them.
 pub struct Probe {
     samples: Arc<Samples>,
     started_at_unix_ms: u64,
@@ -280,13 +262,6 @@ impl Probe {
             );
         }
 
-        // No contest was raised, so no contest was answered in time.
-        // Zero trials is what the grading is handed, and zero trials
-        // grade `assumed` — which is the whole of what this probe can
-        // honestly say about `q`.
-        let trials = 0_u64;
-        let misses = 0_u64;
-
         Ok((
             serde_json::json!({
                 "provenance": {
@@ -295,16 +270,6 @@ impl Probe {
                     "machine": machine,
                     "started_at_unix_ms": self.started_at_unix_ms,
                     "measured_at_unix_ms": finished_at_unix_ms,
-                },
-                "omission": {
-                    "response_probability": assumed_number(assumed.omission.response_probability),
-                    "response_blocks": assumed_number(assumed.omission.response_blocks),
-                    "response_cost_cap": assumed_number(assumed.omission.response_cost_cap),
-                    "response_trials": {
-                        "trials": trials,
-                        "misses": misses,
-                        "miss_upper_ppb": clopper_pearson_upper_ppb(trials, misses),
-                    },
                 },
                 "expected_payment_values": {
                     "value": assumed_number(assumed.expected_payment_values.value),

@@ -342,7 +342,7 @@ mod tests {
         PaidChannelPolicyV1, PaidExecutionPolicyV1, private_policy_commitment,
     };
     use hellas_rpc::protocol::work_setup::{
-        OmissionMeasurements, ProviderChannelPolicy, WorkChannelConfig, WorkChannelDescriptor,
+        ProviderChannelPolicy, WorkChannelConfig, WorkChannelDescriptor,
     };
     use hellas_rpc::protocol::{ContentId, Digest as ProtocolDigest};
     use hellas_rpc::services::work_setup::WorkSetupHandler;
@@ -374,7 +374,9 @@ mod tests {
     const FUNDING: u64 = 100;
     /// What the provider stakes on the bond.
     const STAKE: u64 = 12;
-    const OMISSION_BOND: u64 = 4;
+    /// One over half the funding, so the bond exceeds the capacity it
+    /// leaves behind at zero fees.
+    const OMISSION_BOND: u64 = 51;
     const HORIZON: u64 = 500;
     const SALT: [u8; 32] = [0x5a; 32];
     /// The window the provider measured its response probability over,
@@ -470,14 +472,6 @@ mod tests {
         EdgeValues::new(FUNDING, 0, Fees::new(0, 0, 0, 0))
     }
 
-    fn measurements() -> OmissionMeasurements {
-        OmissionMeasurements {
-            response_probability: 999_000,
-            response_blocks: WINDOW,
-            response_cost_cap: 1,
-        }
-    }
-
     /// The floor these fixtures run under: a budget in which no wait
     /// takes any time, so §4's `S` and `R` are zero, its response-window
     /// floor is the kernel's own `MIN_OMIT_RESPONSE_BLOCKS`, and `T` is
@@ -513,7 +507,6 @@ mod tests {
             channel_policy: channel_policy(),
             execution_policy: execution_policy(),
             expected_payment_values: expected_values(),
-            omission: measurements(),
             floor: floor(),
         }
     }
@@ -931,7 +924,6 @@ mod tests {
                 channel_policy: channel_policy(),
                 execution_policy: execution_policy(),
                 expected_payment_values: expected_values(),
-                omission: measurements(),
             }) {
                 Ok(descriptor) => descriptor,
                 Err(error) => panic!("the configured channel opens: {error}"),

@@ -21,9 +21,7 @@ use hellas_rpc::protocol::artifacts::{
     BoundTermId, Canonical as _, InputAddressed as _, OutputAddressed as _, PreparedPaidInputV1,
     SourceRef, TextArtifact, TextExecution, TextPolicy, TokenIds,
 };
-use hellas_rpc::protocol::mount::{
-    MountBudget, MountFloor, TRIAL_FLOOR, clopper_pearson_upper_ppb, grade_response_probability,
-};
+use hellas_rpc::protocol::mount::{MountBudget, MountFloor};
 use hellas_rpc::protocol::work::{
     JobDeadlines, PaidChannelPolicyV1, PaidExecutionPolicyV1, PaidJobAuthorizationV1,
     PrivateRecord as _, decode_transcript, delivery_request_digest, encode_transcript,
@@ -32,7 +30,7 @@ use hellas_rpc::protocol::work::{
     work_id,
 };
 use hellas_rpc::protocol::work_bundle::WorkChannelSetupBundleV1;
-use hellas_rpc::protocol::work_setup::{OmissionMeasurements, ProviderChannelPolicy};
+use hellas_rpc::protocol::work_setup::ProviderChannelPolicy;
 use hellas_rpc::services::execute::ExecuteClientImpl;
 use hellas_rpc::services::work::WorkClientImpl;
 use hellas_rpc::services::work_setup::WorkSetupClientImpl;
@@ -948,7 +946,9 @@ async fn unmounted_work_refuses_every_method_as_bounded_retryable_not_ready() {
 // finalized read and one sink that keeps what it was handed.
 
 const SALT: [u8; 32] = [0x5a; 32];
-const OMISSION_BOND: u64 = 4;
+/// One over half the funding, so the bond exceeds the capacity it
+/// leaves behind at zero fees.
+const OMISSION_BOND: u64 = 601;
 const PAYMENT_VALUE: u64 = 1_000;
 const PAYMENT_RESERVE: u64 = 200;
 /// The finalized block this channel's payment Open landed in, and so
@@ -1226,11 +1226,6 @@ fn provider_policy() -> ProviderChannelPolicy {
         channel_policy: channel_policy(),
         execution_policy: execution_policy(),
         expected_payment_values: EdgeValues::new(PAYMENT_VALUE, PAYMENT_RESERVE, Fees::ZERO),
-        omission: OmissionMeasurements {
-            response_probability: 999_000,
-            response_blocks: MIN_OMIT_RESPONSE_BLOCKS,
-            response_cost_cap: 1,
-        },
         floor: floor(),
     }
 }
@@ -1278,10 +1273,6 @@ fn fully_measured_admission(root: &Path) -> PaymentAdmission {
         Err(error) => panic!("the test executable is readable: {error}"),
     };
     let binary = Digest::hash(&executable);
-    let response_probability = match grade_response_probability(TRIAL_FLOOR, 0) {
-        Some(probability) => probability,
-        None => panic!("the clean measured trial floor earns a probability"),
-    };
     let artifact = serde_json::json!({
         "provenance": {
             "binary": hex::encode(binary.as_bytes()),
@@ -1289,20 +1280,6 @@ fn fully_measured_admission(root: &Path) -> PaymentAdmission {
             "machine": "node-e2e-fixture",
             "started_at_unix_ms": ARTIFACT_STARTED_AT,
             "measured_at_unix_ms": ARTIFACT_FINISHED_AT,
-        },
-        "omission": {
-            "response_probability": {
-                "value": response_probability,
-                "evidence": "measured",
-                "samples": TRIAL_FLOOR,
-            },
-            "response_blocks": measured_artifact_value(MIN_OMIT_RESPONSE_BLOCKS),
-            "response_cost_cap": measured_artifact_value(1),
-            "response_trials": {
-                "trials": TRIAL_FLOOR,
-                "misses": 0,
-                "miss_upper_ppb": clopper_pearson_upper_ppb(TRIAL_FLOOR, 0),
-            },
         },
         "expected_payment_values": {
             "value": measured_artifact_value(PAYMENT_VALUE),

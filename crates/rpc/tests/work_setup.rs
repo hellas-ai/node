@@ -18,36 +18,23 @@ use hellas_rpc::protocol::work::{
     PaidChannelPolicyV1, PaidExecutionPolicyV1, PaidWorkError, private_policy_commitment,
 };
 use hellas_rpc::protocol::work_setup::{
-    CloseDescriptor, LeaseState, OMISSION_PROBABILITY_SCALE, ObservedChannel, OmissionError,
-    OmissionMeasurements, PendingState, WorkChannelConfig, WorkChannelDescriptor, WorkSetupError,
-    check_omission_economics, payment_terms_hash,
+    CloseDescriptor, LeaseState, ObservedChannel, PendingState, WorkChannelConfig,
+    WorkChannelDescriptor, WorkSetupError, check_collateral, payment_terms_hash,
 };
 use hellas_rpc::protocol::{ContentId, Digest};
 
 // ── Fixture ───────────────────────────────────────────────────────────
 
 const HORIZON: u64 = 500;
-const OMISSION_BOND: u64 = 4;
+/// One over half the funding: the least bond that exceeds the capacity
+/// it leaves behind, at zero fees.
+const OMISSION_BOND: u64 = 601;
 const PAYMENT_VALUE: u64 = 1_000;
 const PAYMENT_RESERVE: u64 = 200;
 const STAKE: u64 = 64;
 const SALT: [u8; 32] = [0x5a; 32];
-/// A probability and cost cap the fixture's capacity clears with room,
-/// so a test that moves one of the three inputs is testing that input.
-const Q: u64 = 999_000;
-const COST_CAP: u64 = 1;
-/// The response window the fixture's terms admit, and the window `Q` is
-/// declared to have been measured over.
+/// The response window the fixture's terms admit.
 const WINDOW: u64 = hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS;
-
-/// The three measurements, at the window the fixture's terms admit.
-fn measured(response_probability: u64, response_cost_cap: u64) -> OmissionMeasurements {
-    OmissionMeasurements {
-        response_probability,
-        response_blocks: WINDOW,
-        response_cost_cap,
-    }
-}
 
 fn network() -> NetworkId {
     let Some(network) = NetworkId::new("hellas-test") else {
@@ -131,7 +118,6 @@ fn config() -> WorkChannelConfig {
         channel_policy: channel_policy(),
         execution_policy: execution_policy(),
         expected_payment_values: payment_values(),
-        omission: measured(Q, COST_CAP),
     }
 }
 
@@ -323,163 +309,47 @@ fn observed<'a>(bond: &'a Edge, payment: &'a Edge) -> ObservedChannel<'a> {
     }
 }
 
-// ── Omission economics ────────────────────────────────────────────────
+// ── Collateral ────────────────────────────────────────────────────────
 
-/// Every one of the four gates, at its limit and one unit past it, with
-/// the other three held clear.
+/// The one gate, at its limit and one unit past it.
 #[test]
-fn omission_economics_hold_exactly_at_their_four_boundaries() {
-    const M: u64 = OMISSION_PROBABILITY_SCALE;
-
-    // `q` is a probability out of M. Zero and M+1 are not.
+fn the_bond_must_strictly_exceed_the_capacity_it_insures() {
     assert_eq!(
-        check_omission_economics(measured(0, 1), WINDOW, 10, 1),
-        Err(OmissionError::ProbabilityOutOfRange { q: 0 }),
-    );
-    assert_eq!(
-        check_omission_economics(measured(M + 1, 1), WINDOW, 10, 1),
-        Err(OmissionError::ProbabilityOutOfRange { q: M + 1 }),
-    );
-    // Zero at zero capacity, where the third inequality is `0 > 0` and
-    // refuses on its own. The `q = 0` arm is not what makes this safe;
-    // it is what makes the refusal name the thing to change.
-    assert_eq!(
-        check_omission_economics(measured(0, 1), WINDOW, 10, 0),
-        Err(OmissionError::ProbabilityOutOfRange { q: 0 }),
-    );
-    // q = 1 and q = M are both inside the range; whether they pass is
-    // the third inequality's business, not the first's.
-    assert_eq!(
-        check_omission_economics(measured(M, 1), WINDOW, 10, u64::MAX),
-        Ok(())
-    );
-    assert!(!matches!(
-        check_omission_economics(measured(1, 1), WINDOW, 10, 1),
-        Err(OmissionError::ProbabilityOutOfRange { .. }),
-    ));
-
-    // The window the terms admit must be at least the window `q` was
-    // measured over. Equal passes, one block short does not, and longer
-    // passes because more time to answer cannot make answering less
-    // likely.
-    assert_eq!(
-        check_omission_economics(measured(M, 1), WINDOW - 1, 10, 0),
-        Err(OmissionError::ResponseWindowUnderMeasured {
-            window: WINDOW - 1,
-            measured: WINDOW,
+        check_collateral(10, 10),
+        Err(WorkSetupError::Undercollateralised {
+            bond: 10,
+            capacity: 10,
         }),
     );
+    assert_eq!(check_collateral(11, 10), Ok(()));
     assert_eq!(
-        check_omission_economics(measured(M, 1), WINDOW, 10, 0),
-        Ok(())
-    );
-    assert_eq!(
-        check_omission_economics(measured(M, 1), WINDOW + 1, 10, 0),
-        Ok(())
-    );
-
-    // The bond must strictly exceed the measured response cost.
-    assert_eq!(
-        check_omission_economics(measured(M, 10), WINDOW, 10, 0),
-        Err(OmissionError::BondBelowResponseCost { bond: 10, cap: 10 }),
-    );
-    assert_eq!(
-        check_omission_economics(measured(M, 11), WINDOW, 10, 0),
-        Err(OmissionError::BondBelowResponseCost { bond: 10, cap: 11 }),
-    );
-    assert_eq!(
-        check_omission_economics(measured(M, 10), WINDOW, 11, 0),
-        Ok(())
-    );
-
-    // `q*bond > (M-q)*capacity`, strictly. With q = M/2 the two sides
-    // are equal at bond == capacity, so this walks that exact edge.
-    let half = M / 2;
-    assert_eq!(
-        check_omission_economics(measured(half, 1), WINDOW, 1_000, 1_000),
-        Err(OmissionError::OmissionNotLossMaking {
-            responded: u128::from(half) * 1_000,
-            omitted: u128::from(M - half) * 1_000,
+        check_collateral(0, 0),
+        Err(WorkSetupError::Undercollateralised {
+            bond: 0,
+            capacity: 0,
         }),
-    );
-    assert_eq!(
-        check_omission_economics(measured(half, 1), WINDOW, 1_001, 1_000),
-        Ok(())
-    );
-    assert!(matches!(
-        check_omission_economics(measured(half, 1), WINDOW, 1_000, 1_001),
-        Err(OmissionError::OmissionNotLossMaking { .. }),
-    ));
-
-    // Both products at their widest. `u64 * u64` does not fit `u64`, so
-    // a narrower multiplication here would wrap and call the worst case
-    // safe.
-    assert_eq!(
-        check_omission_economics(measured(1, 0), WINDOW, u64::MAX, u64::MAX),
-        Err(OmissionError::OmissionNotLossMaking {
-            responded: u128::from(u64::MAX),
-            omitted: u128::from(M - 1) * u128::from(u64::MAX),
-        }),
-    );
-    assert_eq!(
-        check_omission_economics(measured(M, u64::MAX - 1), WINDOW, u64::MAX, u64::MAX),
-        Ok(()),
     );
 }
 
-/// The window gate is not decoration: a channel whose terms answer
-/// faster than the provider measured itself answering does not open.
-///
-/// Only the measured window moves. The terms, the bond, the capacity,
-/// and `q` are the fixture's, so what refuses this is the pairing of a
-/// probability with a window it was not measured over.
-#[test]
-fn a_probability_measured_over_a_longer_window_does_not_open_a_shorter_channel() {
-    let mut stale = config();
-    stale.omission.response_blocks = WINDOW + 1;
-    assert_eq!(
-        WorkChannelDescriptor::open(stale),
-        Err(WorkSetupError::Omission(
-            OmissionError::ResponseWindowUnderMeasured {
-                window: WINDOW,
-                measured: WINDOW + 1,
-            }
-        )),
-    );
-    // The same configuration measured at the window the terms actually
-    // admit opens, which is what says the refusal above was the window
-    // and not something the mutation dragged along with it.
-    assert!(WorkChannelDescriptor::open(config()).is_ok());
-}
-
-/// A channel whose configured funding does not clear the inequality is
-/// refused at configuration time, before anything is signed.
+/// A channel whose bond does not exceed its payment capacity is refused
+/// at configuration time, before anything is signed.
 #[test]
 fn a_channel_whose_capacity_defeats_the_bond_does_not_open() {
-    // Capacity is `value + reserve - omission_bond` at zero fees, so
-    // moving `q` alone is what decides this: at this capacity the
-    // provider would have to answer essentially always.
-    let mut unlikely = config();
-    unlikely.omission.response_probability = 1;
-    assert!(matches!(
-        WorkChannelDescriptor::open(unlikely),
-        Err(WorkSetupError::Omission(
-            OmissionError::OmissionNotLossMaking { .. }
-        )),
-    ));
-
-    // A cost cap at the funded bond, and one below it.
-    let mut at_cap = config();
-    at_cap.omission.response_cost_cap = OMISSION_BOND;
-    assert!(matches!(
-        WorkChannelDescriptor::open(at_cap),
-        Err(WorkSetupError::Omission(
-            OmissionError::BondBelowResponseCost { .. }
-        )),
-    ));
-    let mut under_cap = config();
-    under_cap.omission.response_cost_cap = OMISSION_BOND - 1;
-    assert!(WorkChannelDescriptor::open(under_cap).is_ok());
+    // Capacity is `value + reserve - omission_bond` at zero fees, so the
+    // two sides meet at half the funding: a bond of exactly half is
+    // refused and the fixture's, one over it, opens.
+    let half = (PAYMENT_VALUE + PAYMENT_RESERVE) / 2;
+    let mut thin = config();
+    thin.payment_terms.omission_bond = half;
+    assert_eq!(
+        WorkChannelDescriptor::open(thin),
+        Err(WorkSetupError::Undercollateralised {
+            bond: half,
+            capacity: PAYMENT_VALUE + PAYMENT_RESERVE - half,
+        }),
+    );
+    assert_eq!(OMISSION_BOND, half + 1);
+    assert!(WorkChannelDescriptor::open(config()).is_ok());
 }
 
 /// The policy body and its salt have to produce the commitment the
@@ -742,8 +612,8 @@ fn readiness_reprices_the_economics_against_the_funded_edge() {
     let good = observed(&bond, &payment);
 
     // The configured expectation is unchanged and still passes; only
-    // the funded value moves, and it moves capacity past what this
-    // provider's measured availability can deter.
+    // the funded value moves, and it moves capacity past what the
+    // bond insures.
     let overfunded = EdgeBytes {
         value: u64::MAX / 2,
         reserve: PAYMENT_RESERVE,
@@ -760,9 +630,7 @@ fn readiness_reprices_the_economics_against_the_funded_edge() {
             payment: Some(&overfunded),
             ..good
         }),
-        Err(WorkSetupError::Omission(
-            OmissionError::OmissionNotLossMaking { .. }
-        )),
+        Err(WorkSetupError::Undercollateralised { .. }),
     ));
 
     // A reserve that does not price the dearer exit.

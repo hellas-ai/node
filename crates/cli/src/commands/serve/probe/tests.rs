@@ -7,11 +7,6 @@ fn assumptions(exclude: &[&str]) -> AssumptionsFile {
             .filter(|term| !exclude.contains(term))
             .map(|term| ((*term).to_string(), 7))
             .collect(),
-        omission: AssumedOmission {
-            response_probability: 999_000,
-            response_blocks: 20,
-            response_cost_cap: 1,
-        },
         expected_payment_values: AssumedPaymentValues {
             value: 1_000,
             reserve: 200,
@@ -93,12 +88,6 @@ fn what_the_run_did_not_see_is_assumed_and_named() {
             assert!(unmeasured.contains(&term), "{term} is not named");
         }
     }
-    // No contest was raised, so `q` rests on nothing and says so.
-    assert_eq!(artifact["omission"]["response_trials"]["trials"], 0);
-    assert_eq!(
-        artifact["omission"]["response_probability"]["evidence"],
-        "assumed"
-    );
 }
 
 /// A term that is neither observed nor written down stops the run,

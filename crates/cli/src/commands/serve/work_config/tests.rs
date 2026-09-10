@@ -390,10 +390,11 @@ use hellas_rpc::protocol::work_setup::WorkSetupError;
 use hellas_rpc::work_handshake::SetupEndpoint;
 use hellas_rpc::work_store::{Role, SetupScan, SetupStore};
 
-/// The window the fixture artifact measured its response
-/// probability over, and the one the fixture's terms admit.
+/// The window the fixture's terms admit.
 const WINDOW: u64 = hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS + 4;
-const OMISSION_BOND: u64 = 4;
+/// One over half the funding, so the bond exceeds the capacity it
+/// leaves behind at zero fees.
+const OMISSION_BOND: u64 = 601;
 const PAYMENT_VALUE: u64 = 1_000;
 const PAYMENT_RESERVE: u64 = 200;
 
@@ -407,10 +408,6 @@ fn network() -> NetworkId {
 /// The window the run's own timestamps sit inside.
 const RUN_STARTED_AT: u64 = 1_756_339_000_000;
 const RUN_FINISHED_AT: u64 = 1_756_339_200_000;
-
-/// The clean run behind the fixture's `q`: the fewest independent
-/// contests §4 admits, and none of them missed.
-const TRIALS: u64 = hellas_rpc::protocol::mount::TRIAL_FLOOR;
 
 fn measured(value: u64) -> serde_json::Value {
     serde_json::json!({ "value": value, "evidence": "measured", "samples": 3_000 })
@@ -482,24 +479,6 @@ fn artifact() -> serde_json::Value {
             "machine": "bootstrap-1",
             "started_at_unix_ms": RUN_STARTED_AT,
             "measured_at_unix_ms": RUN_FINISHED_AT,
-        },
-        "omission": {
-            // 2,995 clean trials bound the miss rate at 999_745
-            // parts per billion, which is 1_000 parts per million
-            // of miss and so 999_000 of availability. The value is
-            // not written here so much as earned.
-            "response_probability": {
-                "value": 999_000,
-                "evidence": "measured",
-                "samples": TRIALS,
-            },
-            "response_blocks": measured(WINDOW),
-            "response_cost_cap": measured(1),
-            "response_trials": {
-                "trials": TRIALS,
-                "misses": 0,
-                "miss_upper_ppb": 999_745,
-            },
         },
         "expected_payment_values": {
             "value": measured(PAYMENT_VALUE),
@@ -767,14 +746,6 @@ fn a_measured_artifact_round_trips_into_a_policy() {
     // is what the whole artifact rests on.
     assert_eq!(evidence.samples, 2);
     assert_eq!(
-        evidence.policy.omission,
-        OmissionMeasurements {
-            response_probability: 999_000,
-            response_blocks: WINDOW,
-            response_cost_cap: 1,
-        },
-    );
-    assert_eq!(
         evidence.policy.expected_payment_values,
         EdgeValues::new(PAYMENT_VALUE, PAYMENT_RESERVE, Fees::new(0, 0, 0, 0)),
     );
@@ -802,11 +773,7 @@ fn an_unknown_artifact_field_is_refused_by_name() {
     for (path, field) in [
         (&[][..], "lower_tail_block_ms"),
         (&["provenance"][..], "restart_downtime_ms"),
-        (&["omission"][..], "general_inclusion_blocks"),
-        (
-            &["omission", "response_probability"][..],
-            "confidence_upper",
-        ),
+        (&["budget"][..], "confidence_upper"),
         (&["expected_payment_values", "close_fees"][..], "settlement"),
     ] {
         let error = format!(
@@ -829,9 +796,6 @@ fn a_missing_artifact_field_is_refused_by_name() {
     for (path, field) in [
         (&["provenance"][..], "machine"),
         (&["provenance"][..], "measured_at_unix_ms"),
-        (&["omission"][..], "response_blocks"),
-        (&["omission", "response_cost_cap"][..], "evidence"),
-        (&["omission", "response_cost_cap"][..], "samples"),
         (&["expected_payment_values"][..], "close_fees"),
         (&["expected_payment_values", "close_fees"][..], "lifetime"),
     ] {
@@ -857,11 +821,11 @@ fn a_missing_artifact_field_is_refused_by_name() {
 #[test]
 fn a_label_its_samples_contradict_is_refused_by_name() {
     let mut unsampled = artifact();
-    unsampled["omission"]["response_blocks"] =
-        serde_json::json!({ "value": WINDOW, "evidence": "measured", "samples": 0 });
+    unsampled["expected_payment_values"]["value"] =
+        serde_json::json!({ "value": PAYMENT_VALUE, "evidence": "measured", "samples": 0 });
     let error = format!("{:?}", duties_for(&unsampled, None).unwrap_err());
     assert!(
-        error.contains("omission.response_blocks") && error.contains("no samples"),
+        error.contains("expected_payment_values.value") && error.contains("no samples"),
         "unexpected error: {error}",
     );
 
@@ -910,7 +874,7 @@ fn a_measured_artifact_yields_a_policy_that_admits() {
 #[test]
 fn an_assumed_field_refuses_admission_and_keeps_setup_and_close() {
     let mut value = artifact();
-    value["omission"]["response_cost_cap"] = assumed(1);
+    value["expected_payment_values"]["close_fees"]["base"] = assumed(0);
     let duties = duties_for(&value, None).expect("an assumed artifact still loads");
     let measured = duties_for(&artifact(), None).expect("the fixture artifact loads");
 
@@ -1341,87 +1305,6 @@ fn a_non_positive_lower_tail_block_time_refuses() {
     assert!(duties.payment_admission().is_none());
 }
 
-/// Under 2,995 trials the response probability is `assumed`,
-/// whatever the file labelled it, and one assumed field is a node
-/// that countersigns nothing.
-#[test]
-fn a_run_short_of_the_trial_floor_is_assumed() {
-    let mut thin = artifact();
-    thin["omission"]["response_trials"] = serde_json::json!({
-        "trials": TRIALS - 1,
-        "misses": 0,
-        // The bound one trial short of the floor: 1_000_079 parts
-        // per billion, which is worse than 0.001 and is exactly why
-        // the floor is 2,995 and not a round number.
-        "miss_upper_ppb": 1_000_079,
-    });
-    thin["omission"]["response_probability"] = serde_json::json!({
-        "value": 999_000,
-        "evidence": "measured",
-        "samples": TRIALS - 1,
-    });
-
-    let duties = duties_for(&thin, None).expect("a thin artifact still loads");
-
-    assert!(
-        !duties.admits_paid_work(),
-        "2,994 clean trials do not earn q = 0.999",
-    );
-    assert!(matches!(duties, PaidWorkDuties::Assumed(_)));
-    assert_eq!(
-        duties.evidence().expect("evidence").samples,
-        0,
-        "an assumed field rests on no samples",
-    );
-}
-
-/// Enough trials and a bound that misses is still `assumed`: the
-/// count and the bound are two rules, and the second one bites.
-#[test]
-fn a_bound_above_the_admitted_miss_rate_is_assumed() {
-    let mut missed = artifact();
-    missed["omission"]["response_trials"] = serde_json::json!({
-        "trials": 3_000,
-        "misses": 1,
-        // 3,000 trials with one miss bound the miss rate at
-        // 1_580_302 parts per billion — over 0.001, on more trials
-        // than the floor asks for.
-        "miss_upper_ppb": 1_580_302,
-    });
-    missed["omission"]["response_probability"] = serde_json::json!({
-        "value": 999_000,
-        "evidence": "measured",
-        "samples": 3_000,
-    });
-
-    let duties = duties_for(&missed, None).expect("the artifact still loads");
-
-    assert!(matches!(duties, PaidWorkDuties::Assumed(_)));
-    assert!(!duties.admits_paid_work());
-}
-
-/// An artifact whose own bound does not follow from its own trials
-/// is refused, and so is one claiming an availability its trials
-/// did not earn. Neither is a label: both are arithmetic.
-#[test]
-fn an_artifact_that_misreports_its_own_grading_is_refused() {
-    let mut flattered = artifact();
-    flattered["omission"]["response_trials"]["miss_upper_ppb"] = serde_json::json!(1);
-    let error = format!("{:?}", duties_for(&flattered, None).unwrap_err());
-    assert!(
-        error.contains("999745") || error.contains("999_745") || error.contains("999745"),
-        "the refusal does not say what the trials actually bound: {error}",
-    );
-
-    let mut overclaimed = artifact();
-    overclaimed["omission"]["response_probability"]["value"] = serde_json::json!(999_999);
-    let error = format!("{:?}", duties_for(&overclaimed, None).unwrap_err());
-    assert!(
-        error.contains("response_probability") && error.contains("999000"),
-        "the refusal does not name what the trials earn: {error}",
-    );
-}
-
 /// A budget term's label answers to its samples, exactly as every
 /// other artifact number's does — and a term that names a value
 /// beside its samples is refused, because only one of the two would
@@ -1490,8 +1373,8 @@ fn a_sample_from_outside_the_run_is_refused() {
 }
 
 /// An `assumed` budget term keeps setup and the close duty and
-/// takes away the countersignature, exactly as an assumed omission
-/// number does. The floor is still computed over it — a written
+/// takes away the countersignature, exactly as an assumed payment
+/// value does. The floor is still computed over it — a written
 /// number is still a number the arithmetic has to hold for.
 #[test]
 fn an_assumed_budget_term_refuses_admission_and_keeps_the_floor() {
@@ -1648,11 +1531,6 @@ fn the_probe_writes_an_artifact_this_loader_reads_and_grades() {
                 "lower_tail_block_ms": assumed_budget.lower_tail_block_ms,
                 "general_inclusion_blocks": assumed_budget.general_inclusion_blocks,
             },
-            "omission": {
-                "response_probability": 999_000,
-                "response_blocks": WINDOW,
-                "response_cost_cap": 1,
-            },
             "expected_payment_values": {
                 "value": PAYMENT_VALUE,
                 "reserve": PAYMENT_RESERVE,
@@ -1750,7 +1628,6 @@ fn the_probe_writes_an_artifact_this_loader_reads_and_grades() {
     ] {
         assert_eq!(artifact["budget"][term]["evidence"], "assumed", "{term}");
     }
-    assert_eq!(artifact["omission"]["response_trials"]["trials"], 0);
     match (expected_grade, duties) {
         (Ok(expected_floor), PaidWorkDuties::Assumed(evidence)) => {
             assert_eq!(evidence.samples, 0, "an assumed field rests on no samples");

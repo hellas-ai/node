@@ -39,12 +39,10 @@
 //! [`ProviderChannelPolicy::admit`] run the same formulas over the same
 //! samples. What is here is the artifact those samples are written into,
 //! the labelling that lets a node with none of them say so out loud, and
-//! the two judgements a reader makes rather than trusts: the raw
-//! observations are reduced to §4's terms *here*, by this node, and the
-//! Clopper–Pearson grading of the response probability is recomputed
-//! *here* from the trials the artifact reports. An artifact cannot talk
-//! its way into admission by writing a flattering summary or a
-//! flattering bound; it can only report what it saw.
+//! the one judgement a reader makes rather than trusts: the raw
+//! observations are reduced to §4's terms *here*, by this node. An
+//! artifact cannot talk its way into admission by writing a flattering
+//! summary; it can only report what it saw.
 //!
 //! Every number in the artifact carries `measured` or `assumed`; one
 //! `assumed` field is a node that countersigns no new channel by default;
@@ -69,13 +67,11 @@ use hellas_kernel::{
 use hellas_rpc::ContentId;
 use hellas_rpc::peers::PeerId;
 use hellas_rpc::protocol::Digest;
-use hellas_rpc::protocol::mount::{
-    FloorError, MountBudget, MountFloor, clopper_pearson_upper_ppb, grade_response_probability,
-};
+use hellas_rpc::protocol::mount::{FloorError, MountBudget, MountFloor};
 use hellas_rpc::protocol::work::{
     PaidChannelPolicyV1, PaidExecutionPolicyV1, check_execution_policy,
 };
-use hellas_rpc::protocol::work_setup::{OmissionMeasurements, ProviderChannelPolicy};
+use hellas_rpc::protocol::work_setup::ProviderChannelPolicy;
 use hellas_rpc::work_handshake::PaymentAdmission;
 use hellas_rpc::work_store::{Role, SetupStore, discover_setups};
 use serde::Deserialize;
@@ -293,7 +289,6 @@ impl WorkConfig {
                 channel_policy: self.channel_policy,
                 execution_policy: self.execution_policy,
                 expected_payment_values: artifact.expected_payment_values,
-                omission: artifact.omission,
                 floor,
             },
         });
@@ -1046,9 +1041,7 @@ impl Evidence {
 /// measurement wearing the wrong label. Both are refused, by name.
 ///
 /// Nothing here grades the number. The `64 >= T` floor is computed from
-/// [`BudgetFile`]'s raw samples and the confidence bound from
-/// [`TrialsFile`]'s trials; this is the honest label those two answer
-/// to.
+/// [`BudgetFile`]'s raw samples; this is the honest label it answers to.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MeasuredU64 {
@@ -1074,7 +1067,6 @@ impl MeasuredU64 {
 /// One artifact, read and folded into the values a policy needs.
 struct MeasuredArtifact {
     provenance: ArtifactProvenance,
-    omission: OmissionMeasurements,
     expected_payment_values: EdgeValues,
     /// §4's terms, reduced from the file's raw samples by this node.
     budget: MountBudget,
@@ -1086,7 +1078,6 @@ struct MeasuredArtifact {
 #[serde(deny_unknown_fields)]
 struct ArtifactBodyFile {
     provenance: ProvenanceFile,
-    omission: OmissionFile,
     expected_payment_values: PaymentValuesFile,
     budget: BudgetFile,
 }
@@ -1101,15 +1092,6 @@ impl ArtifactBodyFile {
         // compile-time hole an author sees, not a field whose label is
         // silently never read.
         let fields = [
-            (
-                "omission.response_probability",
-                &self.omission.response_probability,
-            ),
-            ("omission.response_blocks", &self.omission.response_blocks),
-            (
-                "omission.response_cost_cap",
-                &self.omission.response_cost_cap,
-            ),
             (
                 "expected_payment_values.value",
                 &self.expected_payment_values.value,
@@ -1143,50 +1125,6 @@ impl ArtifactBodyFile {
             samples = samples.min(field.samples);
         }
 
-        // §4's grading, recomputed here rather than believed. The
-        // artifact reports the trials and the bound it drew from them;
-        // this node draws the bound again and refuses a file whose two
-        // disagree, then applies the rule to the trials themselves. A
-        // run that does not clear both halves leaves the response
-        // probability `assumed` whatever the file called it, which is
-        // §4's own "otherwise the field is assumed" and not a second
-        // policy.
-        let trials = &self.omission.response_trials;
-        let bound = clopper_pearson_upper_ppb(trials.trials, trials.misses);
-        if bound != trials.miss_upper_ppb {
-            bail!(
-                "omission.response_trials.miss_upper_ppb is {}, and {} trials with {} misses \
-                 bound the miss rate at {bound} parts per billion",
-                trials.miss_upper_ppb,
-                trials.trials,
-                trials.misses,
-            );
-        }
-        match grade_response_probability(trials.trials, trials.misses) {
-            Some(q) => {
-                if self.omission.response_probability.evidence == Evidence::Measured {
-                    if self.omission.response_probability.value != q {
-                        bail!(
-                            "omission.response_probability is {} and {} trials with {} misses \
-                             earn {q}",
-                            self.omission.response_probability.value,
-                            trials.trials,
-                            trials.misses,
-                        );
-                    }
-                    if self.omission.response_probability.samples != trials.trials {
-                        bail!(
-                            "omission.response_probability rests on {} samples and \
-                             omission.response_trials reports {} trials",
-                            self.omission.response_probability.samples,
-                            trials.trials,
-                        );
-                    }
-                }
-            }
-            None => evidence = Evidence::Assumed,
-        }
-
         // The run before its samples, because the run's window is what
         // every sample's own timestamp is checked against.
         let provenance = self.provenance.into_provenance()?;
@@ -1201,11 +1139,6 @@ impl ArtifactBodyFile {
 
         Ok(MeasuredArtifact {
             provenance,
-            omission: OmissionMeasurements {
-                response_probability: self.omission.response_probability.value,
-                response_blocks: self.omission.response_blocks.value,
-                response_cost_cap: self.omission.response_cost_cap.value,
-            },
             budget,
             expected_payment_values: EdgeValues::new(
                 self.expected_payment_values.value.value,
@@ -1257,40 +1190,6 @@ impl ProvenanceFile {
             measured_at_unix_ms: self.measured_at_unix_ms,
         })
     }
-}
-
-/// The three numbers [`OmissionMeasurements`] is, field for field.
-///
-/// Spelled out rather than flattened for [`ExecutionPolicyFile`]'s
-/// reason: these are the numbers a provider's whole new-work admission
-/// rests on, and a default here would be this node claiming a
-/// measurement its operator never made.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct OmissionFile {
-    response_probability: MeasuredU64,
-    response_blocks: MeasuredU64,
-    response_cost_cap: MeasuredU64,
-    response_trials: TrialsFile,
-}
-
-/// The contest trials behind `response_probability`, raw.
-///
-/// A probability is a summary and §4 will not take a summary for this
-/// one: what it wants is how many contests were raised, how many were
-/// missed, and the one-sided bound those two imply. All three are
-/// present because the reader recomputes the third from the first two
-/// and refuses a file whose own arithmetic does not close.
-///
-/// A run that raised no contests writes zeroes here, and zero trials
-/// grade `assumed` — which is what a bootstrap that cannot fund 2,995
-/// contests honestly reports.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TrialsFile {
-    trials: u64,
-    misses: u64,
-    miss_upper_ppb: u64,
 }
 
 #[derive(Debug, Deserialize)]

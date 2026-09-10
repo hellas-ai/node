@@ -24,7 +24,7 @@ use hellas_rpc::protocol::work::{
     PaidChannelPolicyV1, PaidExecutionPolicyV1, private_policy_commitment,
 };
 use hellas_rpc::protocol::work_bundle::WorkChannelSetupBundleV1;
-use hellas_rpc::protocol::work_setup::{OmissionMeasurements, ProviderChannelPolicy};
+use hellas_rpc::protocol::work_setup::ProviderChannelPolicy;
 use hellas_rpc::protocol::{ContentId, Digest};
 use hellas_rpc::services::work_setup::WorkSetupHandler;
 use hellas_rpc::work_close::{BlockSourceError, FinalizedBlocks, FinalizedWork, TxSink};
@@ -127,7 +127,9 @@ fn payment_terms(bond_edge: EdgeId) -> WorkPaymentTerms {
         private_policy_commitment: private_policy_commitment(network(), &SALT, &channel_policy()),
         omit_response_blocks: hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
         start_validity_blocks: hellas_kernel::MAX_START_VALIDITY_BLOCKS,
-        omission_bond: 4,
+        // Over half of the dearest edge these fixtures meet (4,096), so the
+        // bond exceeds the capacity it leaves on every one of them.
+        omission_bond: 2_049,
     }
 }
 
@@ -190,12 +192,7 @@ fn provider_policy() -> ProviderChannelPolicy {
         policy_salt: SALT,
         channel_policy: channel_policy(),
         execution_policy: execution_policy(),
-        expected_payment_values: EdgeValues::new(1_000, 200, Fees::ZERO),
-        omission: OmissionMeasurements {
-            response_probability: 999_000,
-            response_blocks: hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
-            response_cost_cap: 1,
-        },
+        expected_payment_values: EdgeValues::new(3_000, 200, Fees::ZERO),
         floor: floor(),
     }
 }
@@ -408,7 +405,8 @@ const WORK_PAYMENT_CLOSES: u8 = 0b0001_1000;
 const WORK_STAKE_CLOSES: u8 = 0b0000_0010;
 
 fn edge(terms: TermsHash, maker: Key, taker: Key, allowed: u8) -> Edge {
-    valued_edge(64, terms, maker, taker, allowed)
+    // 60 of capacity once the 2,049 bond is taken out.
+    valued_edge(2_109, terms, maker, taker, allowed)
 }
 
 fn valued_edge(value: u64, terms: TermsHash, maker: Key, taker: Key, allowed: u8) -> Edge {
@@ -456,7 +454,7 @@ fn payment_object() -> Edge {
 /// Reachable, and not a fixture convenience. An edge's id is a hash over
 /// the funding coins and the terms, never over what those coins are
 /// worth, so the client that names them decides the edge's value — and
-/// `provider_policy` merely expects 1,000.
+/// `provider_policy` merely expects 3,200.
 fn overfunded_payment_object() -> Edge {
     valued_edge(
         4_096,
@@ -2130,7 +2128,7 @@ async fn a_completed_setup_hands_back_the_channel_it_mounted() {
         4_096,
         "the mount settled against the edge the coherent read found",
     );
-    assert_eq!(mounted.state().settlement().capacity(), 4_092);
+    assert_eq!(mounted.state().settlement().capacity(), 2_047);
     assert!(
         mounted.state().close_opened().is_some(),
         "and the origin block's own contest is journaled on the channel handed back",
@@ -2143,7 +2141,7 @@ async fn a_completed_setup_hands_back_the_channel_it_mounted() {
         .expect("the configured expectation settles");
     assert_eq!(
         expected.adjudicated_total(),
-        1_200,
+        3_200,
         "and the expectation a re-deriving caller would have reached is another number",
     );
 }
@@ -2866,7 +2864,7 @@ async fn an_overfunded_close_only_channel_settles_at_the_edge_it_holds() {
         .mounted
         .expect("a close-only mount hands back the channel it opened");
     assert_eq!(mounted.state().settlement().adjudicated_total(), 4_096);
-    assert_eq!(mounted.state().settlement().capacity(), 4_092);
+    assert_eq!(mounted.state().settlement().capacity(), 2_047);
     // The channel journal is held for as long as that store lives, so
     // the restart below is a restart of both files.
     drop(mounted);
@@ -2914,10 +2912,10 @@ async fn an_overfunded_close_only_channel_settles_at_the_edge_it_holds() {
         .expected_settlement()
         .expect("the configured expectation settles");
     assert_eq!(funded.adjudicated_total(), 4_096);
-    assert_eq!(funded.capacity(), 4_092);
+    assert_eq!(funded.capacity(), 2_047);
     assert_eq!(
         expected.adjudicated_total(),
-        1_200,
+        3_200,
         "the expectation is a different close from the one this edge can pay",
     );
 }

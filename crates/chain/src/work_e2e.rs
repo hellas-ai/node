@@ -118,8 +118,7 @@ use hellas_rpc::protocol::work::{
     identity_source_digest, private_policy_commitment,
 };
 use hellas_rpc::protocol::work_setup::{
-    OmissionMeasurements, ProviderChannelPolicy, ReadyChannel, WorkChannelConfig,
-    WorkChannelDescriptor,
+    ProviderChannelPolicy, ReadyChannel, WorkChannelConfig, WorkChannelDescriptor,
 };
 use hellas_rpc::services::work::WorkServer;
 use hellas_rpc::services::work_setup::WorkSetupHandler;
@@ -168,7 +167,9 @@ const CLIENT_FUNDING: u64 = 100;
 /// returned principal and earnings must be two distinguishable numbers.
 const PROVIDER_STAKE: u64 = 12;
 /// What a proved understatement forfeits.
-const OMISSION_BOND: u64 = 4;
+/// One over half the funding, so the bond exceeds the capacity it
+/// leaves behind at zero fees.
+const OMISSION_BOND: u64 = 51;
 /// The sole job's price, fixed by the execution policy both parties
 /// signed.
 const PRICE: u64 = 10;
@@ -391,21 +392,6 @@ fn expected_values() -> EdgeValues {
     EdgeValues::new(CLIENT_FUNDING, 0, Fees::new(0, 0, 0, 0))
 }
 
-/// The measured artifact this admission rests on, constructed here.
-///
-/// §4-B's floor arithmetic, confidence gate and probe are deliberately
-/// not run: what the runner is handed is one of three
-/// [`PaymentAdmission`] values, and this is the one a fully measured
-/// artifact produces. Admission is therefore genuinely on — the provider
-/// countersigns because it holds this, not because a test told it to.
-fn measurements() -> OmissionMeasurements {
-    OmissionMeasurements {
-        response_probability: 999_000,
-        response_blocks: WINDOW,
-        response_cost_cap: 1,
-    }
-}
-
 /// The floor these fixtures run under: a budget in which no wait
 /// takes any time, so §4's `S` and `R` are zero, its response-window
 /// floor is the kernel's own `MIN_OMIT_RESPONSE_BLOCKS`, and `T` is
@@ -441,7 +427,6 @@ fn provider_policy() -> ProviderChannelPolicy {
         channel_policy: channel_policy(),
         execution_policy: execution_policy(),
         expected_payment_values: expected_values(),
-        omission: measurements(),
         floor: floor(),
     }
 }
@@ -455,7 +440,6 @@ fn descriptor(allocations: &[(SettlementKey, u64)]) -> WorkChannelDescriptor {
         channel_policy: channel_policy(),
         execution_policy: execution_policy(),
         expected_payment_values: expected_values(),
-        omission: measurements(),
     }) {
         Ok(descriptor) => descriptor,
         Err(error) => panic!("the configured channel opens: {error}"),

@@ -28,7 +28,7 @@ use hellas_rpc::protocol::work::{
     PaidChannelPolicyV1, PaidExecutionPolicyV1, private_policy_commitment,
 };
 use hellas_rpc::protocol::work_bundle::WorkChannelSetupBundleV1;
-use hellas_rpc::protocol::work_setup::{OmissionMeasurements, ProviderChannelPolicy};
+use hellas_rpc::protocol::work_setup::ProviderChannelPolicy;
 use hellas_rpc::protocol::{ContentId, Digest};
 use hellas_rpc::services::work_setup::{WorkSetup, WorkSetupClientImpl, WorkSetupServer};
 use hellas_rpc::work_handshake::{
@@ -60,7 +60,9 @@ where
 const HORIZON: u64 = 500;
 const STAKE: u64 = 64;
 const SALT: [u8; 32] = [0x5a; 32];
-const OMISSION_BOND: u64 = 4;
+/// One over half the funding, so the bond exceeds the capacity it
+/// leaves behind at zero fees.
+const OMISSION_BOND: u64 = 601;
 const PAYMENT_VALUE: u64 = 1_000;
 const PAYMENT_RESERVE: u64 = 200;
 /// The window the provider measured its own response probability over,
@@ -220,11 +222,6 @@ fn provider_policy() -> ProviderChannelPolicy {
             PAYMENT_RESERVE,
             Fees::new(0, 0, 0, 0),
         ),
-        omission: OmissionMeasurements {
-            response_probability: 999_000,
-            response_blocks: WINDOW,
-            response_cost_cap: 1,
-        },
         floor: floor(),
     }
 }
@@ -500,7 +497,7 @@ async fn two_endpoints_that_have_never_met_open_a_channel() {
 #[tokio::test]
 async fn a_provider_does_not_countersign_terms_its_own_policy_refuses() {
     let base = payment_terms(bond_edge());
-    let refused: [(&str, WorkPaymentTerms); 4] = [
+    let refused: [(&str, WorkPaymentTerms); 3] = [
         (
             "a credit policy that is not this provider's",
             WorkPaymentTerms {
@@ -513,16 +510,9 @@ async fn a_provider_does_not_countersign_terms_its_own_policy_refuses() {
             },
         ),
         (
-            "an omission bond that does not clear the measured response cost",
+            "an omission bond that does not exceed the capacity it insures",
             WorkPaymentTerms {
                 omission_bond: 1,
-                ..base.clone()
-            },
-        ),
-        (
-            "a response window shorter than the one the probability was measured over",
-            WorkPaymentTerms {
-                omit_response_blocks: WINDOW - 1,
                 ..base.clone()
             },
         ),

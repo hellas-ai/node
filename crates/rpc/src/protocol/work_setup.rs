@@ -42,9 +42,10 @@
 //!
 //! Not that a correctness game is available. This profile has no
 //! challenge path, so the section-7 provider-deterrence inequality is
-//! not checked and is not claimed. What *is* checked is the omission
-//! contest's economics, because that contest is implemented
-//! ([`check_omission_economics`]).
+//! not checked and is not claimed. What *is* checked is that the
+//! omission bond exceeds the payment capacity it insures
+//! ([`check_collateral`]), so that omitting a response can never pay:
+//! the contest is implemented, and that is the one number it needs.
 //!
 //! Not that a job may be signed. That is a per-signature question with
 //! its own deadlines, and it is [`ReadyChannel::check_signable`].
@@ -60,14 +61,6 @@ use crate::protocol::work::{
     PaidChannel, PaidChannelPolicyV1, PaidExecutionPolicyV1, PaidWorkError, PrivateRecord,
     check_execution_policy,
 };
-
-/// Denominator of the omission-contest probability `q`.
-///
-/// `q` is a measured availability, and a measured availability is a
-/// ratio. Fixing the denominator here rather than carrying a pair means
-/// the two sides of the inequality below cannot be computed against two
-/// different scales.
-pub const OMISSION_PROBABILITY_SCALE: u64 = 1_000_000;
 
 /// Why a configured channel is not one this endpoint may work over.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -111,9 +104,18 @@ pub enum WorkSetupError {
     /// nothing it could settle is bounded.
     #[error("the payment edge's reserve does not price both of its close routes")]
     Unsettleable,
-    /// An omission-economics gate failed.
-    #[error("omission economics: {0}")]
-    Omission(#[from] OmissionError),
+    /// The omission bond does not exceed the capacity it insures, so
+    /// omitting a response could pay more than it forfeits.
+    #[error(
+        "omission bond {bond} does not exceed the payment capacity {capacity}, \
+         so omitting a response could pay"
+    )]
+    Undercollateralised {
+        /// Bond the payment terms fund.
+        bond: u64,
+        /// Largest cumulative amount a certificate on this channel may name.
+        capacity: u64,
+    },
     /// The finalized height is at or past the admission horizon.
     #[error("finalized height {height} is at or past the admission horizon {horizon}")]
     HorizonPassed {
@@ -231,79 +233,6 @@ impl core::fmt::Display for PendingState {
     }
 }
 
-/// Why the omission contest's economics do not hold.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum OmissionError {
-    /// The measured response probability is outside `1..=M`.
-    #[error("measured response probability {q} is outside 1..={OMISSION_PROBABILITY_SCALE}")]
-    ProbabilityOutOfRange {
-        /// Probability numerator that was configured.
-        q: u64,
-    },
-    /// The terms give the watcher less time to answer than the window
-    /// the response probability was measured over.
-    #[error(
-        "the terms admit {window} blocks to answer a contest, under the {measured} blocks \
-         the response probability was measured over"
-    )]
-    ResponseWindowUnderMeasured {
-        /// `omit_response_blocks`, as the terms fix it.
-        window: u64,
-        /// Blocks the measurement allowed for the response.
-        measured: u64,
-    },
-    /// The funded bond does not exceed the measured cost of responding.
-    #[error("omission bond {bond} does not exceed the measured response cost cap {cap}")]
-    BondBelowResponseCost {
-        /// Bond the payment terms fund.
-        bond: u64,
-        /// Measured cost of answering one contest.
-        cap: u64,
-    },
-    /// Omitting a response is not loss-making at this bond, probability,
-    /// and capacity.
-    #[error(
-        "q*bond = {responded} does not exceed (M-q)*capacity = {omitted}, \
-         so omission is not loss-making"
-    )]
-    OmissionNotLossMaking {
-        /// `q * omission_bond`.
-        responded: u128,
-        /// `(M - q) * payment_capacity`.
-        omitted: u128,
-    },
-}
-
-/// What one operator measured about its own watcher.
-///
-/// The window travels with the probability because the probability is
-/// only ever a number about *that* window. "Answers a contest in time"
-/// is not a property of a watcher alone; it is a property of a watcher
-/// and a deadline, and the deadline is the terms'
-/// `omit_response_blocks`. A `q` measured over sixty blocks says nothing
-/// about a channel whose terms admit six, and
-/// [`check_omission_economics`] would otherwise spend it as though it
-/// did — which is why the check is here and not in a provider-side floor
-/// beside it. A floor is a second number with its own justification; the
-/// measurement window is the justification the first number already had.
-///
-/// The comparison is one-sided on purpose: a window *longer* than the one
-/// measured is admitted. The measured probability is the chance of
-/// answering within `response_blocks`, and more blocks cannot make that
-/// answer less likely, so `q` is a lower bound for every longer window
-/// and the inequality it feeds stays conservative.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct OmissionMeasurements {
-    /// Probability, out of [`OMISSION_PROBABILITY_SCALE`], that this
-    /// provider's watcher answers a contest within
-    /// [`Self::response_blocks`].
-    pub response_probability: u64,
-    /// Blocks the measurement above allowed the watcher to answer in.
-    pub response_blocks: u64,
-    /// Measured cost cap of answering one contest.
-    pub response_cost_cap: u64,
-}
-
 /// What an operator configured for one paid channel, before anything
 /// has been checked.
 ///
@@ -328,8 +257,6 @@ pub struct WorkChannelConfig {
     /// The payment edge's value, reserve, and close fees as the
     /// operator expects them to be funded.
     pub expected_payment_values: EdgeValues,
-    /// What the provider measured about its own watcher.
-    pub omission: OmissionMeasurements,
 }
 
 /// Everything a provider fixes about a channel before a client names the
@@ -356,8 +283,6 @@ pub struct ProviderChannelPolicy {
     /// The payment edge's value, reserve, and close fees as the provider
     /// requires them to be funded.
     pub expected_payment_values: EdgeValues,
-    /// What the provider measured about its own watcher.
-    pub omission: OmissionMeasurements,
     /// §4's measured floor for this deployment, over the artifact's raw
     /// samples.
     ///
@@ -457,7 +382,6 @@ impl ProviderChannelPolicy {
             channel_policy: self.channel_policy,
             execution_policy: self.execution_policy,
             expected_payment_values: self.expected_payment_values,
-            omission: self.omission,
         })
     }
 }
@@ -467,8 +391,8 @@ impl ProviderChannelPolicy {
 /// Constructed only through [`Self::open`], which is where the policy
 /// commitment is opened and those gates run. A descriptor in hand is
 /// therefore a channel whose policy body matches its terms and whose
-/// omission economics hold at the configured measurements — none of
-/// which says anything yet about what is on chain.
+/// bond covers the capacity it insures — none of which says anything
+/// yet about what is on chain.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkChannelDescriptor {
     channel: PaidChannel,
@@ -477,12 +401,11 @@ pub struct WorkChannelDescriptor {
     policy_salt: [u8; 32],
     execution_policy: PaidExecutionPolicyV1,
     expected_payment_values: EdgeValues,
-    omission: OmissionMeasurements,
 }
 
 impl WorkChannelDescriptor {
     /// Opens a configured channel: checks its policy commitment, its
-    /// execution policy, and its omission economics.
+    /// execution policy, and that its bond covers its capacity.
     ///
     /// The bond edge and its terms hash are read out of the payment
     /// terms rather than configured separately, for the same reason
@@ -501,13 +424,12 @@ impl WorkChannelDescriptor {
     /// [`WorkSetupError::Record`] when the policy commitment or the
     /// execution policy is refused, [`WorkSetupError::Unsettleable`]
     /// when the expected edge values do not price both close routes, and
-    /// [`WorkSetupError::Omission`] when the contest's economics do not
-    /// hold.
+    /// [`WorkSetupError::Undercollateralised`] when the bond does not
+    /// exceed the capacity it insures.
     pub fn open(config: WorkChannelConfig) -> Result<Self, WorkSetupError> {
         let bond_edge = config.payment_terms.bond_edge;
         let bond_terms_hash = config.payment_terms.bond_terms_hash();
         let omission_bond = config.payment_terms.omission_bond;
-        let omit_response_blocks = config.payment_terms.omit_response_blocks;
         let channel = PaidChannel::new(
             config.network,
             config.payment_edge,
@@ -519,12 +441,7 @@ impl WorkChannelDescriptor {
 
         let settlement = work_payment_settlement(config.expected_payment_values, omission_bond)
             .ok_or(WorkSetupError::Unsettleable)?;
-        check_omission_economics(
-            config.omission,
-            omit_response_blocks,
-            omission_bond,
-            settlement.capacity(),
-        )?;
+        check_collateral(omission_bond, settlement.capacity())?;
 
         Ok(Self {
             channel,
@@ -533,7 +450,6 @@ impl WorkChannelDescriptor {
             policy_salt: config.policy_salt,
             execution_policy: config.execution_policy,
             expected_payment_values: config.expected_payment_values,
-            omission: config.omission,
         })
     }
 
@@ -664,17 +580,12 @@ impl WorkChannelDescriptor {
 
         // The capacity every later amount is bounded by, taken from the
         // edge that will pay rather than from the operator's
-        // expectation. The economics are re-checked against it for the
-        // same reason: a channel funded below what was configured has
-        // different economics than the ones that were approved.
+        // expectation. The collateral rule is re-checked against it for
+        // the same reason: a channel funded above what was configured
+        // has more to steal than the bond that was approved insures.
         let settlement = work_payment_settlement(payment.values(), terms.omission_bond)
             .ok_or(WorkSetupError::Unsettleable)?;
-        check_omission_economics(
-            self.omission,
-            terms.omit_response_blocks,
-            terms.omission_bond,
-            settlement.capacity(),
-        )?;
+        check_collateral(terms.omission_bond, settlement.capacity())?;
 
         let horizon = terms.admission_horizon().get();
         if observed.height >= horizon {
@@ -1143,83 +1054,34 @@ impl ReadyChannel {
     }
 }
 
-/// Checks that understating a payment close costs the client more than
-/// it stands to keep.
+/// Checks that the omission bond exceeds the capacity it insures.
 ///
-/// The thief the implemented contest admits is the *client*, and the
-/// theft is an understatement: the client opens a close naming less than
-/// it has already signed for, and if this provider's watcher is offline
-/// for `omit_response_blocks` that understated start settles and the
-/// client keeps the difference. The provider's omission is the
-/// opportunity; it is not the profit, and a provider that stays offline
-/// only loses. The kernel's rule is `WorkPaymentTerms::omission_bond` —
-/// "amount the client forfeits to the provider when a close reveals the
-/// client understated" — charged on a `Party::Maker` opener, and the
-/// payment edge's maker is the client.
+/// This is the whole of the omission contest's economics. A provider that
+/// omits a response forfeits `omission_bond`; the most it could gain by
+/// doing so is the channel's `payment_capacity`. With the bond strictly
+/// larger, omission is loss-making at *every* response probability, so
+/// no measurement of the provider's availability is needed to price the
+/// channel and none is taken.
 ///
-/// What deters it is that bond, and what makes the bond sufficient is an
-/// inequality over three measured quantities. With `M` =
-/// [`OMISSION_PROBABILITY_SCALE`]:
-///
-/// - `1 <= q <= M`, where `q/M` is the measured probability that this
-///   provider's watcher answers a contest within
-///   [`OmissionMeasurements::response_blocks`];
-/// - `omit_response_blocks >= response_blocks`, so the deadline the
-///   terms actually impose is one `q` was measured against. Without it
-///   `q` is a number about a window this channel does not have, and the
-///   third inequality spends it anyway;
-/// - `omission_bond > response_cost_cap`, so answering pays the
-///   provider more than answering costs it, and the response the whole
-///   deterrence rests on is one the provider actually wants to make;
-/// - `q * omission_bond > (M - q) * payment_capacity`, so the client's
-///   expected forfeit exceeds its expected theft.
-///
-/// The products are `u128` because both factors are `u64` and their
-/// product is not. The `q > M` half of the range check is load-bearing:
-/// `M - q` below would underflow without it. The `q == 0` half is not —
-/// `q = 0` makes the third inequality `0 > M * capacity`, which is false
-/// for *every* capacity, zero included, because the comparison is
-/// strict. It is kept for the answer it gives rather than the refusal:
-/// `ProbabilityOutOfRange` names the configuration mistake, where
-/// `OmissionNotLossMaking { responded: 0, .. }` would report an
-/// arithmetic result that says nothing about what to change.
-///
-/// These are bilateral policy gates, not kernel facts. The kernel checks
+/// This is a bilateral policy gate, not a kernel fact. The kernel checks
 /// that the bond is funded and that a proved understatement forfeits it.
 /// Nothing on chain checks that a provider is actually online, and no
 /// hash can make one respond.
 ///
 /// # Errors
 ///
-/// One [`OmissionError`] naming the inequality that failed.
-pub fn check_omission_economics(
-    measured: OmissionMeasurements,
-    omit_response_blocks: u64,
+/// [`WorkSetupError::Undercollateralised`] naming both numbers.
+pub const fn check_collateral(
     omission_bond: u64,
     payment_capacity: u64,
-) -> Result<(), OmissionError> {
-    let q = measured.response_probability;
-    if q == 0 || q > OMISSION_PROBABILITY_SCALE {
-        return Err(OmissionError::ProbabilityOutOfRange { q });
+) -> Result<(), WorkSetupError> {
+    if omission_bond > payment_capacity {
+        return Ok(());
     }
-    if omit_response_blocks < measured.response_blocks {
-        return Err(OmissionError::ResponseWindowUnderMeasured {
-            window: omit_response_blocks,
-            measured: measured.response_blocks,
-        });
-    }
-    if omission_bond <= measured.response_cost_cap {
-        return Err(OmissionError::BondBelowResponseCost {
-            bond: omission_bond,
-            cap: measured.response_cost_cap,
-        });
-    }
-    let responded = u128::from(q) * u128::from(omission_bond);
-    let omitted = u128::from(OMISSION_PROBABILITY_SCALE - q) * u128::from(payment_capacity);
-    if responded <= omitted {
-        return Err(OmissionError::OmissionNotLossMaking { responded, omitted });
-    }
-    Ok(())
+    Err(WorkSetupError::Undercollateralised {
+        bond: omission_bond,
+        capacity: payment_capacity,
+    })
 }
 
 /// Returns the terms hash of one payment body, as the edge commits to

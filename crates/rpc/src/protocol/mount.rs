@@ -1,5 +1,4 @@
-//! §4-B: the two waits, the blocks they cost, and the evidence a number
-//! has to have before it may call itself measured.
+//! §4-B: the two waits and the blocks they cost.
 //!
 //! # What is arithmetic here and what is judgement
 //!
@@ -44,50 +43,11 @@
 //! costs blocks, and blocks are what the floor is denominated in. Whole
 //! numbers also mean `ceil` division is exact, so a hand-checked example
 //! and the code agree to the digit.
-//!
-//! # The grading
-//!
-//! [`clopper_pearson_upper_ppb`] is the one-sided 95% Clopper–Pearson
-//! upper bound on the *miss* rate, computed from the binomial tail this
-//! module evaluates itself. No statistics dependency: the bound is the
-//! `p` at which the chance of seeing this few misses falls to 5%, the
-//! binomial tail is monotone in `p`, and a bisection over it is the
-//! whole method. [`grade_response_probability`] applies §4's rule to it
-//! — at least [`TRIAL_FLOOR`] independent trials *and* a bound no worse
-//! than [`MISS_BOUND_PPB`] — and returns the `q` those trials earn, or
-//! `None` for a field that has to be written `assumed`.
 
 use hellas_kernel::{
     MAX_START_VALIDITY_BLOCKS, RESPONSE_FINALIZATION_BLOCKS, RESPONSE_INCLUSION_BLOCKS,
     RESPONSE_POLL_BLOCKS, RESPONSE_PROPAGATION_BLOCKS,
 };
-
-use crate::protocol::work_setup::OMISSION_PROBABILITY_SCALE;
-
-/// Independent trials §4 requires before `q = 0.999` may be claimed.
-///
-/// Not a preference and not a round number: 2,995 is the smallest `n`
-/// for which a clean run — zero misses — has a 95% Clopper–Pearson upper
-/// miss bound at or under 0.001. At 2,994 the same clean run bounds the
-/// miss rate at 0.0010001, which is worse than the claim. The two rules
-/// §4 states are therefore one rule stated twice for a run with no
-/// misses, and two different rules for a run with any.
-pub const TRIAL_FLOOR: u64 = 2_995;
-
-/// The upper miss bound §4 admits, in parts per billion: `0.001`.
-///
-/// Parts per billion rather than the `1..=1_000_000` scale `q` is
-/// reported on, because the interesting comparisons happen in the sixth
-/// decimal place and a bound rounded to the reporting scale would admit
-/// a run that missed it.
-pub const MISS_BOUND_PPB: u64 = 1_000_000;
-
-/// One minus the confidence the bound is taken at: a 95% one-sided
-/// bound.
-const ALPHA: f64 = 0.05;
-
-/// Parts per billion in one.
-const PPB: f64 = 1_000_000_000.0;
 
 /// Every §4 term the two waits are built from, reduced to the one number
 /// each contributes.
@@ -472,92 +432,6 @@ impl MountFloor {
             })
         }
     }
-}
-
-/// The 95% one-sided Clopper–Pearson upper bound on the miss rate, in
-/// parts per billion, rounded up.
-///
-/// The bound is the largest `p` at which a run this clean still had a 5%
-/// chance of happening: `P[misses or fewer | n, p] = 0.05`. That
-/// probability falls as `p` rises, so the equation has one root and a
-/// bisection finds it. Rounding the answer up is the safe direction — a
-/// bound reported smaller than it is would admit a run that did not earn
-/// it.
-///
-/// A run with no trials, or one whose every trial missed, bounds the
-/// miss rate at one: `1_000_000_000`.
-#[must_use]
-pub fn clopper_pearson_upper_ppb(trials: u64, misses: u64) -> u64 {
-    if trials == 0 || misses >= trials {
-        return PPB as u64;
-    }
-    let (mut low, mut high) = (0.0_f64, 1.0_f64);
-    // Sixty halvings exhaust an f64 mantissa over this interval; a
-    // hundred is the same answer with the arithmetic's own headroom.
-    for _ in 0..100 {
-        let mid = 0.5 * (low + high);
-        if binomial_at_most(misses, trials, mid) > ALPHA {
-            low = mid;
-        } else {
-            high = mid;
-        }
-    }
-    let ppb = (high * PPB).ceil();
-    if ppb >= PPB { PPB as u64 } else { ppb as u64 }
-}
-
-/// `P[at most k successes | n trials, probability p]`.
-///
-/// Summed from the `k = 0` term upwards by the ratio between successive
-/// terms, which never forms a factorial and never leaves the scale of
-/// the answer. The first term is taken through a logarithm because
-/// `(1-p)^n` underflows for the large `n` and large `p` the bisection
-/// visits on its way down; the underflow is the true answer there, and
-/// the sum stops early once it reaches one.
-fn binomial_at_most(k: u64, n: u64, p: f64) -> f64 {
-    if p <= 0.0 {
-        return 1.0;
-    }
-    if p >= 1.0 {
-        return f64::from(u8::from(k >= n));
-    }
-    let complement = 1.0 - p;
-    let ratio = p / complement;
-    let mut term = (n as f64 * complement.ln()).exp();
-    let mut sum = term;
-    for i in 0..k {
-        term *= (n - i) as f64 / (i + 1) as f64 * ratio;
-        sum += term;
-        if sum >= 1.0 {
-            return 1.0;
-        }
-    }
-    sum
-}
-
-/// §4's grading of the response probability: the `q` these trials earn,
-/// or `None` for a field that must be written `assumed`.
-///
-/// Both halves of the rule, and neither is sufficient alone.
-/// [`TRIAL_FLOOR`] trials with one miss fails the bound; a clean run of
-/// a hundred passes the bound trivially and fails the count. The `q`
-/// returned is the complement of the bound on the
-/// [`OMISSION_PROBABILITY_SCALE`] the omission economics are computed
-/// on, with the bound rounded *up* first, so the availability claimed is
-/// never larger than the evidence supports.
-#[must_use]
-pub fn grade_response_probability(trials: u64, misses: u64) -> Option<u64> {
-    if trials < TRIAL_FLOOR {
-        return None;
-    }
-    let upper_ppb = clopper_pearson_upper_ppb(trials, misses);
-    if upper_ppb > MISS_BOUND_PPB {
-        return None;
-    }
-    // ppb to the reporting scale, rounding the miss rate up so the
-    // availability rounds down.
-    let scale = PPB as u64 / OMISSION_PROBABILITY_SCALE;
-    Some(OMISSION_PROBABILITY_SCALE - upper_ppb.div_ceil(scale))
 }
 
 #[cfg(test)]

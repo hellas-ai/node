@@ -1,10 +1,10 @@
 use std::fs;
 
-use hellas_kernel::{EdgeValues, Fees, MIN_OMIT_RESPONSE_BLOCKS};
+use hellas_kernel::{EdgeValues, Fees};
 use hellas_rpc::protocol::Digest;
 use hellas_rpc::protocol::mount::{FloorError, MountBudget};
 use hellas_rpc::protocol::work::{PaidChannelPolicyV1, PaidExecutionPolicyV1};
-use hellas_rpc::protocol::work_setup::{OmissionMeasurements, ProviderChannelPolicy};
+use hellas_rpc::protocol::work_setup::ProviderChannelPolicy;
 use hellas_rpc::work_close::{BlockSourceError, FinalizedWork};
 
 use super::super::work_config::{ArtifactProvenance, MeasuredEvidence, load_work_config};
@@ -91,11 +91,6 @@ fn policy() -> ProviderChannelPolicy {
             fixed_price: 10,
         },
         expected_payment_values: EdgeValues::new(1_000, 200, Fees::new(0, 0, 0, 0)),
-        omission: OmissionMeasurements {
-            response_probability: 999_000,
-            response_blocks: MIN_OMIT_RESPONSE_BLOCKS + 4,
-            response_cost_cap: 1,
-        },
         floor: match budget().floor() {
             Ok(floor) => floor,
             Err(error) => panic!("the fixture budget has a floor: {error}"),

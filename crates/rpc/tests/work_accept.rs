@@ -34,8 +34,7 @@ use hellas_rpc::protocol::work::{
     prepared_input_digest, private_policy_commitment, propose_authorization, signing_hash, work_id,
 };
 use hellas_rpc::protocol::work_setup::{
-    ObservedChannel, OmissionMeasurements, ReadyChannel, WorkChannelConfig, WorkChannelDescriptor,
-    payment_terms_hash,
+    ObservedChannel, ReadyChannel, WorkChannelConfig, WorkChannelDescriptor, payment_terms_hash,
 };
 use hellas_rpc::services::work::{Work, WorkServer};
 use hellas_rpc::work::{
@@ -62,13 +61,13 @@ use tokio::sync::mpsc;
 const HORIZON: u64 = 500;
 const PRICE: u64 = 10;
 const CREDIT_LIMIT: u64 = 40;
-const OMISSION_BOND: u64 = 4;
+/// One over half the funding, so the bond exceeds the capacity it
+/// leaves behind at zero fees.
+const OMISSION_BOND: u64 = 601;
 const PAYMENT_VALUE: u64 = 1_000;
 const PAYMENT_RESERVE: u64 = 200;
 const STAKE: u64 = 64;
 const SALT: [u8; 32] = [0x5a; 32];
-const Q: u64 = 999_000;
-const COST_CAP: u64 = 1;
 /// The finalized block both endpoints have processed through.
 const CURSOR: u64 = 10;
 
@@ -175,11 +174,6 @@ fn descriptor() -> WorkChannelDescriptor {
         channel_policy: channel_policy(),
         execution_policy: execution_policy(),
         expected_payment_values: payment_values(),
-        omission: OmissionMeasurements {
-            response_probability: Q,
-            response_blocks: hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
-            response_cost_cap: COST_CAP,
-        },
     };
     match WorkChannelDescriptor::open(config) {
         Ok(descriptor) => descriptor,

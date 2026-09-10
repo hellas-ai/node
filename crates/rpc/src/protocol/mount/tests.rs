@@ -164,55 +164,6 @@ fn a_short_window_and_a_short_margin_are_both_refused() {
     );
 }
 
-/// 2,995 is not a round number, it is the answer to the bound.
-///
-/// A clean run of 2,995 bounds the miss rate at or under 0.001 and a
-/// clean run of 2,994 does not — which is what makes §4's two rules
-/// one rule for a run with no misses. If the bisection or the
-/// binomial tail were wrong, this boundary would move.
-#[test]
-fn the_trial_floor_is_where_a_clean_run_earns_the_claim() {
-    assert!(clopper_pearson_upper_ppb(TRIAL_FLOOR, 0) <= MISS_BOUND_PPB);
-    assert!(clopper_pearson_upper_ppb(TRIAL_FLOOR - 1, 0) > MISS_BOUND_PPB);
-    // 1 - 0.05^(1/2995), to the part per billion.
-    assert_eq!(clopper_pearson_upper_ppb(TRIAL_FLOOR, 0), 999_745);
-}
-
-/// The count and the bound are two rules, and each refuses on its
-/// own.
-#[test]
-fn thin_evidence_and_a_missed_bound_are_both_assumed() {
-    // Enough trials, one miss too many: 3,000 trials with one miss
-    // bounds the miss rate at 0.00158.
-    assert_eq!(grade_response_probability(3_000, 1), None);
-    // The bound is comfortable and the count is not.
-    assert_eq!(grade_response_probability(TRIAL_FLOOR - 1, 0), None);
-    assert_eq!(grade_response_probability(100, 0), None);
-    // A run in which everything missed.
-    assert_eq!(grade_response_probability(10_000, 10_000), None);
-}
-
-/// A clean run at the floor earns exactly `q = 0.999`, and a longer
-/// run earns more.
-#[test]
-fn a_graded_run_earns_the_availability_its_bound_leaves() {
-    assert_eq!(
-        grade_response_probability(TRIAL_FLOOR, 0),
-        Some(999_000),
-        "the bound is 999_745 ppb, which is 1_000 ppm of miss",
-    );
-    assert_eq!(
-        grade_response_probability(3_000_000, 0),
-        Some(999_999),
-        "a thousandfold run bounds the miss rate a thousandfold lower",
-    );
-    // Misses are affordable once there are enough trials to price
-    // them: 1 in 5,000 bounds the miss rate at 948_780 ppb, which
-    // is 949 ppm.
-    assert_eq!(clopper_pearson_upper_ppb(5_000, 1), 948_418);
-    assert_eq!(grade_response_probability(5_000, 1), Some(999_051));
-}
-
 /// `max6` is a sum, and the overlap it double-counts is the reason
 /// it is safe.
 #[test]
