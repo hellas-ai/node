@@ -12,6 +12,7 @@ use hellas_executor::{
 };
 use hellas_kernel::Secp256k1Signer;
 use hellas_rpc::policy::ExecutePolicy;
+use hellas_rpc::work_handshake::PaymentAdmission;
 use hellas_rpc::{Assurance, FetchEnvironment, ProducerId, ProducerSigningKey};
 use iroh::SecretKey;
 use serde::Deserialize;
@@ -26,11 +27,9 @@ use tracing::warn;
 mod codex_provider;
 mod node;
 mod node_handler;
-pub mod probe;
 pub mod provision;
 pub mod work_config;
 
-pub use probe::{ProbeOptions, run_probe};
 pub use provision::{ProvisionOptions, run_provision};
 pub use work_config::{WorkConfig, load_work_config};
 
@@ -140,14 +139,10 @@ async fn run_with_store(
         &content_index,
     )?;
 
-    // What the operator configured, said back once, and then which of
-    // §4's four evidence cases this node started in, in words. The
-    // second line is the one that matters: §4 disables setup and new
-    // work on missing, changed or `assumed` evidence and never disables
-    // recovery, so a node that admits no paid work still serves its
-    // journals and still answers a contest. That is why an artifact that
-    // is absent or is not the pinned one is a warning here and not a
-    // startup refusal.
+    // What the operator configured, said back once. A node with a
+    // paid-work configuration serves its journals, answers every
+    // contest, and countersigns new paid channels over the policy that
+    // configuration makes. There is no second gate in front of that.
     let mut work_runner = None;
     if let Some(work) = options.work_config.as_ref() {
         // A configured route is a promise about durable state, so verify all
@@ -161,28 +156,13 @@ async fn run_with_store(
             journal_root = %work.journal_root.display(),
             routes = work.routes.len(),
             poll_ms = work.poll.as_millis(),
-            response_alarm_margin_blocks = work.response_alarm_margin_blocks,
+            min_omit_response_blocks = work.min_omit_response_blocks,
             // Said back because it is the party the chain will see: an
             // operator who funded a different one has configured a node
             // that can settle nothing, and this is where they find out.
             settlement_party = %hex::encode(options.settlement_key.party_key().to_bytes()),
-            "loaded the paid-work configuration",
+            "loaded the paid-work configuration; paid admission is on",
         );
-        if work.unsafe_devnet_admits_assumed_measurements() {
-            warn!(
-                network = %work.chain.network,
-                "UNSAFE DEVNET MODE: assumed paid-work measurements will be admitted",
-            );
-        }
-        let duties = work_config::load_paid_work_duties(work)?;
-        if duties.admits_paid_work() {
-            info!("{}", duties.summary());
-        } else {
-            warn!("{}", duties.summary());
-        }
-        // The whole of what the clock is built from, decided here and
-        // carried there. The admission in particular is §4's answer and
-        // not a flag the runner re-derives.
         work_runner = Some(node::WorkRunnerConfig {
             network: work.chain.network,
             threshold_identity: work.chain.threshold_identity.clone(),
@@ -191,7 +171,7 @@ async fn run_with_store(
             validators: work.validators.clone(),
             poll: work.poll,
             settlement_key: options.settlement_key.clone(),
-            admission: duties.payment_admission(),
+            admission: Some(PaymentAdmission::Admits(Box::new(work.provider_policy()))),
         });
     }
 

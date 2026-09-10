@@ -112,7 +112,6 @@ use hellas_rpc::protocol::artifacts::{
     BoundTermId, Canonical as _, InputAddressed as _, OutputAddressed as _, PreparedPaidInputV1,
     SourceRef, TextArtifact, TextExecution, TextExecutionId, TextPolicy, TokenIds, completed_text,
 };
-use hellas_rpc::protocol::mount::{MountBudget, MountFloor};
 use hellas_rpc::protocol::work::{
     JobDeadlines, PaidChannelPolicyV1, PaidExecutionPolicyV1, generation_policy_digest,
     identity_source_digest, private_policy_commitment,
@@ -392,34 +391,6 @@ fn expected_values() -> EdgeValues {
     EdgeValues::new(CLIENT_FUNDING, 0, Fees::new(0, 0, 0, 0))
 }
 
-/// The floor these fixtures run under: a budget in which no wait
-/// takes any time, so §4's `S` and `R` are zero, its response-window
-/// floor is the kernel's own `MIN_OMIT_RESPONSE_BLOCKS`, and `T` is
-/// four. What each test below observes is therefore its own gate and
-/// never this one.
-fn floor() -> MountFloor {
-    let instant = MountBudget {
-        fsync_tail_ms: 0,
-        rotation_tail_ms: 0,
-        response_build_ms: 0,
-        one_block_fetch_ms: 0,
-        fresh_tip_ms: 0,
-        close_prepared_fsync_ms: 0,
-        rpc_ms: 0,
-        response_worker_ms: 0,
-        general_worker_ms: 0,
-        validation_ms: 0,
-        restart_replay_ms_at_cap: 0,
-        restart_downtime_ms: 0,
-        lower_tail_block_ms: 1,
-        general_inclusion_blocks: 0,
-    };
-    match instant.floor() {
-        Ok(floor) => floor,
-        Err(error) => panic!("a one-millisecond block prices every wait: {error}"),
-    }
-}
-
 fn provider_policy() -> ProviderChannelPolicy {
     ProviderChannelPolicy {
         network: TEST_NETWORK,
@@ -427,7 +398,7 @@ fn provider_policy() -> ProviderChannelPolicy {
         channel_policy: channel_policy(),
         execution_policy: execution_policy(),
         expected_payment_values: expected_values(),
-        floor: floor(),
+        min_omit_response_blocks: hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
     }
 }
 

@@ -524,10 +524,10 @@ impl WorkHandler for UnmountedWork {
 /// What the clock over one node's paid-work journals is built from.
 ///
 /// Every field is something the serve path has already loaded and
-/// checked. The admission most of all: [`PaymentAdmission`] is
-/// `PaidWorkDuties::payment_admission`'s answer to §4's evidence rule,
-/// carried here rather than asked again, so there is no second place a
-/// node could decide whether it countersigns new paid work.
+/// checked. The admission most of all: [`PaymentAdmission`] is built
+/// once from the loaded work configuration and carried here rather than
+/// derived again, so there is no second place a node could decide
+/// whether it countersigns new paid work.
 pub(super) struct WorkRunnerConfig {
     /// The network the journals are keyed and the signatures bound to.
     pub(super) network: NetworkId,
@@ -543,8 +543,8 @@ pub(super) struct WorkRunnerConfig {
     pub(super) poll: Duration,
     /// The key every settlement this node signs is signed with.
     pub(super) settlement_key: Secp256k1Signer,
-    /// What a setup endpoint over this node's evidence countersigns, or
-    /// `None` when there is no evidence to build one over at all.
+    /// What a setup endpoint over this node's configuration countersigns,
+    /// or `None` when there is no policy to build one over at all.
     pub(super) admission: Option<PaymentAdmission>,
 }
 
@@ -1017,11 +1017,10 @@ enum Driven {
         /// journal at startup.
         policy: Option<Box<ProviderChannelPolicy>>,
     },
-    /// §4's missing, changed or unconfigured evidence: there is no
-    /// admission and therefore no setup endpoint to build. Recovery is
-    /// not disabled by any of those, so the journal itself is driven —
-    /// history, mount and close duty are the driver's, and none of them
-    /// countersigns anything.
+    /// No admission was configured, so there is no setup endpoint to
+    /// build. Recovery is not disabled by that, so the journal itself is
+    /// driven — history, mount and close duty are the driver's, and none
+    /// of them countersigns anything.
     Recovery(Box<SetupStore>),
     /// The channel this setup mounted, including the recovery authority
     /// needed to finish a job accepted before a process restart.

@@ -69,12 +69,12 @@ fn config() -> serde_json::Value {
             },
         },
         "poll_ms": 250,
-        // F+G+I+S+R+1 over the fixture budget below, exactly.
-        "response_alarm_margin_blocks": 16,
-        "artifact": {
-            "path": "/var/lib/hellas/work/artifact.json",
-            "digest": hex32(0x77),
+        "expected_payment_values": {
+            "value": PAYMENT_VALUE,
+            "reserve": PAYMENT_RESERVE,
+            "close_fees": { "base": 0, "slot": 0, "proof": 0, "lifetime": 0 },
         },
+        "min_omit_response_blocks": hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
     })
 }
 
@@ -132,10 +132,13 @@ fn a_work_config_round_trips_from_a_file() {
     assert_eq!(loaded.execution_policy.fixed_price, 10);
     assert_eq!(loaded.execution_policy.max_stop_token_ids, 4);
     assert_eq!(loaded.poll, Duration::from_millis(250));
-    assert_eq!(loaded.response_alarm_margin_blocks, 16);
     assert_eq!(
-        loaded.measured_artifact().map(|artifact| artifact.digest),
-        Some(Digest::from_bytes([0x77; 32])),
+        loaded.expected_payment_values,
+        EdgeValues::new(PAYMENT_VALUE, PAYMENT_RESERVE, Fees::new(0, 0, 0, 0)),
+    );
+    assert_eq!(
+        loaded.min_omit_response_blocks,
+        hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS
     );
 }
 
@@ -172,7 +175,10 @@ fn two_routes_cannot_name_the_same_bond() {
 fn a_missing_field_is_refused_by_name() {
     for (path, field) in [
         (&[][..], "poll_ms"),
-        (&[][..], "response_alarm_margin_blocks"),
+        (&[][..], "min_omit_response_blocks"),
+        (&[][..], "expected_payment_values"),
+        (&["expected_payment_values"][..], "reserve"),
+        (&["expected_payment_values", "close_fees"][..], "lifetime"),
         (&[][..], "validators"),
         (&[][..], "routes"),
         (&["chain"][..], "threshold_identity"),
@@ -378,16 +384,15 @@ fn a_watcher_that_never_polls_is_refused() {
     assert!(error.contains("poll_ms"), "unexpected error: {error}");
 }
 
-// ── The measured artifact ─────────────────────────────────────────
+// ── The provider policy and its journals ─────────────────────────
 
 use hellas_kernel::{
     BlockHeight, CoinId, EdgeId, Funding, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Parties,
     Payout, Secp256k1Signer, Secp256k1Verifier, Terms, Tx, WorkPaymentTerms, WorkStakeBondTerms,
 };
-use hellas_rpc::protocol::mount::MountBudget;
 use hellas_rpc::protocol::work::private_policy_commitment;
 use hellas_rpc::protocol::work_setup::WorkSetupError;
-use hellas_rpc::work_handshake::SetupEndpoint;
+use hellas_rpc::work_handshake::{PaymentAdmission, SetupEndpoint};
 use hellas_rpc::work_store::{Role, SetupScan, SetupStore};
 
 /// The window the fixture's terms admit.
@@ -403,132 +408,6 @@ fn network() -> NetworkId {
         panic!("the fixture configuration's network id is one");
     };
     network
-}
-
-/// The window the run's own timestamps sit inside.
-const RUN_STARTED_AT: u64 = 1_756_339_000_000;
-const RUN_FINISHED_AT: u64 = 1_756_339_200_000;
-
-fn measured(value: u64) -> serde_json::Value {
-    serde_json::json!({ "value": value, "evidence": "measured", "samples": 3_000 })
-}
-
-fn assumed(value: u64) -> serde_json::Value {
-    serde_json::json!({ "value": value, "evidence": "assumed", "samples": 0 })
-}
-
-/// One §4 budget term, as the observations behind it rather than as
-/// an answer. The reader takes the tail itself.
-fn observed(values: &[u64]) -> serde_json::Value {
-    let samples: Vec<serde_json::Value> = values
-        .iter()
-        .enumerate()
-        .map(|(index, value)| {
-            serde_json::json!({
-                "at_unix_ms": RUN_STARTED_AT + index as u64,
-                "value": value,
-            })
-        })
-        .collect();
-    serde_json::json!({ "evidence": "measured", "samples": samples })
-}
-
-/// One §4 budget term nobody observed.
-fn written_down(value: u64) -> serde_json::Value {
-    serde_json::json!({ "evidence": "assumed", "value": value })
-}
-
-/// The budget a completed bootstrap run leaves behind.
-///
-/// Small explicit sample sets, so the tail of each term is visible
-/// at a glance and the floor over them is hand-checkable. Every
-/// value is a plausible one for a node with an SSD and a
-/// half-second block, and none of them is round: a term dropped
-/// from a formula shows up as a wrong total rather than as a wash.
-fn budget() -> serde_json::Value {
-    serde_json::json!({
-        "fsync_tail_ms": observed(&[2, 5, 3]),
-        "rotation_tail_ms": observed(&[9, 12]),
-        "response_build_ms": observed(&[3, 4]),
-        "one_block_fetch_ms": observed(&[18, 25]),
-        "fresh_tip_ms": observed(&[11, 14]),
-        "close_prepared_fsync_ms": observed(&[4, 6]),
-        "rpc_ms": observed(&[30, 44]),
-        "response_worker_ms": observed(&[7, 9]),
-        "general_worker_ms": observed(&[5, 8]),
-        "validation_ms": observed(&[2, 3]),
-        "restart_replay_ms_at_cap": observed(&[430, 520]),
-        "restart_downtime_ms": observed(&[820, 900]),
-        // The one term whose tail is the small end: a short block
-        // buys less time, so 480 is the conservative reading of
-        // these three.
-        "lower_tail_block_ms": observed(&[520, 480, 505]),
-        "general_inclusion_blocks": observed(&[2, 3]),
-    })
-}
-
-/// The artifact a completed bootstrap run leaves behind: every
-/// number measured, and every number one this fixture's terms are
-/// priced by.
-fn artifact() -> serde_json::Value {
-    let binary = running_binary_digest().expect("the test executable identifies itself");
-    serde_json::json!({
-        "provenance": {
-            "binary": hex::encode(binary.as_bytes()),
-            "config": hex32(0x22),
-            "machine": "bootstrap-1",
-            "started_at_unix_ms": RUN_STARTED_AT,
-            "measured_at_unix_ms": RUN_FINISHED_AT,
-        },
-        "expected_payment_values": {
-            "value": measured(PAYMENT_VALUE),
-            "reserve": measured(PAYMENT_RESERVE),
-            "close_fees": {
-                "base": measured(0),
-                "slot": measured(0),
-                "proof": measured(0),
-                "lifetime": measured(0),
-            },
-        },
-        "budget": budget(),
-    })
-}
-
-/// The same artifact with one budget term replaced.
-fn artifact_with(term: &str, entry: serde_json::Value) -> serde_json::Value {
-    let mut value = artifact();
-    value["budget"][term] = entry;
-    value
-}
-
-/// Writes one artifact beside a configuration that pins it, and
-/// answers what that node's evidence lets it do.
-///
-/// The pin is the digest of the bytes actually written, unless
-/// `pin` overrides it: the changed-evidence case then differs from
-/// the matching one in exactly the field under test and in nothing
-/// else.
-fn duties_for(artifact: &serde_json::Value, pin: Option<String>) -> CliResult<PaidWorkDuties> {
-    duties_for_config(config(), artifact, pin)
-}
-
-/// The same load with an explicitly chosen work configuration.
-fn duties_for_config(
-    config: serde_json::Value,
-    artifact: &serde_json::Value,
-    pin: Option<String>,
-) -> CliResult<PaidWorkDuties> {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("artifact.json");
-    let bytes = artifact.to_string();
-    fs::write(&path, &bytes).unwrap();
-    let digest = pin.unwrap_or_else(|| hex::encode(Digest::hash(bytes.as_bytes()).as_bytes()));
-    let loaded = load(with(
-        config,
-        "artifact",
-        serde_json::json!({ "path": path.display().to_string(), "digest": digest }),
-    ))?;
-    load_paid_work_duties(&loaded)
 }
 
 /// Inserts `field` into the object at `path`, which the schema does
@@ -645,12 +524,19 @@ fn setup_endpoint(dir: &tempfile::TempDir, admission: PaymentAdmission) -> Setup
     endpoint
 }
 
+/// The policy the fixture configuration makes.
+fn policy() -> ProviderChannelPolicy {
+    load(config())
+        .expect("the fixture configuration loads")
+        .provider_policy()
+}
+
+fn admits() -> PaymentAdmission {
+    PaymentAdmission::Admits(Box::new(policy()))
+}
+
 fn write_provider_offer(dir: &tempfile::TempDir) {
-    let duties = duties_for(&artifact(), None).expect("the route fixture's policy loads");
-    let admission = duties
-        .payment_admission()
-        .expect("the route fixture carries measured evidence");
-    let mut endpoint = setup_endpoint(dir, admission);
+    let mut endpoint = setup_endpoint(dir, admits());
     endpoint
         .propose_bond(network(), bond_funding(), bond_terms())
         .expect("the provider offer is durable");
@@ -723,332 +609,75 @@ fn a_route_is_refused_when_its_journal_is_not_under_the_configured_root() {
     );
 }
 
-/// The artifact round-trips: every labelled number arrives in the
-/// policy, and what the policy has no field for arrives beside it.
+/// Every field of the policy is one the operator wrote, and arrives
+/// as written.
 #[test]
-fn a_measured_artifact_round_trips_into_a_policy() {
-    let duties = duties_for(&artifact(), None).expect("the fixture artifact loads");
-
-    assert!(duties.admits_paid_work());
-    let evidence = duties.evidence().expect("a read artifact is evidence");
+fn a_configuration_makes_its_policy_field_for_field() {
+    let policy = policy();
+    assert_eq!(policy.network, network());
+    assert_eq!(policy.policy_salt, [0x5a; 32]);
+    assert_eq!(policy.channel_policy.compute_credit_limit, 40);
+    assert_eq!(policy.execution_policy.fixed_price, 10);
     assert_eq!(
-        evidence.provenance,
-        ArtifactProvenance {
-            binary: running_binary_digest().expect("the test executable identifies itself"),
-            config: Digest::from_bytes([0x22; 32]),
-            machine: "bootstrap-1".to_string(),
-            started_at_unix_ms: RUN_STARTED_AT,
-            measured_at_unix_ms: RUN_FINISHED_AT,
-        },
-    );
-    // The weakest link and not an average: the budget's shortest
-    // sample set is `rotation_tail_ms` at two observations, and two
-    // is what the whole artifact rests on.
-    assert_eq!(evidence.samples, 2);
-    assert_eq!(
-        evidence.policy.expected_payment_values,
+        policy.expected_payment_values,
         EdgeValues::new(PAYMENT_VALUE, PAYMENT_RESERVE, Fees::new(0, 0, 0, 0)),
     );
-    // The four fields a provider fixes for itself come from the
-    // configuration and never from the artifact.
-    assert_eq!(evidence.policy.network.as_str(), "hellas-devnet");
-    assert_eq!(evidence.policy.policy_salt, [0x5a; 32]);
-    assert_eq!(evidence.policy.channel_policy.compute_credit_limit, 40);
-    assert_eq!(evidence.policy.execution_policy.fixed_price, 10);
     assert_eq!(
-        duties.summary(),
-        "paid admission is on: every field of the pinned artifact is measured, \
-         and its floor needs T=11 of the 64-block start span",
+        policy.min_omit_response_blocks,
+        hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS
     );
 }
 
-/// An unknown artifact field is refused by name, wherever it sits.
-///
-/// The names are §4-B's on purpose: the confidence bound, the
-/// lower-tail block time and the restart downtime are what a later
-/// measured gate consumes, and a file carrying one today is an
-/// operator configuring something this node does not implement.
+/// The configured window is the provider's own gate at admission:
+/// terms under it are refused by name, and the same terms clear a
+/// configuration that asks for less.
 #[test]
-fn an_unknown_artifact_field_is_refused_by_name() {
-    for (path, field) in [
-        (&[][..], "lower_tail_block_ms"),
-        (&["provenance"][..], "restart_downtime_ms"),
-        (&["budget"][..], "confidence_upper"),
-        (&["expected_payment_values", "close_fees"][..], "settlement"),
-    ] {
-        let error = format!(
-            "{:?}",
-            duties_for(&with_unknown(artifact(), path, field), None)
-                .expect_err("an unknown artifact field is refused"),
-        );
-        assert!(
-            error.contains(field),
-            "the refusal for {field} does not name it: {error}",
-        );
-    }
-}
-
-/// Every artifact field is required, and the label most of all: a
-/// number with no `evidence` beside it would be a measurement
-/// nobody claimed.
-#[test]
-fn a_missing_artifact_field_is_refused_by_name() {
-    for (path, field) in [
-        (&["provenance"][..], "machine"),
-        (&["provenance"][..], "measured_at_unix_ms"),
-        (&["expected_payment_values"][..], "close_fees"),
-        (&["expected_payment_values", "close_fees"][..], "lifetime"),
-    ] {
-        let error = format!(
-            "{:?}",
-            duties_for(&without(artifact(), path, field), None)
-                .expect_err("an artifact missing a required field is refused"),
-        );
-        assert!(
-            error.contains(field),
-            "the refusal for a missing {field} does not name it: {error}",
-        );
-    }
-}
-
-/// A label its own sample count contradicts is refused by name.
-///
-/// Both directions, because both are dishonest: a `measured` number
-/// resting on nothing is not a measurement, and an `assumed` number
-/// reporting samples is a measurement wearing the wrong label — and
-/// the second one would turn paid admission *off* for a node that
-/// had actually earned it.
-#[test]
-fn a_label_its_samples_contradict_is_refused_by_name() {
-    let mut unsampled = artifact();
-    unsampled["expected_payment_values"]["value"] =
-        serde_json::json!({ "value": PAYMENT_VALUE, "evidence": "measured", "samples": 0 });
-    let error = format!("{:?}", duties_for(&unsampled, None).unwrap_err());
-    assert!(
-        error.contains("expected_payment_values.value") && error.contains("no samples"),
-        "unexpected error: {error}",
+fn terms_under_the_configured_window_are_refused_at_admission() {
+    let strict = load(with(
+        config(),
+        "min_omit_response_blocks",
+        serde_json::json!(WINDOW + 1),
+    ))
+    .expect("a stricter window is a configuration")
+    .provider_policy();
+    assert_eq!(
+        strict
+            .admit(payment_edge(), payment_terms())
+            .map(|descriptor| descriptor.channel().payment_edge()),
+        Err(WorkSetupError::ResponseWindowBelowMinimum {
+            window: WINDOW,
+            minimum: WINDOW + 1,
+        }),
     );
+    assert!(policy().admit(payment_edge(), payment_terms()).is_ok());
+}
 
-    let mut oversampled = artifact();
-    oversampled["expected_payment_values"]["reserve"] = serde_json::json!({
-        "value": PAYMENT_RESERVE,
-        "evidence": "assumed",
-        "samples": 12,
-    });
-    let error = format!("{:?}", duties_for(&oversampled, None).unwrap_err());
+/// A window the kernel would refuse at every open is refused when the
+/// file is read, not at the first client.
+#[test]
+fn a_window_under_the_kernels_minimum_is_refused_by_the_loader() {
+    let error = format!(
+        "{:?}",
+        load(with(
+            config(),
+            "min_omit_response_blocks",
+            serde_json::json!(hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS - 1),
+        ))
+        .expect_err("a window under the kernel's minimum is refused"),
+    );
     assert!(
-        error.contains("expected_payment_values.reserve"),
+        error.contains("min_omit_response_blocks"),
         "unexpected error: {error}",
     );
 }
 
-/// A fully measured artifact yields a policy that admits, and an
-/// admission that countersigns.
-#[test]
-fn a_measured_artifact_yields_a_policy_that_admits() {
-    let duties = duties_for(&artifact(), None).expect("the fixture artifact loads");
-    let policy = &duties
-        .evidence()
-        .expect("a read artifact is evidence")
-        .policy;
-
-    let descriptor = policy
-        .admit(payment_edge(), payment_terms())
-        .expect("a measured policy admits the terms it was measured for");
-
-    assert_eq!(descriptor.bond_edge(), bond_edge());
-    assert!(matches!(
-        duties.payment_admission(),
-        Some(PaymentAdmission::Admits(_)),
-    ));
-}
-
-/// One `assumed` field is a node that countersigns nothing and
-/// still runs setup and the close duty.
-///
-/// The numbers are the measured fixture's, to the byte: only the
-/// label moves. So what refuses admission is the absence of
-/// evidence and not a value that failed a check — `admit` on this
-/// very policy still succeeds, and the endpoint built over it never
-/// gets to ask, because `Proposes` declines every proposed payment.
-#[test]
-fn an_assumed_field_refuses_admission_and_keeps_setup_and_close() {
-    let mut value = artifact();
-    value["expected_payment_values"]["close_fees"]["base"] = assumed(0);
-    let duties = duties_for(&value, None).expect("an assumed artifact still loads");
-    let measured = duties_for(&artifact(), None).expect("the fixture artifact loads");
-
-    assert!(!duties.admits_paid_work());
-    let evidence = duties.evidence().expect("a read artifact is evidence");
-    assert_eq!(evidence.samples, 0, "an assumed field rests on no samples");
-    assert_eq!(
-        evidence.policy,
-        measured
-            .evidence()
-            .expect("a read artifact is evidence")
-            .policy,
-        "only the label moved",
-    );
-    evidence
-        .policy
-        .admit(payment_edge(), payment_terms())
-        .expect("the numbers themselves still price these terms");
-
-    // Setup and the close duty still run: close state is derivable
-    // from this policy, and an endpoint is built over an admission
-    // that countersigns nothing.
-    evidence
-        .policy
-        .describe_close(payment_edge(), payment_terms())
-        .expect("close state is derivable from an assumed policy");
-    let admission = duties.payment_admission().expect("an artifact was read");
-    assert!(matches!(admission, PaymentAdmission::Proposes(_)));
-    let dir = tempfile::tempdir().unwrap();
-    let mut endpoint = setup_endpoint(&dir, admission);
-    endpoint
-        .propose_bond(network(), bond_funding(), bond_terms())
-        .expect("an unmeasured provider still journals its half of a setup");
-
-    assert!(
-        duties.summary().contains("no paid admission"),
-        "unexpected summary: {}",
-        duties.summary(),
-    );
-}
-
-/// No file at the configured path is a node before its bootstrap
-/// run, not a broken one: §4 disables new work on missing evidence
-/// and never disables recovery or the close duty.
-#[test]
-fn a_missing_artifact_admits_no_paid_work() {
-    let dir = tempfile::tempdir().unwrap();
-    let loaded = load(with(
-        config(),
-        "artifact",
-        serde_json::json!({
-            "path": dir.path().join("artifact.json").display().to_string(),
-            "digest": hex32(0x77),
-        }),
-    ))
-    .expect("a configuration pinning an artifact that is not there still loads");
-
-    let duties =
-        load_paid_work_duties(&loaded).expect("a missing artifact is an answer, not an error");
-
-    assert_eq!(duties, PaidWorkDuties::NotFound);
-    assert!(!duties.admits_paid_work());
-    assert!(duties.payment_admission().is_none());
-    assert!(
-        duties.summary().contains("no paid admission"),
-        "unexpected summary: {}",
-        duties.summary(),
-    );
-}
-
-/// A configuration naming no artifact at all is the same answer in
-/// different words.
-#[test]
-fn a_config_without_an_artifact_admits_no_paid_work() {
-    let loaded = load(without(config(), &[], "artifact")).expect("the config still loads");
-    assert!(loaded.measured_artifact().is_none());
-
-    let duties = load_paid_work_duties(&loaded).expect("no artifact is not an error");
-
-    assert_eq!(duties, PaidWorkDuties::NotConfigured);
-    assert!(duties.payment_admission().is_none());
-    assert!(
-        duties.summary().contains("no paid admission"),
-        "unexpected summary: {}",
-        duties.summary(),
-    );
-}
-
-/// An artifact that is not the one the configuration pins is
-/// refused as evidence, and the node still starts.
-///
-/// §4 groups changed evidence with missing evidence: both disable
-/// setup and new work, and neither disables recovery or the close
-/// duty. Refusing to start would be the one way to guarantee an
-/// open contest is never answered.
-#[test]
-fn an_artifact_that_is_not_the_pinned_one_is_refused() {
-    let duties = duties_for(&artifact(), Some(hex32(0x77)))
-        .expect("changed evidence is an answer, not a startup failure");
-
-    assert_eq!(duties, PaidWorkDuties::Changed);
-    assert!(duties.payment_admission().is_none());
-    assert!(
-        duties.summary().contains("no paid admission"),
-        "unexpected summary: {}",
-        duties.summary(),
-    );
-}
-
-/// A byte-for-byte pinned artifact is still evidence about the
-/// binary that measured it, not whichever binary happens to read
-/// it later.
-#[test]
-fn an_artifact_measured_by_another_binary_is_changed() {
-    let mut foreign = artifact();
-    let binary = Digest::from_bytes([0x21; 32]);
-    assert_ne!(
-        running_binary_digest().expect("the test executable identifies itself"),
-        binary,
-        "the fixture must name another binary",
-    );
-    foreign["provenance"]["binary"] = serde_json::json!(hex::encode(binary.as_bytes()));
-
-    let duties = duties_for(&foreign, None)
-        .expect("another measuring binary is changed evidence, not a startup failure");
-
-    assert_eq!(duties, PaidWorkDuties::Changed);
-    assert!(duties.payment_admission().is_none());
-    assert!(
-        duties.summary().contains("another measuring binary"),
-        "unexpected summary: {}",
-        duties.summary(),
-    );
-}
-
-/// Bytes that do not match the pin are not this node's evidence to
-/// interpret. Even an unparseable stale file is therefore changed
-/// evidence, not a startup failure that prevents the close duty.
-#[test]
-fn a_mismatching_unparseable_artifact_is_changed_before_it_is_parsed() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("artifact.json");
-    let bytes = b"this is not an artifact";
-    fs::write(&path, bytes).unwrap();
-    let pin = Digest::from_bytes([0x77; 32]);
-    assert_ne!(Digest::hash(bytes), pin, "the fixture must miss its pin");
-    let loaded = load(with(
-        config(),
-        "artifact",
-        serde_json::json!({
-            "path": path.display().to_string(),
-            "digest": hex::encode(pin.as_bytes()),
-        }),
-    ))
-    .expect("a configuration pinning stale bytes still loads");
-
-    let duties = load_paid_work_duties(&loaded)
-        .expect("mismatching bytes are changed evidence before they are parsed");
-
-    assert_eq!(duties, PaidWorkDuties::Changed);
-    assert!(duties.payment_admission().is_none());
-}
-
-/// A `ProviderChannelPolicy` is built from a configuration and its
-/// artifact, and a `SetupEndpoint` over that — which is the pair
-/// nothing in this crate could construct at all.
+/// A `ProviderChannelPolicy` is built from a configuration, and a
+/// `SetupEndpoint` over that — which is the pair nothing in this crate
+/// could construct at all.
 #[test]
 fn a_setup_endpoint_is_built_from_the_loaded_policy() {
-    let duties = duties_for(&artifact(), None).expect("the fixture artifact loads");
-    let admission = duties
-        .payment_admission()
-        .expect("a measured artifact carries an admission");
     let dir = tempfile::tempdir().unwrap();
-    let mut endpoint = setup_endpoint(&dir, admission);
+    let mut endpoint = setup_endpoint(&dir, admits());
 
     assert!(endpoint.state().revision().is_none());
     let state = endpoint
@@ -1056,591 +685,6 @@ fn a_setup_endpoint_is_built_from_the_loaded_policy() {
         .expect("the endpoint signs and journals its bond proposal");
 
     assert_eq!(state.revision(), Some(1));
-}
-
-// ── §4-B: the floor, and the grading ──────────────────────────────
-
-/// The floor this artifact yields, hand-checked term by term.
-///
-/// Every number below is arithmetic over [`budget`]'s sample sets
-/// and nothing else, so a coefficient dropped or a term summed into
-/// the wrong wait fails here rather than in a deployment:
-///
-/// tails: `fsync 5, rotation 12, build 4, fetch 25, tip 14,`
-/// `close-fsync 6, rpc 44, resp-worker 9, gen-worker 8,`
-/// `validation 3, replay 520, downtime 900`, and the *shortest*
-/// block, `480`, with `Ig = 3`.
-///
-/// `Wresp  = 3×5 + 12 + 4 + 25 + (44+9+3) = 15+12+4+25+56 = 112`
-/// `S      = ceil(112/480) = 1`
-/// `Wstart = 14 + 6 + 12 + (44+8+3) = 14+6+12+55 = 87`
-/// `Sg     = ceil(87/480) = 1`
-/// `R      = ceil((900+520)/480) = ceil(1420/480) = 3`
-/// `T      = 2 + 1 + 3 + 1 + 3 + 1 = 11`
-/// `omit   = 2 + 4 + 1 + 8 + 1 + 3 + 1 = 20`
-/// `alarm  = 2 + 1 + 8 + 1 + 3 + 1 = 16`
-#[test]
-fn the_floor_over_this_artifact_is_the_hand_checked_one() {
-    let duties = duties_for(&artifact(), None).expect("the fixture artifact loads");
-    let floor = duties
-        .evidence()
-        .expect("a read artifact is evidence")
-        .floor;
-
-    assert_eq!(floor.wresp_ms(), 112);
-    assert_eq!(floor.s(), 1);
-    assert_eq!(floor.wstart_ms(), 87);
-    assert_eq!(floor.sg(), 1);
-    assert_eq!(floor.r(), 3);
-    assert_eq!(floor.t(), 11);
-    assert_eq!(floor.min_omit_response_blocks(), 20);
-    assert_eq!(floor.alarm_margin_blocks(), 16);
-    // The two the configuration and the terms are held to, met
-    // exactly rather than comfortably: the fixture's window is
-    // `MIN_OMIT_RESPONSE_BLOCKS + 4 = 20` and its alarm margin 16.
-    assert_eq!(floor.min_omit_response_blocks(), WINDOW);
-    assert_eq!(
-        floor.alarm_margin_blocks(),
-        load(config())
-            .expect("the fixture config loads")
-            .response_alarm_margin_blocks,
-    );
-}
-
-/// The watcher may consume the four blocks the response floor
-/// prices for polling, but not one millisecond more at this
-/// artifact's own conservative block tail.
-#[test]
-fn the_poll_cadence_fits_inside_the_artifacts_priced_blocks() {
-    let artifact = artifact_with("lower_tail_block_ms", observed(&[520, 500, 505]));
-    let priced_poll_ms = RESPONSE_POLL_BLOCKS * 500;
-    let at_limit = duties_for_config(
-        with(config(), "poll_ms", serde_json::json!(priced_poll_ms)),
-        &artifact,
-        None,
-    )
-    .expect("the exact four-block cadence is priced");
-    assert!(at_limit.admits_paid_work());
-
-    let error = format!(
-        "{:#}",
-        duties_for_config(
-            with(config(), "poll_ms", serde_json::json!(priced_poll_ms + 1)),
-            &artifact,
-            None,
-        )
-        .expect_err("one millisecond beyond four blocks is not priced"),
-    );
-    assert!(
-        error.contains("poll_ms 2001")
-            && error.contains("2000 ms")
-            && error.contains("RESPONSE_POLL_BLOCKS=4")
-            && error.contains("lower_tail_block_ms=500"),
-        "unexpected refusal: {error}",
-    );
-}
-
-/// `64 >= T` admits and `T > 64` refuses — at startup, and again at
-/// provider admission over the very same policy.
-///
-/// The two are separate gates on purpose. Startup is where an
-/// operator learns; admission is where a counterparty is told. A
-/// node whose artifact was swapped under it between the two still
-/// countersigns nothing.
-#[test]
-fn a_budget_that_does_not_fit_the_start_span_refuses_at_startup_and_at_admission() {
-    // T = F + G + Ig + Sg + R + 1 = 2 + 1 + Ig + 1 + 3 + 1, so Ig
-    // is what carries it across the span.
-    let admits = duties_for(
-        &artifact_with("general_inclusion_blocks", observed(&[56])),
-        None,
-    )
-    .expect("the artifact loads");
-    assert!(admits.admits_paid_work());
-    assert_eq!(
-        admits.evidence().expect("evidence").floor.t(),
-        64,
-        "the largest budget the fixed start span admits",
-    );
-
-    let refuses = duties_for(
-        &artifact_with("general_inclusion_blocks", observed(&[57])),
-        None,
-    )
-    .expect("a refusing floor is an answer, not a startup failure");
-
-    assert_eq!(
-        refuses,
-        PaidWorkDuties::Refused(FloorError::StartSpanTooShort { t: 65, span: 64 }),
-    );
-    assert!(!refuses.admits_paid_work());
-    assert!(
-        refuses.payment_admission().is_none(),
-        "a node that cannot fit the start span holds no policy to countersign with",
-    );
-    assert!(
-        refuses.summary().contains("no paid admission"),
-        "unexpected summary: {}",
-        refuses.summary(),
-    );
-
-    // And the same refusal at provider admission, over a policy
-    // that is otherwise the admitting one to the byte.
-    let mut policy = admits.evidence().expect("evidence").policy.clone();
-    policy.floor = over_the_span();
-    assert_eq!(
-        policy.admit(payment_edge(), payment_terms()),
-        Err(WorkSetupError::Floor(FloorError::StartSpanTooShort {
-            t: 65,
-            span: 64,
-        })),
-    );
-}
-
-/// A floor whose `T` is one past the fixed start span.
-fn over_the_span() -> MountFloor {
-    let mut over = MountBudget {
-        fsync_tail_ms: 5,
-        rotation_tail_ms: 12,
-        response_build_ms: 4,
-        one_block_fetch_ms: 25,
-        fresh_tip_ms: 14,
-        close_prepared_fsync_ms: 6,
-        rpc_ms: 44,
-        response_worker_ms: 9,
-        general_worker_ms: 8,
-        validation_ms: 3,
-        restart_replay_ms_at_cap: 520,
-        restart_downtime_ms: 900,
-        lower_tail_block_ms: 480,
-        general_inclusion_blocks: 3,
-    };
-    over.general_inclusion_blocks = 57;
-    match over.floor() {
-        Ok(floor) => floor,
-        Err(error) => panic!("a positive lower tail prices every wait: {error}"),
-    }
-}
-
-/// Terms that leave less time to answer than the measured floor
-/// needs are refused at provider admission, by both numbers.
-///
-/// The kernel's own `MIN_OMIT_RESPONSE_BLOCKS` is 16 and would take
-/// these terms; the measured floor is 20, because this deployment's
-/// own seek and restart cost `S = 1` and `R = 3` blocks the kernel
-/// constant cannot know about.
-#[test]
-fn terms_under_the_measured_response_window_are_refused_at_admission() {
-    let duties = duties_for(&artifact(), None).expect("the fixture artifact loads");
-    let policy = &duties.evidence().expect("evidence").policy;
-    let mut short = payment_terms();
-    short.omit_response_blocks = WINDOW - 1;
-
-    assert!(
-        short.omit_response_blocks > hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
-        "the kernel's own floor would take these terms",
-    );
-    assert_eq!(
-        policy.admit(payment_edge(), short),
-        Err(WorkSetupError::Floor(
-            FloorError::ResponseWindowBelowFloor {
-                window: WINDOW - 1,
-                floor: 20,
-            }
-        )),
-    );
-}
-
-/// A configured alarm that fires later than the budget needs is a
-/// refusal, not a warning.
-#[test]
-fn an_alarm_margin_under_the_measured_floor_refuses() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("artifact.json");
-    let bytes = artifact().to_string();
-    fs::write(&path, &bytes).unwrap();
-    let loaded = load(with(
-        with(
-            config(),
-            "response_alarm_margin_blocks",
-            serde_json::json!(15),
-        ),
-        "artifact",
-        serde_json::json!({
-            "path": path.display().to_string(),
-            "digest": hex::encode(Digest::hash(bytes.as_bytes()).as_bytes()),
-        }),
-    ))
-    .expect("a configuration with a short alarm margin still loads");
-
-    let duties = load_paid_work_duties(&loaded).expect("the pinned artifact is read");
-
-    assert_eq!(
-        duties,
-        PaidWorkDuties::Refused(FloorError::AlarmMarginBelowFloor {
-            margin: 15,
-            floor: 16,
-        }),
-    );
-    assert!(duties.payment_admission().is_none());
-}
-
-/// A block that takes no time refuses admission, by §4's name for
-/// it.
-///
-/// The tail taken for `lower_tail_block_ms` is the *shortest*
-/// sample, so one zero in the set is enough — which is the point:
-/// a run that observed one instantaneous block observed a clock
-/// nobody can price a wait against.
-#[test]
-fn a_non_positive_lower_tail_block_time_refuses() {
-    let duties = duties_for(
-        &artifact_with("lower_tail_block_ms", observed(&[520, 0, 505])),
-        None,
-    )
-    .expect("the artifact still loads");
-
-    assert_eq!(duties, PaidWorkDuties::Refused(FloorError::NoLowerTail));
-    assert!(!duties.admits_paid_work());
-    assert!(duties.payment_admission().is_none());
-}
-
-/// A budget term's label answers to its samples, exactly as every
-/// other artifact number's does — and a term that names a value
-/// beside its samples is refused, because only one of the two would
-/// ever be read.
-#[test]
-fn a_budget_term_whose_label_its_samples_contradict_is_refused_by_name() {
-    for (entry, expected) in [
-        (
-            serde_json::json!({ "evidence": "measured", "samples": [] }),
-            "no samples",
-        ),
-        (
-            serde_json::json!({ "evidence": "assumed", "value": 7, "samples": [
-                { "at_unix_ms": RUN_STARTED_AT, "value": 5 },
-            ] }),
-            "reports 1 samples",
-        ),
-        (
-            serde_json::json!({ "evidence": "assumed" }),
-            "names no value",
-        ),
-        (
-            serde_json::json!({
-                "evidence": "measured",
-                "value": 7,
-                "samples": [{ "at_unix_ms": RUN_STARTED_AT, "value": 5 }],
-            }),
-            "writes 7 down beside its samples",
-        ),
-    ] {
-        let error = format!(
-            "{:?}",
-            duties_for(&artifact_with("rpc_ms", entry), None)
-                .expect_err("a contradicted budget label is refused"),
-        );
-        assert!(
-            error.contains("budget.rpc_ms") && error.contains(expected),
-            "unexpected refusal: {error}",
-        );
-    }
-}
-
-/// A sample stamped outside the run that claims it is not a sample
-/// of that run, and a floor computed over one would be a floor for
-/// a machine nobody named.
-#[test]
-fn a_sample_from_outside_the_run_is_refused() {
-    let stray = serde_json::json!({
-        "evidence": "measured",
-        "samples": [
-            { "at_unix_ms": RUN_STARTED_AT, "value": 30 },
-            { "at_unix_ms": RUN_FINISHED_AT + 1, "value": 44 },
-        ],
-    });
-
-    let error = format!(
-        "{:?}",
-        duties_for(&artifact_with("rpc_ms", stray), None)
-            .expect_err("a sample outside the run window is refused"),
-    );
-
-    assert!(
-        error.contains("budget.rpc_ms") && error.contains("outside the run"),
-        "unexpected refusal: {error}",
-    );
-}
-
-/// An `assumed` budget term keeps setup and the close duty and
-/// takes away the countersignature, exactly as an assumed payment
-/// value does. The floor is still computed over it — a written
-/// number is still a number the arithmetic has to hold for.
-#[test]
-fn an_assumed_budget_term_refuses_admission_and_keeps_the_floor() {
-    let duties = duties_for(&artifact_with("validation_ms", written_down(3)), None)
-        .expect("an artifact with one written-down term still loads");
-
-    assert!(!duties.admits_paid_work());
-    assert!(matches!(duties, PaidWorkDuties::Assumed(_)));
-    let evidence = duties.evidence().expect("a read artifact is evidence");
-    assert_eq!(evidence.samples, 0);
-    assert_eq!(
-        evidence.floor.t(),
-        11,
-        "the written-down 3 is the same 3 the run would have measured",
-    );
-    assert!(matches!(
-        duties.payment_admission(),
-        Some(PaymentAdmission::Proposes(_)),
-    ));
-}
-
-/// The demo bypass is both explicit and exact-network scoped. Merely
-/// naming a network that sounds like a devnet must not arm it.
-#[test]
-fn unsafe_assumed_admission_is_refused_outside_the_shipped_devnet() {
-    for network in ["hellas-testnet-1", "someone-elses-devnet", "hellas-devnet"] {
-        let mut value = config();
-        value["chain"]["network_id"] = serde_json::json!(network);
-        value["unsafe_devnet_admit_assumed_measurements"] = serde_json::json!(true);
-
-        let error = format!(
-            "{:#}",
-            load(value).expect_err("only the exact shipped devnet may arm the bypass"),
-        );
-        assert!(
-            error.contains("unsafe_devnet_admit_assumed_measurements")
-                && error.contains(UNSAFE_ASSUMED_ADMISSION_NETWORK),
-            "unexpected refusal for {network}: {error}",
-        );
-    }
-}
-
-/// The isolated demo may use honest written-down numbers while the
-/// remaining probes are being built, without relabelling them measured.
-#[test]
-fn explicit_shipped_devnet_bypass_admits_an_assumed_artifact() {
-    let mut value = config();
-    value["chain"]["network_id"] = serde_json::json!(UNSAFE_ASSUMED_ADMISSION_NETWORK);
-    value["unsafe_devnet_admit_assumed_measurements"] = serde_json::json!(true);
-    let artifact = artifact_with("validation_ms", written_down(3));
-
-    let duties = duties_for_config(value, &artifact, None)
-        .expect("the explicit devnet bypass reads the pinned artifact");
-
-    assert!(matches!(
-        duties,
-        PaidWorkDuties::UnsafeDevnetAdmitsAssumed(_)
-    ));
-    assert!(duties.admits_paid_work());
-    assert!(matches!(
-        duties.payment_admission(),
-        Some(PaymentAdmission::Admits(_)),
-    ));
-    assert!(
-        duties.summary().starts_with("UNSAFE DEVNET"),
-        "the operator output must not resemble measured admission: {}",
-        duties.summary(),
-    );
-    assert_eq!(
-        duties
-            .evidence()
-            .expect("assumed evidence stays visible")
-            .samples,
-        0,
-    );
-}
-
-/// The bypass changes only the assumed-label decision. It never invents
-/// an artifact or ignores the configured content pin.
-#[test]
-fn unsafe_devnet_bypass_still_requires_the_exact_pinned_artifact() {
-    let mut missing = config();
-    missing["chain"]["network_id"] = serde_json::json!(UNSAFE_ASSUMED_ADMISSION_NETWORK);
-    missing["unsafe_devnet_admit_assumed_measurements"] = serde_json::json!(true);
-    missing
-        .as_object_mut()
-        .expect("config is an object")
-        .remove("artifact");
-    let loaded = load(missing).expect("an artifact remains optional for recovery");
-    let duties = load_paid_work_duties(&loaded).expect("missing evidence is a state");
-    assert_eq!(duties, PaidWorkDuties::NotConfigured);
-    assert!(!duties.admits_paid_work());
-
-    let mut changed = config();
-    changed["chain"]["network_id"] = serde_json::json!(UNSAFE_ASSUMED_ADMISSION_NETWORK);
-    changed["unsafe_devnet_admit_assumed_measurements"] = serde_json::json!(true);
-    let duties = duties_for_config(changed, &artifact(), Some(hex32(0xff)))
-        .expect("a changed pin is an evidence state");
-    assert_eq!(duties, PaidWorkDuties::Changed);
-    assert!(!duties.admits_paid_work());
-}
-
-/// The probe writes an artifact this loader reads — and grades
-/// exactly as honestly as the run deserves.
-///
-/// This is the whole of what §4-A was missing: before it, nothing
-/// in the tree could produce an artifact at all, and the only
-/// `measured` one anywhere was a fixture. What the operator path
-/// produces here is a *real* one — three terms from real fsyncs,
-/// real rotations and real replays on a real journal, and eleven
-/// written down. Those eleven make a floor that fits this deployment
-/// `assumed`; a machine whose measured waits do not fit is `refused`
-/// by that exact floor instead. The assertion below derives which
-/// answer this run earned from its raw samples, so machine speed can
-/// change the grade but cannot change whether the correspondence
-/// passes.
-#[test]
-fn the_probe_writes_an_artifact_this_loader_reads_and_grades() {
-    let dir = tempfile::tempdir().unwrap();
-    let config_path = write(&dir, &config());
-    let assume_path = dir.path().join("assume.json");
-    // The three measured slots are overwritten from the artifact
-    // before this becomes a budget; they are not assumptions the
-    // probe is handed.
-    let assumed_budget = MountBudget {
-        fsync_tail_ms: 0,
-        rotation_tail_ms: 0,
-        response_build_ms: 4,
-        one_block_fetch_ms: 25,
-        fresh_tip_ms: 14,
-        close_prepared_fsync_ms: 6,
-        rpc_ms: 44,
-        response_worker_ms: 9,
-        general_worker_ms: 8,
-        validation_ms: 3,
-        restart_replay_ms_at_cap: 0,
-        restart_downtime_ms: 100,
-        lower_tail_block_ms: 5_000,
-        general_inclusion_blocks: 3,
-    };
-    fs::write(
-        &assume_path,
-        serde_json::json!({
-            "budget": {
-                "response_build_ms": assumed_budget.response_build_ms,
-                "one_block_fetch_ms": assumed_budget.one_block_fetch_ms,
-                "fresh_tip_ms": assumed_budget.fresh_tip_ms,
-                "close_prepared_fsync_ms": assumed_budget.close_prepared_fsync_ms,
-                "rpc_ms": assumed_budget.rpc_ms,
-                "response_worker_ms": assumed_budget.response_worker_ms,
-                "general_worker_ms": assumed_budget.general_worker_ms,
-                "validation_ms": assumed_budget.validation_ms,
-                "restart_downtime_ms": assumed_budget.restart_downtime_ms,
-                "lower_tail_block_ms": assumed_budget.lower_tail_block_ms,
-                "general_inclusion_blocks": assumed_budget.general_inclusion_blocks,
-            },
-            "expected_payment_values": {
-                "value": PAYMENT_VALUE,
-                "reserve": PAYMENT_RESERVE,
-                "base": 0,
-                "slot": 0,
-                "proof": 0,
-                "lifetime": 0,
-            },
-        })
-        .to_string(),
-    )
-    .unwrap();
-    let out = dir.path().join("artifact.json");
-
-    crate::commands::serve::run_probe(crate::commands::serve::ProbeOptions {
-        work_config: config_path,
-        journal_root: dir.path().join("journals"),
-        machine: "bootstrap-1".to_string(),
-        assume: assume_path,
-        out: out.clone(),
-    })
-    .expect("the bootstrap run completes and writes its artifact");
-
-    // Pinned by the digest of the bytes the probe wrote, which is
-    // what the probe told the operator to pin.
-    let bytes = fs::read(&out).expect("the artifact is on the disk");
-    let loaded = load(with(
-        config(),
-        "artifact",
-        serde_json::json!({
-            "path": out.display().to_string(),
-            "digest": hex::encode(Digest::hash(&bytes).as_bytes()),
-        }),
-    ))
-    .expect("the configuration pinning the probe's artifact loads");
-
-    // Derive the grade from the bytes before asking the loader for
-    // it. A loaded floor answers to the durations this run actually
-    // saw; no duration here is a test threshold.
-    let artifact: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    let longest = |term: &str| {
-        artifact["budget"][term]["samples"]
-            .as_array()
-            .unwrap_or_else(|| panic!("{term} carries raw samples"))
-            .iter()
-            .map(|sample| {
-                sample["value"]
-                    .as_u64()
-                    .unwrap_or_else(|| panic!("{term} carries a whole-millisecond sample"))
-            })
-            .max()
-            .unwrap_or_else(|| panic!("{term} carries at least one sample"))
-    };
-    let measured_budget = MountBudget {
-        fsync_tail_ms: longest("fsync_tail_ms"),
-        rotation_tail_ms: longest("rotation_tail_ms"),
-        restart_replay_ms_at_cap: longest("restart_replay_ms_at_cap"),
-        ..assumed_budget
-    };
-    let expected_grade = measured_budget.floor().and_then(|floor| {
-        floor.check_start_span()?;
-        floor.check_alarm_margin(loaded.response_alarm_margin_blocks)?;
-        Ok(floor)
-    });
-
-    let duties = load_paid_work_duties(&loaded).expect("the probe's artifact parses");
-    assert!(!duties.admits_paid_work());
-    assert_eq!(artifact["provenance"]["machine"], "bootstrap-1");
-    let started_at = artifact["provenance"]["started_at_unix_ms"]
-        .as_u64()
-        .expect("the probe writes a whole-millisecond start");
-    let measured_at = artifact["provenance"]["measured_at_unix_ms"]
-        .as_u64()
-        .expect("the probe writes a whole-millisecond finish");
-    assert!(started_at <= measured_at, "the run's own window is one",);
-    for term in [
-        "fsync_tail_ms",
-        "rotation_tail_ms",
-        "restart_replay_ms_at_cap",
-    ] {
-        assert_eq!(artifact["budget"][term]["evidence"], "measured", "{term}");
-    }
-    for term in [
-        "response_build_ms",
-        "one_block_fetch_ms",
-        "fresh_tip_ms",
-        "close_prepared_fsync_ms",
-        "rpc_ms",
-        "response_worker_ms",
-        "general_worker_ms",
-        "validation_ms",
-        "restart_downtime_ms",
-        "lower_tail_block_ms",
-        "general_inclusion_blocks",
-    ] {
-        assert_eq!(artifact["budget"][term]["evidence"], "assumed", "{term}");
-    }
-    match (expected_grade, duties) {
-        (Ok(expected_floor), PaidWorkDuties::Assumed(evidence)) => {
-            assert_eq!(evidence.samples, 0, "an assumed field rests on no samples");
-            assert_eq!(evidence.provenance.machine, "bootstrap-1");
-            assert_eq!(evidence.floor, expected_floor);
-        }
-        (Err(expected), PaidWorkDuties::Refused(actual)) => {
-            assert_eq!(actual, expected, "the loader grades this run's own floor");
-        }
-        (expected, actual) => {
-            panic!("the loader graded the probe as {actual:?}, expected {expected:?}")
-        }
-    }
 }
 
 /// A restarted node rebuilds the endpoint from what serve holds: the
@@ -1659,23 +703,13 @@ fn the_probe_writes_an_artifact_this_loader_reads_and_grades() {
 fn a_restarted_node_rebuilds_its_endpoint_from_the_root_and_the_identity() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("work-journals");
-    let artifact_path = dir.path().join("artifact.json");
-    let bytes = artifact().to_string();
-    fs::write(&artifact_path, &bytes).unwrap();
     let loaded = load(with(
-        with(
-            config(),
-            "journal",
-            serde_json::json!({ "root": root.display().to_string() }),
-        ),
-        "artifact",
-        serde_json::json!({
-            "path": artifact_path.display().to_string(),
-            "digest": hex::encode(Digest::hash(bytes.as_bytes()).as_bytes()),
-        }),
+        config(),
+        "journal",
+        serde_json::json!({ "root": root.display().to_string() }),
     ))
     .expect("the fixture configuration loads");
-    let duties = load_paid_work_duties(&loaded).expect("the pinned artifact is read");
+    let admission = PaymentAdmission::Admits(Box::new(loaded.provider_policy()));
 
     // The identity `identity init` wrote, and the key it settles
     // with. Nothing in the configuration above names either.
@@ -1697,11 +731,7 @@ fn a_restarted_node_rebuilds_its_endpoint_from_the_root_and_the_identity() {
             &Secp256k1Verifier::new(),
         )
         .expect("the journal opens under the configured root");
-        let mut endpoint = SetupEndpoint::new(
-            store,
-            settlement.clone(),
-            duties.payment_admission().expect("an artifact was read"),
-        );
+        let mut endpoint = SetupEndpoint::new(store, settlement.clone(), admission.clone());
         endpoint
             .arm_scan(SetupScan {
                 height: 7,
@@ -1736,7 +766,7 @@ fn a_restarted_node_rebuilds_its_endpoint_from_the_root_and_the_identity() {
     let mut endpoint = SetupEndpoint::new(
         store,
         crate::identity::settlement_signer(&identity),
-        duties.payment_admission().expect("an artifact was read"),
+        admission.clone(),
     );
 
     let state = endpoint

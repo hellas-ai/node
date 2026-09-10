@@ -43,7 +43,7 @@ use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey, TransportAddr};
 
 use super::CliResult;
-use super::serve::work_config::{WorkConfig, load_paid_work_duties, load_work_config};
+use super::serve::work_config::{WorkConfig, load_work_config};
 
 /// Paid-work commands intended for deployment bring-up and smoke tests.
 #[derive(Debug, Subcommand)]
@@ -386,16 +386,7 @@ async fn run_one(
     );
 
     let config = load_work_config(&args.work_config)?;
-    let duties = load_paid_work_duties(&config)?;
-    let policy = duties
-        .evidence()
-        .map(|evidence| evidence.policy.clone())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "the work config supplies no usable channel policy: {}",
-                duties.summary(),
-            )
-        })?;
+    let policy = config.provider_policy();
     let prepared = read_prepared_input(&args.prepared_input)?;
     let identities = InputIdentities::from_prepared(&prepared)?;
     check_policy_input(&policy, identities)?;
@@ -612,7 +603,7 @@ fn payment_terms(
             &policy.policy_salt,
             &policy.channel_policy,
         ),
-        omit_response_blocks: policy.omission.response_blocks,
+        omit_response_blocks: policy.min_omit_response_blocks,
         start_validity_blocks: MAX_START_VALIDITY_BLOCKS,
         omission_bond,
     }

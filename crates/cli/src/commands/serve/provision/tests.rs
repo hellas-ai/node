@@ -1,13 +1,12 @@
 use std::fs;
 
-use hellas_kernel::{EdgeValues, Fees};
+use hellas_kernel::{EdgeValues, Fees, MIN_OMIT_RESPONSE_BLOCKS};
 use hellas_rpc::protocol::Digest;
-use hellas_rpc::protocol::mount::{FloorError, MountBudget};
 use hellas_rpc::protocol::work::{PaidChannelPolicyV1, PaidExecutionPolicyV1};
 use hellas_rpc::protocol::work_setup::ProviderChannelPolicy;
 use hellas_rpc::work_close::{BlockSourceError, FinalizedWork};
 
-use super::super::work_config::{ArtifactProvenance, MeasuredEvidence, load_work_config};
+use super::super::work_config::load_work_config;
 use super::*;
 
 fn network() -> NetworkId {
@@ -42,28 +41,6 @@ fn floor() -> SetupScan {
     }
 }
 
-/// A budget whose §4 floor is computable, so a policy can be made
-/// over it. The numbers are the tails of the work-config fixture's
-/// own samples: a deployment with an SSD and a half-second block.
-fn budget() -> MountBudget {
-    MountBudget {
-        fsync_tail_ms: 5,
-        rotation_tail_ms: 12,
-        response_build_ms: 4,
-        one_block_fetch_ms: 25,
-        fresh_tip_ms: 14,
-        close_prepared_fsync_ms: 6,
-        rpc_ms: 44,
-        response_worker_ms: 9,
-        general_worker_ms: 8,
-        validation_ms: 3,
-        restart_replay_ms_at_cap: 520,
-        restart_downtime_ms: 900,
-        lower_tail_block_ms: 480,
-        general_inclusion_blocks: 3,
-    }
-}
-
 fn policy() -> ProviderChannelPolicy {
     let Ok(environment) = hex::encode([0x11; 32]).parse() else {
         panic!("the fixture environment id is one");
@@ -91,36 +68,8 @@ fn policy() -> ProviderChannelPolicy {
             fixed_price: 10,
         },
         expected_payment_values: EdgeValues::new(1_000, 200, Fees::new(0, 0, 0, 0)),
-        floor: match budget().floor() {
-            Ok(floor) => floor,
-            Err(error) => panic!("the fixture budget has a floor: {error}"),
-        },
+        min_omit_response_blocks: MIN_OMIT_RESPONSE_BLOCKS,
     }
-}
-
-/// The evidence both labels carry. Identical either way, which is
-/// what the labels are about: only what may be countersigned moves.
-fn evidence() -> Box<MeasuredEvidence> {
-    Box::new(MeasuredEvidence {
-        provenance: ArtifactProvenance {
-            binary: Digest::from_bytes([0x21; 32]),
-            config: Digest::from_bytes([0x22; 32]),
-            machine: "bootstrap-1".to_string(),
-            started_at_unix_ms: 1_756_339_000_000,
-            measured_at_unix_ms: 1_756_339_200_000,
-        },
-        samples: 2,
-        floor: policy().floor,
-        policy: policy(),
-    })
-}
-
-fn admits() -> PaidWorkDuties {
-    PaidWorkDuties::Admits(evidence())
-}
-
-fn assumed() -> PaidWorkDuties {
-    PaidWorkDuties::Assumed(evidence())
 }
 
 /// A threshold identity the real work-config loader accepts.
@@ -177,7 +126,12 @@ fn routed_work_config(root: &Path, routes: Vec<serde_json::Value>) -> CliResult<
             },
         },
         "poll_ms": 250,
-        "response_alarm_margin_blocks": 16,
+        "expected_payment_values": {
+            "value": 1_000,
+            "reserve": 200,
+            "close_fees": { "base": 0, "slot": 0, "proof": 0, "lifetime": 0 },
+        },
+        "min_omit_response_blocks": MIN_OMIT_RESPONSE_BLOCKS,
     });
     let path = root.join("work-config.json");
     fs::write(&path, file.to_string())
@@ -215,16 +169,20 @@ fn options_for(
 }
 
 /// The whole command, minus the one step that needs a validator.
-fn provision(root: &Path, duties: &PaidWorkDuties, max_job_price: u64) -> CliResult<Provisioned> {
-    provision_options(&options(root, max_job_price), duties)
+fn provision(
+    root: &Path,
+    policy: ProviderChannelPolicy,
+    max_job_price: u64,
+) -> CliResult<Provisioned> {
+    provision_options(&options(root, max_job_price), policy)
 }
 
 fn provision_options(
     options: &ProvisionOptions,
-    duties: &PaidWorkDuties,
+    policy: ProviderChannelPolicy,
 ) -> CliResult<Provisioned> {
     let candidate = BondCandidate::plan(options)?;
-    Offer::plan(options, duties, candidate)?.journal(floor())
+    Offer::plan(options, policy, candidate)?.journal(floor())
 }
 
 /// The bond the fixture inputs name, spelled out here rather than
@@ -274,14 +232,14 @@ fn preview_and_real_offer_use_the_identical_bond_candidate() {
     let expected = preview.bond_edge;
     let candidate = BondCandidate::plan(&options)
         .unwrap_or_else(|error| panic!("the same bond plans: {error:#}"));
-    let offer = Offer::plan(&options, &admits(), candidate)
+    let offer = Offer::plan(&options, policy(), candidate)
         .unwrap_or_else(|error| panic!("the routed offer plans: {error:#}"));
     assert_eq!(expected, expected_bond(40));
     assert_eq!(offer.bond_edge, expected);
 }
 
 #[tokio::test]
-async fn preview_needs_neither_a_route_nor_evidence_chain_or_journal() {
+async fn preview_needs_neither_a_route_nor_a_chain_nor_a_journal() {
     let root = tempfile::tempdir().unwrap();
     let config = routed_work_config(root.path(), Vec::new())
         .unwrap_or_else(|error| panic!("a route-free config loads: {error:#}"));
@@ -384,7 +342,7 @@ fn assert_no_offer_artifact(root: &Path, bond: EdgeId, signature: &[u8]) {
 #[test]
 fn a_provisioned_root_is_the_offer_a_runner_discovers() {
     let dir = tempfile::tempdir().unwrap();
-    let Ok(made) = provision(dir.path(), &admits(), 40) else {
+    let Ok(made) = provision(dir.path(), policy(), 40) else {
         panic!("a configured provider makes its offer");
     };
     assert_eq!(made.bond_edge, expected_bond(40));
@@ -437,9 +395,9 @@ fn disjoint_routes_bonds_and_stakes_make_two_discoverable_offers() {
     let first = options_for(config.clone(), first_client, &[0xa1], 40);
     let second = options_for(config, second_client, &[0xb1], 41);
 
-    provision_options(&first, &admits())
+    provision_options(&first, policy())
         .unwrap_or_else(|error| panic!("the first offer is made: {error:#}"));
-    provision_options(&second, &admits())
+    provision_options(&second, policy())
         .unwrap_or_else(|error| panic!("the disjoint second offer is made: {error:#}"));
 
     let found = discover_setups(dir.path(), network())
@@ -479,7 +437,7 @@ fn a_restart_refuses_a_coin_reserved_by_an_unanswered_offer_before_signing_or_wr
     )
     .unwrap_or_else(|error| panic!("the two-route fixture loads: {error:#}"));
     let first = options_for(config.clone(), first_client, &[0xa1, 0xa2], 40);
-    provision_options(&first, &admits())
+    provision_options(&first, policy())
         .unwrap_or_else(|error| panic!("the first offer is made: {error:#}"));
 
     let store = open_provider_journal(dir.path(), network(), first_bond)
@@ -499,7 +457,7 @@ fn a_restart_refuses_a_coin_reserved_by_an_unanswered_offer_before_signing_or_wr
     let restarted = load_work_config(&config_path)
         .unwrap_or_else(|error| panic!("the restarted configuration loads: {error:#}"));
     let second = options_for(restarted, second_client, &[0xa2, 0xb2], 41);
-    let Err(error) = provision_options(&second, &admits()) else {
+    let Err(error) = provision_options(&second, policy()) else {
         panic!("a restarted provider accepted stake reserved by revision one");
     };
 
@@ -542,7 +500,7 @@ fn a_second_offer_cannot_reuse_the_first_offers_peer() {
     let first_config = routed_work_config(dir.path(), vec![route(0x51, first_bond, first_client)])
         .unwrap_or_else(|error| panic!("the first route loads: {error:#}"));
     let first = options_for(first_config, first_client, &[0xa1], 40);
-    provision_options(&first, &admits())
+    provision_options(&first, policy())
         .unwrap_or_else(|error| panic!("the first offer is made: {error:#}"));
 
     let error = routed_work_config(
@@ -577,10 +535,10 @@ fn a_second_offer_cannot_reuse_the_first_offers_peer() {
 fn a_second_offer_cannot_reuse_the_first_offers_bond() {
     let dir = tempfile::tempdir().unwrap();
     let options = options(dir.path(), 40);
-    let first = provision_options(&options, &admits())
+    let first = provision_options(&options, policy())
         .unwrap_or_else(|error| panic!("the first offer is made: {error:#}"));
 
-    let Err(error) = provision_options(&options, &admits()) else {
+    let Err(error) = provision_options(&options, policy()) else {
         panic!("a second offer reused the first offer's bond");
     };
     let said = format!("{error:#}");
@@ -600,7 +558,7 @@ fn a_second_offer_cannot_reuse_the_first_offers_bond() {
 #[test]
 fn the_offer_is_on_the_disk_before_the_command_returns() {
     let dir = tempfile::tempdir().unwrap();
-    let Ok(made) = provision(dir.path(), &admits(), 40) else {
+    let Ok(made) = provision(dir.path(), policy(), 40) else {
         panic!("the offer is made");
     };
 
@@ -617,65 +575,6 @@ fn the_offer_is_on_the_disk_before_the_command_returns() {
         2,
         "the armed floor and the revision are both frames in the file",
     );
-}
-
-/// §4's evidence rule is about a countersignature, and this is not
-/// one. An unmeasured provider journals the same offer, byte for
-/// byte, that a measured one journals — which is why an artifact
-/// measured later serves this very revision instead of needing a new
-/// one.
-#[test]
-fn an_unmeasured_provider_makes_the_offer_a_measured_one_would() {
-    let measured_root = tempfile::tempdir().unwrap();
-    let assumed_root = tempfile::tempdir().unwrap();
-
-    let Ok(measured) = provision(measured_root.path(), &admits(), 40) else {
-        panic!("a measured provider makes its offer");
-    };
-    let Ok(assumed) = provision(assumed_root.path(), &assumed(), 40) else {
-        panic!("an unmeasured provider still makes its offer");
-    };
-    assert_eq!(assumed, measured);
-
-    let (Ok(measured_store), Ok(assumed_store)) = (
-        open_provider_journal(measured_root.path(), network(), measured.bond_edge),
-        open_provider_journal(assumed_root.path(), network(), assumed.bond_edge),
-    ) else {
-        panic!("both journals reopen");
-    };
-    assert_eq!(
-        measured_store.state().bundle_bytes(),
-        assumed_store.state().bundle_bytes(),
-        "the journal records which bond was staked, never which artifact was read",
-    );
-}
-
-/// No policy is no endpoint, so there is nothing to make an offer
-/// with — and the refusal names which of §4's cases produced it.
-#[test]
-fn a_provider_with_no_policy_has_no_offer_to_make() {
-    for duties in [
-        PaidWorkDuties::NotConfigured,
-        PaidWorkDuties::NotFound,
-        PaidWorkDuties::Changed,
-        PaidWorkDuties::Refused(FloorError::NoLowerTail),
-    ] {
-        let dir = tempfile::tempdir().unwrap();
-        let Err(error) = provision(dir.path(), &duties, 40) else {
-            panic!("a node with no policy has no offer: {duties:?}");
-        };
-
-        let said = format!("{error:#}");
-        assert!(
-            said.contains("no offer to make"),
-            "unexpected refusal for {duties:?}: {said}",
-        );
-        assert!(
-            said.contains(&duties.summary()),
-            "the refusal does not name the evidence case: {said}",
-        );
-        assert_eq!(provider_setups(dir.path()), 0, "a refusal wrote a journal");
-    }
 }
 
 /// A stake no open could carry is refused rather than quietly cut

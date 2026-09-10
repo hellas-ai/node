@@ -695,37 +695,6 @@ enum Commands {
         command: CodexAuthCommand,
     },
     #[cfg(feature = "node")]
-    /// Run the bootstrap measurement and write the artifact `serve` reads
-    ///
-    /// §4's floor is a measured policy, so a node with no artifact
-    /// countersigns no paid channel. This is the run that produces one.
-    /// It countersigns nothing itself, records raw samples rather than
-    /// summaries, and writes `assumed` — by name, on the terminal — for
-    /// every term this deployment cannot observe. Pin the digest it
-    /// prints in the configuration's `artifact.digest`.
-    Measure {
-        /// The paid-work configuration this run measures under
-        #[arg(long = "work-config")]
-        work_config: PathBuf,
-        /// Journal root the workload runs on. Use the one the node will
-        /// serve from: the disk being measured has to be the disk the
-        /// duties run on.
-        #[arg(long = "journal-root")]
-        journal_root: PathBuf,
-        /// The machine, as you name it. It is recorded in the artifact,
-        /// because a measurement is a statement about a machine.
-        #[arg(long = "machine")]
-        machine: String,
-        /// What you write down for every term no run here can observe.
-        /// A term that is neither measured nor named in this file stops
-        /// the run.
-        #[arg(long = "assume")]
-        assume: PathBuf,
-        /// Where the artifact is written
-        #[arg(long = "out")]
-        out: PathBuf,
-    },
-    #[cfg(feature = "node")]
     /// Make one of this provider's bond offers, so its client has something to
     /// answer
     ///
@@ -786,8 +755,6 @@ fn validate_identity_options(
         #[cfg(feature = "chain")]
         Commands::Chain { .. } => Some("chain"),
         Commands::CodexAuth { .. } => Some("codex-auth"),
-        #[cfg(feature = "node")]
-        Commands::Measure { .. } => Some("measure"),
         _ => None,
     };
     if let Some(name) = identity_free
@@ -955,38 +922,6 @@ async fn async_main() {
     let command = match command {
         Commands::Chain { command } => {
             let result = commands::chain::run(command).await;
-            tracer_provider.shutdown();
-            if let Err(err) = result {
-                eprintln!("error: {err:#}");
-                std::process::exit(1);
-            }
-            return;
-        }
-        command => command,
-    };
-
-    // A bootstrap run signs nothing, dials nothing, and countersigns
-    // nothing: it writes to a journal directory of its own and hashes
-    // two files. Loading — or worse, creating — a settlement identity
-    // for it would make the measurement depend on a key it never uses,
-    // and would make an operator with an unreadable identity file
-    // unable to measure the machine that would fix it.
-    #[cfg(feature = "node")]
-    let command = match command {
-        Commands::Measure {
-            work_config,
-            journal_root,
-            machine,
-            assume,
-            out,
-        } => {
-            let result = commands::serve::run_probe(commands::serve::ProbeOptions {
-                work_config,
-                journal_root,
-                machine,
-                assume,
-                out,
-            });
             tracer_provider.shutdown();
             if let Err(err) = result {
                 eprintln!("error: {err:#}");
@@ -1401,8 +1336,6 @@ async fn async_main() {
         },
         Commands::ProducerKey { .. } => unreachable!("producer-key handled before identity load"),
         Commands::CodexAuth { .. } => unreachable!("codex-auth handled before identity load"),
-        #[cfg(feature = "node")]
-        Commands::Measure { .. } => unreachable!("measure handled before identity load"),
         Commands::Monitor {
             timeout_secs,
             no_interrogate,

@@ -9,7 +9,6 @@ pub mod identity;
 pub mod job;
 pub mod manifest;
 #[cfg(feature = "work")]
-pub mod mount;
 pub mod open;
 pub mod retention;
 pub mod schemes;

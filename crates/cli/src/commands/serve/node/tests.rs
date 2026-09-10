@@ -21,7 +21,6 @@ use hellas_rpc::protocol::artifacts::{
     BoundTermId, Canonical as _, InputAddressed as _, OutputAddressed as _, PreparedPaidInputV1,
     SourceRef, TextArtifact, TextExecution, TextPolicy, TokenIds,
 };
-use hellas_rpc::protocol::mount::{MountBudget, MountFloor};
 use hellas_rpc::protocol::work::{
     JobDeadlines, PaidChannelPolicyV1, PaidExecutionPolicyV1, PaidJobAuthorizationV1,
     PrivateRecord as _, decode_transcript, delivery_request_digest, encode_transcript,
@@ -49,11 +48,8 @@ use hellas_wire::{AuthLevel, PeerIdentity};
 use iroh::{EndpointAddr, TransportAddr};
 use tokio::sync::{Notify, Semaphore};
 
+use super::super::work_config::{WorkRoutes, load_work_config};
 use super::*;
-use crate::commands::serve::work_config::{
-    ArtifactIdentity, ChainCrossCheck, WorkConfig, WorkRoutes, load_paid_work_duties,
-    load_work_config,
-};
 
 fn assert_retryable_not_ready(refusal: WorkRefused) {
     assert_eq!(refusal.code, WorkRefusalCode::NotReady as i32);
@@ -1102,7 +1098,12 @@ fn configured_routes(routes: &[(PeerId, EdgeId, Key)]) -> WorkRoutes {
             },
         },
         "poll_ms": 1,
-        "response_alarm_margin_blocks": MAX_START_VALIDITY_BLOCKS,
+        "expected_payment_values": {
+            "value": PAYMENT_VALUE,
+            "reserve": PAYMENT_RESERVE,
+            "close_fees": { "base": 0, "slot": 0, "proof": 0, "lifetime": 0 },
+        },
+        "min_omit_response_blocks": MIN_OMIT_RESPONSE_BLOCKS,
     });
     let dir = temp();
     let path = dir.path().join("routes.json");
@@ -1186,39 +1187,6 @@ fn payment_terms() -> WorkPaymentTerms {
     }
 }
 
-/// The policy a measured artifact would make, built here directly.
-///
-/// Which of §4's evidence cases produces which admission is
-/// `work_config`'s to decide and its tests' to check; what the runner
-/// is handed is one of the three values below, and this is them.
-/// The floor these fixtures run under: a budget in which no wait
-/// takes any time, so §4's `S` and `R` are zero, its response-window
-/// floor is the kernel's own `MIN_OMIT_RESPONSE_BLOCKS`, and `T` is
-/// four. What each test below observes is therefore its own gate and
-/// never this one.
-fn floor() -> MountFloor {
-    let instant = MountBudget {
-        fsync_tail_ms: 0,
-        rotation_tail_ms: 0,
-        response_build_ms: 0,
-        one_block_fetch_ms: 0,
-        fresh_tip_ms: 0,
-        close_prepared_fsync_ms: 0,
-        rpc_ms: 0,
-        response_worker_ms: 0,
-        general_worker_ms: 0,
-        validation_ms: 0,
-        restart_replay_ms_at_cap: 0,
-        restart_downtime_ms: 0,
-        lower_tail_block_ms: 1,
-        general_inclusion_blocks: 0,
-    };
-    match instant.floor() {
-        Ok(floor) => floor,
-        Err(error) => panic!("a one-millisecond block prices every wait: {error}"),
-    }
-}
-
 fn provider_policy() -> ProviderChannelPolicy {
     ProviderChannelPolicy {
         network: network(),
@@ -1226,7 +1194,7 @@ fn provider_policy() -> ProviderChannelPolicy {
         channel_policy: channel_policy(),
         execution_policy: execution_policy(),
         expected_payment_values: EdgeValues::new(PAYMENT_VALUE, PAYMENT_RESERVE, Fees::ZERO),
-        floor: floor(),
+        min_omit_response_blocks: MIN_OMIT_RESPONSE_BLOCKS,
     }
 }
 
@@ -1236,118 +1204,6 @@ fn admits() -> PaymentAdmission {
 
 fn proposes() -> PaymentAdmission {
     PaymentAdmission::Proposes(Box::new(provider_policy()))
-}
-
-const ARTIFACT_STARTED_AT: u64 = 1_756_339_000_000;
-const ARTIFACT_FINISHED_AT: u64 = 1_756_339_200_000;
-
-fn measured_artifact_value(value: u64) -> serde_json::Value {
-    serde_json::json!({ "value": value, "evidence": "measured", "samples": 3 })
-}
-
-fn observed_artifact_values(values: &[u64]) -> serde_json::Value {
-    let samples: Vec<_> = values
-        .iter()
-        .enumerate()
-        .map(|(index, value)| {
-            serde_json::json!({
-                "at_unix_ms": ARTIFACT_STARTED_AT + index as u64,
-                "value": value,
-            })
-        })
-        .collect();
-    serde_json::json!({ "evidence": "measured", "samples": samples })
-}
-
-/// Builds and loads the same kind of fully measured artifact a node
-/// accepts at startup. The e2e proof takes its admission from this
-/// production evidence gate, so `assumed` cannot accidentally make a
-/// test pass by weakening §4.
-fn fully_measured_admission(root: &Path) -> PaymentAdmission {
-    let executable = match std::env::current_exe() {
-        Ok(path) => path,
-        Err(error) => panic!("the test executable has a path: {error}"),
-    };
-    let executable = match std::fs::read(&executable) {
-        Ok(bytes) => bytes,
-        Err(error) => panic!("the test executable is readable: {error}"),
-    };
-    let binary = Digest::hash(&executable);
-    let artifact = serde_json::json!({
-        "provenance": {
-            "binary": hex::encode(binary.as_bytes()),
-            "config": hex::encode([0x44; 32]),
-            "machine": "node-e2e-fixture",
-            "started_at_unix_ms": ARTIFACT_STARTED_AT,
-            "measured_at_unix_ms": ARTIFACT_FINISHED_AT,
-        },
-        "expected_payment_values": {
-            "value": measured_artifact_value(PAYMENT_VALUE),
-            "reserve": measured_artifact_value(PAYMENT_RESERVE),
-            "close_fees": {
-                "base": measured_artifact_value(0),
-                "slot": measured_artifact_value(0),
-                "proof": measured_artifact_value(0),
-                "lifetime": measured_artifact_value(0),
-            },
-        },
-        "budget": {
-            "fsync_tail_ms": observed_artifact_values(&[0, 0]),
-            "rotation_tail_ms": observed_artifact_values(&[0, 0]),
-            "response_build_ms": observed_artifact_values(&[0, 0]),
-            "one_block_fetch_ms": observed_artifact_values(&[0, 0]),
-            "fresh_tip_ms": observed_artifact_values(&[0, 0]),
-            "close_prepared_fsync_ms": observed_artifact_values(&[0, 0]),
-            "rpc_ms": observed_artifact_values(&[0, 0]),
-            "response_worker_ms": observed_artifact_values(&[0, 0]),
-            "general_worker_ms": observed_artifact_values(&[0, 0]),
-            "validation_ms": observed_artifact_values(&[0, 0]),
-            "restart_replay_ms_at_cap": observed_artifact_values(&[0, 0]),
-            "restart_downtime_ms": observed_artifact_values(&[0, 0]),
-            "lower_tail_block_ms": observed_artifact_values(&[1, 1]),
-            "general_inclusion_blocks": observed_artifact_values(&[0, 0]),
-        },
-    });
-    let bytes = match serde_json::to_vec(&artifact) {
-        Ok(bytes) => bytes,
-        Err(error) => panic!("the measured artifact encodes: {error}"),
-    };
-    let path = root.join("measured-work-artifact.json");
-    if let Err(error) = std::fs::write(&path, &bytes) {
-        panic!("the measured artifact is written: {error}");
-    }
-    let config = WorkConfig {
-        chain: ChainCrossCheck {
-            network: network(),
-            genesis_payload_digest: Digest::from_bytes([0x45; 32]),
-            threshold_identity: threshold_identity(),
-        },
-        validators: Vec::new(),
-        journal_root: root.join("unused-by-the-artifact-loader"),
-        routes: Default::default(),
-        policy_salt: SALT,
-        channel_policy: channel_policy(),
-        execution_policy: execution_policy(),
-        poll: Duration::from_millis(1),
-        response_alarm_margin_blocks: MAX_START_VALIDITY_BLOCKS,
-        artifact: Some(ArtifactIdentity {
-            path,
-            digest: Digest::hash(&bytes),
-        }),
-        unsafe_devnet_admit_assumed_measurements: false,
-    };
-    let duties = match load_paid_work_duties(&config) {
-        Ok(duties) => duties,
-        Err(error) => panic!("the fully measured fixture artifact loads: {error}"),
-    };
-    let Some(admission) = duties.payment_admission() else {
-        panic!("a fully measured artifact supplies paid admission");
-    };
-    assert!(
-        matches!(admission, PaymentAdmission::Admits(_)),
-        "a fully measured artifact admits rather than assuming",
-    );
-    admission
 }
 
 // ── The handshake this journal retains ────────────────────────────
@@ -2422,8 +2278,7 @@ impl TxSink for NodeChain {
 }
 
 /// The runner a node starts with: the configured root, the stored
-/// identity, and whichever of §4's three admissions this node's
-/// evidence produced.
+/// identity, and whichever admission it was configured with.
 fn runner(
     root: &Path,
     admission: Option<PaymentAdmission>,
@@ -3327,7 +3182,7 @@ async fn run_advertised_paid_exchange(
 #[tokio::test(flavor = "multi_thread")]
 async fn paid_setup_and_accept_reach_the_mounted_services_over_the_advertised_alpns() {
     let fixture = temp();
-    let admission = fully_measured_admission(fixture.path());
+    let admission = admits();
     for (name, contested) in [("ready", false), ("contested", true)] {
         let root = fixture.path().join(format!("provider-{name}"));
         let client_root = fixture.path().join(format!("client-{name}"));

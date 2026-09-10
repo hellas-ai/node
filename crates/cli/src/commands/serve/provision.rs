@@ -47,32 +47,6 @@
 //! afterwards, so every collision is refused before a floor is written or a
 //! bond signature is made.
 //!
-//! # Evidence gates the countersignature, not the journal
-//!
-//! §4's evidence rule is spelled once, in [`PaidWorkDuties`], and it is a
-//! rule about a signature: an assumed artifact normally yields
-//! [`PaymentAdmission::Proposes`], which declines every payment a client
-//! proposes, and the identical policy under a measured artifact yields
-//! `Admits`. The one exception is the explicitly unsafe, exact-network
-//! devnet switch: it yields `Admits` from assumed evidence and remains named
-//! as unsafe in [`PaidWorkDuties`]. This command does not ask that question a second time. It
-//! refuses only where there is no policy at all — no artifact
-//! configured, none found, one that is not the pinned one, or one the
-//! measured floor refuses — because there is then no endpoint to build,
-//! and [`super::work_config`] has already said that a policy invented to
-//! fill that gap would be exactly the measurement this node does not
-//! have.
-//!
-//! Provisioning under an assumed artifact is therefore allowed, and the
-//! reason is that the journal outlives the artifact. Nothing in a setup
-//! journal records which evidence case wrote it, so the same revision 1
-//! is served — and admitted — by a restart under a measured one. A
-//! provisioning-time evidence gate would be a permanent refusal decided
-//! from a fact that changes at every startup, and it would deadlock the
-//! deployment it was meant to protect: eleven of §4's fourteen terms need
-//! a funded channel with an open contest on a live chain ([`super::probe`]),
-//! and a funded channel needs an offer for a client to answer.
-//!
 //! # What the operator chooses, and what is built
 //!
 //! Every number in the bond is the operator's and this command invents
@@ -87,7 +61,6 @@
 //! and re-spelling any of that here would be a second answer to a
 //! question consensus already answers.
 //!
-//! [`PaidWorkDuties`]: super::work_config::PaidWorkDuties
 //! [`SetupState::funding_coins`]: hellas_rpc::work_store::SetupState::funding_coins
 
 use std::collections::BTreeSet;
@@ -100,12 +73,13 @@ use hellas_kernel::{
     BlockHeight, CoinId, EdgeId, Funding, Key, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, NetworkId,
     Parties, Payout, Secp256k1Signer, Secp256k1Verifier, Terms, Tx, WorkStakeBondTerms,
 };
+use hellas_rpc::protocol::work_setup::ProviderChannelPolicy;
 use hellas_rpc::work_close::FinalizedBlocks;
 use hellas_rpc::work_handshake::{PaymentAdmission, SetupEndpoint};
 use hellas_rpc::work_store::{Role, SetupScan, SetupStore, discover_setups};
 use tracing::{info, warn};
 
-use super::work_config::{PaidWorkDuties, WorkConfig, WorkRoute, load_paid_work_duties};
+use super::work_config::{WorkConfig, WorkRoute};
 use crate::commands::CliResult;
 
 /// What an operator asks for when they make one offer.
@@ -137,8 +111,7 @@ pub struct ProvisionOptions {
 ///
 /// # Errors
 ///
-/// A configuration that builds no provider policy or no matching bilateral
-/// route, a route, bond, or funding coin already reserved by another offer,
+/// A configuration with no matching bilateral route, a route, bond, or funding coin already reserved by another offer,
 /// a key or coin id that is not one, no configured validator with a finalized
 /// block to read a floor from, and whatever the setup journal says about the
 /// revision it refused or could not make durable.
@@ -152,8 +125,7 @@ pub async fn run_provision(options: ProvisionOptions) -> CliResult<()> {
         println!("bond_edge: {}", hex::encode(candidate.bond_edge.to_bytes()));
         return Ok(());
     }
-    let duties = load_paid_work_duties(&options.work_config)?;
-    let offer = Offer::plan(&options, &duties, candidate)?;
+    let offer = Offer::plan(&options, options.work_config.provider_policy(), candidate)?;
     // Dialled after every refusal that can be made without a chain, and
     // before the journal exists: a floor is the first thing written into
     // it, so a run that cannot read one leaves no half-made offer behind.
@@ -172,10 +144,6 @@ pub async fn run_provision(options: ProvisionOptions) -> CliResult<()> {
         made.floor.height,
         hex::encode(made.floor.payload),
     );
-    // Said back because it decides what a client that answers this offer
-    // will be told: the same revision 1 is served either way, and only a
-    // measured artifact countersigns the payment proposed over it.
-    println!("{}", duties.summary());
     Ok(())
 }
 
@@ -256,15 +224,10 @@ impl Offer {
     /// without a chain.
     fn plan(
         options: &ProvisionOptions,
-        duties: &PaidWorkDuties,
+        policy: ProviderChannelPolicy,
         candidate: BondCandidate,
     ) -> CliResult<Self> {
-        let Some(admission) = duties.payment_admission() else {
-            bail!(
-                "this configuration builds no provider policy, so it has no offer to make: {}",
-                duties.summary(),
-            );
-        };
+        let admission = PaymentAdmission::Admits(Box::new(policy));
         let BondCandidate {
             network,
             journal_root,
