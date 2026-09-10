@@ -8,7 +8,6 @@ pub mod fetch_environment;
 pub mod identity;
 pub mod job;
 pub mod manifest;
-#[cfg(feature = "work")]
 pub mod open;
 pub mod retention;
 pub mod schemes;
