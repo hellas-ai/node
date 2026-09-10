@@ -1185,7 +1185,7 @@ fn provisioning_an_offer_loads_a_stored_settlement_identity() {
     ])
     .unwrap();
 
-    let Err(error) = load_command_identity(&provision.command, Some(&path), true) else {
+    let Err(error) = load_command_identity(&provision.command, Some(&path)) else {
         panic!("a bond is staked with a key an operator already made");
     };
     assert!(
@@ -1212,7 +1212,7 @@ fn serving_paid_work_loads_a_stored_settlement_identity() {
     let paid = Cli::try_parse_from(["hellas", "serve", "--work-config", "/tmp/work.json"]).unwrap();
     let unpaid = Cli::try_parse_from(["hellas", "serve"]).unwrap();
 
-    let Err(error) = load_command_identity(&paid.command, Some(&path), true) else {
+    let Err(error) = load_command_identity(&paid.command, Some(&path)) else {
         panic!("paid work is settled with a key an operator already made");
     };
     assert!(
@@ -1224,9 +1224,9 @@ fn serving_paid_work_loads_a_stored_settlement_identity() {
     // The key is the identity's own, and the identity is the one on
     // disk: created here by a `serve` that was asked for no paid
     // work, and read back by the paid one that would not create it.
-    let created = load_command_identity(&unpaid.command, Some(&path), true)
+    let created = load_command_identity(&unpaid.command, Some(&path))
         .expect("a serve with no paid work still creates its transport identity");
-    let loaded = load_command_identity(&paid.command, Some(&path), true)
+    let loaded = load_command_identity(&paid.command, Some(&path))
         .expect("the stored identity is what paid work settles with");
     assert_eq!(
         identity::settlement_signer(&loaded).party_key(),
@@ -1249,7 +1249,7 @@ fn an_unreadable_settlement_identity_is_a_startup_failure() {
     std::fs::write(&path, b"not an identity").unwrap();
     let paid = Cli::try_parse_from(["hellas", "serve", "--work-config", "/tmp/work.json"]).unwrap();
 
-    let Err(error) = load_command_identity(&paid.command, Some(&path), true) else {
+    let Err(error) = load_command_identity(&paid.command, Some(&path)) else {
         panic!("an identity file that is not one is not a key to settle with");
     };
 

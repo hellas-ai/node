@@ -714,7 +714,7 @@ fn a_restarted_node_rebuilds_its_endpoint_from_the_root_and_the_identity() {
     // The identity `identity init` wrote, and the key it settles
     // with. Nothing in the configuration above names either.
     let identity_path = dir.path().join("identity");
-    let identity = crate::identity::load_or_create(Some(&identity_path), true)
+    let identity = crate::identity::load_or_create(Some(&identity_path))
         .expect("the operator's identity is created once");
     let settlement = crate::identity::settlement_signer(&identity);
     let terms = bond_terms_staked_by(&settlement);

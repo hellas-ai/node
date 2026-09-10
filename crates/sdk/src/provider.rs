@@ -266,12 +266,6 @@ where
             RootProof::AppleAppAttest(assertion) => {
                 open_response::Proof::AppleAppAttestAssertion(assertion)
             }
-            RootProof::Tpm20(_) => {
-                return Err(WireStatus::new(
-                    WireCode::FailedPrecondition,
-                    "TPM confidential open is not implemented",
-                ));
-            }
         };
         Ok(OpenResponse {
             provider_genesis: self.enrollment.canonical_bytes(),

@@ -493,9 +493,6 @@ fn verify_open_response(
                     )
                 })
         }
-        RootKind::Tpm20 => Err(ClientError::protocol(
-            "TPM confidential open verification is not implemented",
-        )),
     }?;
     Ok(producer_key)
 }

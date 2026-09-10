@@ -58,9 +58,7 @@ use hellas_rpc::work::{
 };
 use hellas_rpc::work_close::{FinalizedBlocks, TxSink};
 use hellas_rpc::work_handshake::{PaymentAdmission, SetupEndpoint, SetupService};
-use hellas_rpc::work_open::{
-    SetupAdvance, SetupDriveError, SetupProgress, SetupView, advance_setup,
-};
+use hellas_rpc::work_open::{SetupAdvance, SetupDriveError, SetupProgress, SetupView};
 use hellas_rpc::work_store::{ChannelStore, JobPhase, Role, SetupStore, discover_setups};
 use hellas_rpc::{Assurance, ProducerSigningKey};
 use hellas_wire::iroh::{IrohTransport, IrohTransportError};
@@ -524,10 +522,9 @@ impl WorkHandler for UnmountedWork {
 /// What the clock over one node's paid-work journals is built from.
 ///
 /// Every field is something the serve path has already loaded and
-/// checked. The admission most of all: [`PaymentAdmission`] is built
-/// once from the loaded work configuration and carried here rather than
-/// derived again, so there is no second place a node could decide
-/// whether it countersigns new paid work.
+/// checked. The policy most of all: it is the loaded work
+/// configuration's, carried here rather than derived again, so there is
+/// no second place a node could decide what it countersigns over.
 pub(super) struct WorkRunnerConfig {
     /// The network the journals are keyed and the signatures bound to.
     pub(super) network: NetworkId,
@@ -543,9 +540,8 @@ pub(super) struct WorkRunnerConfig {
     pub(super) poll: Duration,
     /// The key every settlement this node signs is signed with.
     pub(super) settlement_key: Secp256k1Signer,
-    /// What a setup endpoint over this node's configuration countersigns,
-    /// or `None` when there is no policy to build one over at all.
-    pub(super) admission: Option<PaymentAdmission>,
+    /// What every setup endpoint this node builds countersigns over.
+    pub(super) policy: ProviderChannelPolicy,
 }
 
 /// The channel this node answers `Work` from, once the runner has been
@@ -709,7 +705,7 @@ where
     S: FinalizedBlocks + FinalizedWorkView + Sync,
 {
     let Some(descriptor) = descriptor else {
-        anyhow::bail!("this channel has no measured admission policy");
+        anyhow::bail!("this channel has no admission descriptor");
     };
     let query = WorkChannelQuery {
         bond_edge: descriptor.bond_edge(),
@@ -998,10 +994,10 @@ impl MountedSetup {
 /// this file, and the setup is not driven again afterwards, because a
 /// second step would open a second journal on the same file.
 enum Driven {
-    /// This node holds an admission, so the journal is driven behind the
-    /// setup service that answers for it. Only an `Admits` policy is
-    /// retained: it is the provider authority from which the full channel
-    /// descriptor is rebuilt after the setup reveals its actual terms.
+    /// The journal is driven behind the setup service that answers for
+    /// it. The policy is retained beside the service: it is the provider
+    /// authority from which the full channel descriptor is rebuilt after
+    /// the setup reveals its actual terms.
     Setup {
         /// The endpoint this journal is both driven and served behind.
         service: SetupService,
@@ -1010,18 +1006,13 @@ enum Driven {
         /// Boxed because it is the widest thing this enum carries by a
         /// long way — every other payload here is a handle or a store
         /// pointer, one or two words each — and a journal is one value
-        /// with four shapes, so the three that hold no policy would
+        /// with three shapes, so the two that hold no policy would
         /// otherwise each be as large as the one that does.
         /// [`PaymentAdmission`] already holds it behind the same
         /// indirection, and this is built from that one, once per
         /// journal at startup.
-        policy: Option<Box<ProviderChannelPolicy>>,
+        policy: Box<ProviderChannelPolicy>,
     },
-    /// No admission was configured, so there is no setup endpoint to
-    /// build. Recovery is not disabled by that, so the journal itself is
-    /// driven — history, mount and close duty are the driver's, and none
-    /// of them countersigns anything.
-    Recovery(Box<SetupStore>),
     /// The channel this setup mounted, including the recovery authority
     /// needed to finish a job accepted before a process restart.
     Channel(Box<DrivenChannel>),
@@ -1082,32 +1073,6 @@ impl DrivenChannel {
     }
 }
 
-impl Driven {
-    /// Takes one step of the setup this journal holds, or `None` when
-    /// this journal is past its setup.
-    async fn advance<S>(&mut self, source: &S) -> Option<Result<SetupAdvance, SetupDriveError>>
-    where
-        S: SetupView + FinalizedBlocks + TxSink + Sync + ?Sized,
-    {
-        match self {
-            Self::Setup { service, .. } => {
-                Some(service.advance_setup(source, source, source).await)
-            }
-            Self::Recovery(store) => Some(
-                advance_setup(
-                    source,
-                    source,
-                    source,
-                    store.as_mut(),
-                    &Secp256k1Verifier::new(),
-                )
-                .await,
-            ),
-            Self::Channel(_) | Self::Done => None,
-        }
-    }
-}
-
 /// One setup journal on a clock.
 struct SetupClock {
     /// The bond this journal stakes, so a log line names which one.
@@ -1141,18 +1106,24 @@ impl SetupClock {
     {
         let bond = hex::encode(self.bond_edge.to_bytes());
         let mut answered = true;
-        if let Some(step) = self.driven.advance(source).await {
+        // One step of the setup this journal holds, with the policy the
+        // mount it may hand back is rebuilt from; nothing, once the
+        // journal is past its setup.
+        let step = match &mut self.driven {
+            Driven::Setup { service, policy } => Some((
+                service.advance_setup(source, source, source).await,
+                policy.clone(),
+            )),
+            Driven::Channel(_) | Driven::Done => None,
+        };
+        if let Some((step, policy)) = step {
             match step {
                 Ok(SetupAdvance { progress, mounted }) => {
                     if let Some(store) = mounted {
-                        let policy = match &self.driven {
-                            Driven::Setup { policy, .. } => policy.clone(),
-                            Driven::Recovery(_) | Driven::Channel(_) | Driven::Done => None,
-                        };
                         if let Some(peer) = self.route_peer {
                             setup_mount.clear(peer, self.bond_edge);
                         }
-                        self.take_mount(store, signer, policy.as_deref(), source, work_mount);
+                        self.take_mount(store, signer, &policy, source, work_mount);
                     } else if matches!(
                         progress,
                         SetupProgress::Aborted(_) | SetupProgress::Faulted(_)
@@ -1197,7 +1168,7 @@ impl SetupClock {
         &mut self,
         store: ChannelStore,
         signer: &Secp256k1Signer,
-        policy: Option<&ProviderChannelPolicy>,
+        policy: &ProviderChannelPolicy,
         source: &S,
         mount: &MountedWork<S>,
     ) {
@@ -1206,19 +1177,16 @@ impl SetupClock {
         // fields, while the mounted channel supplies the payment edge and
         // complete terms the two parties actually signed. This is a full
         // descriptor reconstruction, not a mount-time readiness cache.
-        let descriptor = policy.and_then(|policy| {
+        let descriptor = {
             let channel = store.state().channel();
-            match policy.admit(
-                channel.payment_edge(),
-                channel.payment_terms().clone(),
-            ) {
+            match policy.admit(channel.payment_edge(), channel.payment_terms().clone()) {
                 Ok(descriptor) => Some(descriptor),
                 Err(error) => {
                     warn!(bond, %error, "the mounted channel no longer satisfies its admission policy");
                     None
                 }
             }
-        });
+        };
         match CloseEndpoint::new(store, signer.clone()) {
             Ok(close) => {
                 let service = WorkService::close_only(close);
@@ -1350,33 +1318,25 @@ where
                     continue;
                 }
             };
-            let driven = match config.admission.clone() {
-                Some(admission) => {
-                    let policy = match &admission {
-                        PaymentAdmission::Admits(policy) => Some(policy.clone()),
-                        PaymentAdmission::Proposes(_) => None,
-                    };
-                    let service = SetupService::new(SetupEndpoint::new(
-                        store,
-                        config.settlement_key.clone(),
-                        admission,
-                    ));
-                    if let Some(peer) = route_peer {
-                        if setup_mount.mount(peer, setup.bond_edge, &service) {
-                            info!(
-                                bond,
-                                "this node now answers WorkSetup from its driven setup"
-                            );
-                        } else {
-                            warn!(bond, "this provider setup has an ambiguous peer route");
-                        }
-                    } else {
-                        warn!(bond, "this provider setup has no configured peer route");
-                    }
-                    Driven::Setup { service, policy }
+            let policy = Box::new(config.policy.clone());
+            let service = SetupService::new(SetupEndpoint::new(
+                store,
+                config.settlement_key.clone(),
+                PaymentAdmission::Admits(policy.clone()),
+            ));
+            if let Some(peer) = route_peer {
+                if setup_mount.mount(peer, setup.bond_edge, &service) {
+                    info!(
+                        bond,
+                        "this node now answers WorkSetup from its driven setup"
+                    );
+                } else {
+                    warn!(bond, "this provider setup has an ambiguous peer route");
                 }
-                None => Driven::Recovery(Box::new(store)),
-            };
+            } else {
+                warn!(bond, "this provider setup has no configured peer route");
+            }
+            let driven = Driven::Setup { service, policy };
             clocks.push(SetupClock {
                 bond_edge: setup.bond_edge,
                 route_peer,

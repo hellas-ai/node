@@ -12,7 +12,6 @@ use hellas_executor::{
 };
 use hellas_kernel::Secp256k1Signer;
 use hellas_rpc::policy::ExecutePolicy;
-use hellas_rpc::work_handshake::PaymentAdmission;
 use hellas_rpc::{Assurance, FetchEnvironment, ProducerId, ProducerSigningKey};
 use iroh::SecretKey;
 use serde::Deserialize;
@@ -171,7 +170,7 @@ async fn run_with_store(
             validators: work.validators.clone(),
             poll: work.poll,
             settlement_key: options.settlement_key.clone(),
-            admission: Some(PaymentAdmission::Admits(Box::new(work.provider_policy()))),
+            policy: work.provider_policy(),
         });
     }
 

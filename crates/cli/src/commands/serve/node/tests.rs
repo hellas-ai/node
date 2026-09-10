@@ -532,7 +532,7 @@ async fn two_vouched_peers_receive_their_distinct_configured_offers() {
             validators: Vec::new(),
             poll: Duration::from_millis(1),
             settlement_key: provider(),
-            admission: Some(admits()),
+            policy: provider_policy(),
         },
         MountedWork::<TestChain>::default(),
         setup_mount.clone(),
@@ -643,7 +643,7 @@ fn discover_two_route_runner(
             validators: Vec::new(),
             poll: Duration::from_millis(1),
             settlement_key: provider(),
-            admission: Some(admits()),
+            policy: provider_policy(),
         },
         work_mount.clone(),
         setup_mount.clone(),
@@ -1015,7 +1015,7 @@ fn temp() -> tempfile::TempDir {
 fn test_remote_execution() -> RemoteExecutionServices {
     let directory = temp();
     let identity_path = directory.path().join("identity");
-    let identity = crate::identity::load_or_create(Some(&identity_path), true)
+    let identity = crate::identity::load_or_create(Some(&identity_path))
         .expect("the test remote-execution identity is created");
     let executor = Executor::spawn_with_producer_key(
         ExecutePolicy::Deny,
@@ -1200,10 +1200,6 @@ fn provider_policy() -> ProviderChannelPolicy {
 
 fn admits() -> PaymentAdmission {
     PaymentAdmission::Admits(Box::new(provider_policy()))
-}
-
-fn proposes() -> PaymentAdmission {
-    PaymentAdmission::Proposes(Box::new(provider_policy()))
 }
 
 // ── The handshake this journal retains ────────────────────────────
@@ -2278,10 +2274,10 @@ impl TxSink for NodeChain {
 }
 
 /// The runner a node starts with: the configured root, the stored
-/// identity, and whichever admission it was configured with.
+/// identity, and the policy it was configured with.
 fn runner(
     root: &Path,
-    admission: Option<PaymentAdmission>,
+    policy: ProviderChannelPolicy,
     mount: &MountedWork<TestChain>,
 ) -> WorkRunner<TestChain> {
     match WorkRunner::discover(
@@ -2293,7 +2289,7 @@ fn runner(
             validators: Vec::new(),
             poll: Duration::from_millis(1),
             settlement_key: provider(),
-            admission,
+            policy,
         },
         mount.clone(),
         MountedSetup::default(),
@@ -2761,7 +2757,7 @@ struct RunningPaidNode {
 }
 
 impl RunningPaidNode {
-    async fn start(root: &Path, admission: PaymentAdmission, source: NodeChain) -> Self {
+    async fn start(root: &Path, policy: ProviderChannelPolicy, source: NodeChain) -> Self {
         let setup_mount = MountedSetup::default();
         let execution_calls = Arc::new(AtomicUsize::new(0));
         let peer = PeerId::from_bytes(*SecretKey::from_bytes(&[0x62; 32]).public().as_bytes());
@@ -2777,7 +2773,7 @@ impl RunningPaidNode {
                 validators: Vec::new(),
                 poll: Duration::from_millis(1),
                 settlement_key: provider(),
-                admission: Some(admission),
+                policy,
             },
             work_mount.clone(),
             setup_mount.clone(),
@@ -3073,18 +3069,12 @@ impl RunningPaidNode {
 async fn run_advertised_paid_exchange(
     root: &Path,
     client_root: &Path,
-    admission: PaymentAdmission,
+    policy: ProviderChannelPolicy,
     contested: bool,
 ) {
-    let policy = match &admission {
-        PaymentAdmission::Admits(policy) => policy.as_ref().clone(),
-        PaymentAdmission::Proposes(_) => {
-            panic!("the e2e fixture must carry fully measured admission")
-        }
-    };
-    seed_provider_offer(root, admission.clone());
+    seed_provider_offer(root, PaymentAdmission::Admits(Box::new(policy.clone())));
     let source = NodeChain::new();
-    let node = RunningPaidNode::start(root, admission, source.clone()).await;
+    let node = RunningPaidNode::start(root, policy.clone(), source.clone()).await;
     assert!(
         node.setup_mount.service(&node.context()).is_some(),
         "the runner mounts the exact setup it drives before the first dial",
@@ -3182,7 +3172,7 @@ async fn run_advertised_paid_exchange(
 #[tokio::test(flavor = "multi_thread")]
 async fn paid_setup_and_accept_reach_the_mounted_services_over_the_advertised_alpns() {
     let fixture = temp();
-    let admission = admits();
+    let policy = provider_policy();
     for (name, contested) in [("ready", false), ("contested", true)] {
         let root = fixture.path().join(format!("provider-{name}"));
         let client_root = fixture.path().join(format!("client-{name}"));
@@ -3200,7 +3190,7 @@ async fn paid_setup_and_accept_reach_the_mounted_services_over_the_advertised_al
             entries.next().is_none(),
             "each provider fixture starts from an empty root",
         );
-        run_advertised_paid_exchange(&root, &client_root, admission.clone(), contested).await;
+        run_advertised_paid_exchange(&root, &client_root, policy.clone(), contested).await;
     }
 }
 
@@ -3216,7 +3206,7 @@ async fn a_restart_with_an_open_contest_is_answered_on_the_clock() {
     write_setup_journal(dir.path());
     let start_id = write_contested_channel(dir.path());
     let mount = MountedWork::default();
-    let mut runner = runner(dir.path(), Some(admits()), &mount);
+    let mut runner = runner(dir.path(), provider_policy(), &mount);
     let chain = TestChain::new();
 
     assert!(
@@ -3258,7 +3248,7 @@ async fn the_paid_work_clock_submits_adjudication_when_consensus_makes_it_due_an
     write_setup_journal(dir.path());
     let start_id = write_contested_channel(dir.path());
     let mount = MountedWork::default();
-    let mut runner = runner(dir.path(), Some(admits()), &mount);
+    let mut runner = runner(dir.path(), provider_policy(), &mount);
     let chain = TestChain::new();
     chain.set_snapshot(channel_snapshot(ORIGIN, None, Some(pending_contest(false))));
 
@@ -3303,7 +3293,7 @@ async fn the_paid_work_clock_returns_the_completed_bond_at_its_horizon() {
     let dir = temp();
     write_setup_journal(dir.path());
     let mount = MountedWork::default();
-    let mut runner = runner(dir.path(), Some(admits()), &mount);
+    let mut runner = runner(dir.path(), provider_policy(), &mount);
     let chain = TestChain::new();
     chain.set_snapshot(channel_snapshot(
         bond_terms().timeout.get(),
@@ -3333,46 +3323,6 @@ async fn the_paid_work_clock_returns_the_completed_bond_at_its_horizon() {
     assert_eq!(submitted.len(), 1, "no other transaction is submitted");
 }
 
-/// §4's rule, driven: evidence that is `assumed` or absent turns
-/// admission off and leaves every contest answered.
-///
-/// The two cases are the two admissions `payment_admission` returns
-/// for them — `Proposes`, which countersigns nothing, and `None`,
-/// which is no setup endpoint at all. Both still reach the mount and
-/// both still answer, and neither admits a job.
-#[tokio::test]
-async fn unmeasured_evidence_answers_the_contest_and_admits_no_work() {
-    for admission in [Some(proposes()), None] {
-        let dir = temp();
-        write_setup_journal(dir.path());
-        let start_id = write_contested_channel(dir.path());
-        let mount = MountedWork::default();
-        let mut runner = runner(dir.path(), admission.clone(), &mount);
-        let chain = TestChain::new();
-
-        assert!(runner.tick(&chain).await, "the fixture chain answers");
-
-        assert_eq!(
-            responded(&chain),
-            start_id,
-            "unmeasured evidence still answers a contest: {admission:?}",
-        );
-        let Some(service) = mount.service(&vouched_context(default_route_peer())) else {
-            panic!("unmeasured evidence still mounts its channel: {admission:?}")
-        };
-        let Some(accept_work_response::Outcome::Refused(refusal)) =
-            service.accept(&AcceptWorkRequest::default()).outcome
-        else {
-            panic!("a channel with no readiness decision refuses new work")
-        };
-        assert_eq!(
-            refusal.code,
-            WorkRefusalCode::NotReady as i32,
-            "unmeasured evidence admits no new work: {admission:?}",
-        );
-    }
-}
-
 /// The runner mounts what it is handed, and `Work` answers from it.
 ///
 /// The discriminator is deliberately not the refusal code of
@@ -3385,7 +3335,7 @@ async fn the_clock_serves_work_from_the_channel_it_was_handed() {
     let dir = temp();
     write_setup_journal(dir.path());
     let mount = MountedWork::default();
-    let mut runner = runner(dir.path(), Some(admits()), &mount);
+    let mut runner = runner(dir.path(), provider_policy(), &mount);
     let chain = TestChain::new();
 
     let unmounted: WithTrailer<AdmitCertificateResponse> = UnmountedWork
@@ -3459,7 +3409,7 @@ async fn the_clock_resumes_an_accepted_job_after_restart() {
     let mount = MountedWork::with_backend(AnsweringPaidBackend {
         calls: Arc::clone(&calls),
     });
-    let mut runner = runner(dir.path(), Some(admits()), &mount);
+    let mut runner = runner(dir.path(), provider_policy(), &mount);
     let chain = TestChain::new();
     chain.set_snapshot(ready_channel_snapshot(ORIGIN, None));
 
@@ -3513,7 +3463,7 @@ async fn the_clock_does_not_starve_the_request_path() {
     write_setup_journal(dir.path());
     let backend = BlockingPaidBackend::new();
     let mount = MountedWork::with_backend(backend.clone());
-    let mut runner = runner(dir.path(), Some(admits()), &mount);
+    let mut runner = runner(dir.path(), provider_policy(), &mount);
     let chain = TestChain::slow();
     chain.set_snapshot(ready_channel_snapshot(ORIGIN, None));
 
@@ -3570,7 +3520,7 @@ async fn a_clean_shutdown_leaves_a_replayable_journal() {
     write_setup_journal(dir.path());
     let start_id = write_contested_channel(dir.path());
     let mount = MountedWork::default();
-    let runner = runner(dir.path(), Some(admits()), &mount);
+    let runner = runner(dir.path(), provider_policy(), &mount);
     let chain = TestChain::new();
     let (stop, stopped) = oneshot::channel();
     let task = {

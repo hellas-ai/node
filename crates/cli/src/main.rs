@@ -58,7 +58,6 @@ fn validate_serve_assurance(
 fn load_command_identity(
     command: &Commands,
     path: Option<&Path>,
-    software_root: bool,
 ) -> anyhow::Result<identity::LocalIdentity> {
     #[cfg(feature = "node")]
     let settles_paid_work = matches!(
@@ -81,7 +80,7 @@ fn load_command_identity(
     if read_only {
         identity::load_existing(path)
     } else {
-        identity::load_or_create(path, software_root)
+        identity::load_or_create(path)
     }
 }
 
@@ -934,14 +933,13 @@ async fn async_main() {
 
     // Before anything binds, and before any other startup work: a
     // command that cannot have an identity has nothing further to do.
-    let local_identity =
-        match load_command_identity(&command, cli.identity.as_deref(), cli.software_root) {
-            Ok(identity) => identity,
-            Err(err) => {
-                eprintln!("error: {err:#}");
-                std::process::exit(1);
-            }
-        };
+    let local_identity = match load_command_identity(&command, cli.identity.as_deref()) {
+        Ok(identity) => identity,
+        Err(err) => {
+            eprintln!("error: {err:#}");
+            std::process::exit(1);
+        }
+    };
     let secret_key = local_identity.transport_key.clone();
     #[cfg(feature = "node")]
     if let Commands::Serve { assurance, .. } = &command

@@ -13,8 +13,8 @@
 //! it binds together:
 //!
 //!   - the hardware root that vouches for the installation
-//!     ([`RootKind`] + `root_public_key`) — Secure Enclave, TPM 2.0, or
-//!     a plain software key on a machine with neither;
+//!     ([`RootKind`] + `root_public_key`) — Secure Enclave, or a plain
+//!     software key on a machine without one;
 //!   - `producer_public_key`, the key that signs the provider's work;
 //!   - `transport_public_key`, the key that terminates its connections;
 //!   - `platform_credential`, its Apple App Attest registration if it
@@ -50,14 +50,14 @@ use crate::{ContentId, DagCborEncoder, PublicKey, Signature, SignatureKind};
 
 /// The kind of hardware root vouching for a provider installation.
 ///
-/// Discriminants are wire values and must not be reordered.
+/// Discriminants are wire values and must not be reordered. `2` was a
+/// TPM 2.0 attestation key: never implemented on either side, so it was
+/// removed, and a statement carrying it decodes as an unknown root kind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum RootKind {
     /// Apple Secure Enclave, attested through App Attest.
     SecureEnclave = 1,
-    /// TPM 2.0 attestation key.
-    Tpm20 = 2,
     /// A plain software key. No hardware claim is made: this is for
     /// machines with neither of the above, and a requester that cares
     /// about hardware backing must refuse it.
@@ -91,8 +91,6 @@ pub struct ProviderGenesisStatement {
 pub enum RootProof {
     /// Apple attestation object over the statement.
     AppleAppAttest(Vec<u8>),
-    /// TPM 2.0 attestation-key signature.
-    Tpm20(Signature),
     /// Software root-key signature. Carries no hardware claim.
     Software(Signature),
 }
@@ -239,11 +237,6 @@ fn encode_signed(e: &mut DagCborEncoder, genesis: &SignedProviderGenesis) {
     encode_statement(e, &genesis.statement);
     match &genesis.root_proof {
         RootProof::AppleAppAttest(proof) => encode_proof(e, 1, proof),
-        RootProof::Tpm20(signature) => {
-            e.array(2);
-            e.u64(2);
-            encode_signature(e, signature);
-        }
         RootProof::Software(signature) => {
             e.array(2);
             e.u64(3);
@@ -320,7 +313,6 @@ fn decode_statement(
     decoder.tag("hellas.provider.genesis.statement.v2")?;
     let root_kind = match decoder.u64("root kind")? {
         1 => RootKind::SecureEnclave,
-        2 => RootKind::Tpm20,
         3 => RootKind::Software,
         value => {
             return Err(ProviderGenesisDecodeError::new(format!(
@@ -365,7 +357,6 @@ fn decode_proof(decoder: &mut Decoder<'_>) -> Result<RootProof, ProviderGenesisD
         1 => Ok(RootProof::AppleAppAttest(
             decoder.bytes("Apple App Attest proof")?.to_vec(),
         )),
-        2 => Ok(RootProof::Tpm20(decode_signature(decoder)?)),
         3 => Ok(RootProof::Software(decode_signature(decoder)?)),
         value => Err(ProviderGenesisDecodeError::new(format!(
             "unknown provider genesis proof tag {value}"

@@ -217,12 +217,6 @@ impl OpenHandler for OpenIdentity {
             RootProof::AppleAppAttest(assertion) => {
                 open_response::Proof::AppleAppAttestAssertion(assertion)
             }
-            RootProof::Tpm20(_) => {
-                return Err(WireStatus::new(
-                    WireCode::FailedPrecondition,
-                    "TPM confidential open is not implemented",
-                ));
-            }
         };
         Ok(OpenResponse {
             provider_genesis: self.enrollment.canonical_bytes(),
@@ -255,17 +249,14 @@ fn build_open_identity(
     })
 }
 
-pub(crate) fn load_or_create(
-    path: Option<&Path>,
-    software_root: bool,
-) -> anyhow::Result<LocalIdentity> {
+pub(crate) fn load_or_create(path: Option<&Path>) -> anyhow::Result<LocalIdentity> {
     let path = path
         .map(Path::to_owned)
         .map(Ok)
         .unwrap_or_else(default_path)?;
     match fs::read(&path) {
         Ok(bytes) => decode(&path, &bytes),
-        Err(error) if error.kind() == ErrorKind::NotFound => create(&path, software_root),
+        Err(error) if error.kind() == ErrorKind::NotFound => create(&path),
         Err(error) => {
             Err(error).with_context(|| format!("failed to read identity file {}", path.display()))
         }
@@ -343,16 +334,15 @@ fn default_hellas_path(file: &str, flag: &str) -> anyhow::Result<PathBuf> {
     Ok(PathBuf::from(home).join(IDENTITY_DIR).join(file))
 }
 
-fn create_root(explicit: bool, _installation_nonce: [u8; 32]) -> anyhow::Result<PlatformRoot> {
-    require_software_root(explicit)?;
+fn create_root(_installation_nonce: [u8; 32]) -> anyhow::Result<PlatformRoot> {
     Ok(PlatformRoot::Software(ProducerSigningKey::generate()))
 }
 
-fn create(path: &Path, software_root: bool) -> anyhow::Result<LocalIdentity> {
+fn create(path: &Path) -> anyhow::Result<LocalIdentity> {
     let producer_key = ProducerSigningKey::generate();
     let transport_key = SecretKey::generate();
     let installation_nonce = rand::random();
-    let root = Arc::new(create_root(software_root, installation_nonce)?);
+    let root = Arc::new(create_root(installation_nonce)?);
     let statement = statement(&root, &producer_key, &transport_key, installation_nonce);
     let genesis = SignedProviderGenesis {
         root_proof: root.prove(&statement.canonical_bytes())?,
@@ -579,39 +569,6 @@ fn persist(path: &Path, stored: &StoredIdentity) -> anyhow::Result<bool> {
         Err(error) => Err(error.error)
             .with_context(|| format!("failed to persist identity file {}", path.display())),
     }
-}
-
-#[cfg(target_os = "linux")]
-fn require_software_root(explicit: bool) -> anyhow::Result<()> {
-    require_software_root_at(
-        explicit,
-        Path::new("/sys/class/tpm/tpm0"),
-        &[Path::new("/dev/tpmrm0"), Path::new("/dev/tpm0")],
-    )
-}
-
-#[cfg(target_os = "linux")]
-fn require_software_root_at(explicit: bool, tpm: &Path, devices: &[&Path]) -> anyhow::Result<()> {
-    if explicit || !tpm.exists() {
-        return Ok(());
-    }
-    let device = devices
-        .iter()
-        .copied()
-        .find(|path| path.exists())
-        .context("TPM 2.0 is present but has no device node; use --software-root explicitly")?;
-    if let Err(error) = fs::OpenOptions::new().read(true).write(true).open(device) {
-        bail!(
-            "TPM 2.0 is present but {} is inaccessible ({error}); use --software-root explicitly",
-            device.display()
-        );
-    }
-    bail!("TPM 2.0 is present; use --software-root explicitly until TPM root support graduates")
-}
-
-#[cfg(not(target_os = "linux"))]
-fn require_software_root(_explicit: bool) -> anyhow::Result<()> {
-    Ok(())
 }
 
 fn create_dir_restricted(path: &Path) -> std::io::Result<()> {
