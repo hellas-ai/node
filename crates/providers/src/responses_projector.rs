@@ -1,3 +1,5 @@
+use super::stream::{project_events, push_sse};
+
 use hellas_adaptors::{
     OutputEvent, SseDecoder, StopReason, TextChannel, ToolCallArgumentsDelta, ToolCallEnd,
     ToolCallStart, Usage, WireEventData, WireStreamEvent,
@@ -6,9 +8,7 @@ use hellas_executor::{
     FetchAdaptorError, FetchAdaptorFactory, FetchAdaptorSession, FetchCall, FetchProjector,
     FetchProviderResponseHead, FetchRequestView, PreparedFetchRequest, ProjectedFetch,
 };
-use hellas_rpc::fetch::{
-    MAX_FETCH_REQUEST_BODY_BYTES, encode_fetch_event_payload, encode_fetch_terminal_payload,
-};
+use hellas_rpc::fetch::{MAX_FETCH_REQUEST_BODY_BYTES, encode_fetch_terminal_payload};
 use hellas_rpc::{ContentId, FetchEnvironment, JsonBytes};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
@@ -1351,17 +1351,6 @@ impl ResponsesFetchProjector {
             ))
         }
     }
-
-    fn project_events(events: Vec<OutputEvent>) -> Result<Vec<ProjectedFetch>, FetchAdaptorError> {
-        events
-            .into_iter()
-            .map(|event| {
-                encode_fetch_event_payload(&event)
-                    .map(ProjectedFetch::Event)
-                    .map_err(fetch_payload_error)
-            })
-            .collect()
-    }
 }
 
 impl FetchProjector for ResponsesFetchProjector {
@@ -1387,36 +1376,14 @@ impl FetchProjector for ResponsesFetchProjector {
                 "Responses stream contained bytes after terminal",
             ));
         }
-        let before = self.decoder.frame_count();
-        let ignored_before = self.decoder.ignored_line_count();
-        let noncanonical_before = self.decoder.noncanonical_line_count();
-        let frames = self
-            .decoder
-            .push(bytes)
-            .map_err(|err| fetch_failed(err.to_string()))?;
-        let consumed = self.decoder.frame_count() - before;
-        if consumed != frames.len() as u64 {
-            return Err(fetch_failed(
-                "Responses stream contained a non-data SSE frame",
-            ));
-        }
-        if self.decoder.ignored_line_count() != ignored_before {
-            return Err(fetch_failed(
-                "Responses stream contained non-canonical SSE lines",
-            ));
-        }
-        if self.decoder.noncanonical_line_count() != noncanonical_before {
-            return Err(fetch_failed(
-                "Responses stream contained non-canonical SSE framing",
-            ));
-        }
+        let frames = push_sse(&mut self.decoder, bytes, "Responses").map_err(fetch_failed)?;
         let events = self.decode_frames(frames)?;
         if self.terminal.is_some() && !self.decoder.pending_bytes().is_empty() {
             return Err(fetch_failed(
                 "Responses stream contained bytes after terminal",
             ));
         }
-        Self::project_events(events)
+        project_events(&events).map_err(fetch_payload_error)
     }
 
     fn finish(&mut self) -> Result<Vec<ProjectedFetch>, FetchAdaptorError> {
@@ -1428,44 +1395,20 @@ impl FetchProjector for ResponsesFetchProjector {
                 "Responses SSE stream ended without a blank-line frame delimiter",
             ));
         }
-        let before = self.decoder.frame_count();
-        let ignored_before = self.decoder.ignored_line_count();
-        let noncanonical_before = self.decoder.noncanonical_line_count();
-        let frames = self
-            .decoder
-            .finish()
-            .map_err(|err| fetch_failed(err.to_string()))?;
-        let consumed = self.decoder.frame_count() - before;
-        if consumed != frames.len() as u64 {
-            return Err(fetch_failed(
-                "Responses stream contained a non-data SSE frame",
-            ));
-        }
-        if self.decoder.ignored_line_count() != ignored_before {
-            return Err(fetch_failed(
-                "Responses stream contained non-canonical SSE lines",
-            ));
-        }
-        if self.decoder.noncanonical_line_count() != noncanonical_before {
-            return Err(fetch_failed(
-                "Responses stream contained non-canonical SSE framing",
-            ));
-        }
-        let events = self.decode_frames(frames)?;
-        let mut projected = Self::project_events(events)?;
+        // Complete frames were consumed by project(); an empty buffer has no tail to decode.
         let terminal = self
             .terminal
             .take()
             .ok_or_else(|| fetch_failed("Responses stream ended without verified terminal"))?;
-        projected.push(ProjectedFetch::Terminal(
+        let projected = ProjectedFetch::Terminal(
             encode_fetch_terminal_payload(&OutputEvent::Finished {
                 stop_reason: terminal.stop_reason,
                 usage: terminal.usage,
             })
             .map_err(fetch_payload_error)?,
-        ));
+        );
         self.finished = true;
-        Ok(projected)
+        Ok(vec![projected])
     }
 }
 

@@ -124,10 +124,10 @@ validator = [
 ]
 wasm-client = ["client-core", "hellas-wire/ws-wasm"]
 # The block source a paid endpoint's settlement watcher reads. It is its
-# own feature because the work protocol is the only thing in `hellas-rpc`
-# that needs the consensus kernel's types, and a chain client that only
-# serves coins has no use for them.
-work-watcher = ["block-view", "hellas-rpc/work"]
+# own feature because a paid endpoint needs both the block codec and the
+# durable work driver, while a chain client that only serves coins has no
+# use for either.
+work-watcher = ["block-view", "dep:hellas-work"]
 
 [dependencies]
 axum = { workspace = true, optional = true }
@@ -157,6 +157,7 @@ hellas-genesis = { workspace = true, optional = true }
 hellas-kernel = { workspace = true, optional = true, default-features = false }
 hellas-rpc = { workspace = true, optional = true, features = ["chain"] }
 hellas-wire = { workspace = true, optional = true }
+hellas-work = { workspace = true, optional = true }
 hex = { workspace = true, optional = true }
 opentelemetry = { workspace = true, optional = true }
 opentelemetry-otlp = { workspace = true, optional = true }

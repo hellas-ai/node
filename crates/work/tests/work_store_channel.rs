@@ -6,13 +6,10 @@
 //! assertions are about the second process — never about what the first
 //! one intended.
 
-#![cfg(feature = "work")]
-
 use hellas_kernel::{
     BlockHeight, EarnedCertificate, EdgeId, EdgeValues, Encode as _, Fees, List, MAX_EDGE_OUTPUTS,
-    NetworkId, Parties, Party, PayloadHash, Payout, Secp256k1Signer, Secp256k1Verifier, Sig,
-    TermsHash, WorkPaymentSettlement, WorkPaymentTerms, WorkStakeBondTerms,
-    work_payment_settlement,
+    Parties, Party, PayloadHash, Payout, Secp256k1Signer, Secp256k1Verifier, Sig, TermsHash,
+    WorkPaymentSettlement, WorkPaymentTerms, WorkStakeBondTerms, work_payment_settlement,
 };
 use hellas_rpc::evaluate::{
     EvaluateOutputTranscriptBuilder, EvaluateStopReason, EvaluateTerminal, EvaluateUsage,
@@ -29,15 +26,19 @@ use hellas_rpc::protocol::work::{
     payment_binding_digest, prepared_input_digest, private_policy_commitment, result_digest,
     terminal_result, work_id,
 };
-use hellas_rpc::work_store::journal::{Journal, JournalError, JournalId, JournalKind};
-use hellas_rpc::work_store::{
-    ChannelRecord, ChannelStateError, ChannelStore, JobPhase, JobState, Role, SetupOrigin,
-    TerminalOutcome, WorkStoreError,
-};
 use hellas_rpc::{
     Application, Assurance, CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR, ContentId, Evaluate,
     EvaluateRequest, OutputEventEnvelope, ProducerSigningKey, ProgramManifest, PublicKey,
 };
+use hellas_work::work_store::journal::{Journal, JournalError, JournalId, JournalKind};
+use hellas_work::work_store::{
+    ChannelRecord, ChannelStateError, ChannelStore, JobPhase, JobState, Role, SetupOrigin,
+    TerminalOutcome, WorkStoreError,
+};
+
+#[path = "support/basic.rs"]
+mod basic;
+use basic::{network, temp};
 
 // ── Fixture ───────────────────────────────────────────────────────────
 
@@ -50,13 +51,6 @@ const DELIVERY_LIMIT: u64 = 25;
 const OMISSION_BOND: u64 = 4;
 const PAYMENT_VALUE: u64 = 1_000;
 const SALT: [u8; 32] = [0x5a; 32];
-
-fn network() -> NetworkId {
-    let Some(network) = NetworkId::new("hellas-test") else {
-        panic!("a short ascii id is a legal network id");
-    };
-    network
-}
 
 fn client() -> Secp256k1Signer {
     let Ok(signer) = Secp256k1Signer::from_secret_scalar([0x21; 32]) else {
@@ -130,13 +124,6 @@ fn settlement() -> WorkPaymentSettlement {
         panic!("a funded edge prices both exits");
     };
     settlement
-}
-
-fn temp() -> tempfile::TempDir {
-    match tempfile::tempdir() {
-        Ok(dir) => dir,
-        Err(error) => panic!("a temporary directory: {error}"),
-    }
 }
 
 fn open(root: &std::path::Path, role: Role) -> ChannelStore {
@@ -470,11 +457,11 @@ fn one_paid_job_moves_every_ledger_once() {
     commit_all(&mut store, &provider_sequence(&channel, &job));
 
     let state = store.state();
-    assert!(state.job().is_none(), "a paid job is closed");
+    assert!(state.jobs().next().is_none(), "a paid job is closed");
     assert_eq!(state.ledger().credited_cumulative(), PRICE);
     assert!(
         matches!(
-            state.terminal().map(|terminal| &terminal.outcome),
+            state.terminals().next().map(|terminal| &terminal.outcome),
             Some(TerminalOutcome::Certified { .. })
         ),
         "the one job rests at a certified terminal",
@@ -495,10 +482,10 @@ fn the_client_credits_the_same_payment_it_signed() {
 
     let state = store.state();
     assert_eq!(state.ledger().credited_cumulative(), PRICE);
-    assert!(state.job().is_none());
+    assert!(state.jobs().next().is_none());
     assert!(
         matches!(
-            state.terminal().map(|terminal| &terminal.outcome),
+            state.terminals().next().map(|terminal| &terminal.outcome),
             Some(TerminalOutcome::Certified { .. })
         ),
         "the one job rests at a certified terminal",
@@ -629,7 +616,7 @@ fn a_result_must_be_the_transcript_it_is_stored_beside() {
     if let Err(error) = store.commit(job.result_record(&channel), &verifier) {
         panic!("a result and its own transcript record: {error}");
     }
-    let Some(open) = store.state().job() else {
+    let Some(open) = store.state().jobs().next() else {
         panic!("the job is open");
     };
     assert_eq!(open.phase(), JobPhase::Ready);
@@ -653,7 +640,7 @@ fn a_restart_finds_the_transcript_the_result_was_derived_from() {
     }
 
     let recovered = open(dir.path(), Role::Provider);
-    let Some(open) = recovered.state().job() else {
+    let Some(open) = recovered.state().jobs().next() else {
         panic!("the job is still open");
     };
     assert_eq!(open.phase(), JobPhase::Ready);
@@ -800,7 +787,7 @@ fn the_payment_deadline_is_the_last_height_a_payment_may_be_signed_at() {
         let sequence = client_sequence(&channel, &job);
         commit_all(&mut store, &sequence[..5]);
         assert_eq!(
-            store.state().job().map(JobState::phase),
+            store.state().jobs().next().map(JobState::phase),
             Some(JobPhase::Matched),
         );
         advance(&mut store, height);
@@ -917,7 +904,7 @@ fn a_verdict_belongs_to_a_client_holding_a_result() {
     let sequence = client_sequence(&channel, &job);
     commit_all(&mut store, &sequence[..3]);
     assert_eq!(
-        store.state().job().map(JobState::phase),
+        store.state().jobs().next().map(JobState::phase),
         Some(JobPhase::Accepted)
     );
     let error = store
@@ -953,7 +940,7 @@ fn a_verdict_belongs_to_a_client_holding_a_result() {
     }
     assert_eq!(store.len(), before, "and it is not written twice");
     assert_eq!(
-        store.state().job().map(JobState::phase),
+        store.state().jobs().next().map(JobState::phase),
         Some(JobPhase::Matched)
     );
 }
@@ -973,7 +960,7 @@ fn an_authenticated_result_is_payable_without_reproduction() {
     let sequence = client_sequence(&channel, &job);
     commit_all(&mut store, &sequence[..4]);
     assert_eq!(
-        store.state().job().map(JobState::phase),
+        store.state().jobs().next().map(JobState::phase),
         Some(JobPhase::Ready)
     );
 
@@ -1117,7 +1104,10 @@ fn every_provider_write_boundary_recovers_to_one_state() {
         let recovered = open(dir.path(), Role::Provider);
         let state = recovered.state();
         assert_eq!(
-            state.job().map(hellas_rpc::work_store::JobState::phase),
+            state
+                .jobs()
+                .next()
+                .map(hellas_work::work_store::JobState::phase),
             phase,
             "phase after {} records",
             index + 1
@@ -1145,7 +1135,7 @@ fn a_half_signed_job_keeps_its_bytes() {
     }
 
     let mut recovered = open(dir.path(), Role::Provider);
-    let Some(open_job) = recovered.state().job() else {
+    let Some(open_job) = recovered.state().jobs().next() else {
         panic!("the half-signed job survives");
     };
     assert_eq!(open_job.phase(), JobPhase::HalfSigned);
@@ -1239,7 +1229,7 @@ fn an_interrupted_invocation_stays_indeterminate() {
     assert!(!recovered.state().is_indeterminate());
     assert!(
         matches!(
-            recovered.state().terminal().map(|t| &t.outcome),
+            recovered.state().terminals().next().map(|t| &t.outcome),
             Some(TerminalOutcome::Indeterminate)
         ),
         "the job rests at an indeterminate terminal",
@@ -1325,7 +1315,7 @@ fn delivery_credit_bounds_what_may_be_released() {
         "unexpected error: {error}"
     );
     assert!(
-        store.state().job().map(JobState::phase) == Some(JobPhase::Ready),
+        store.state().jobs().next().map(JobState::phase) == Some(JobPhase::Ready),
         "nothing was released, so the job is still ready",
     );
 
@@ -1336,7 +1326,7 @@ fn delivery_credit_bounds_what_may_be_released() {
     let job = job_at(&roomy, 1, 0);
     commit_all(&mut store, &provider_sequence(&roomy, &job)[..5]);
     assert_eq!(
-        store.state().job().map(JobState::phase),
+        store.state().jobs().next().map(JobState::phase),
         Some(JobPhase::Delivered),
     );
 }
@@ -1751,8 +1741,9 @@ fn a_corrupt_channel_journal_is_not_replayed_as_an_earlier_state() {
     assert_eq!(
         recovered
             .state()
-            .job()
-            .map(hellas_rpc::work_store::JobState::phase),
+            .jobs()
+            .next()
+            .map(hellas_work::work_store::JobState::phase),
         Some(JobPhase::Delivered)
     );
     drop(recovered);
@@ -1854,8 +1845,9 @@ fn an_append_the_file_ends_inside_is_removed() {
         assert_eq!(
             recovered
                 .state()
-                .job()
-                .map(hellas_rpc::work_store::JobState::phase),
+                .jobs()
+                .next()
+                .map(hellas_work::work_store::JobState::phase),
             Some(JobPhase::Delivered),
             "case {label}"
         );
@@ -1972,7 +1964,7 @@ fn a_journal_torn_inside_its_header_is_written_again() {
     let mut recovered = open(dir.path(), Role::Provider);
     assert!(recovered.recovered_torn_tail());
     assert!(recovered.is_empty(), "there was never a record under it");
-    assert!(recovered.state().job().is_none());
+    assert!(recovered.state().jobs().next().is_none());
     // And it is a journal again, not a file that half exists.
     if let Err(error) = recovered.commit(job.proposed(), &Secp256k1Verifier::new()) {
         panic!("the rewritten journal takes a record: {error}");
@@ -2434,8 +2426,9 @@ fn a_result_needs_the_marker_that_says_the_backend_was_called() {
     assert_eq!(
         store
             .state()
-            .job()
-            .map(hellas_rpc::work_store::JobState::phase),
+            .jobs()
+            .next()
+            .map(hellas_work::work_store::JobState::phase),
         Some(JobPhase::Accepted)
     );
 }
@@ -2457,7 +2450,7 @@ fn the_retained_dispatch_input_is_the_one_the_authorization_commits_to() {
     }
 
     let recovered = open(dir.path(), Role::Provider);
-    let Some(open_job) = recovered.state().job() else {
+    let Some(open_job) = recovered.state().jobs().next() else {
         panic!("the accepted job survives");
     };
     assert_eq!(open_job.prepared_input(), bundle_bytes(1).as_slice());
@@ -2484,7 +2477,7 @@ fn the_retained_dispatch_input_is_the_one_the_authorization_commits_to() {
         matches!(error, WorkStoreError::Channel(ChannelStateError::Record(_))),
         "unexpected error: {error}"
     );
-    assert!(fresh.state().job().is_none());
+    assert!(fresh.state().jobs().next().is_none());
 
     // And bytes that are not a bundle at all.
     let error = fresh
@@ -2570,7 +2563,7 @@ fn inputs_swapped_on_the_disk_are_not_a_job_to_execute() {
         );
         if readable {
             match opened {
-                Ok(store) => assert!(store.state().job().is_some(), "the job replays"),
+                Ok(store) => assert!(store.state().jobs().next().is_some(), "the job replays"),
                 Err(error) => panic!("the journal this route wrote reopens: {error}"),
             }
             continue;
@@ -2636,7 +2629,7 @@ fn a_retained_close_start_admits_no_further_work() {
     commit_all(&mut store, &provider_sequence(&channel, &paid));
     assert_eq!(store.state().max_executable_certificate(), PRICE);
 
-    let Ok(start) = hellas_rpc::work_close::close_start(
+    let Ok(start) = hellas_work::work_close::close_start(
         &channel,
         hellas_kernel::Party::Taker,
         RECEIPT_HEIGHT,
@@ -2673,7 +2666,7 @@ fn a_retained_close_start_admits_no_further_work() {
         PRICE,
         "and it moves nothing",
     );
-    assert!(store.state().job().is_none());
+    assert!(store.state().jobs().next().is_none());
 }
 
 /// Each `JobTerminal` variant is permanent: once the channel's one job
@@ -2762,9 +2755,12 @@ fn each_job_terminal_rejects_a_late_reply_and_a_second_proposal() {
                 panic!("{name}: reaching the terminal records: {error}");
             }
         }
-        assert!(store.state().job().is_none(), "{name}: the one job is over");
         assert!(
-            store.state().terminal().is_some(),
+            store.state().jobs().next().is_none(),
+            "{name}: the one job is over"
+        );
+        assert!(
+            store.state().terminals().next().is_some(),
             "{name}: and its terminal is on the disk",
         );
 
@@ -2811,7 +2807,11 @@ fn a_whole_job_opens_no_counterparty_loss_file() {
     commit_all(&mut store, &provider_sequence(&channel, &job));
     assert!(
         matches!(
-            store.state().terminal().map(|terminal| &terminal.outcome),
+            store
+                .state()
+                .terminals()
+                .next()
+                .map(|terminal| &terminal.outcome),
             Some(TerminalOutcome::Certified { .. })
         ),
         "the job reached a certified terminal",
@@ -2906,7 +2906,7 @@ fn one_contest_admits_one_answer() {
     // The one answer those two derive.
     let answer = ChannelRecord::CloseResponded {
         start_id,
-        response_digest: hellas_rpc::work_close::response_body_digest(
+        response_digest: hellas_work::work_close::response_body_digest(
             &channel,
             start_id,
             &job.certificate,
@@ -2981,7 +2981,7 @@ fn one_contest_admits_one_answer() {
         let refused = store.commit(
             ChannelRecord::CloseResponded {
                 start_id,
-                response_digest: hellas_rpc::work_close::response_body_digest(
+                response_digest: hellas_work::work_close::response_body_digest(
                     &channel,
                     start_id,
                     &job.certificate,
@@ -3094,7 +3094,7 @@ fn closed_store(root: &std::path::Path) -> ChannelStore {
             },
             ChannelRecord::CloseResponded {
                 start_id,
-                response_digest: hellas_rpc::work_close::response_body_digest(
+                response_digest: hellas_work::work_close::response_body_digest(
                     &channel,
                     start_id,
                     &job.certificate,
@@ -3188,7 +3188,7 @@ fn a_checkpoint_replays_to_what_the_frames_replayed_to() {
     let delivered = temp();
     let delivered = delivered_store(delivered.path());
     let delivered = delivered.state();
-    let Some(job) = delivered.job() else {
+    let Some(job) = delivered.jobs().next() else {
         panic!("the delivered fixture holds its job");
     };
     assert_eq!(job.phase(), JobPhase::Delivered);
@@ -3197,13 +3197,13 @@ fn a_checkpoint_replays_to_what_the_frames_replayed_to() {
     assert!(!job.transcript().is_empty());
     assert!(!job.prepared_input().is_empty());
     assert_eq!(delivered.cursor().0, RECEIPT_HEIGHT);
-    assert_eq!(delivered.terminal(), None);
+    assert_eq!(delivered.terminals().next(), None);
 
     let closed = temp();
     let closed = closed_store(closed.path());
     let closed = closed.state();
-    assert!(closed.job().is_none());
-    assert!(closed.terminal().is_some());
+    assert!(closed.jobs().next().is_none());
+    assert!(closed.terminals().next().is_some());
     assert_eq!(closed.ledger().credited_cumulative(), PRICE);
     assert!(closed.close_prepared().is_some());
     assert!(closed.close_opened().is_some());
@@ -3276,7 +3276,7 @@ fn a_rotation_crashing_at_any_step_reopens_the_same_channel() {
 /// the number of blocks read.
 #[test]
 fn a_duty_survives_repeated_rotation() {
-    use hellas_rpc::work_store::journal::{MAX_ACTIVE_FRAMES, MAX_ACTIVE_JOURNAL_BYTES};
+    use hellas_work::work_store::journal::{MAX_ACTIVE_FRAMES, MAX_ACTIVE_JOURNAL_BYTES};
 
     let dir = temp();
     let expected = {
@@ -3292,8 +3292,8 @@ fn a_duty_survives_repeated_rotation() {
             "every block was read",
         );
         assert_eq!(
-            store.state().terminal(),
-            before.terminal(),
+            store.state().terminals().next(),
+            before.terminals().next(),
             "rotation moves bytes and not facts",
         );
         store.state().clone()
@@ -3308,7 +3308,7 @@ fn a_duty_survives_repeated_rotation() {
     let Some(name) = path.file_name().and_then(std::ffi::OsStr::to_str) else {
         panic!("the journal has a name");
     };
-    let Some((_, generation)) = hellas_rpc::work_store::journal::journal_name_parts(name) else {
+    let Some((_, generation)) = hellas_work::work_store::journal::journal_name_parts(name) else {
         panic!("the journal's name carries its generation");
     };
     assert!(
@@ -3338,7 +3338,7 @@ fn a_duty_survives_repeated_rotation() {
 /// cursor advances that a duty is made of are not.
 #[test]
 fn new_work_stops_where_a_duty_carries_on() {
-    use hellas_rpc::work_store::journal::{DUTY_RESERVE_FRAMES, MAX_ACTIVE_FRAMES};
+    use hellas_work::work_store::journal::{DUTY_RESERVE_FRAMES, MAX_ACTIVE_FRAMES};
 
     let dir = temp();
     let channel = channel();
@@ -3363,7 +3363,7 @@ fn new_work_stops_where_a_duty_carries_on() {
         "new work stops when the journal cannot rotate: {refused:?}",
     );
     assert!(
-        store.state().job().is_none(),
+        store.state().jobs().next().is_none(),
         "and nothing was written for it",
     );
 

@@ -1,76 +1,19 @@
-//! Canonical private records of a paid job: what was authorized, what
-//! came back, what it cost, and which scalar certificate paid for it.
+//! Canonical private authorization, result, and payment records.
 //!
-//! # What these records are for
+//! Both parties sign the authorization; the provider signs the result;
+//! the client signs the payment binding and kernel [`EarnedCertificate`].
+//! Digests bind the network and channel. Consensus settles the cumulative
+//! certificate, while these private records identify the job it paid for.
 //!
-//! Consensus settles one number. An [`EarnedCertificate`] names a payment
-//! edge, its terms, and a cumulative amount, and the kernel pays out
-//! against exactly that (`crates/kernel/src/work.rs`). Nothing in it says
-//! which job was done, at what price, in which environment, or whether
-//! the answer was ever delivered. These records are the private chain
-//! that makes the scalar mean something:
+//! [`CreditLedger`] checks cumulative payment arithmetic. Durable endpoint
+//! state in `hellas-work` prevents duplicate job payments across restarts.
+//! Payment requires an authenticated result; local reproduction is optional.
+//! These records grant no correctness-challenge or slashing right.
 //!
-//! ```text
-//! both signatures
-//!   -> authorization digest / work_id
-//!   -> provider-signed result_digest
-//!   -> client-signed PaymentBindingV1(work_id, result, certificate)
-//!   -> client-signed EarnedCertificate(credited + price)
-//!   -> kernel payout
-//! ```
-//!
-//! There is no provider signature between the result and the payment,
-//! and there is deliberately no room for one. The provider has already
-//! co-signed the authorization that fixes the price and signed the
-//! result that earns it; a third provider signature restating those two
-//! numbers would add no authority to either, and would be a second place
-//! for the price to be written down.
-//!
-//! A chain of digests is not by itself a ledger: every link above can be
-//! rebuilt truthfully for a job that was already paid for, at a fresh
-//! cumulative, and read alone it is indistinguishable from a second job.
-//! [`CreditLedger`] is what makes it a ledger. It holds the whole of the
-//! cross-call state — the credited amount and the jobs already paid for
-//! — and it is the only thing here that says a job is paid for at most
-//! once.
-//!
-//! None of it is consensus input, and none of it is on L1. It lives here,
-//! in the neutral protocol crate, so the provider and the client have one
-//! implementation of these digests rather than two that agree until they
-//! do not.
-//!
-//! # Profile
-//!
-//! These bodies are the transitional `SIGNED_TRANSCRIPT_FULL_REEXEC_V1`
-//! profile: a fixed-price Evaluate job whose correctness the client
-//! establishes by full independent reexecution. They grant no
-//! correctness-game right. That is why the authorization has its own
-//! domain — `hellas.work.paid-job-authorize.v1` — and deliberately not
-//! the v4 game domain `hellas.work.job-and-dispute-authorize.v2`
-//! (`workflows/roadmap/concurrency-design-v4.md:410-413`): two different
-//! objects under one domain is a replay vector, and a body from this
-//! profile must fail a game decoder by tag before any field is read.
-//!
-//! # Bounded preimages
-//!
-//! Every fixed record is hashed with [`SingleChunkHasher`], which
-//! *asserts* rather than errors once a preimage reaches
-//! [`hellas_xet::MIN_CHUNK_SIZE`]. Each body here is fixed-width, so each
-//! complete preimage has a compile-time maximum, and both preimage
-//! shapes — record and channel id — are asserted below. The four
-//! variable-length preimages — the generation policy, the identity
-//! artifact, the prepared input bundle, and the canonical output — use
-//! the streaming [`XetFileHasher`] instead, which has no such limit and
-//! which agrees with one-shot [`Digest::hash`] under every write
-//! segmentation.
-//!
-//! # Signatures
-//!
-//! Signatures ride beside these bodies, never inside them. The provider
-//! signs the authorization and the result; the client signs the
-//! authorization, the payment binding, and the kernel's earned digest.
-//! Every digest below binds the network and the channel, so a body
-//! lifted from one channel is not a body in another.
+//! Fixed-width preimages use [`SingleChunkHasher`] with compile-time bounds
+//! below [`hellas_xet::MIN_CHUNK_SIZE`]. Variable-width preimages use
+//! [`XetFileHasher`]. Signatures accompany the bodies rather than changing
+//! their canonical encoding; changing a domain or encoding changes signatures.
 
 use hellas_kernel::{
     BufferWriter, EarnedCertificate, EdgeId, Encode, Key, NetworkId, PayloadHash, Terms, TermsHash,
@@ -95,8 +38,7 @@ use crate::{
 // digest computed under it, which is why they are written once here and
 // never spelled at a call site.
 
-/// Channel identity. Fixed by v4 (`concurrency-design-v4.md:203-209`) and
-/// shared with it: a channel is the same object in both protocols.
+/// Channel identity domain.
 const CHANNEL: &[u8] = b"hellas.work.channel.v2";
 /// Salted commitment to the static channel credit policy.
 const PAID_CHANNEL_POLICY: &[u8] = b"hellas.work.paid-channel-policy.v1";
@@ -1748,13 +1690,10 @@ pub fn next_payment(
 
 /// What one endpoint has already credited on one channel.
 ///
-/// One value: the cumulative amount already credited. This channel
-/// admits one job for its whole life, so "paid for at most once" is a
-/// fact about the channel's permanent terminal — a second payment has no
-/// second job to pay for — rather than a set this ledger must carry. What
-/// this value is for is the arithmetic: the price a payment adds is
-/// credited on top of it, and the certificate must settle exactly the
-/// sum.
+/// One value: the cumulative amount already credited. Individual jobs
+/// are retained by the durable work store, while this value supplies the
+/// arithmetic shared by all of them: each payment adds its price on top
+/// of it and its certificate must settle exactly that sum.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CreditLedger {
     credited_cumulative: u64,
@@ -1767,16 +1706,13 @@ impl CreditLedger {
         Self::default()
     }
 
-    /// A channel that has credited exactly this much.
+    /// Restores a checkpointed cumulative credit total.
     ///
-    /// For the one caller that recovers a ledger rather than building
-    /// one: a journal checkpoint carries this value across a rotation,
-    /// and the job the credit was for is closed by then, so nothing is
-    /// left to re-run [`Self::credit_payment`] over. The store checks it
-    /// against the certificate its own terminal holds before it is
-    /// trusted; this is only the way to say the number.
+    /// A journal checkpoint carries this value across a rotation. The
+    /// store validates it against its retained payment terminals before
+    /// it is trusted; this constructor only restores the number.
     #[must_use]
-    pub(crate) const fn credited(credited_cumulative: u64) -> Self {
+    pub const fn from_credited_cumulative(credited_cumulative: u64) -> Self {
         Self {
             credited_cumulative,
         }

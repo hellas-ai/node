@@ -67,11 +67,9 @@ let
     # to empty binaries.
     kernel = mk "check-kernel" "cargo test -p hellas-kernel --all-features" (cargoEnv rustToolchain);
     executor = mk "check-executor" "cargo test -p hellas-executor" (cargoEnv rustToolchain);
-    # The paid-work protocol module is behind `work`, which nothing in the
-    # default graph turns on — so without this line its records, digests,
-    # and vector suite would be neither compiled nor linted here. It is
-    # the one RPC feature that pulls the consensus kernel in, which is
-    # exactly why it is checked rather than assumed.
+    # The paid-work wire records stay behind RPC's `work` feature, while
+    # endpoint workflow and durable recovery live in `hellas-work`.
+    # Neither enters the default graph, so both need an explicit gate.
     #
     # The whole package runs, not one named test file: `work` pulls
     # `evaluate` and therefore `execute`, so this line is also what
@@ -81,7 +79,7 @@ let
     # unnoticed, which is exactly what happened once.
     rpc-work =
       mk "check-rpc-work"
-        "cargo test -p hellas-rpc --features work && cargo clippy -p hellas-rpc --features work --all-targets -- -D warnings"
+        "cargo test -p hellas-rpc --features work && cargo test -p hellas-work && cargo clippy -p hellas-rpc --features work --all-targets -- -D warnings && cargo clippy -p hellas-work --all-targets -- -D warnings"
         (cargoEnv rustToolchain);
     # The client's paid-work half and the oracle inside it. `work` is off
     # by default on `hellas-client`, so `check-clippy` compiles none of
@@ -116,7 +114,7 @@ let
         (cargoEnv rustToolchain);
     # The settlement watcher's block source: the codec above plus the
     # paid endpoint's journal. It is the only dimension that compiles
-    # `hellas-chain` and `hellas-rpc/work` together, so it is the only
+    # `hellas-chain` and `hellas-work` together, so it is the only
     # one that fails when the two disagree about what a finalized block
     # hands a watcher.
     chain-work-watcher =

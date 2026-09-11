@@ -53,16 +53,16 @@ use hellas_rpc::services::fetch::{Fetch, Open as FetchOpen};
 use hellas_rpc::services::node::{Node, NodeServer};
 use hellas_rpc::services::work::{Work, WorkHandler, WorkServer};
 use hellas_rpc::services::work_setup::{WorkSetup, WorkSetupHandler, WorkSetupServer};
-use hellas_rpc::work::{
-    CloseEndpoint, PaidEvaluateBackend, RunError, RunOutcome, WorkService, run_accepted_work,
-};
-use hellas_rpc::work_close::{FinalizedBlocks, TxSink};
-use hellas_rpc::work_handshake::{PaymentAdmission, SetupEndpoint, SetupService};
-use hellas_rpc::work_open::{SetupAdvance, SetupDriveError, SetupProgress, SetupView};
-use hellas_rpc::work_store::{ChannelStore, JobPhase, Role, SetupStore, discover_setups};
 use hellas_rpc::{Assurance, ProducerSigningKey};
 use hellas_wire::iroh::{IrohTransport, IrohTransportError};
 use hellas_wire::{Dispatcher, ServiceMarker, StreamTransport, TransportContext, WireStatus};
+use hellas_work::work::{
+    CloseEndpoint, PaidEvaluateBackend, RunError, RunOutcome, WorkService, run_accepted_work,
+};
+use hellas_work::work_close::{FinalizedBlocks, TxSink};
+use hellas_work::work_handshake::{PaymentAdmission, SetupEndpoint, SetupService};
+use hellas_work::work_open::{SetupAdvance, SetupDriveError, SetupProgress, SetupView};
+use hellas_work::work_store::{ChannelStore, JobPhase, Role, SetupStore, discover_setups};
 use iroh::{Endpoint, EndpointId, SecretKey, endpoint::Connection, endpoint::presets};
 use tokio::sync::{Mutex as AsyncMutex, Semaphore, mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
@@ -762,7 +762,7 @@ where
         };
         // Derive the id from the request while the accepted response
         // is still only a possibility. The response carries only the
-        // provider signature, and consulting `state.job()` after it
+        // provider signature, and consulting `state.jobs().next()` after it
         // leaves would race the clock terminalizing that same job.
         let work_id = self
             .service
@@ -1038,10 +1038,9 @@ impl DrivenChannel {
     fn accepted_work_id(&self) -> anyhow::Result<Option<Digest>> {
         self.service
             .with_state(|state| {
-                state
-                    .job()
-                    .filter(|job| job.phase() == JobPhase::Accepted)
-                    .map(|job| job.work_id())
+                let mut jobs = state.jobs();
+                let job = jobs.next()?;
+                (jobs.next().is_none() && job.phase() == JobPhase::Accepted).then(|| job.work_id())
             })
             .context("the driven channel state is unavailable")
     }

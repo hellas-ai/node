@@ -163,25 +163,13 @@ impl WireAdaptor for OpenAiResponsesAdaptor {
 
         let created = response_event(
             "response.created",
-            response_status_event(
-                state,
-                request,
-                "response.created",
-                "queued",
-                Vec::new(),
-                None,
-            ),
+            response_status_payload(state, request, "queued", Vec::new(), None),
+            state,
         );
         let in_progress = response_event(
             "response.in_progress",
-            response_status_event(
-                state,
-                request,
-                "response.in_progress",
-                "in_progress",
-                Vec::new(),
-                None,
-            ),
+            response_status_payload(state, request, "in_progress", Vec::new(), None),
+            state,
         );
 
         Ok(vec![created, in_progress])
@@ -207,13 +195,12 @@ impl WireAdaptor for OpenAiResponsesAdaptor {
                 events.push(response_event(
                     "response.output_text.delta",
                     json!({
-                        "type": "response.output_text.delta",
-                        "sequence_number": next_sequence(state),
                         "item_id": state.message_id,
                         "output_index": output_index,
                         "content_index": 0,
                         "delta": delta,
                     }),
+                    state,
                 ));
                 Ok(events)
             }
@@ -258,10 +245,9 @@ impl WireAdaptor for OpenAiResponsesAdaptor {
                 events.push(response_event(
                     "response.failed",
                     json!({
-                        "type": "response.failed",
-                        "sequence_number": next_sequence(state),
                         "response": response,
                     }),
+                    state,
                 ));
                 Ok(events)
             }
@@ -286,10 +272,9 @@ impl WireAdaptor for OpenAiResponsesAdaptor {
                 let completed = response_event(
                     terminal_response_event(stop_reason),
                     json!({
-                        "type": terminal_response_event(stop_reason),
-                        "sequence_number": next_sequence(state),
                         "response": response,
                     }),
+                    state,
                 );
                 events.push(completed);
                 Ok(events)
@@ -1078,8 +1063,6 @@ fn render_tool_call_start(
     Ok(vec![response_event(
         "response.output_item.added",
         json!({
-            "type": "response.output_item.added",
-            "sequence_number": next_sequence(state),
             "output_index": output_index,
             "item": {
                 "id": id,
@@ -1090,6 +1073,7 @@ fn render_tool_call_start(
                 "status": "in_progress",
             },
         }),
+        state,
     )])
 }
 
@@ -1105,22 +1089,20 @@ fn ensure_message_item_started(state: &mut ResponsesStreamState) -> Vec<WireStre
         response_event(
             "response.output_item.added",
             json!({
-                "type": "response.output_item.added",
-                "sequence_number": next_sequence(state),
                 "output_index": output_index,
                 "item": item,
             }),
+            state,
         ),
         response_event(
             "response.content_part.added",
             json!({
-                "type": "response.content_part.added",
-                "sequence_number": next_sequence(state),
                 "item_id": state.message_id,
                 "output_index": output_index,
                 "content_index": 0,
                 "part": part,
             }),
+            state,
         ),
     ]
 }
@@ -1134,13 +1116,12 @@ fn render_reasoning_delta(state: &mut ResponsesStreamState, delta: String) -> Ve
     events.push(response_event(
         "response.reasoning_summary_text.delta",
         json!({
-            "type": "response.reasoning_summary_text.delta",
-            "sequence_number": next_sequence(state),
             "item_id": state.reasoning_id,
             "output_index": output_index,
             "summary_index": 0,
             "delta": delta,
         }),
+        state,
     ));
     events
 }
@@ -1155,17 +1136,14 @@ fn ensure_reasoning_item_started(state: &mut ResponsesStreamState) -> Vec<WireSt
         response_event(
             "response.output_item.added",
             json!({
-                "type": "response.output_item.added",
-                "sequence_number": next_sequence(state),
                 "output_index": output_index,
                 "item": reasoning_item_json(&state.reasoning_id, "in_progress", &state.reasoning_text),
             }),
+            state,
         ),
         response_event(
             "response.reasoning_summary_part.added",
             json!({
-                "type": "response.reasoning_summary_part.added",
-                "sequence_number": next_sequence(state),
                 "item_id": state.reasoning_id,
                 "output_index": output_index,
                 "summary_index": 0,
@@ -1174,6 +1152,7 @@ fn ensure_reasoning_item_started(state: &mut ResponsesStreamState) -> Vec<WireSt
                     "text": "",
                 },
             }),
+            state,
         ),
     ]
 }
@@ -1195,19 +1174,16 @@ fn finish_reasoning_item(
         response_event(
             "response.reasoning_summary_text.done",
             json!({
-                "type": "response.reasoning_summary_text.done",
-                "sequence_number": next_sequence(state),
                 "item_id": state.reasoning_id,
                 "output_index": output_index,
                 "summary_index": 0,
                 "text": state.reasoning_text,
             }),
+            state,
         ),
         response_event(
             "response.reasoning_summary_part.done",
             json!({
-                "type": "response.reasoning_summary_part.done",
-                "sequence_number": next_sequence(state),
                 "item_id": state.reasoning_id,
                 "output_index": output_index,
                 "summary_index": 0,
@@ -1216,15 +1192,15 @@ fn finish_reasoning_item(
                     "text": state.reasoning_text,
                 },
             }),
+            state,
         ),
         response_event(
             "response.output_item.done",
             json!({
-                "type": "response.output_item.done",
-                "sequence_number": next_sequence(state),
                 "output_index": output_index,
                 "item": reasoning_item_json(&state.reasoning_id, item_status, &state.reasoning_text),
             }),
+            state,
         ),
     ]
 }
@@ -1242,33 +1218,30 @@ fn finish_message_item(
         response_event(
             "response.output_text.done",
             json!({
-                "type": "response.output_text.done",
-                "sequence_number": next_sequence(state),
                 "item_id": state.message_id,
                 "output_index": output_index,
                 "content_index": 0,
                 "text": state.text,
             }),
+            state,
         ),
         response_event(
             "response.content_part.done",
             json!({
-                "type": "response.content_part.done",
-                "sequence_number": next_sequence(state),
                 "item_id": state.message_id,
                 "output_index": output_index,
                 "content_index": 0,
                 "part": completed_text,
             }),
+            state,
         ),
         response_event(
             "response.output_item.done",
             json!({
-                "type": "response.output_item.done",
-                "sequence_number": next_sequence(state),
                 "output_index": output_index,
                 "item": item,
             }),
+            state,
         ),
     ]
 }
@@ -1314,12 +1287,11 @@ fn render_tool_call_arguments_delta(
     Ok(vec![response_event(
         "response.function_call_arguments.delta",
         json!({
-            "type": "response.function_call_arguments.delta",
-            "sequence_number": next_sequence(state),
             "item_id": id,
             "output_index": output_index,
             "delta": delta,
         }),
+        state,
     )])
 }
 
@@ -1343,21 +1315,19 @@ fn render_tool_call_end(
         response_event(
             "response.function_call_arguments.done",
             json!({
-                "type": "response.function_call_arguments.done",
-                "sequence_number": next_sequence(state),
                 "item_id": id,
                 "output_index": output_index,
                 "arguments": arguments,
             }),
+            state,
         ),
         response_event(
             "response.output_item.done",
             json!({
-                "type": "response.output_item.done",
-                "sequence_number": next_sequence(state),
                 "output_index": output_index,
                 "item": item,
             }),
+            state,
         ),
     ])
 }
@@ -1400,28 +1370,24 @@ fn render_structured_delta(
     events.push(response_event(
         "response.output_text.delta",
         json!({
-            "type": "response.output_text.delta",
-            "sequence_number": next_sequence(state),
             "item_id": state.message_id,
             "output_index": output_index,
             "content_index": 0,
             "delta": rendered,
         }),
+        state,
     ));
     Ok(events)
 }
 
-fn response_status_event(
-    state: &mut ResponsesStreamState,
+fn response_status_payload(
+    state: &ResponsesStreamState,
     request: &ParsedResponseRequest,
-    event_type: &str,
     status: &str,
     output: Vec<JsonValue>,
     usage: Option<Usage>,
 ) -> JsonValue {
     json!({
-        "type": event_type,
-        "sequence_number": next_sequence(state),
         "response": response_json(ResponseJsonParts {
             response_id: &state.response_id,
             created_at: state.created_at,
@@ -1552,14 +1518,15 @@ fn usage_json(usage: Usage) -> JsonValue {
     })
 }
 
-fn response_event(name: &str, data: JsonValue) -> WireStreamEvent {
-    WireStreamEvent::json(Some(name.to_string()), data)
-}
-
-fn next_sequence(state: &mut ResponsesStreamState) -> u64 {
-    let current = state.sequence_number;
+fn response_event(
+    name: &str,
+    mut data: JsonValue,
+    state: &mut ResponsesStreamState,
+) -> WireStreamEvent {
+    data["type"] = json!(name);
+    data["sequence_number"] = json!(state.sequence_number);
     state.sequence_number = state.sequence_number.saturating_add(1);
-    current
+    WireStreamEvent::json(Some(name.to_string()), data)
 }
 
 fn next_output_index(state: &mut ResponsesStreamState) -> usize {
@@ -1586,6 +1553,22 @@ mod tests {
 
     fn raw(value: JsonValue) -> RawRequest {
         RawRequest::from_value(value).unwrap()
+    }
+
+    fn event_names(events: &[WireStreamEvent]) -> Vec<&str> {
+        events
+            .iter()
+            .enumerate()
+            .map(|(sequence, event)| {
+                let name = event.name.as_deref().expect("named SSE event");
+                let WireEventData::Json(data) = &event.data else {
+                    panic!("expected JSON event");
+                };
+                assert_eq!(data["type"], name);
+                assert_eq!(data["sequence_number"], sequence as u64);
+                name
+            })
+            .collect()
     }
 
     fn sample_request() -> ParsedResponseRequest {
@@ -2099,10 +2082,7 @@ mod tests {
                 .unwrap(),
         );
 
-        let names = events
-            .iter()
-            .map(|event| event.name.as_deref().unwrap_or(""))
-            .collect::<Vec<_>>();
+        let names = event_names(&events);
         assert_eq!(
             names,
             vec![
@@ -2161,10 +2141,7 @@ mod tests {
                 .unwrap(),
         );
 
-        let names = events
-            .iter()
-            .map(|event| event.name.as_deref().unwrap_or(""))
-            .collect::<Vec<_>>();
+        let names = event_names(&events);
         assert_eq!(names.last().copied(), Some("response.incomplete"));
         let incomplete = match &events.last().unwrap().data {
             WireEventData::Json(value) => value,
@@ -2257,10 +2234,7 @@ mod tests {
                 .unwrap(),
         );
 
-        let names = events
-            .iter()
-            .map(|event| event.name.as_deref().unwrap_or(""))
-            .collect::<Vec<_>>();
+        let names = event_names(&events);
         assert_eq!(
             names,
             vec![
@@ -2354,10 +2328,7 @@ mod tests {
                 .unwrap(),
         );
 
-        let names = events
-            .iter()
-            .map(|event| event.name.as_deref().unwrap_or(""))
-            .collect::<Vec<_>>();
+        let names = event_names(&events);
         assert_eq!(
             names,
             vec![

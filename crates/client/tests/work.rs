@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::Bytes;
-use hellas_client::work::payment::{pay_for_checked_result, pay_for_result};
+use hellas_client::work::payment::pay_for_result;
 use hellas_client::work::reproduce::{ReproduceFault, Reproduced, Reproducer};
 use hellas_client::work::{
     CheckedResult, CollectError, CollectOutcome, CollectResultError, CollectResultOutcome,
@@ -46,20 +46,20 @@ use hellas_rpc::protocol::work_setup::{
     ObservedChannel, ReadyChannel, WorkChannelConfig, WorkChannelDescriptor, payment_terms_hash,
 };
 use hellas_rpc::services::work::WorkServer;
-use hellas_rpc::work::{
-    BackendFault, ClientEndpoint, PaidEvaluateBackend, PreparedEvaluateInput, ProviderEndpoint,
-    RunOutcome, WorkService, run_accepted_work,
-};
-use hellas_rpc::work_close::{BlockSourceError, FinalizedBlocks, FinalizedWork, observe};
-use hellas_rpc::work_store::{
-    ChannelRecord, ChannelStore, JobPhase, JobState, Role, SetupOrigin, TerminalOutcome,
-};
 use hellas_rpc::{
     Application, Assurance, CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR, ContentId, EvaluateRequest,
     OutputEventEnvelope, ProducerSigningKey, ProgramManifest, PublicKey,
 };
 use hellas_wire::mux::{MessagePipe, MuxConfig, MuxTransport, Role as MuxRole};
 use hellas_wire::{DefaultClock, Dispatcher, StreamTransport};
+use hellas_work::work::{
+    BackendFault, ClientEndpoint, PaidEvaluateBackend, PreparedEvaluateInput, ProviderEndpoint,
+    RunOutcome, WorkService, run_accepted_work,
+};
+use hellas_work::work_close::{BlockSourceError, FinalizedBlocks, FinalizedWork, observe};
+use hellas_work::work_store::{
+    ChannelRecord, ChannelStore, JobPhase, JobState, Role, SetupOrigin, TerminalOutcome,
+};
 use tokio::sync::mpsc;
 
 // ── Fixture ───────────────────────────────────────────────────────────
@@ -716,7 +716,7 @@ async fn a_checked_answer_is_the_only_thing_that_reaches_the_matched_phase() {
         "unexpected outcome: {waiting:?}",
     );
     assert_eq!(
-        endpoint.state().job().map(JobState::phase),
+        endpoint.state().jobs().next().map(JobState::phase),
         Some(JobPhase::Accepted),
     );
 
@@ -733,7 +733,7 @@ async fn a_checked_answer_is_the_only_thing_that_reaches_the_matched_phase() {
     assert_eq!(result.work_id, id);
     assert!(!transcript.is_empty());
     assert_eq!(
-        endpoint.state().job().map(JobState::phase),
+        endpoint.state().jobs().next().map(JobState::phase),
         Some(JobPhase::Matched),
     );
 
@@ -752,7 +752,7 @@ async fn a_checked_answer_is_the_only_thing_that_reaches_the_matched_phase() {
     {
         assert_eq!(
             service
-                .with_state(|state| state.job().map(JobState::phase))
+                .with_state(|state| state.jobs().next().map(JobState::phase))
                 .expect("the endpoint is reachable"),
             Some(JobPhase::Delivered),
             "the provider delivered the plaintext once",
@@ -764,7 +764,7 @@ async fn a_checked_answer_is_the_only_thing_that_reaches_the_matched_phase() {
     drop(endpoint);
     drop(service);
     let recovered = store_at(client_root.path(), &ready, Role::Client, CURSOR);
-    let Some(job) = recovered.state().job() else {
+    let Some(job) = recovered.state().jobs().next() else {
         panic!("the job is still open");
     };
     assert_eq!(job.phase(), JobPhase::Matched);
@@ -812,7 +812,7 @@ async fn a_checked_answer_becomes_a_payment_the_provider_admitted() {
 
     let (transport, server) = transport_pair();
     let serving = serve(server, service.clone());
-    let credited = pay_for_checked_result(transport, &mut endpoint, id).await;
+    let credited = pay_for_result(transport, &mut endpoint, id).await;
     serving.abort();
     let Ok(credited) = credited else {
         panic!("the checked answer is paid for: {credited:?}");
@@ -827,14 +827,17 @@ async fn a_checked_answer_becomes_a_payment_the_provider_admitted() {
             .expect("the endpoint is reachable");
         assert_eq!(state.ledger().credited_cumulative(), PRICE);
         assert_eq!(state.max_executable_certificate(), PRICE);
-        assert!(state.job().is_none(), "the job is closed by its payment");
+        assert!(
+            state.jobs().next().is_none(),
+            "the job is closed by its payment"
+        );
     }
 
     drop(endpoint);
     drop(service);
     let recovered = store_at(client_root.path(), &ready, Role::Client, CURSOR);
     let state = recovered.state();
-    assert!(state.job().is_none());
+    assert!(state.jobs().next().is_none());
     assert_eq!(state.ledger().credited_cumulative(), PRICE);
     let Some(payment) = state.last_payment() else {
         panic!("the payment is on the disk");
@@ -873,7 +876,7 @@ async fn an_authenticated_answer_is_paid_without_reexecution() {
         "the authenticated answer is collected: {collected:?}",
     );
     assert_eq!(
-        endpoint.state().job().map(JobState::phase),
+        endpoint.state().jobs().next().map(JobState::phase),
         Some(JobPhase::Ready),
         "ordinary collection does not claim an independent match",
     );
@@ -988,7 +991,7 @@ async fn a_payment_signed_before_a_crash_is_re_sent_after_it() {
     };
     let (transport, server) = transport_pair();
     let serving = serve(server, service.clone());
-    let credited = pay_for_checked_result(transport, &mut endpoint, id).await;
+    let credited = pay_for_result(transport, &mut endpoint, id).await;
     serving.abort();
     assert_eq!(credited.ok(), Some(PRICE));
     assert_eq!(
@@ -1053,14 +1056,15 @@ async fn a_refuted_answer_closes_the_job_and_is_not_paid_for() {
     // The refutation is durable and permanent: the one job rests at a
     // refuted terminal, so it is closed rather than merely unpaid.
     assert!(
-        endpoint.state().job().is_none(),
+        endpoint.state().jobs().next().is_none(),
         "the refuted job is closed"
     );
     assert!(
         matches!(
             endpoint
                 .state()
-                .terminal()
+                .terminals()
+                .next()
                 .map(|terminal| &terminal.outcome),
             Some(TerminalOutcome::Refuted { .. })
         ),
@@ -1069,7 +1073,7 @@ async fn a_refuted_answer_closes_the_job_and_is_not_paid_for() {
 
     let (transport, server) = transport_pair();
     let serving = serve(server, service.clone());
-    let paid = pay_for_checked_result(transport, &mut endpoint, id).await;
+    let paid = pay_for_result(transport, &mut endpoint, id).await;
     serving.abort();
     assert!(paid.is_err(), "a refuted answer is not paid for: {paid:?}");
     assert!(
@@ -1133,7 +1137,7 @@ async fn a_refutation_is_permanent_across_a_restart() {
         "unexpected outcome: {refused:?}",
     );
     assert!(
-        endpoint.state().job().is_none(),
+        endpoint.state().jobs().next().is_none(),
         "the refuted job is closed"
     );
     drop(endpoint);
@@ -1145,14 +1149,15 @@ async fn a_refutation_is_permanent_across_a_restart() {
         matches!(
             recovered
                 .state()
-                .terminal()
+                .terminals()
+                .next()
                 .map(|terminal| &terminal.outcome),
             Some(TerminalOutcome::Refuted { .. })
         ),
         "a restart keeps the refutation",
     );
     assert!(
-        recovered.state().job().is_none(),
+        recovered.state().jobs().next().is_none(),
         "and does not reopen the job",
     );
 
@@ -1220,7 +1225,7 @@ async fn an_engine_that_cannot_run_records_no_verdict() {
     };
     assert!(reason.contains("the weights did not load"), "{reason}");
     assert_eq!(
-        endpoint.state().job().map(JobState::phase),
+        endpoint.state().jobs().next().map(JobState::phase),
         Some(JobPhase::Ready),
         "a check that did not happen is not a check that passed",
     );
@@ -1288,7 +1293,7 @@ async fn a_stalled_reproduction_refuses_to_pay_at_the_barrier() {
     // client's own journal is past the height to sign it by.
     let (transport, server) = transport_pair();
     let serving = serve(server, service.clone());
-    let paid = pay_for_checked_result(transport, &mut endpoint, id).await;
+    let paid = pay_for_result(transport, &mut endpoint, id).await;
     serving.abort();
     assert!(
         paid.is_err(),

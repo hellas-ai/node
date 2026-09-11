@@ -6,16 +6,14 @@
 //! calls, so "invoked once" is an assertion about a number rather than
 //! about a comment.
 
-#![cfg(feature = "work")]
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use hellas_kernel::{
     BlockHeight, Decode as _, Edge, EdgeId, EdgeValues, Fees, Key, LeaseSlots, List,
-    MAX_EDGE_OUTPUTS, NetworkId, Parties, Payout, PendingSlot, RegistryChunk, RegistryNamespace,
-    RegistryRecordTag, Secp256k1Signer, Secp256k1Verifier, SigVerifier as _, Terms, TermsHash,
-    WorkPaymentSettlement, WorkPaymentTerms, WorkStakeBondTerms, work_payment_settlement,
+    MAX_EDGE_OUTPUTS, Parties, Payout, PendingSlot, Secp256k1Verifier, SigVerifier as _, Terms,
+    TermsHash, WorkPaymentSettlement, WorkPaymentTerms, WorkStakeBondTerms,
+    work_payment_settlement,
 };
 use hellas_rpc::evaluate::{
     EvaluateOutputTranscriptBuilder, EvaluateStopReason, EvaluateTerminal, EvaluateUsage,
@@ -36,19 +34,21 @@ use hellas_rpc::protocol::work_setup::{
     ObservedChannel, ReadyChannel, WorkChannelConfig, WorkChannelDescriptor, WorkSetupError,
     payment_terms_hash,
 };
-use hellas_rpc::work::{
-    BackendFault, PaidEvaluateBackend, PreparedEvaluateInput, ProviderEndpoint, RunAdmission,
-    RunError, RunOutcome, WorkService, run_accepted_work,
-};
-use hellas_rpc::work_close::{FinalizedWork, observe};
-use hellas_rpc::work_store::{
-    ChannelRecord, ChannelStateError, ChannelStore, JobPhase, JobState, Role, SetupOrigin,
-    TerminalOutcome, WorkStoreError,
-};
 use hellas_rpc::{
     Application, Assurance, CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR, ContentId, EvaluateRequest,
     OutputEventEnvelope, ProducerSigningKey, ProgramManifest, PublicKey,
 };
+use hellas_work::work::{
+    BackendFault, PaidEvaluateBackend, PreparedEvaluateInput, ProviderEndpoint, RunAdmission,
+    RunError, RunOutcome, WorkService, run_accepted_work,
+};
+use hellas_work::work_store::{
+    ChannelRecord, ChannelStateError, ChannelStore, JobPhase, JobState, Role, SetupOrigin,
+    TerminalOutcome, WorkStoreError,
+};
+
+mod support;
+use support::{advance, bond_edge, client, network, payload_at, payment_edge, provider, temp};
 
 // ── Fixture ───────────────────────────────────────────────────────────
 
@@ -83,28 +83,6 @@ const fn deadlines() -> JobDeadlines {
 /// terminal deadline.
 const LAST_DISPATCH: u64 = deadlines().terminal - 6;
 
-fn network() -> NetworkId {
-    let Some(network) = NetworkId::new("hellas-test") else {
-        panic!("a short ascii id is a legal network id");
-    };
-    network
-}
-
-fn client() -> Secp256k1Signer {
-    signer(0x21)
-}
-
-fn provider() -> Secp256k1Signer {
-    signer(0x22)
-}
-
-fn signer(byte: u8) -> Secp256k1Signer {
-    let Ok(signer) = Secp256k1Signer::from_secret_scalar([byte; 32]) else {
-        panic!("a fixed scalar is a key");
-    };
-    signer
-}
-
 fn producer(byte: u8) -> ProducerSigningKey {
     let Ok(key) = ProducerSigningKey::from_secret_bytes([byte; 32]) else {
         panic!("a fixed scalar is a producer key");
@@ -116,14 +94,6 @@ fn producer(byte: u8) -> ProducerSigningKey {
 /// party key is.
 fn provider_producer() -> ProducerSigningKey {
     producer(0x22)
-}
-
-fn bond_edge() -> EdgeId {
-    EdgeId::from_bytes([0x11; EdgeId::LENGTH])
-}
-
-fn payment_edge() -> EdgeId {
-    EdgeId::from_bytes([0x22; EdgeId::LENGTH])
 }
 
 fn channel_policy() -> PaidChannelPolicyV1 {
@@ -245,13 +215,6 @@ fn settlement() -> WorkPaymentSettlement {
     settlement
 }
 
-fn temp() -> tempfile::TempDir {
-    match tempfile::tempdir() {
-        Ok(dir) => dir,
-        Err(error) => panic!("a temporary directory: {error}"),
-    }
-}
-
 fn store_at(root: &std::path::Path, height: u64) -> ChannelStore {
     let mut store = match ChannelStore::open(
         root,
@@ -268,22 +231,7 @@ fn store_at(root: &std::path::Path, height: u64) -> ChannelStore {
     store
 }
 
-/// The payload digest of the synthetic block at `height`.
-///
-/// A cursor is contiguous, so a fixture that moves it has to name a
-/// chain rather than repeat one digest: each block's parent is the last
-/// block's payload, and the watcher refuses anything else.
-fn payload_at(height: u64) -> [u8; 32] {
-    let mut payload = [0xc0; 32];
-    for (slot, byte) in payload.iter_mut().zip(height.to_be_bytes()) {
-        *slot = byte;
-    }
-    payload
-}
-
-/// Where the fixture channel was opened: the genesis block of the
-/// synthetic chain above, so a store starts with a clock and `advance`
-/// reads block one next.
+/// The fixture channel starts at the synthetic chain genesis.
 fn origin() -> SetupOrigin {
     SetupOrigin {
         payment_edge: payment_edge(),
@@ -298,22 +246,6 @@ fn origin() -> SetupOrigin {
 ///
 /// The same call the settlement loop makes, so a fixture cursor is a
 /// cursor this endpoint could have reached.
-fn advance(store: &mut ChannelStore, height: u64) {
-    let mut next = store.state().cursor().0.saturating_add(1);
-    while next <= height {
-        let block = FinalizedWork {
-            height: next,
-            parent: payload_at(next.saturating_sub(1)),
-            payload: payload_at(next),
-            txs: Vec::new(),
-        };
-        if let Err(error) = observe(store, &block, &Secp256k1Verifier::new()) {
-            panic!("the fixture block applies: {error}");
-        }
-        next = next.saturating_add(1);
-    }
-}
-
 fn commit(store: &mut ChannelStore, record: ChannelRecord) {
     if let Err(error) = store.commit(record, &Secp256k1Verifier::new()) {
         panic!("the fixture record commits: {error}");
@@ -547,7 +479,7 @@ impl PaidEvaluateBackend for CountingBackend {
 // ── Reading answers ───────────────────────────────────────────────────
 
 fn phase_of(service: &WorkService) -> Option<JobPhase> {
-    match service.with_state(|state| state.job().map(JobState::phase)) {
+    match service.with_state(|state| state.jobs().next().map(JobState::phase)) {
         Ok(phase) => phase,
         Err(error) => panic!("the endpoint is reachable: {error}"),
     }
@@ -800,7 +732,7 @@ async fn a_result_is_on_the_disk_before_its_signature_is_returned() {
     drop(service);
 
     let recovered = store_at(dir.path(), CURSOR);
-    let Some(job) = recovered.state().job() else {
+    let Some(job) = recovered.state().jobs().next() else {
         panic!("the job is still open");
     };
     assert_eq!(job.phase(), JobPhase::Ready);
@@ -1082,9 +1014,9 @@ async fn a_backend_fault_is_not_the_clients_debt() {
     let (open_job, failed) = service
         .with_state(|state| {
             (
-                state.job().is_some(),
+                state.jobs().next().is_some(),
                 matches!(
-                    state.terminal().map(|terminal| &terminal.outcome),
+                    state.terminals().next().map(|terminal| &terminal.outcome),
                     Some(TerminalOutcome::Failed { .. })
                 ),
             )
@@ -1116,7 +1048,7 @@ async fn a_backend_that_answers_the_wrong_question_signs_nothing() {
 
         assert!(
             service
-                .with_state(|state| state.job().is_none())
+                .with_state(|state| state.jobs().next().is_none())
                 .expect("the endpoint is reachable"),
             "the job was ended",
         );
@@ -1124,7 +1056,7 @@ async fn a_backend_that_answers_the_wrong_question_signs_nothing() {
         // Nothing was signed: reopening finds no result on the disk.
         drop(service);
         let recovered = store_at(dir.path(), CURSOR);
-        assert!(recovered.state().job().is_none());
+        assert!(recovered.state().jobs().next().is_none());
     }
 }
 
@@ -1189,6 +1121,18 @@ impl EdgeBytes {
     }
 }
 
+fn lease_over(bond: EdgeId, payment: EdgeId) -> LeaseSlots {
+    support::lease_over(
+        bond,
+        payment,
+        payment_terms_hash(payment_terms()).as_bytes(),
+        &payment_terms().private_policy_commitment,
+        HORIZON,
+        FORMAT_VERSION,
+        TAG_BOND_LEASE,
+    )
+}
+
 fn bond_object() -> Edge {
     EdgeBytes {
         value: STAKE,
@@ -1211,28 +1155,4 @@ fn payment_object() -> Edge {
         allowed: WORK_PAYMENT_CLOSES,
     }
     .build()
-}
-
-fn lease_over(bond: EdgeId, payment: EdgeId) -> LeaseSlots {
-    let mut value = vec![FORMAT_VERSION, TAG_BOND_LEASE, 2];
-    value.extend_from_slice(&bond.to_bytes());
-    value.extend_from_slice(&payment.to_bytes());
-    value.extend_from_slice(payment_terms_hash(payment_terms()).as_bytes());
-    value.extend_from_slice(&payment_terms().private_policy_commitment);
-    value.extend_from_slice(&HORIZON.to_be_bytes());
-
-    let slots = [0, 1].map(|index| {
-        RegistryChunk::split(
-            RegistryNamespace::BondLease,
-            RegistryRecordTag::BondLease,
-            &value,
-            index,
-        )
-    });
-    let parsed = hellas_kernel::parse_bond_lease(slots, bond);
-    assert!(
-        matches!(parsed, LeaseSlots::Present(_)),
-        "the hand-written lease is readable, got {parsed:?}",
-    );
-    parsed
 }

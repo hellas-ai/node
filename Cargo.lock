@@ -580,6 +580,7 @@ dependencies = [
 [[package]]
 name = "catena-lang"
 version = "0.1.0"
+source = "git+https://github.com/hellas-ai/catena-lang?rev=be373057d9e974c1cae0c5b8cc93238ae79104ef#be373057d9e974c1cae0c5b8cc93238ae79104ef"
 dependencies = [
  "anyhow",
  "clap",
@@ -2551,6 +2552,7 @@ dependencies = [
  "hellas-kernel",
  "hellas-rpc",
  "hellas-wire",
+ "hellas-work",
  "hex",
  "opentelemetry 0.31.0",
  "opentelemetry-otlp 0.31.1",
@@ -2599,6 +2601,7 @@ dependencies = [
  "hellas-rpc",
  "hellas-store",
  "hellas-wire",
+ "hellas-work",
  "hellas-xet",
  "hex",
  "iroh",
@@ -2639,6 +2642,7 @@ dependencies = [
  "hellas-kernel",
  "hellas-rpc",
  "hellas-wire",
+ "hellas-work",
  "hex",
  "iroh",
  "iroh-mdns-address-lookup",
@@ -2667,6 +2671,7 @@ dependencies = [
  "hellas-rpc",
  "hellas-store",
  "hellas-wire",
+ "hellas-work",
  "libc",
  "prometheus-client",
  "rand 0.10.2",
@@ -2858,6 +2863,22 @@ dependencies = [
  "wasm-bindgen-futures",
  "web-time",
  "ws_stream_wasm",
+]
+
+[[package]]
+name = "hellas-work"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "hellas-kernel",
+ "hellas-rpc",
+ "hellas-wire",
+ "hellas-xet",
+ "prost",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

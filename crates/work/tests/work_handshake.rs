@@ -11,8 +11,6 @@
 //! Each mutation test states what it breaks. A rule with no test that
 //! fails when the rule is deleted is not a rule.
 
-#![cfg(feature = "work")]
-
 use bytes::Bytes;
 use hellas_kernel::{
     BlockHeight, CoinId, EdgeId, EdgeValues, Fees, Funding, List, MAX_EDGE_OUTPUTS,
@@ -30,13 +28,13 @@ use hellas_rpc::protocol::work_bundle::WorkChannelSetupBundleV1;
 use hellas_rpc::protocol::work_setup::ProviderChannelPolicy;
 use hellas_rpc::protocol::{ContentId, Digest};
 use hellas_rpc::services::work_setup::{WorkSetup, WorkSetupClientImpl, WorkSetupServer};
-use hellas_rpc::work_handshake::{
+use hellas_wire::mux::{MessagePipe, MuxConfig, MuxTransport, Role as MuxRole};
+use hellas_wire::{DefaultClock, Dispatcher, ServiceMarker, StreamTransport};
+use hellas_work::work_handshake::{
     PaymentAdmission, SetupEndpoint, SetupExchangeError, SetupService, apply_setup_exchange,
     prepare_setup_exchange, send_setup_exchange,
 };
-use hellas_rpc::work_store::{Role, SetupScan, SetupStore};
-use hellas_wire::mux::{MessagePipe, MuxConfig, MuxTransport, Role as MuxRole};
-use hellas_wire::{DefaultClock, Dispatcher, ServiceMarker, StreamTransport};
+use hellas_work::work_store::{Role, SetupScan, SetupStore};
 use prost::Message as _;
 use tokio::sync::mpsc;
 
@@ -526,7 +524,7 @@ async fn a_provider_does_not_countersign_terms_its_own_policy_refuses() {
             Err(SetupExchangeError::Refused { refusal, reason }) => {
                 assert_eq!(
                     refusal,
-                    hellas_rpc::work::WorkRefusal::Declined,
+                    hellas_work::work::WorkRefusal::Declined,
                     "{what}: refused as {refusal} — {reason}",
                 );
             }
@@ -591,7 +589,7 @@ async fn a_proposing_endpoint_declines_to_countersign_admissible_terms() {
     }
     match exchange_setup(dialer, &mut caller).await {
         Err(SetupExchangeError::Refused { refusal, .. }) => {
-            assert_eq!(refusal, hellas_rpc::work::WorkRefusal::Declined);
+            assert_eq!(refusal, hellas_work::work::WorkRefusal::Declined);
         }
         other => panic!("a proposing endpoint countersigned: {other:?}"),
     }

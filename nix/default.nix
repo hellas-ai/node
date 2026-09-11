@@ -3,7 +3,6 @@
   system,
   nixpkgs,
   rust-overlay,
-  catena-lang,
 }:
 let
   nativePkg = import ./package.nix {
@@ -12,7 +11,6 @@ let
       system
       nixpkgs
       rust-overlay
-      catena-lang
       ;
   };
   inherit (nativePkg)
@@ -90,7 +88,7 @@ let
     multiple-versions = "allow"
 
     [sources]
-    allow-git = ["https://github.com/commonwarexyz/monorepo"]
+    allow-git = ["https://github.com/commonwarexyz/monorepo", "https://github.com/hellas-ai/catena-lang"]
   '';
   denyCommand = "cargo deny check --config ${denyConfig}";
 
@@ -174,7 +172,6 @@ let
           system
           nixpkgs
           rust-overlay
-          catena-lang
           crossSystem
           ;
       };

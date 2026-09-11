@@ -112,7 +112,7 @@ pub(crate) enum ExecutorOwedRequest {
     /// decided this invocation was owed and made that decision durable before
     /// this message was sent.
     RunPaidEvaluate {
-        input: Box<hellas_rpc::work::PreparedEvaluateInput>,
+        input: Box<hellas_work::work::PreparedEvaluateInput>,
         reply: oneshot::Sender<Result<ExecuteOutcome, ExecutorError>>,
     },
     #[cfg(all(test, feature = "evaluate"))]

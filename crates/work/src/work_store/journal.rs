@@ -1,116 +1,7 @@
-//! The one durable thing under a paid endpoint: an append-only file
-//! that is fsynced before the bytes it records are released.
+//! Append-only, fsynced journal with exclusive ownership and crash recovery.
 //!
-//! # What a journal is for
-//!
-//! Every rule in this module family is a rule about *order*. A
-//! signature exported before the state that authorises it is durable is
-//! a signature the endpoint cannot account for after a crash: the peer
-//! holds it, and the endpoint has never heard of it. So the only thing
-//! this file offers is "these bytes are on the disk, and they were
-//! there before you were told so" — [`Journal::append`] returns after
-//! `fsync`, and callers release nothing before it returns.
-//!
-//! # Crash story
-//!
-//! Before an append: `n` frames on disk. After it: `n + 1`. Interrupt
-//! it and the caller was never told it succeeded, so recovery's job is
-//! to get back to `n`.
-//!
-//! What the interruption leaves depends on what died. A dead *process*
-//! leaves a short prefix of the frame: the kernel either took the whole
-//! `write_all` or took a prefix of it. A dead *machine* is not so
-//! orderly. The frame is not on the disk until `sync_all` returns, and
-//! until then it is pages in a cache that reach the platter in whatever
-//! order they like — while the file's length may already have grown.
-//!
-//! So the rule is about *extent*, and only about extent. A frame whose
-//! bytes are not all in the file is an append the file ends inside:
-//! nothing was written after it, its writer was never given an `Ok`,
-//! and recovery truncates it. A frame whose bytes are all there and
-//! whose digest does not verify is a different thing — it is
-//! indistinguishable from a record this endpoint was told it had
-//! written and may already have acted on. Recovery refuses the file
-//! rather than reconstructing a state behind one: it is
-//! [`JournalError::Corrupt`], deliberately terminal, wherever in the
-//! file it is.
-//!
-//! That is the fail-closed half of the trade, and it is chosen over the
-//! other one. Truncating a complete-length frame silently drops a
-//! record whose signature may already be in a peer's hands, and the
-//! endpoint would then contradict what it has promised — which is the
-//! one failure this whole module family exists to stop. A channel that
-//! will not open is loud and an operator can act on it; an endpoint
-//! quietly behind its own signature is neither.
-//!
-//! # A failed append is terminal for the writer
-//!
-//! [`Journal::append`] either returns after `fsync` or poisons the
-//! journal. A write or a sync that fails leaves the file in a state
-//! this process cannot describe: a prefix may be on the platter, the
-//! length may have grown, and the sequence this frame would occupy may
-//! or may not be free. So no further append is admitted through that
-//! handle — [`JournalError::Poisoned`] — and the only way on is to
-//! reopen, which is the one path that reads the file and finds out what
-//! is actually there.
-//!
-//! # What it is not
-//!
-//! It is not a defence against an adversary with write access to the
-//! file. The frame digests bind position and header, so a frame cannot
-//! be moved, duplicated, reordered, or lifted from another channel's
-//! journal — but anyone who can write the file can also write a whole
-//! consistent journal, and this module makes no claim otherwise. Its
-//! threat is a crash, not a forger.
-//!
-//! It is not a filesystem. Recovery finds the frames by following the
-//! length fields, so a length that is not a length says the file ends
-//! inside that frame, and nothing after it can be found to say
-//! otherwise. Such a frame is truncated as the tear it almost always
-//! is — and if it were instead damage in the middle of the file, the
-//! records after it go with it. That is the one place this module can
-//! lose a write it acknowledged, and it is named rather than papered
-//! over.
-//!
-//! It is not a database. There is one writer, holding an exclusive
-//! `flock` taken before anything is replayed, and a second process
-//! fails to open rather than waiting for the first.
-//!
-//! # Rotation, and why a duty is not bounded by a file
-//!
-//! A close duty lives as long as the edges that fund it, and consensus
-//! does not bound that. A file does. So a journal is not one file: it is
-//! a numbered sequence of them under one stem, and the whole of what one
-//! generation owes its successor is a [`Replay::checkpoint`] — the
-//! canonical encoding of the exact state a full replay would have
-//! reached, written as the successor's first frame. Replay after a valid
-//! successor never reads a predecessor's frame, which is why nothing
-//! upstream has to acknowledge anything before a rotation can happen.
-//!
-//! The install order is the whole of the crash story, and it is the one
-//! thing here that is silent when it is wrong:
-//!
-//! 1. write the checkpoint as the first frame of the successor's
-//!    *candidate* file, and `fsync` the file;
-//! 2. rename the candidate to the successor's final name, and `fsync`
-//!    the directory;
-//! 3. only then unlink the predecessor, and `fsync` the directory again.
-//!
-//! Interrupt it anywhere and what is on the disk is still a journal.
-//! Before the rename there is a predecessor and an uninstalled
-//! candidate, and recovery ignores a candidate entirely — it is a file
-//! nobody was ever told about. After the rename there is a predecessor
-//! and a complete successor, and recovery takes the newest complete
-//! successor and finishes the retirement the crash interrupted. After
-//! the unlink there is only the successor. All four leave the same
-//! state, because the successor's first frame *is* that state.
-//!
-//! [`Journal::at_soft_limit`] is where a caller is told to rotate:
-//! [`MAX_ACTIVE_FRAMES`] and [`MAX_ACTIVE_JOURNAL_BYTES`] less the duty
-//! reserve. The reserve above it is not spare room for more work — it is
-//! what an already-exported duty finishes into when rotation cannot
-//! complete, which is why the two are separate numbers and why the
-//! caller, not this file, decides which of its records is which.
+//! A torn final frame is truncated; a complete corrupt frame fails closed.
+//! Rotation installs a checkpointed successor before retiring its predecessor.
 
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{Read as _, Write as _};
@@ -118,37 +9,16 @@ use std::path::{Path, PathBuf};
 
 use hellas_xet::XetFileHasher;
 
-use crate::observe::{LEVEL, TARGET, Timing};
-use crate::protocol::Digest;
+use hellas_rpc::observe::{LEVEL, TARGET, Timing};
+use hellas_rpc::protocol::Digest;
 
 use super::hex;
 
 /// First bytes of every journal file.
 const MAGIC: &[u8] = b"hellas.work-journal.v1";
-/// Envelope version of the header and framing below.
-///
-/// Old versions are intentionally refused; each retirement is a
-/// pre-deployment reset, not a migratable format change. Version 1
-/// journals predate `ScanArmed` and `ArmedBundle`, so replay cannot
-/// prove that every authorization which escaped still has a recoverable
-/// observation floor and close descriptor. Version 2 journals predate
-/// the one-job terminal: channel tags 7–11 meant admitted-payment,
-/// ending, and three close records, and this binary reads those same
-/// bytes as the terminal and shifted close records — so a v2 file under
-/// the current header would mis-replay rather than fail. Version 3 is a
-/// different reason: its tags did not move, they ran out. It has no
-/// twelfth tag, so an answer to a contest is a thing that journal cannot
-/// say, and a channel whose answer was fixed replays as one that never
-/// fixed it — free to fix a different one. Version 4 is the last one
-/// without a generation: its header cannot say which file of a rotated
-/// sequence it is, so a predecessor's frames verify at the same
-/// sequences in its successor and a stale generation opens as the live
-/// one. The reset is pre-deployment, like the three before it: no
-/// journal written by a deployed node is being retired here. Version 5
-/// stores a single implicit job: follow-on records have no work ID and
-/// checkpoints have one job/terminal slot. Reading one as the concurrent
-/// format could apply reordered messages to the wrong job, so v6 makes
-/// every job record explicit and stores active/archive collections.
+/// Version 6 stores explicit work IDs and active/completed job collections.
+/// Older versions omit required recovery markers, contest responses, journal
+/// generations, or job IDs. They are rejected rather than migrated.
 const FORMAT_VERSION: u8 = 6;
 /// Domain of the header digest every frame is bound to.
 const HEADER_DOMAIN: &[u8] = b"hellas.work.journal-header.v1";

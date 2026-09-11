@@ -33,18 +33,18 @@ use hellas_rpc::protocol::work_setup::ProviderChannelPolicy;
 use hellas_rpc::services::execute::ExecuteClientImpl;
 use hellas_rpc::services::work::WorkClientImpl;
 use hellas_rpc::services::work_setup::WorkSetupClientImpl;
-use hellas_rpc::work::{BackendFault, PreparedEvaluateInput, WorkRefusal};
-use hellas_rpc::work_close::{BlockSourceError, FinalizedWork};
-use hellas_rpc::work_handshake::{apply_setup_exchange, prepare_setup_exchange};
-use hellas_rpc::work_open::{FinalizedSetup, SetupQuery};
-use hellas_rpc::work_store::{
-    ChannelRecord, SetupEnd, SetupOrigin, SetupRecord, SetupScan, TerminalOutcome,
-};
 use hellas_rpc::{
     Application, Assurance, CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR, ContentId, EvaluateRequest,
     OutputEventEnvelope, ProducerSigningKey, ProgramManifest, PublicKey, SubmitTxOutcome,
 };
 use hellas_wire::{AuthLevel, PeerIdentity};
+use hellas_work::work::{BackendFault, PreparedEvaluateInput, WorkRefusal};
+use hellas_work::work_close::{BlockSourceError, FinalizedWork};
+use hellas_work::work_handshake::{apply_setup_exchange, prepare_setup_exchange};
+use hellas_work::work_open::{FinalizedSetup, SetupQuery};
+use hellas_work::work_store::{
+    ChannelRecord, SetupEnd, SetupOrigin, SetupRecord, SetupScan, TerminalOutcome,
+};
 use iroh::{EndpointAddr, TransportAddr};
 use tokio::sync::{Notify, Semaphore};
 
@@ -3423,7 +3423,8 @@ async fn the_clock_resumes_an_accepted_job_after_restart() {
                     service
                         .with_state(|state| {
                             state
-                                .job()
+                                .jobs()
+                                .next()
                                 .filter(|job| job.work_id() == work_id)
                                 .map(|job| job.phase())
                         })

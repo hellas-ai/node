@@ -1,0 +1,23 @@
+[package]
+name = "hellas-work"
+description = "Durable paid-work orchestration for Hellas endpoints"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation.workspace = true
+
+[dependencies]
+hellas-kernel = { workspace = true, features = ["secp256k1"] }
+hellas-rpc = { workspace = true, features = ["work"] }
+hellas-wire.workspace = true
+hellas-xet.workspace = true
+prost = { version = "0.14", default-features = false, features = ["derive"] }
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+bytes.workspace = true
+hellas-wire = { workspace = true, features = ["mux"] }
+tempfile.workspace = true
+tokio.workspace = true

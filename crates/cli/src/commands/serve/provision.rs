@@ -61,7 +61,7 @@
 //! and re-spelling any of that here would be a second answer to a
 //! question consensus already answers.
 //!
-//! [`SetupState::funding_coins`]: hellas_rpc::work_store::SetupState::funding_coins
+//! [`SetupState::funding_coins`]: hellas_work::work_store::SetupState::funding_coins
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -74,9 +74,9 @@ use hellas_kernel::{
     Parties, Payout, Secp256k1Signer, Secp256k1Verifier, Terms, Tx, WorkStakeBondTerms,
 };
 use hellas_rpc::protocol::work_setup::ProviderChannelPolicy;
-use hellas_rpc::work_close::FinalizedBlocks;
-use hellas_rpc::work_handshake::{PaymentAdmission, SetupEndpoint};
-use hellas_rpc::work_store::{Role, SetupScan, SetupStore, discover_setups};
+use hellas_work::work_close::FinalizedBlocks;
+use hellas_work::work_handshake::{PaymentAdmission, SetupEndpoint};
+use hellas_work::work_store::{Role, SetupScan, SetupStore, discover_setups};
 use tracing::{info, warn};
 
 use super::work_config::{WorkConfig, WorkRoute};

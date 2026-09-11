@@ -1,22 +1,5 @@
 {
   "nodes": {
-    "catena-lang": {
-      "flake": false,
-      "locked": {
-        "lastModified": 1788196629,
-        "narHash": "sha256-kB9Xj8JItEd3mGuVK7MNIfzxoApKb/6FV4TUeSNdpaI=",
-        "ref": "grw/hellas-safe-runtime",
-        "rev": "be373057d9e974c1cae0c5b8cc93238ae79104ef",
-        "revCount": 271,
-        "type": "git",
-        "url": "file:../catena-lang"
-      },
-      "original": {
-        "ref": "grw/hellas-safe-runtime",
-        "type": "git",
-        "url": "file:../catena-lang"
-      }
-    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1782959384,
@@ -51,7 +34,6 @@
     },
     "root": {
       "inputs": {
-        "catena-lang": "catena-lang",
         "nixpkgs": "nixpkgs",
         "rust-overlay": "rust-overlay"
       }

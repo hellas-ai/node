@@ -1,66 +1,18 @@
-//! The places a measured budget is sampled, and the one way a sample
-//! leaves them.
+//! Timing events for paid-work operations under [`TARGET`].
 //!
-//! # What this is for
-//!
-//! The mount's two waits are arithmetic over quantities nothing in this
-//! tree emitted:
-//!
-//! ```text
-//! Wresp  = 3×fsync_tail_ms + rotation_tail_ms + response_build_ms
-//!          + one_block_fetch_ms + max6(rpc_ms + response_worker_ms + validation_ms)
-//! Wstart = fresh_tip_ms + close_prepared_fsync_ms + rotation_tail_ms
-//!          + max6(rpc_ms + general_worker_ms + validation_ms)
-//! ```
-//!
-//! Every name in those two lines is the name of an event emitted under
-//! [`TARGET`], at the one place that already performs the work it
-//! measures. A reader mapping a sample to the addend it belongs to has
-//! nothing to translate: the event's name *is* the term.
-//!
-//! # A sample, and not a summary
-//!
-//! Each seam emits one event per piece of work, carrying `ms` and enough
-//! identity to say which piece of work it was — which journal, which
-//! block, which contest. Nothing here averages, counts, or keeps a
-//! running anything: a mean cannot be turned back into a lower tail, and
-//! a lower tail and a confidence bound are what the budgets are made of.
-//!
-//! # Observation, and not decision
-//!
-//! [`Timing::ms`] is the only thing that reads a clock back, and its
-//! result is only ever a field of an event. No branch anywhere in this
-//! crate is taken on a duration, no work is refused because of one, and
-//! a journal writes the same bytes in the same order whether or not
-//! anybody is listening.
-//!
-//! # What a node that is not measuring pays
-//!
-//! One relaxed atomic load per seam. [`Timing::start`] asks `tracing`
-//! whether a DEBUG event under [`TARGET`] could reach anyone; with no
-//! subscriber installed the process-wide maximum level is `OFF`, the
-//! answer is no before any callsite is consulted, and no clock is read,
-//! nothing is formatted, and nothing is allocated. The event macros
-//! below are guarded by the same question, so their fields — the hex
-//! keys especially — are never built either.
+//! [`Timing`] reads the clock only when tracing enables the event. Samples
+//! report durations and identifying fields; they do not drive protocol
+//! decisions. [`Samples`] retains individual observations for inspection.
 
 use web_time::Instant;
 
-/// The target every sample in this crate is emitted under.
-///
-/// One target for all of them, so a reader turns the whole measurement
-/// surface on with one directive and a node that does not want it pays
-/// for none of it.
+/// Tracing target shared by all timing events.
 pub const TARGET: &str = "hellas.mount.measure";
 
 /// The level every sample is emitted at.
 pub const LEVEL: tracing::Level = tracing::Level::DEBUG;
 
-/// A measurement that has started — or has not, because nobody asked.
-///
-/// The `None` case is the whole point: an unobserved node builds one of
-/// these, reads no clock, and hands it back to a seam that emits
-/// nothing.
+/// Start time, absent when tracing disables timing events.
 #[derive(Clone, Copy, Debug)]
 pub struct Timing(Option<Instant>);
 
@@ -72,11 +24,7 @@ impl Timing {
         Self(tracing::enabled!(target: TARGET, LEVEL).then(Instant::now))
     }
 
-    /// Returns how long the work took in milliseconds, or `None` when
-    /// this measurement never started.
-    ///
-    /// The only reader of a duration in this crate, and every caller of
-    /// it puts the answer straight into an event field.
+    /// Elapsed milliseconds, or `None` if timing was disabled.
     #[must_use]
     pub fn ms(self) -> Option<f64> {
         self.0
@@ -87,21 +35,11 @@ impl Timing {
 /// One observation a seam emitted.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Sample {
-    /// The term this is one observation of, spelled as §4 spells it.
+    /// Name of the measured operation.
     pub quantity: &'static str,
     /// How long the work took.
     pub ms: f64,
-    /// When the collector took delivery of it, in milliseconds since the
-    /// Unix epoch.
-    ///
-    /// §4 asks an artifact for raw samples *and* timestamps, and a
-    /// duration is not a time. The clock is read here rather than at the
-    /// seam on purpose: a seam that is not being collected from reads no
-    /// clock at all, and one that is has already paid for a lock and an
-    /// allocation, so a second clock read changes nothing it measures.
-    /// A machine whose clock is not monotone yields a sample out of
-    /// order, which is a fact about the run and is recorded as one
-    /// rather than smoothed.
+    /// Collection time in Unix milliseconds, without clock-order correction.
     pub at_unix_ms: u64,
     /// The identity fields the seam carried, in emission order.
     pub fields: Vec<(&'static str, String)>,
@@ -117,12 +55,7 @@ impl Sample {
     }
 }
 
-/// The reading half of the seam: a subscriber that keeps every sample
-/// and does nothing else with it.
-///
-/// Deliberately not an aggregate. It computes no mean, no quantile and
-/// no bound — it hands back the individual observations and leaves every
-/// judgement about them to whoever asked.
+/// Tracing subscriber retaining raw timing samples in emission order.
 #[derive(Debug, Default)]
 pub struct Samples(std::sync::Mutex<Vec<Sample>>);
 
@@ -220,22 +153,8 @@ pub fn unix_ms() -> u64 {
         })
 }
 
-/// Keeps one dispatcher alive for the rest of the process, so that a
-/// seam's callsite is never left cached as one nobody could ever be
-/// interested in.
-///
-/// `tracing` caches a callsite's interest process-wide and recomputes it
-/// only when a dispatcher is added. A callsite first reached while no
-/// dispatcher exists is cached as "never", and a collector installed on
-/// another thread a moment later can miss the rebuild — so a seam goes
-/// quiet for a reader that is plainly listening. This dispatcher
-/// collects nothing and answers nothing; it exists only to say that a
-/// sample under [`TARGET`] is *sometimes* interesting, which sends every
-/// such callsite to whichever collector the emitting thread has.
-///
-/// It is installed by [`Samples::new`] and nowhere else. A node that
-/// never builds a collector never builds this either, and goes on paying
-/// one atomic load per seam.
+/// Keeps timing callsites conditionally enabled across thread-local collectors.
+/// `Samples::new` installs this once because tracing caches interest globally.
 fn hold_the_seams_open() {
     static OPEN: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
     let _ = OPEN.get_or_init(|| tracing::Dispatch::new(Listening));

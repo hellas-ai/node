@@ -255,8 +255,8 @@ impl WorkChannelSnapshot {
     pub fn finalized_setup(
         &self,
         funding: &BTreeSet<CoinId>,
-    ) -> Option<hellas_rpc::work_open::FinalizedSetup> {
-        Some(hellas_rpc::work_open::FinalizedSetup {
+    ) -> Option<hellas_work::work_open::FinalizedSetup> {
+        Some(hellas_work::work_open::FinalizedSetup {
             height: self.block.height,
             bond: self.bond,
             payment: self.payment,

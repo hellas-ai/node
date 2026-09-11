@@ -128,24 +128,6 @@ use hellas_wire::{StreamTransport, TransportContext, WireStatus};
 
 use prost::Message as _;
 
-use crate::observe::{LEVEL, TARGET, Timing};
-use crate::pb::work::{
-    AcceptWorkRequest, AcceptWorkResponse, AdmitCertificateRequest, AdmitCertificateResponse,
-    DeliverResultRequest, DeliverResultResponse, WorkAccepted, WorkDelivered, WorkPaid,
-    WorkRefusalCode, WorkRefused, accept_work_response::Outcome,
-    admit_certificate_response::Outcome as AdmitOutcome,
-    deliver_result_response::Outcome as DeliverOutcome,
-};
-use crate::protocol::Digest;
-use crate::protocol::artifacts::{PreparedPaidInputParts, PreparedPaidInputV1};
-use crate::protocol::work::{
-    JobDeadlines, PaidJobAuthorizationV1, PaidJobResultV1, PaidWorkError, PaymentBindingV1,
-    PrivateRecord as _, check_authorization, check_prepared_input, delivery_request_digest,
-    encode_transcript, next_payment, payment_binding_digest, propose_authorization, result_digest,
-    signing_hash, terminal_result, work_id,
-};
-use crate::protocol::work_setup::{ObservedChannel, ReadyChannel, WorkSetupError};
-use crate::services::work::{WorkClientImpl, WorkHandler};
 use crate::work_close::{
     CatchUpError, CloseChannel, CloseError, CloseProgress, FinalizedBlocks, FinalizedWork, TxSink,
     adjudicated_close, advance_close, catch_up, close_duty_present, close_response, close_start,
@@ -157,7 +139,25 @@ use crate::work_store::{
     ChannelRecord, ChannelState, ChannelStateError, ChannelStore, JobPhase, JobState,
     PaidCertificate, Role, TerminalOutcome, WorkStoreError, hex,
 };
-use crate::{EvaluateRequest, OutputEventEnvelope, SubmitTxOutcome};
+use hellas_rpc::observe::{LEVEL, TARGET, Timing};
+use hellas_rpc::pb::work::{
+    AcceptWorkRequest, AcceptWorkResponse, AdmitCertificateRequest, AdmitCertificateResponse,
+    DeliverResultRequest, DeliverResultResponse, WorkAccepted, WorkDelivered, WorkPaid,
+    WorkRefusalCode, WorkRefused, accept_work_response::Outcome,
+    admit_certificate_response::Outcome as AdmitOutcome,
+    deliver_result_response::Outcome as DeliverOutcome,
+};
+use hellas_rpc::protocol::Digest;
+use hellas_rpc::protocol::artifacts::{PreparedPaidInputParts, PreparedPaidInputV1};
+use hellas_rpc::protocol::work::{
+    JobDeadlines, PaidJobAuthorizationV1, PaidJobResultV1, PaidWorkError, PaymentBindingV1,
+    PrivateRecord as _, check_authorization, check_prepared_input, delivery_request_digest,
+    encode_transcript, next_payment, payment_binding_digest, propose_authorization, result_digest,
+    signing_hash, terminal_result, work_id,
+};
+use hellas_rpc::protocol::work_setup::{ObservedChannel, ReadyChannel, WorkSetupError};
+use hellas_rpc::services::work::{WorkClientImpl, WorkHandler};
+use hellas_rpc::{EvaluateRequest, OutputEventEnvelope, SubmitTxOutcome};
 
 // ── Refusals ──────────────────────────────────────────────────────────
 
@@ -478,7 +478,7 @@ fn bind_store(
 /// Built from the journal and the key alone, because that is all a close
 /// reads. A close driver exists *because* a channel is contested, or its
 /// bond is gone, or its horizon has passed — and
-/// [`WorkChannelDescriptor::check_ready`](crate::protocol::work_setup::WorkChannelDescriptor::check_ready)
+/// [`WorkChannelDescriptor::check_ready`](hellas_rpc::protocol::work_setup::WorkChannelDescriptor::check_ready)
 /// refuses every one of those. A close capability that needed a
 /// [`ReadyChannel`] could therefore never be built for the channels it
 /// exists for.
@@ -2267,7 +2267,7 @@ impl WorkService {
     /// no new work.
     ///
     /// This is the mount a channel gets when
-    /// [`WorkChannelDescriptor::check_ready`](crate::protocol::work_setup::WorkChannelDescriptor::check_ready)
+    /// [`WorkChannelDescriptor::check_ready`](hellas_rpc::protocol::work_setup::WorkChannelDescriptor::check_ready)
     /// has nothing to say: a contest is open, the bond edge is gone, or
     /// the admission horizon has passed. Every one of those is a state a
     /// close driver exists for, and none of them is a readiness
@@ -2281,7 +2281,7 @@ impl WorkService {
     ///
     /// The one way an admitting service comes to exist after a close-only
     /// mount, and it takes the value only
-    /// [`WorkChannelDescriptor::check_ready`](crate::protocol::work_setup::WorkChannelDescriptor::check_ready)
+    /// [`WorkChannelDescriptor::check_ready`](hellas_rpc::protocol::work_setup::WorkChannelDescriptor::check_ready)
     /// produces. Nothing here refreshes it afterwards: its freshness is
     /// the caller's in exactly the sense [`ReadyChannel`] documents.
     ///
@@ -2622,7 +2622,10 @@ impl WorkHandler for WorkService {
         request: AcceptWorkRequest,
         _context: TransportContext,
     ) -> impl core::future::Future<
-        Output = Result<impl Into<crate::call::WithTrailer<AcceptWorkResponse>> + Send, WireStatus>,
+        Output = Result<
+            impl Into<hellas_rpc::call::WithTrailer<AcceptWorkResponse>> + Send,
+            WireStatus,
+        >,
     > + Send {
         core::future::ready(Ok(self.accept(&request)))
     }
@@ -2633,7 +2636,7 @@ impl WorkHandler for WorkService {
         context: TransportContext,
     ) -> impl core::future::Future<
         Output = Result<
-            impl Into<crate::call::WithTrailer<DeliverResultResponse>> + Send,
+            impl Into<hellas_rpc::call::WithTrailer<DeliverResultResponse>> + Send,
             WireStatus,
         >,
     > + Send {
@@ -2646,7 +2649,7 @@ impl WorkHandler for WorkService {
         _context: TransportContext,
     ) -> impl core::future::Future<
         Output = Result<
-            impl Into<crate::call::WithTrailer<AdmitCertificateResponse>> + Send,
+            impl Into<hellas_rpc::call::WithTrailer<AdmitCertificateResponse>> + Send,
             WireStatus,
         >,
     > + Send {
@@ -3128,7 +3131,7 @@ impl ClientEndpoint {
     /// is nothing here a provider quoted.
     ///
     /// The journal then runs
-    /// [`crate::protocol::work::CreditLedger::credit_payment`] over the
+    /// [`hellas_rpc::protocol::work::CreditLedger::credit_payment`] over the
     /// job it recorded itself, so the two signatures below are made
     /// before the ledger has agreed and released after it has — a
     /// certificate the ledger refuses is one whose bytes never leave.

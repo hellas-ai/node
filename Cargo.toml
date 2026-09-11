@@ -15,6 +15,7 @@ members = [
     "crates/sdk",
     "crates/store",
     "crates/wire",
+    "crates/work",
     "crates/xet",
 ]
 default-members = ["crates/cli"]
@@ -34,7 +35,7 @@ async-stream = "0.3"
 axum = "0.8"
 base64 = "0.22"
 bytes = "1"
-catena-lang = { path = "../catena-lang/catena-lang", default-features = false }
+catena-lang = { git = "https://github.com/hellas-ai/catena-lang", rev = "be373057d9e974c1cae0c5b8cc93238ae79104ef", default-features = false }
 cc = "1"
 ciborium = "0.2"
 commonware-actor = { git = "https://github.com/commonwarexyz/monorepo", rev = "4c3ebe4274d908557d91b637240e8b93609fb32f" }
@@ -67,6 +68,7 @@ hellas-rpc = { path = "crates/rpc", default-features = false }
 hellas-sdk = { path = "crates/sdk", default-features = false }
 hellas-store = { path = "crates/store", default-features = false }
 hellas-wire = { path = "crates/wire", default-features = false }
+hellas-work = { path = "crates/work", default-features = false }
 hellas-xet = { path = "crates/xet", default-features = false }
 hex = "0.4"
 iroh = { version = "1", default-features = false }

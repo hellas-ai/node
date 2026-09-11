@@ -1,54 +1,14 @@
-//! Which channel this endpoint will work over, and whether it may.
+//! Paid-channel configuration and readiness checks.
 //!
-//! # What a configured channel is
+//! [`WorkChannelDescriptor::check_ready`] checks the configured terms against
+//! live edges, their parties, the bond lease, contest state, collateral, and
+//! admission horizon. Terms are hashed locally and compared with on-chain
+//! commitments; a terms hash alone does not describe the channel.
 //!
-//! [`WorkChannelDescriptor`] is everything an endpoint was told about
-//! one paid channel: the network, both edge ids, the complete tag-2
-//! payment terms — which embed the complete tag-4 bond — the private
-//! policy body and its salt, the execution policy, and the three
-//! measurements the omission contest's economics depend on. It is
-//! configuration, and none of it is evidence.
-//!
-//! [`WorkChannelDescriptor::check_ready`] is what turns it into
-//! evidence, by comparing it against one finalized read the caller
-//! supplies. What it establishes is that at that read: both edges are
-//! live, both hash to the configured terms, both name the parties those
-//! terms fix, the bond is leased to *this* payment edge, no contest is
-//! open, the funded edge still clears the omission inequality, and the
-//! height is inside the admission horizon.
-//!
-//! That the read is coherent — one block, one state root, one database
-//! snapshot — is the caller's, not this module's. See
-//! [`ObservedChannel`].
-//!
-//! # Why the terms are hashed locally
-//!
-//! A finalized edge carries a terms *hash*, not a terms body. Nothing
-//! read off the chain says what shape the terms have, who the parties
-//! are, or what the bond covers. So the descriptor's own bodies are
-//! hashed here and compared with the edge's commitment; the shape is
-//! never inferred from the lookup. That is also why the payment terms
-//! are carried whole rather than as a hash: the bond edge, the parties,
-//! the admission horizon, and the policy commitment are all read out of
-//! them, and a hash answers none of those questions.
-//!
-//! # What readiness does not claim
-//!
-//! Not that the objects were authenticated. In this milestone's trusted
-//! mode the values come from a chain process inside the endpoint's trust
-//! boundary and carry no membership proof; readiness is a statement
-//! about what was reported, and the report's provenance is the
-//! operator's.
-//!
-//! Not that a correctness game is available. This profile has no
-//! challenge path, so the section-7 provider-deterrence inequality is
-//! not checked and is not claimed. What *is* checked is that the
-//! omission bond exceeds the payment capacity it insures
-//! ([`check_collateral`]), so that omitting a response can never pay:
-//! the contest is implemented, and that is the one number it needs.
-//!
-//! Not that a job may be signed. That is a per-signature question with
-//! its own deadlines, and it is [`ReadyChannel::check_signable`].
+//! The caller must authenticate one coherent finalized [`ObservedChannel`]
+//! snapshot. Readiness neither authorizes a particular job signature (see
+//! [`ReadyChannel::check_signable`]) nor establishes computation correctness.
+//! [`check_collateral`] checks the payment-omission bond, not fraud insurance.
 
 use hellas_kernel::{
     BlockHeight, Decode, DecodeError, Edge, EdgeId, EdgeValues, Encode, Fees, LeaseSlots,

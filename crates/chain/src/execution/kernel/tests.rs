@@ -1247,7 +1247,7 @@ fn a_work_payment_channel_settles_end_to_end_through_consensus() {
 ///
 /// The test above hand-builds its start and its close. This one
 /// calls the endpoint's own two builders — `close_start` and
-/// `adjudicated_close` from `hellas_rpc::work_close` — and submits
+/// `adjudicated_close` from `hellas_work::work_close` — and submits
 /// what they return, so an endpoint that derived a window, a
 /// contest identifier, a seal, or a split differently from the
 /// kernel would fail here rather than at a demonstration.
@@ -1266,7 +1266,7 @@ fn an_endpoint_built_close_settles_on_a_real_chain() {
         work_payment_settlement,
     };
     use hellas_rpc::protocol::work::{PaidChannel, PaidChannelPolicyV1, private_policy_commitment};
-    use hellas_rpc::work_close::{adjudicated_close, close_start, start_body_digest};
+    use hellas_work::work_close::{adjudicated_close, close_start, start_body_digest};
 
     const FUNDING: u64 = 100;
     const STAKE: u64 = 12;
@@ -1489,7 +1489,7 @@ fn an_endpoint_built_response_forfeits_the_understaters_bond() {
         work_payment_settlement,
     };
     use hellas_rpc::protocol::work::{PaidChannel, PaidChannelPolicyV1, private_policy_commitment};
-    use hellas_rpc::work_close::{adjudicated_close, close_response, close_start};
+    use hellas_work::work_close::{adjudicated_close, close_response, close_start};
 
     const FUNDING: u64 = 100;
     const STAKE: u64 = 12;

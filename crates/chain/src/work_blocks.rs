@@ -2,7 +2,7 @@
 //!
 //! # Why an adapter and not a blanket impl
 //!
-//! The watcher's block source is `hellas_rpc::work_close::FinalizedBlocks`
+//! The watcher's block source is `hellas_work::work_close::FinalizedBlocks`
 //! and a light client is `crate::LightClient`. Both are foreign to each
 //! other, so nothing can implement the first for every one of the
 //! second; [`WorkBlocks`] is the one type that owns that pairing. It
@@ -43,12 +43,12 @@
 //! one from a snapshot that asked about other coins.
 
 use hellas_kernel::{Terms, Tx};
-use hellas_rpc::work::WorkService;
-use hellas_rpc::work_close::{
+use hellas_work::work::WorkService;
+use hellas_work::work_close::{
     BlockSourceError, CatchUpError, CloseError, CloseProgress, FinalizedBlocks, FinalizedWork,
     TxSink,
 };
-use hellas_rpc::work_open::{FinalizedSetup, SetupQuery, SetupView};
+use hellas_work::work_open::{FinalizedSetup, SetupQuery, SetupView};
 
 use crate::SubmitTxOutcome;
 use crate::block_view::FinalizedBlockView;
@@ -345,14 +345,14 @@ mod tests {
     };
     use hellas_rpc::protocol::{ContentId, Digest as ProtocolDigest};
     use hellas_rpc::services::work_setup::WorkSetupHandler;
-    use hellas_rpc::work_close::{BlockSourceError, adjudicated_close, close_start};
-    use hellas_rpc::work_handshake::{PaymentAdmission, SetupEndpoint, SetupService};
-    use hellas_rpc::work_open::{SetupAdvance, SetupProgress, SetupStep, advance_setup};
-    use hellas_rpc::work_store::{
+    use hellas_wire::TransportContext;
+    use hellas_work::work_close::{BlockSourceError, adjudicated_close, close_start};
+    use hellas_work::work_handshake::{PaymentAdmission, SetupEndpoint, SetupService};
+    use hellas_work::work_open::{SetupAdvance, SetupProgress, SetupStep, advance_setup};
+    use hellas_work::work_store::{
         Role, SetupAbort, SetupEnd, SetupOrigin, SetupRecord, SetupScan, SetupStateError,
         SetupStore, WorkStoreError,
     };
-    use hellas_wire::TransportContext;
 
     use crate::HellasBlock;
     use crate::app::Mempool;

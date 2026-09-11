@@ -27,18 +27,18 @@ use hellas_rpc::protocol::work::{
     JobDeadlines, generation_policy_digest, identity_source_digest, private_policy_commitment,
 };
 use hellas_rpc::protocol::work_setup::{ProviderChannelPolicy, WorkChannelDescriptor};
-use hellas_rpc::work::{ClientEndpoint, JobProposal, propose_work};
-use hellas_rpc::work_close::CloseProgress;
-use hellas_rpc::work_close::FinalizedBlocks as _;
-use hellas_rpc::work_handshake::{
+use hellas_wire::ServiceMarker;
+use hellas_wire::iroh::IrohTransport;
+use hellas_work::work::{ClientEndpoint, JobProposal, propose_work};
+use hellas_work::work_close::CloseProgress;
+use hellas_work::work_close::FinalizedBlocks as _;
+use hellas_work::work_handshake::{
     PaymentAdmission, SetupEndpoint, SetupService, apply_setup_exchange, prepare_setup_exchange,
     send_setup_exchange,
 };
-use hellas_rpc::work_open::{SetupAdvance, SetupProgress};
-use hellas_rpc::work_store::journal::MAX_RECORD_BYTES;
-use hellas_rpc::work_store::{Role, SetupScan, SetupStore};
-use hellas_wire::ServiceMarker;
-use hellas_wire::iroh::IrohTransport;
+use hellas_work::work_open::{SetupAdvance, SetupProgress};
+use hellas_work::work_store::journal::MAX_RECORD_BYTES;
+use hellas_work::work_store::{Role, SetupScan, SetupStore};
 use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey, TransportAddr};
 
@@ -493,7 +493,7 @@ async fn run_one(
         "more than one active job matches this prepared input; use a fresh journal root",
     );
     let (work_id, already_collected) = match existing.first().copied() {
-        Some((_work_id, hellas_rpc::work_store::JobPhase::HalfSigned, authorization)) => {
+        Some((_work_id, hellas_work::work_store::JobPhase::HalfSigned, authorization)) => {
             let resumed = JobProposal {
                 prepared_input: proposal.prepared_input.clone(),
                 deadlines: JobDeadlines {
@@ -505,8 +505,8 @@ async fn run_one(
             let transport = dialer.work().await?;
             (propose_work(transport, &mut client, &resumed).await?, false)
         }
-        Some((work_id, hellas_rpc::work_store::JobPhase::Ready, _))
-        | Some((work_id, hellas_rpc::work_store::JobPhase::Matched, _)) => (work_id, true),
+        Some((work_id, hellas_work::work_store::JobPhase::Ready, _))
+        | Some((work_id, hellas_work::work_store::JobPhase::Matched, _)) => (work_id, true),
         Some((work_id, _, _)) => (work_id, false),
         None => {
             let transport = dialer.work().await?;
@@ -614,7 +614,7 @@ async fn drive_setup(
     policy: &ProviderChannelPolicy,
     chain: &WorkBlocks<VerifiedRemoteLightClient>,
     poll: Duration,
-) -> CliResult<(hellas_rpc::work_store::ChannelStore, WorkChannelDescriptor)> {
+) -> CliResult<(hellas_work::work_store::ChannelStore, WorkChannelDescriptor)> {
     loop {
         let SetupAdvance { progress, mounted } = setup
             .advance_setup(chain, chain, chain)

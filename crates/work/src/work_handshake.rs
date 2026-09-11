@@ -3,7 +3,7 @@
 //!
 //! # What this is, and what it is not
 //!
-//! [`crate::protocol::work_bundle`] is the artifact, and it says of
+//! [`hellas_rpc::protocol::work_bundle`] is the artifact, and it says of
 //! itself that "somebody has to carry half-signed bytes between the two
 //! processes". [`crate::work_store::setup`] is the journal that fsyncs
 //! each revision before the signature it carries is exported. This is
@@ -87,7 +87,7 @@
 //! edge, so terms that fail them yield a channel this endpoint will
 //! never admit work over. It is bounded by the stake sitting locked
 //! until the horizon, and no automatic step returns it — see
-//! `hellas_rpc::work_open`'s note on `SetupDecision::TimeoutBond`.
+//! `hellas_work::work_open`'s note on `SetupDecision::TimeoutBond`.
 
 use std::sync::{Arc, Mutex};
 
@@ -97,19 +97,21 @@ use hellas_kernel::{
 };
 use hellas_wire::{StreamTransport, TransportContext, WireStatus};
 
-use crate::pb::work::{
-    ExchangeSetupRequest, ExchangeSetupResponse, SetupAdvanced, WorkRefused,
-    exchange_setup_response::Outcome,
-};
-use crate::protocol::work_bundle::WorkChannelSetupBundleV1;
-use crate::protocol::work_setup::{CloseDescriptor, ProviderChannelPolicy, WorkChannelDescriptor};
-use crate::services::work_setup::{WorkSetupClientImpl, WorkSetupHandler};
 use crate::work::{Refusal, WorkRefusal};
 use crate::work_close::{FinalizedBlocks, TxSink};
 use crate::work_open::{SetupAdvance, SetupChannel, SetupDriveError, SetupView, advance_setup};
 use crate::work_store::{
     SetupRecord, SetupScan, SetupState, SetupStateError, SetupStore, WorkStoreError,
 };
+use hellas_rpc::pb::work::{
+    ExchangeSetupRequest, ExchangeSetupResponse, SetupAdvanced, WorkRefused,
+    exchange_setup_response::Outcome,
+};
+use hellas_rpc::protocol::work_bundle::WorkChannelSetupBundleV1;
+use hellas_rpc::protocol::work_setup::{
+    CloseDescriptor, ProviderChannelPolicy, WorkChannelDescriptor,
+};
+use hellas_rpc::services::work_setup::{WorkSetupClientImpl, WorkSetupHandler};
 
 // ── Refusals ──────────────────────────────────────────────────────────
 
@@ -659,7 +661,7 @@ impl WorkSetupHandler for SetupService {
         _context: TransportContext,
     ) -> impl core::future::Future<
         Output = Result<
-            impl Into<crate::call::WithTrailer<ExchangeSetupResponse>> + Send,
+            impl Into<hellas_rpc::call::WithTrailer<ExchangeSetupResponse>> + Send,
             WireStatus,
         >,
     > + Send {

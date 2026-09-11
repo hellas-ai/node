@@ -3,7 +3,6 @@
   system,
   nixpkgs,
   rust-overlay,
-  catena-lang,
   # When set, builds everything for this target triple via `pkgsCross`.
   # Leave null for native builds.
   crossSystem ? null,
@@ -43,19 +42,7 @@ let
     inherit stdenv;
   };
 
-  # Flake `self` is git-tracked-only; nothing in the previous filter list
-  # (.direnv, target, result-*, etc.) ever lands here in the first place.
-  # Patch the tandem path dependency once at the source boundary so both
-  # buildRustPackage and source-only Hydra checks see immutable store paths.
-  buildSrc = pkgs.runCommand "hellas-source" { } ''
-    mkdir -p "$out"
-    cp -R ${self}/. "$out/"
-    chmod -R u+w "$out"
-    substituteInPlace "$out/Cargo.toml" \
-      --replace-fail \
-        'catena-lang = { path = "../catena-lang/catena-lang", default-features = false }' \
-        'catena-lang = { path = "${catena-lang}/catena-lang", default-features = false }'
-  '';
+  buildSrc = self;
 
   workspaceBuildInputs = [ ];
   workspaceNativeBuildInputs = with pkgs.buildPackages; [
@@ -80,6 +67,7 @@ let
     cargoLock = {
       lockFile = ../Cargo.lock;
       outputHashes = {
+        "catena-lang-0.1.0" = "sha256-kB9Xj8JItEd3mGuVK7MNIfzxoApKb/6FV4TUeSNdpaI=";
         "commonware-actor-2026.7.0" = "sha256-LEVuwzWlttz1znLpe0bmEV/Gk+7v9BI9/Un25tR7naM=";
       };
     };

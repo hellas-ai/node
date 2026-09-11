@@ -39,7 +39,7 @@
 //! here instead, by the operator, and [`WorkConfig::provider_policy`] is
 //! the whole of what is made from them.
 //!
-//! [`MAX_ACTIVE_JOURNAL_BYTES`]: hellas_rpc::work_store::journal::MAX_ACTIVE_JOURNAL_BYTES
+//! [`MAX_ACTIVE_JOURNAL_BYTES`]: hellas_work::work_store::journal::MAX_ACTIVE_JOURNAL_BYTES
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -57,7 +57,7 @@ use hellas_rpc::protocol::work::{
     PaidChannelPolicyV1, PaidExecutionPolicyV1, check_execution_policy,
 };
 use hellas_rpc::protocol::work_setup::ProviderChannelPolicy;
-use hellas_rpc::work_store::{Role, SetupStore, discover_setups};
+use hellas_work::work_store::{Role, SetupStore, discover_setups};
 use serde::Deserialize;
 
 use crate::commands::CliResult;

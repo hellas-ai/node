@@ -14,17 +14,14 @@
 //! `paid_work_vectors.rs`. These tests are about the two endpoints and
 //! the wire between them.
 
-#![cfg(feature = "work")]
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use bytes::Bytes;
 use hellas_kernel::{
     BlockHeight, Decode as _, EarnedCertificate, Edge, EdgeId, EdgeValues, Encode as _, Fees, Key,
-    LeaseSlots, List, MAX_EDGE_OUTPUTS, NetworkId, Parties, Payout, PendingSlot, RegistryChunk,
-    RegistryNamespace, RegistryRecordTag, Secp256k1Signer, Secp256k1Verifier, Terms, TermsHash,
-    WorkPaymentSettlement, WorkPaymentTerms, WorkStakeBondTerms, work_payment_settlement,
+    LeaseSlots, List, MAX_EDGE_OUTPUTS, Parties, Payout, PendingSlot, Secp256k1Signer,
+    Secp256k1Verifier, Terms, TermsHash, WorkPaymentSettlement, WorkPaymentTerms,
+    WorkStakeBondTerms, work_payment_settlement,
 };
 use hellas_rpc::evaluate::{
     EvaluateOutputTranscriptBuilder, EvaluateStopReason, EvaluateTerminal, EvaluateUsage,
@@ -49,20 +46,22 @@ use hellas_rpc::protocol::work_setup::{
     ObservedChannel, ReadyChannel, WorkChannelConfig, WorkChannelDescriptor, payment_terms_hash,
 };
 use hellas_rpc::services::work::{WorkClientImpl, WorkServer};
-use hellas_rpc::work::{
-    BackendFault, ClientEndpoint, PaidEvaluateBackend, PaymentError, PreparedEvaluateInput,
-    ProviderEndpoint, RunError, RunOutcome, WorkRefusal, WorkService, admit_payment, fetch_result,
-    run_accepted_work,
-};
-use hellas_rpc::work_close::{FinalizedWork, observe};
-use hellas_rpc::work_store::{ChannelRecord, ChannelStore, JobPhase, JobState, Role, SetupOrigin};
 use hellas_rpc::{
     Application, Assurance, CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR, ContentId, EvaluateRequest,
     OutputEventEnvelope, ProducerSigningKey, ProgramManifest, PublicKey,
 };
-use hellas_wire::mux::{MessagePipe, MuxConfig, MuxTransport, Role as MuxRole};
-use hellas_wire::{DefaultClock, Dispatcher, StreamTransport};
-use tokio::sync::mpsc;
+use hellas_wire::mux::MuxTransport;
+use hellas_wire::{Dispatcher, StreamTransport};
+use hellas_work::work::{
+    BackendFault, ClientEndpoint, PaidEvaluateBackend, PaymentError, PreparedEvaluateInput,
+    ProviderEndpoint, RunError, RunOutcome, WorkRefusal, WorkService, admit_payment, fetch_result,
+    run_accepted_work,
+};
+use hellas_work::work_close::FinalizedWork;
+use hellas_work::work_store::{ChannelRecord, ChannelStore, JobPhase, JobState, Role, SetupOrigin};
+
+mod support;
+use support::{advance, bond_edge, client, network, payload_at, payment_edge, provider, temp};
 
 /// The one proposal nonce every job in this file carries.
 const NONCE: u8 = 1;
@@ -94,41 +93,11 @@ const fn deadlines() -> JobDeadlines {
     }
 }
 
-fn network() -> NetworkId {
-    let Some(network) = NetworkId::new("hellas-test") else {
-        panic!("a short ascii id is a legal network id");
-    };
-    network
-}
-
-fn client() -> Secp256k1Signer {
-    signer(0x21)
-}
-
-fn provider() -> Secp256k1Signer {
-    signer(0x22)
-}
-
-fn signer(byte: u8) -> Secp256k1Signer {
-    let Ok(signer) = Secp256k1Signer::from_secret_scalar([byte; 32]) else {
-        panic!("a fixed scalar is a key");
-    };
-    signer
-}
-
 fn provider_producer() -> ProducerSigningKey {
     match ProducerSigningKey::from_secret_bytes([0x22; 32]) {
         Ok(key) => key,
         Err(error) => panic!("a fixed scalar is a producer key: {error}"),
     }
-}
-
-fn bond_edge() -> EdgeId {
-    EdgeId::from_bytes([0x11; EdgeId::LENGTH])
-}
-
-fn payment_edge() -> EdgeId {
-    EdgeId::from_bytes([0x22; EdgeId::LENGTH])
 }
 
 fn channel_policy() -> PaidChannelPolicyV1 {
@@ -232,13 +201,6 @@ fn settlement() -> WorkPaymentSettlement {
     settlement
 }
 
-fn temp() -> tempfile::TempDir {
-    match tempfile::tempdir() {
-        Ok(dir) => dir,
-        Err(error) => panic!("a temporary directory: {error}"),
-    }
-}
-
 fn store_at(root: &std::path::Path, ready: &ReadyChannel, role: Role, height: u64) -> ChannelStore {
     let mut store = match ChannelStore::open(
         root,
@@ -255,22 +217,7 @@ fn store_at(root: &std::path::Path, ready: &ReadyChannel, role: Role, height: u6
     store
 }
 
-/// The payload digest of the synthetic block at `height`.
-///
-/// A cursor is contiguous, so a fixture that moves it has to name a
-/// chain rather than repeat one digest: each block's parent is the last
-/// block's payload, and the watcher refuses anything else.
-fn payload_at(height: u64) -> [u8; 32] {
-    let mut payload = [0xc0; 32];
-    for (slot, byte) in payload.iter_mut().zip(height.to_be_bytes()) {
-        *slot = byte;
-    }
-    payload
-}
-
-/// Where the fixture channel was opened: the genesis block of the
-/// synthetic chain above, so a store starts with a clock and `advance`
-/// reads block one next.
+/// The fixture channel starts at the synthetic chain genesis.
 fn origin() -> SetupOrigin {
     SetupOrigin {
         payment_edge: payment_edge(),
@@ -285,22 +232,6 @@ fn origin() -> SetupOrigin {
 ///
 /// The same call the settlement loop makes, so a fixture cursor is a
 /// cursor this endpoint could have reached.
-fn advance(store: &mut ChannelStore, height: u64) {
-    let mut next = store.state().cursor().0.saturating_add(1);
-    while next <= height {
-        let block = FinalizedWork {
-            height: next,
-            parent: payload_at(next.saturating_sub(1)),
-            payload: payload_at(next),
-            txs: Vec::new(),
-        };
-        if let Err(error) = observe(store, &block, &Secp256k1Verifier::new()) {
-            panic!("the fixture block applies: {error}");
-        }
-        next = next.saturating_add(1);
-    }
-}
-
 fn commit(store: &mut ChannelStore, record: ChannelRecord) {
     if let Err(error) = store.commit(record, &Secp256k1Verifier::new()) {
         panic!("the fixture record commits: {error}");
@@ -471,67 +402,9 @@ async fn run_to_result(service: &WorkService, ready: &ReadyChannel, id: Digest) 
 
 // ── Transport plumbing ────────────────────────────────────────────────
 
-struct Pipe {
-    out: mpsc::UnboundedSender<Bytes>,
-    inbox: mpsc::UnboundedReceiver<Bytes>,
-}
-
-impl MessagePipe for Pipe {
-    type SendError = std::io::Error;
-    type RecvError = std::io::Error;
-
-    async fn send_message(&mut self, bytes: Bytes) -> Result<(), Self::SendError> {
-        let _ = self.out.send(bytes);
-        Ok(())
-    }
-
-    async fn recv_message(&mut self) -> Result<Option<Bytes>, Self::RecvError> {
-        Ok(self.inbox.recv().await)
-    }
-}
-
-/// What the two ends of one live session both know.
-///
-/// A mux over a pair of in-memory pipes has no TLS of its own, so the
-/// exporter is supplied here — which is what a QUIC connection does for
-/// itself. Both halves are handed the same value, because that is the
-/// one property the delivery binding rests on: the number is known to
-/// exactly the two ends of one connection.
-fn session() -> hellas_wire::TransportContext {
-    hellas_wire::TransportContext {
-        open_exporter: Some(EXPORTER),
-        ..hellas_wire::TransportContext::default()
-    }
-}
-
-/// The exporter the fixture session exports.
-const EXPORTER: [u8; 32] = [0x5e; 32];
-
-fn transport_pair() -> (MuxTransport, MuxTransport) {
-    let (to_server, server_inbox) = mpsc::unbounded_channel();
-    let (to_client, client_inbox) = mpsc::unbounded_channel();
-    let client = MuxTransport::spawn::<8, _, _>(
-        MuxRole::Client,
-        DefaultClock,
-        MuxConfig::default(),
-        Pipe {
-            out: to_server,
-            inbox: client_inbox,
-        },
-        session(),
-    );
-    let server = MuxTransport::spawn::<8, _, _>(
-        MuxRole::Server,
-        DefaultClock,
-        MuxConfig::default(),
-        Pipe {
-            out: to_client,
-            inbox: server_inbox,
-        },
-        session(),
-    );
-    (client, server)
-}
+#[path = "support/transport.rs"]
+mod transport;
+use transport::transport_pair;
 
 /// Stops one serving task and waits for it to be gone.
 ///
@@ -597,6 +470,18 @@ impl EdgeBytes {
     }
 }
 
+fn lease_over(bond: EdgeId, payment: EdgeId) -> LeaseSlots {
+    support::lease_over(
+        bond,
+        payment,
+        payment_terms_hash(payment_terms()).as_bytes(),
+        &payment_terms().private_policy_commitment,
+        HORIZON,
+        FORMAT_VERSION,
+        TAG_BOND_LEASE,
+    )
+}
+
 fn bond_object() -> Edge {
     EdgeBytes {
         value: STAKE,
@@ -619,30 +504,6 @@ fn payment_object() -> Edge {
         allowed: WORK_PAYMENT_CLOSES,
     }
     .build()
-}
-
-fn lease_over(bond: EdgeId, payment: EdgeId) -> LeaseSlots {
-    let mut value = vec![FORMAT_VERSION, TAG_BOND_LEASE, 2];
-    value.extend_from_slice(&bond.to_bytes());
-    value.extend_from_slice(&payment.to_bytes());
-    value.extend_from_slice(payment_terms_hash(payment_terms()).as_bytes());
-    value.extend_from_slice(&payment_terms().private_policy_commitment);
-    value.extend_from_slice(&HORIZON.to_be_bytes());
-
-    let slots = [0, 1].map(|index| {
-        RegistryChunk::split(
-            RegistryNamespace::BondLease,
-            RegistryRecordTag::BondLease,
-            &value,
-            index,
-        )
-    });
-    let parsed = hellas_kernel::parse_bond_lease(slots, bond);
-    assert!(
-        matches!(parsed, LeaseSlots::Present(_)),
-        "the hand-written lease is readable, got {parsed:?}",
-    );
-    parsed
 }
 
 // ── The state this phase begins from ──────────────────────────────────
@@ -776,7 +637,7 @@ async fn one_certificate_pays_for_one_job() {
     assert_eq!(credited, PRICE);
 
     let state = fixture.client.state();
-    assert!(state.job().is_none(), "the payment closes the job");
+    assert!(state.jobs().next().is_none(), "the payment closes the job");
     assert_eq!(state.ledger().credited_cumulative(), PRICE);
     let Some(payment) = state.last_payment() else {
         panic!("the payment is retained for re-sending");
@@ -800,11 +661,11 @@ async fn one_certificate_pays_for_one_job() {
             .service
             .with_state(|state| state.clone())
             .expect("the endpoint is reachable");
-        assert!(state.job().is_none());
+        assert!(state.jobs().next().is_none());
         assert_eq!(state.ledger().credited_cumulative(), PRICE);
         assert_eq!(state.max_executable_certificate(), PRICE);
         assert!(
-            state.terminal().is_some(),
+            state.terminals().next().is_some(),
             "the admitted certificate is this channel's one terminal",
         );
     }
@@ -854,7 +715,7 @@ async fn one_certificate_pays_for_one_job() {
             "the {role} journal wrote each step once",
         );
         let state = store.state();
-        assert!(state.job().is_none(), "the {role} job is closed");
+        assert!(state.jobs().next().is_none(), "the {role} job is closed");
         assert_eq!(state.ledger().credited_cumulative(), PRICE);
         assert_eq!(state.max_executable_certificate(), PRICE);
     }
@@ -1035,7 +896,7 @@ async fn assert_nothing_credited(service: &WorkService, what: &str) {
         "{what} is not banked either",
     );
     assert_eq!(
-        state.job().map(JobState::phase),
+        state.jobs().next().map(JobState::phase),
         Some(JobPhase::Delivered),
         "{what} leaves the job unpaid",
     );
@@ -1137,7 +998,7 @@ async fn an_uncomputed_job_is_not_paid_for() {
     assert_eq!(state.ledger().credited_cumulative(), 0);
     assert_eq!(state.max_executable_certificate(), 0);
     assert_eq!(
-        state.job().map(JobState::phase),
+        state.jobs().next().map(JobState::phase),
         Some(JobPhase::Accepted),
         "and nothing moved",
     );
@@ -1244,10 +1105,10 @@ async fn a_defaulted_job_is_not_paid_for_as_well() {
         let (open_job, expired) = provider
             .with_state(|state| {
                 (
-                    state.job().is_some(),
+                    state.jobs().next().is_some(),
                     matches!(
-                        state.terminal().map(|t| &t.outcome),
-                        Some(hellas_rpc::work_store::TerminalOutcome::Expired { .. })
+                        state.terminals().next().map(|t| &t.outcome),
+                        Some(hellas_work::work_store::TerminalOutcome::Expired { .. })
                     ),
                 )
             })

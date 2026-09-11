@@ -6,17 +6,14 @@
 //! handed to a function. Every crash is a real one: the store is dropped
 //! and reopened over its own files.
 
-#![cfg(feature = "work")]
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::Bytes;
 use hellas_kernel::{
     BlockHeight, Decode as _, Edge, EdgeId, EdgeValues, Fees, Key, LeaseSlots, List,
-    MAX_EDGE_OUTPUTS, NetworkId, Parties, Payout, PendingSlot, RegistryChunk, RegistryNamespace,
-    RegistryRecordTag, Secp256k1Signer, Secp256k1Verifier, Terms, TermsHash, WorkPaymentSettlement,
-    WorkPaymentTerms, WorkStakeBondTerms, work_payment_settlement,
+    MAX_EDGE_OUTPUTS, Parties, Payout, PendingSlot, Secp256k1Verifier, Terms, TermsHash,
+    WorkPaymentSettlement, WorkPaymentTerms, WorkStakeBondTerms, work_payment_settlement,
 };
 use hellas_rpc::evaluate::{
     EvaluateOutputTranscriptBuilder, EvaluateStopReason, EvaluateTerminal, EvaluateUsage,
@@ -42,19 +39,23 @@ use hellas_rpc::protocol::work_setup::{
     payment_terms_hash,
 };
 use hellas_rpc::services::work::{WorkClientImpl, WorkServer};
-use hellas_rpc::work::{
-    BackendFault, ClientEndpoint, DeliverError, PaidEvaluateBackend, PreparedEvaluateInput,
-    ProviderEndpoint, RunError, RunOutcome, WorkService, fetch_result, run_accepted_work,
-};
-use hellas_rpc::work_close::{FinalizedWork, observe};
-use hellas_rpc::work_store::{ChannelRecord, ChannelStore, JobPhase, JobState, Role, SetupOrigin};
 use hellas_rpc::{
     Application, Assurance, CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR, ContentId, EvaluateRequest,
     OutputEventEnvelope, ProducerSigningKey, ProgramManifest, PublicKey,
 };
 use hellas_wire::mux::{MessagePipe, MuxConfig, MuxTransport, Role as MuxRole};
 use hellas_wire::{DefaultClock, Dispatcher, StreamTransport};
+use hellas_work::work::{
+    BackendFault, ClientEndpoint, DeliverError, PaidEvaluateBackend, PreparedEvaluateInput,
+    ProviderEndpoint, RunError, RunOutcome, WorkService, fetch_result, run_accepted_work,
+};
+use hellas_work::work_store::{ChannelRecord, ChannelStore, JobPhase, JobState, Role, SetupOrigin};
 use tokio::sync::mpsc;
+
+mod support;
+use support::{advance, bond_edge, client, network, payload_at, payment_edge, provider, temp};
+
+const EXPORTER: [u8; 32] = [0x5e; 32];
 
 // ── Fixture ───────────────────────────────────────────────────────────
 
@@ -87,41 +88,11 @@ const fn deadlines() -> JobDeadlines {
 /// before the terminal deadline.
 const LAST_RELEASE: u64 = deadlines().terminal - 2;
 
-fn network() -> NetworkId {
-    let Some(network) = NetworkId::new("hellas-test") else {
-        panic!("a short ascii id is a legal network id");
-    };
-    network
-}
-
-fn client() -> Secp256k1Signer {
-    signer(0x21)
-}
-
-fn provider() -> Secp256k1Signer {
-    signer(0x22)
-}
-
-fn signer(byte: u8) -> Secp256k1Signer {
-    let Ok(signer) = Secp256k1Signer::from_secret_scalar([byte; 32]) else {
-        panic!("a fixed scalar is a key");
-    };
-    signer
-}
-
 fn provider_producer() -> ProducerSigningKey {
     match ProducerSigningKey::from_secret_bytes([0x22; 32]) {
         Ok(key) => key,
         Err(error) => panic!("a fixed scalar is a producer key: {error}"),
     }
-}
-
-fn bond_edge() -> EdgeId {
-    EdgeId::from_bytes([0x11; EdgeId::LENGTH])
-}
-
-fn payment_edge() -> EdgeId {
-    EdgeId::from_bytes([0x22; EdgeId::LENGTH])
 }
 
 fn channel_policy() -> PaidChannelPolicyV1 {
@@ -236,13 +207,6 @@ fn settlement() -> WorkPaymentSettlement {
     settlement
 }
 
-fn temp() -> tempfile::TempDir {
-    match tempfile::tempdir() {
-        Ok(dir) => dir,
-        Err(error) => panic!("a temporary directory: {error}"),
-    }
-}
-
 fn store_at(root: &std::path::Path, ready: &ReadyChannel, role: Role, height: u64) -> ChannelStore {
     let mut store = match ChannelStore::open(
         root,
@@ -259,22 +223,7 @@ fn store_at(root: &std::path::Path, ready: &ReadyChannel, role: Role, height: u6
     store
 }
 
-/// The payload digest of the synthetic block at `height`.
-///
-/// A cursor is contiguous, so a fixture that moves it has to name a
-/// chain rather than repeat one digest: each block's parent is the last
-/// block's payload, and the watcher refuses anything else.
-fn payload_at(height: u64) -> [u8; 32] {
-    let mut payload = [0xc0; 32];
-    for (slot, byte) in payload.iter_mut().zip(height.to_be_bytes()) {
-        *slot = byte;
-    }
-    payload
-}
-
-/// Where the fixture channel was opened: the genesis block of the
-/// synthetic chain above, so a store starts with a clock and `advance`
-/// reads block one next.
+/// The fixture channel starts at the synthetic chain genesis.
 fn origin() -> SetupOrigin {
     SetupOrigin {
         payment_edge: payment_edge(),
@@ -289,22 +238,6 @@ fn origin() -> SetupOrigin {
 ///
 /// The same call the settlement loop makes, so a fixture cursor is a
 /// cursor this endpoint could have reached.
-fn advance(store: &mut ChannelStore, height: u64) {
-    let mut next = store.state().cursor().0.saturating_add(1);
-    while next <= height {
-        let block = FinalizedWork {
-            height: next,
-            parent: payload_at(next.saturating_sub(1)),
-            payload: payload_at(next),
-            txs: Vec::new(),
-        };
-        if let Err(error) = observe(store, &block, &Secp256k1Verifier::new()) {
-            panic!("the fixture block applies: {error}");
-        }
-        next = next.saturating_add(1);
-    }
-}
-
 fn commit(store: &mut ChannelStore, record: ChannelRecord) {
     if let Err(error) = store.commit(record, &Secp256k1Verifier::new()) {
         panic!("the fixture record commits: {error}");
@@ -531,9 +464,6 @@ fn session() -> hellas_wire::TransportContext {
     }
 }
 
-/// The exporter the fixture session exports.
-const EXPORTER: [u8; 32] = [0x5e; 32];
-
 fn transport_pair() -> (MuxTransport, MuxTransport) {
     let (to_server, server_inbox) = mpsc::unbounded_channel();
     let (to_client, client_inbox) = mpsc::unbounded_channel();
@@ -632,13 +562,13 @@ async fn one_answer_crosses_the_wire_and_is_debited_once() {
     {
         assert_eq!(
             service
-                .with_state(|state| state.job().map(JobState::phase))
+                .with_state(|state| state.jobs().next().map(JobState::phase))
                 .expect("the endpoint is reachable"),
             Some(JobPhase::Delivered)
         );
     }
     assert_eq!(
-        endpoint.state().job().map(JobState::phase),
+        endpoint.state().jobs().next().map(JobState::phase),
         Some(JobPhase::Ready)
     );
 
@@ -653,7 +583,7 @@ async fn one_answer_crosses_the_wire_and_is_debited_once() {
     assert_eq!(again, delivered, "the same answer came back");
 
     assert_eq!(
-        endpoint.state().job().map(JobState::phase),
+        endpoint.state().jobs().next().map(JobState::phase),
         Some(JobPhase::Ready),
         "a received result is ready, and a client has no marker past it",
     );
@@ -666,7 +596,7 @@ async fn one_answer_crosses_the_wire_and_is_debited_once() {
     // And it is all on the disk: reopened from the files, the client's
     // journal still holds the result and the transcript it came with.
     let recovered = store_at(client_root.path(), &ready, Role::Client, CURSOR);
-    let Some(job) = recovered.state().job() else {
+    let Some(job) = recovered.state().jobs().next() else {
         panic!("the job is still open");
     };
     assert_eq!(job.phase(), JobPhase::Ready);
@@ -713,7 +643,7 @@ async fn the_last_height_the_delivery_margin_fits_is_the_last_that_may_release()
                 panic!("at {height} the margin still fits: {error}");
             }
             assert_eq!(
-                endpoint.state().job().map(JobState::phase),
+                endpoint.state().jobs().next().map(JobState::phase),
                 Some(JobPhase::Delivered),
                 "the release marked the job delivered",
             );
@@ -726,7 +656,7 @@ async fn the_last_height_the_delivery_margin_fits_is_the_last_that_may_release()
         };
         assert_eq!(terminal, deadlines().terminal);
         assert_eq!(
-            endpoint.state().job().map(JobState::phase),
+            endpoint.state().jobs().next().map(JobState::phase),
             Some(JobPhase::Ready),
             "nothing was marked released",
         );
@@ -822,7 +752,7 @@ async fn a_release_past_the_deadline_is_expired_on_the_wire() {
     assert_eq!(refusal_code(&response), WorkRefusalCode::Expired);
     assert_eq!(
         service
-            .with_state(|state| state.job().map(JobState::phase))
+            .with_state(|state| state.jobs().next().map(JobState::phase))
             .expect("the endpoint is reachable"),
         Some(JobPhase::Ready),
         "nothing was released",
@@ -876,7 +806,7 @@ async fn a_delivery_named_for_another_job_finds_nothing() {
     }
     assert_eq!(
         service
-            .with_state(|state| state.job().map(JobState::phase))
+            .with_state(|state| state.jobs().next().map(JobState::phase))
             .expect("the endpoint is reachable"),
         Some(JobPhase::Ready),
     );
@@ -924,7 +854,7 @@ async fn a_provider_signs_no_result_the_frame_would_not_carry() {
     assert_eq!(limit, u64::from(tight));
     assert_eq!(
         service
-            .with_state(|state| state.job().map(JobState::phase))
+            .with_state(|state| state.jobs().next().map(JobState::phase))
             .expect("the endpoint is reachable"),
         None,
         "and the job is over, at the provider's own cost",
@@ -988,7 +918,7 @@ async fn a_client_refuses_a_frame_over_the_bound_it_signed() {
     assert_eq!(actual, generous);
     assert_eq!(limit, u64::from(tight));
     assert_eq!(
-        endpoint.state().job().map(JobState::phase),
+        endpoint.state().jobs().next().map(JobState::phase),
         Some(JobPhase::Accepted),
         "nothing was recorded",
     );
@@ -1072,7 +1002,7 @@ async fn a_transcript_swapped_in_transit_is_not_recorded() {
         "a swapped transcript is refused: {refused:?}",
     );
     assert_eq!(
-        endpoint.state().job().map(JobState::phase),
+        endpoint.state().jobs().next().map(JobState::phase),
         Some(JobPhase::Accepted),
         "nothing was recorded",
     );
@@ -1082,7 +1012,7 @@ async fn a_transcript_swapped_in_transit_is_not_recorded() {
         panic!("the honest delivery records: {error}");
     }
     assert_eq!(
-        endpoint.state().job().map(JobState::phase),
+        endpoint.state().jobs().next().map(JobState::phase),
         Some(JobPhase::Ready),
     );
 }
@@ -1187,6 +1117,18 @@ impl EdgeBytes {
     }
 }
 
+fn lease_over(bond: EdgeId, payment: EdgeId) -> LeaseSlots {
+    support::lease_over(
+        bond,
+        payment,
+        payment_terms_hash(payment_terms()).as_bytes(),
+        &payment_terms().private_policy_commitment,
+        HORIZON,
+        FORMAT_VERSION,
+        TAG_BOND_LEASE,
+    )
+}
+
 fn bond_object() -> Edge {
     EdgeBytes {
         value: STAKE,
@@ -1209,30 +1151,6 @@ fn payment_object() -> Edge {
         allowed: WORK_PAYMENT_CLOSES,
     }
     .build()
-}
-
-fn lease_over(bond: EdgeId, payment: EdgeId) -> LeaseSlots {
-    let mut value = vec![FORMAT_VERSION, TAG_BOND_LEASE, 2];
-    value.extend_from_slice(&bond.to_bytes());
-    value.extend_from_slice(&payment.to_bytes());
-    value.extend_from_slice(payment_terms_hash(payment_terms()).as_bytes());
-    value.extend_from_slice(&payment_terms().private_policy_commitment);
-    value.extend_from_slice(&HORIZON.to_be_bytes());
-
-    let slots = [0, 1].map(|index| {
-        RegistryChunk::split(
-            RegistryNamespace::BondLease,
-            RegistryRecordTag::BondLease,
-            &value,
-            index,
-        )
-    });
-    let parsed = hellas_kernel::parse_bond_lease(slots, bond);
-    assert!(
-        matches!(parsed, LeaseSlots::Present(_)),
-        "the hand-written lease is readable, got {parsed:?}",
-    );
-    parsed
 }
 
 // ── Who may be handed the answer ──────────────────────────────────────
@@ -1309,7 +1227,7 @@ async fn a_work_id_alone_releases_nothing() {
         );
         assert_eq!(
             service
-                .with_state(|state| state.job().map(JobState::phase))
+                .with_state(|state| state.jobs().next().map(JobState::phase))
                 .expect("the endpoint is reachable"),
             Some(JobPhase::Ready),
             "{name} leaves the answer where it was",
@@ -1395,7 +1313,7 @@ async fn a_transport_without_an_exporter_delivers_nothing() {
     );
     assert_eq!(
         service
-            .with_state(|state| state.job().map(JobState::phase))
+            .with_state(|state| state.jobs().next().map(JobState::phase))
             .expect("the endpoint is reachable"),
         Some(JobPhase::Ready),
         "nothing was released",

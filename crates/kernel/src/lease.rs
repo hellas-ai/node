@@ -97,7 +97,7 @@ pub struct BondLease {
     // by my channel" from "this bond is leased by somebody else", which
     // is a different answer and a different outcome at both endpoint
     // sites that ask — `hellas_rpc::protocol::work_setup`'s readiness
-    // gate and `hellas_rpc::work_store::setup`'s recovery decision,
+    // gate and `hellas_work::work_store::setup`'s recovery decision,
     // whose `LeasedElsewhere` fault has no other source. `bond_edge`
     // alone cannot say it: every lease on this bond names this bond.
     //

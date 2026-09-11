@@ -5,6 +5,7 @@ mod codex_responses;
 mod openai;
 mod responses_fetch;
 mod responses_projector;
+mod stream;
 
 pub use openai::OpenAiResponsesFetchProvider;
 pub use responses_fetch::{execute_responses_request, responses_http_client};

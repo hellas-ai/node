@@ -1,10 +1,10 @@
 //! The machinery this slice deleted has no reachable caller.
 //!
-//! The one-job profile replaces the reusable-slot machinery: nonce
-//! sequences, the multi-job paid-work set, the identity-wide counterparty
-//! loss ledger and its second journal, the interrupted two-file terminal,
-//! the loss-of-a-job cause rule, and the paid-twice error the paid-work
-//! set alone could construct. None of it is behind a feature or a
+//! The current per-channel job archive replaces an earlier reusable-slot
+//! design: identity-wide counterparty-loss accounting and its second
+//! journal, the interrupted two-file terminal, the loss-of-a-job cause
+//! rule, and the paid-twice error that design alone could construct.
+//! None of it is behind a feature or a
 //! `cfg` — it is gone — and the proof that it is gone rather than merely
 //! unused is that its names appear nowhere in this crate's production
 //! source. A caller that could reach it would have to name it, and
@@ -33,8 +33,10 @@ const DELETED: &[&str] = &[
 #[test]
 fn the_deleted_machinery_is_named_nowhere_in_production_source() {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let rpc_src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../rpc/src");
     let mut offenders = Vec::new();
     scan(&src, &mut offenders);
+    scan(&rpc_src, &mut offenders);
     assert!(
         offenders.is_empty(),
         "deleted machinery is still named in production source: {offenders:?}",

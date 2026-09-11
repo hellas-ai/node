@@ -77,12 +77,12 @@ use hellas_kernel::{
     StartId, Terms, Tx, WorkPaymentSettlement, adjudicated_payouts, no_earned_digest,
 };
 
-use crate::observe::{LEVEL, TARGET, Timing};
-use crate::protocol::work::PaidChannel;
 use crate::work::{EndpointError, Handoff};
 use crate::work_store::{
     Applied, ChannelRecord, ChannelStore, JobPhase, Role, TerminalOutcome, WorkStoreError, hex,
 };
+use hellas_rpc::observe::{LEVEL, TARGET, Timing};
+use hellas_rpc::protocol::work::PaidChannel;
 
 /// One finalized block, as a watcher must see it.
 ///
@@ -137,7 +137,7 @@ pub trait TxSink {
     fn submit(
         &self,
         tx: Tx,
-    ) -> impl core::future::Future<Output = Result<crate::SubmitTxOutcome, BlockSourceError>> + Send;
+    ) -> impl core::future::Future<Output = Result<hellas_rpc::SubmitTxOutcome, BlockSourceError>> + Send;
 }
 
 /// Where a watcher gets its finalized blocks.
@@ -251,7 +251,7 @@ pub enum CloseProgress {
         /// Last height the submitted signature can be included at.
         valid_through: u64,
         /// What the node did with the transaction.
-        outcome: crate::SubmitTxOutcome,
+        outcome: hellas_rpc::SubmitTxOutcome,
     },
     /// Nothing is retained that could still be included, and no contest
     /// opened. The channel is open again, and closing it needs a fresh
@@ -747,7 +747,7 @@ fn expiry_at(
     state: &crate::work_store::ChannelState,
     height: u64,
     payload: [u8; 32],
-) -> Vec<(crate::protocol::Digest, TerminalOutcome)> {
+) -> Vec<(hellas_rpc::protocol::Digest, TerminalOutcome)> {
     if state.role() != Role::Provider {
         return Vec::new();
     }
@@ -951,7 +951,7 @@ pub trait CloseChannel {
     fn record_handoff(
         &mut self,
         _start_id: StartId,
-        _outcome: crate::SubmitTxOutcome,
+        _outcome: hellas_rpc::SubmitTxOutcome,
     ) -> Result<(), CatchUpError> {
         Ok(())
     }

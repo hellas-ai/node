@@ -224,9 +224,9 @@ fn a_deleted_field_is_refused_by_name() {
 /// and getting 64 with nothing said, so the loader refuses it by the
 /// name they wrote.
 ///
-/// [`MAX_ACTIVE_JOURNAL_BYTES`]: hellas_rpc::work_store::journal::MAX_ACTIVE_JOURNAL_BYTES
-/// [`MAX_ACTIVE_FRAMES`]: hellas_rpc::work_store::journal::MAX_ACTIVE_FRAMES
-/// [`MAX_CHECKPOINT_BYTES`]: hellas_rpc::work_store::journal::MAX_CHECKPOINT_BYTES
+/// [`MAX_ACTIVE_JOURNAL_BYTES`]: hellas_work::work_store::journal::MAX_ACTIVE_JOURNAL_BYTES
+/// [`MAX_ACTIVE_FRAMES`]: hellas_work::work_store::journal::MAX_ACTIVE_FRAMES
+/// [`MAX_CHECKPOINT_BYTES`]: hellas_work::work_store::journal::MAX_CHECKPOINT_BYTES
 #[test]
 fn a_journal_cap_the_journal_fixes_is_refused_by_name() {
     for field in [
@@ -392,8 +392,8 @@ use hellas_kernel::{
 };
 use hellas_rpc::protocol::work::private_policy_commitment;
 use hellas_rpc::protocol::work_setup::WorkSetupError;
-use hellas_rpc::work_handshake::{PaymentAdmission, SetupEndpoint};
-use hellas_rpc::work_store::{Role, SetupScan, SetupStore};
+use hellas_work::work_handshake::{PaymentAdmission, SetupEndpoint};
+use hellas_work::work_store::{Role, SetupScan, SetupStore};
 
 /// The window the fixture's terms admit.
 const WINDOW: u64 = hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS + 4;
@@ -745,8 +745,9 @@ fn a_restarted_node_rebuilds_its_endpoint_from_the_root_and_the_identity() {
 
     // The restart: the root and the network, and no bond edge or
     // role anywhere in the configuration to be told them by.
-    let found = hellas_rpc::work_store::discover_setups(&loaded.journal_root, loaded.chain.network)
-        .expect("the configured root enumerates");
+    let found =
+        hellas_work::work_store::discover_setups(&loaded.journal_root, loaded.chain.network)
+            .expect("the configured root enumerates");
     assert!(found.unidentified.is_empty(), "{:?}", found.unidentified);
     let [discovered] = found.setups.as_slice() else {
         panic!("one journal was written, one is found: {:?}", found.setups);

@@ -5,8 +5,6 @@
 //! asserted is what the second process may do — never what the first
 //! one meant to do.
 
-#![cfg(feature = "work")]
-
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -26,18 +24,22 @@ use hellas_rpc::protocol::work_bundle::WorkChannelSetupBundleV1;
 use hellas_rpc::protocol::work_setup::ProviderChannelPolicy;
 use hellas_rpc::protocol::{ContentId, Digest};
 use hellas_rpc::services::work_setup::WorkSetupHandler;
-use hellas_rpc::work_close::{BlockSourceError, FinalizedBlocks, FinalizedWork, TxSink};
-use hellas_rpc::work_handshake::{PaymentAdmission, SetupEndpoint, SetupService};
-use hellas_rpc::work_open::{
+use hellas_work::work_close::{BlockSourceError, FinalizedBlocks, FinalizedWork, TxSink};
+use hellas_work::work_handshake::{PaymentAdmission, SetupEndpoint, SetupService};
+use hellas_work::work_open::{
     FinalizedSetup, SetupDriveError, SetupProgress, SetupQuery, SetupStep, SetupView, advance_setup,
 };
-use hellas_rpc::work_store::journal::{Journal, JournalError, JournalId, JournalKind};
-use hellas_rpc::work_store::setup::setup_key;
-use hellas_rpc::work_store::{
+use hellas_work::work_store::journal::{Journal, JournalError, JournalId, JournalKind};
+use hellas_work::work_store::setup::setup_key;
+use hellas_work::work_store::{
     DiscoveredSetup, ObservedSetup, Role, SetupAbort, SetupDecision, SetupDiscoveryError, SetupEnd,
     SetupFault, SetupHistoryBatch, SetupHistoryBlock, SetupRecord, SetupScan, SetupState,
     SetupStateError, SetupStore, WorkStoreError, discover_setups,
 };
+
+#[path = "support/basic.rs"]
+mod basic;
+use basic::{network, temp};
 
 // ── Fixture ───────────────────────────────────────────────────────────
 
@@ -46,13 +48,6 @@ const STAKE: u64 = 64;
 const BOND_COIN: u8 = 0xa1;
 const PAYMENT_COIN: u8 = 0xb1;
 const SALT: [u8; 32] = [0x5a; 32];
-
-fn network() -> NetworkId {
-    let Some(network) = NetworkId::new("hellas-test") else {
-        panic!("a short ascii id is a legal network id");
-    };
-    network
-}
 
 fn other_network() -> NetworkId {
     let Some(network) = NetworkId::new("hellas-other") else {
@@ -636,13 +631,6 @@ impl FinalizedBlocks for Blocks {
             .iter()
             .find(|block| block.height == height)
             .cloned())
-    }
-}
-
-fn temp() -> tempfile::TempDir {
-    match tempfile::tempdir() {
-        Ok(dir) => dir,
-        Err(error) => panic!("a temporary directory: {error}"),
     }
 }
 

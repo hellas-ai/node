@@ -13,11 +13,9 @@
 //! if the version moves, if the header domain moves — the header digest
 //! is in every frame's preimage — or if the frame domain moves.
 
-#![cfg(feature = "work")]
-
 use hellas_rpc::observe::Samples;
-use hellas_rpc::work_store::Role;
-use hellas_rpc::work_store::journal::{Journal, JournalId, JournalKind};
+use hellas_work::work_store::Role;
+use hellas_work::work_store::journal::{Journal, JournalId, JournalKind};
 
 /// Bytes before the first frame: magic, version, kind, role,
 /// generation, key.
@@ -78,7 +76,7 @@ fn a_v1_journal_is_refused() {
     assert!(
         matches!(
             error,
-            hellas_rpc::work_store::JournalError::OldVersion {
+            hellas_work::work_store::JournalError::OldVersion {
                 found: 1,
                 expected: 6,
                 ..
@@ -117,7 +115,7 @@ fn a_v5_single_job_journal_is_refused() {
         panic!("the old header writes: {error}");
     }
     let error = Journal::open(&path, id).expect_err("v5 has no per-record work IDs");
-    let hellas_rpc::work_store::JournalError::OldVersion {
+    let hellas_work::work_store::JournalError::OldVersion {
         found,
         expected,
         retirement,
@@ -146,7 +144,7 @@ fn a_v5_single_job_journal_is_refused() {
 #[test]
 fn a_v2_channel_journal_is_refused_not_misread() {
     use hellas_rpc::protocol::Digest;
-    use hellas_rpc::work_store::ChannelRecord;
+    use hellas_work::work_store::ChannelRecord;
 
     // The old encoding under the new decoder: the v2 tag 6 meant the
     // oracle-verified record, and the same byte decodes today, without
@@ -206,7 +204,7 @@ fn a_v2_channel_journal_is_refused_not_misread() {
     assert!(
         matches!(
             error,
-            hellas_rpc::work_store::JournalError::OldVersion {
+            hellas_work::work_store::JournalError::OldVersion {
                 found: 2,
                 expected: 6,
                 ..
@@ -231,7 +229,7 @@ fn a_v2_channel_journal_is_refused_not_misread() {
 #[test]
 fn a_v3_channel_journal_is_refused_for_the_answer_it_cannot_hold() {
     use hellas_rpc::protocol::Digest;
-    use hellas_rpc::work_store::ChannelRecord;
+    use hellas_work::work_store::ChannelRecord;
 
     // The v3 record set is today's minus the answer, and every tag it
     // does use means today what it meant then.
@@ -284,7 +282,7 @@ fn a_v3_channel_journal_is_refused_for_the_answer_it_cannot_hold() {
         generation: 0,
     };
     let error = Journal::open(&path, id).expect_err("v3 cannot record an answered contest");
-    let hellas_rpc::work_store::JournalError::OldVersion {
+    let hellas_work::work_store::JournalError::OldVersion {
         found,
         expected,
         retirement,
@@ -442,7 +440,7 @@ fn each_append_and_each_rotation_is_its_own_sample() {
 /// generation moved.
 #[test]
 fn work_that_was_not_done_is_not_sampled() {
-    use hellas_rpc::work_store::journal::MAX_CHECKPOINT_BYTES;
+    use hellas_work::work_store::journal::MAX_CHECKPOINT_BYTES;
 
     let Ok(dir) = tempfile::tempdir() else {
         panic!("a temporary directory");

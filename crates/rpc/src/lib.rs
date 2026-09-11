@@ -60,26 +60,6 @@ pub mod run_ticket;
 pub mod serve;
 #[cfg(feature = "execute")]
 pub mod stream;
-/// The paid-work RPC: the acceptance exchange, its two endpoints, and
-/// the refusals they answer with.
-#[cfg(feature = "work")]
-pub mod work;
-/// Settling paid work on chain: the finalized cursor every deadline is
-/// measured against, and the close that spends a certificate.
-#[cfg(feature = "work")]
-pub mod work_close;
-/// The two-Open handshake on the wire: the exchange that gives two
-/// endpoints a channel to do paid work on.
-#[cfg(feature = "work")]
-pub mod work_handshake;
-/// Posting a completed handshake: the driver that submits the two
-/// Opens, observes them finalize, and records where the channel began.
-#[cfg(feature = "work")]
-pub mod work_open;
-/// Durable endpoint state for paid work: the setup journal, the channel
-/// journal, and the counterparty loss ledger.
-#[cfg(feature = "work")]
-pub mod work_store;
 
 pub mod provenance;
 

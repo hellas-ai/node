@@ -209,7 +209,7 @@ pub enum SetupProgress {
         /// Which of the two.
         step: SetupStep,
         /// What the node did with the transaction.
-        outcome: crate::SubmitTxOutcome,
+        outcome: hellas_rpc::SubmitTxOutcome,
     },
     /// Nothing for this endpoint to do: the other party has not
     /// produced the next revision, or the transaction being waited on
@@ -225,7 +225,7 @@ pub enum SetupProgress {
     /// The deterministic bond Timeout was journaled and submitted.
     BondTimeoutSubmitted {
         /// What the node did with the transaction.
-        outcome: crate::SubmitTxOutcome,
+        outcome: hellas_rpc::SubmitTxOutcome,
     },
     /// Setup stopped with the provider's coins unspent, and the journal
     /// records it.

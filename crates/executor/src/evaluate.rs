@@ -763,7 +763,7 @@ impl EvaluateEngine {
     /// Courtesy quote having populated this process's registry.
     pub(crate) async fn start_prepared_input(
         &mut self,
-        input: hellas_rpc::work::PreparedEvaluateInput,
+        input: hellas_work::work::PreparedEvaluateInput,
     ) -> Result<ExecuteOutcome, ExecutorError> {
         let (manifest, resolved) = resolve_prepared_paid_input(input.into_parts())?;
         let request_commitment = *Evaluate::commit_request(&resolved.evaluate_request).as_bytes();

@@ -91,7 +91,7 @@ use commonware_codec::Encode as _;
 use commonware_cryptography::Digestible as _;
 use commonware_glue::stateful::db::{DatabaseSet, Merkleized as _, Unmerkleized as _};
 use commonware_runtime::{Handle, Supervisor as _};
-use hellas_client::work::payment::pay_for_checked_result;
+use hellas_client::work::payment::pay_for_result;
 use hellas_client::work::reproduce::{
     ReproduceFault, Reproduced, Reproducer, plan as reproduction_plan,
 };
@@ -121,20 +121,20 @@ use hellas_rpc::protocol::work_setup::{
 };
 use hellas_rpc::services::work::WorkServer;
 use hellas_rpc::services::work_setup::WorkSetupHandler;
-use hellas_rpc::work::{
-    BackendFault, ClientEndpoint, CloseEndpoint, JobProposal, PaidEvaluateBackend, PaymentError,
-    PreparedEvaluateInput, RunOutcome, WorkService, propose_work, run_accepted_work,
-};
-use hellas_rpc::work_close::{CloseProgress, TxSink, close_start};
-use hellas_rpc::work_handshake::{PaymentAdmission, SetupEndpoint, SetupService};
-use hellas_rpc::work_open::{SetupAdvance, SetupProgress, SetupStep, advance_setup};
-use hellas_rpc::work_store::{Role, SetupOrigin, SetupScan, SetupStore};
 use hellas_rpc::{
     Application, Assurance, CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR, ContentId, EvaluateRequest,
     OutputEventEnvelope, ProducerSigningKey, ProgramManifest, PublicKey as RpcPublicKey,
 };
 use hellas_wire::mux::{MessagePipe, MuxConfig, MuxTransport, Role as MuxRole};
 use hellas_wire::{DefaultClock, Dispatcher, StreamTransport as _, TransportContext};
+use hellas_work::work::{
+    BackendFault, ClientEndpoint, CloseEndpoint, JobProposal, PaidEvaluateBackend, PaymentError,
+    PreparedEvaluateInput, RunOutcome, WorkService, propose_work, run_accepted_work,
+};
+use hellas_work::work_close::{CloseProgress, TxSink, close_start};
+use hellas_work::work_handshake::{PaymentAdmission, SetupEndpoint, SetupService};
+use hellas_work::work_open::{SetupAdvance, SetupProgress, SetupStep, advance_setup};
+use hellas_work::work_store::{Role, SetupOrigin, SetupScan, SetupStore};
 use tokio::sync::mpsc;
 
 use crate::HellasBlock;
@@ -1346,7 +1346,7 @@ async fn run_one_paid_job(devnet: &Devnet, opened: &mut Opened) -> u64 {
     // reaches the matched phase, and `pay` refuses any other one.
     let (transport, server) = transport_pair();
     let serving = serve(server, opened.service.clone());
-    let credited = pay_for_checked_result(transport, &mut opened.client, work_id).await;
+    let credited = pay_for_result(transport, &mut opened.client, work_id).await;
     serving.abort();
     let Ok(credited) = credited else {
         panic!("the checked answer is paid for: {credited:?}");

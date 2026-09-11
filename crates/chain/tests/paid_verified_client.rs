@@ -17,7 +17,7 @@ use hellas_chain::{
     FinalizedWorkView, LatestBlock, LightClient, OwnerCoins, OwnerEdges, QueryError,
     SubmitTxOutcome, WorkBlocks, WorkChannelQuery, WorkChannelSnapshot,
 };
-use hellas_rpc::work_close::FinalizedBlocks as _;
+use hellas_work::work_close::FinalizedBlocks as _;
 use rand::{SeedableRng as _, rngs::StdRng};
 
 struct SigningFixture {

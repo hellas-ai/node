@@ -4,7 +4,7 @@ use hellas_kernel::{EdgeValues, Fees, MIN_OMIT_RESPONSE_BLOCKS};
 use hellas_rpc::protocol::Digest;
 use hellas_rpc::protocol::work::{PaidChannelPolicyV1, PaidExecutionPolicyV1};
 use hellas_rpc::protocol::work_setup::ProviderChannelPolicy;
-use hellas_rpc::work_close::{BlockSourceError, FinalizedWork};
+use hellas_work::work_close::{BlockSourceError, FinalizedWork};
 
 use super::super::work_config::load_work_config;
 use super::*;
@@ -306,7 +306,7 @@ fn root_holds_signature(root: &Path, signature: &[u8]) -> bool {
 /// assertions because opening the absent store to inspect it would create
 /// the revisionless journal this test is meant to rule out.
 fn assert_no_offer_artifact(root: &Path, bond: EdgeId, signature: &[u8]) {
-    let key = hellas_rpc::work_store::setup::setup_key(network(), bond);
+    let key = hellas_work::work_store::setup::setup_key(network(), bond);
     let stem = format!("setup-{}.", hex::encode(key.into_bytes()));
     let entries: Vec<_> = fs::read_dir(root)
         .unwrap_or_else(|error| panic!("the fixture root enumerates: {error}"))

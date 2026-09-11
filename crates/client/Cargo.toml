@@ -26,7 +26,7 @@ evaluate = ["hellas-rpc/evaluate"]
 # independent reexecution check the client makes before a result is
 # payable. Off by default because it pulls the consensus kernel into a
 # client that may only want to fetch.
-work = ["dep:hellas-kernel", "hellas-rpc/work"]
+work = ["dep:hellas-kernel", "dep:hellas-work"]
 
 [dependencies]
 async-stream = { workspace = true, optional = true }
@@ -40,6 +40,7 @@ hellas-attestation = { workspace = true, features = [
 hellas-kernel = { workspace = true, optional = true }
 hellas-rpc = { workspace = true, features = ["execute", "fetch"] }
 hellas-wire.workspace = true
+hellas-work = { workspace = true, optional = true }
 iroh = { workspace = true, features = ["tls-ring"], optional = true }
 iroh-mdns-address-lookup = { workspace = true, optional = true }
 rand.workspace = true

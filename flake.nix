@@ -11,14 +11,7 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     rust-overlay.url = "github:oxalica/rust-overlay";
-    # Temporary committed-only sibling while the safe runtime API is developed
-    # in tandem. Replace this local Git URL when that Catena branch is published.
-    catena-lang = {
-      # A Git input sees only committed files. In particular, it cannot sweep
-      # Catena's target/ tree into the Nix store as a raw path input could.
-      url = "git+file:../catena-lang?ref=grw/hellas-safe-runtime";
-      flake = false;
-    };
+
   };
 
   outputs =
@@ -26,7 +19,6 @@
       self,
       nixpkgs,
       rust-overlay,
-      catena-lang,
     }:
     let
       systems = [
@@ -48,7 +40,6 @@
             system
             nixpkgs
             rust-overlay
-            catena-lang
             ;
         }
       );

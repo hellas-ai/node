@@ -31,6 +31,7 @@ node = [
     "dep:qrcode",
     "hellas-chain/work-watcher",
     "hellas-client/work",
+    "dep:hellas-work",
 ]
 # Token-native remote execution and its local text-presentation boundary.
 # This deliberately does not pull Catena into a client that only dials a node.
@@ -99,6 +100,7 @@ hellas-wire = { workspace = true, features = [
     "discovery-dht",
     "discovery-mdns",
 ] }
+hellas-work = { workspace = true, optional = true }
 hellas-xet = { workspace = true }
 hex.workspace = true
 iroh = { workspace = true, features = ["tls-ring", "metrics"] }

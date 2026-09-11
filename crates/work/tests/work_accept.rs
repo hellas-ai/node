@@ -6,18 +6,14 @@
 //! transport, so the request is framed, routed by method id, decoded,
 //! and answered rather than handed to a function.
 
-#![cfg(feature = "work")]
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use bytes::Bytes;
 use hellas_kernel::{
     BlockHeight, Decode as _, Edge, EdgeId, EdgeValues, Fees, Key, LeaseSlots, List,
-    MAX_EDGE_OUTPUTS, NetworkId, Parties, PayloadHash, Payout, PendingSlot, RegistryChunk,
-    RegistryNamespace, RegistryRecordTag, Secp256k1Signer, Secp256k1Verifier, Sig,
-    SigVerifier as _, Terms, TermsHash, WorkPaymentSettlement, WorkPaymentTerms,
-    WorkStakeBondTerms, work_payment_settlement,
+    MAX_EDGE_OUTPUTS, Parties, PayloadHash, Payout, PendingSlot, Secp256k1Signer,
+    Secp256k1Verifier, Sig, SigVerifier as _, Terms, TermsHash, WorkPaymentSettlement,
+    WorkPaymentTerms, WorkStakeBondTerms, work_payment_settlement,
 };
 use hellas_rpc::pb::work::{
     AcceptWorkRequest, AcceptWorkResponse, WorkAccepted, WorkRefusalCode, WorkRefused,
@@ -37,24 +33,26 @@ use hellas_rpc::protocol::work_setup::{
     ObservedChannel, ReadyChannel, WorkChannelConfig, WorkChannelDescriptor, payment_terms_hash,
 };
 use hellas_rpc::services::work::{Work, WorkServer};
-use hellas_rpc::work::{
-    ClientEndpoint, EndpointError, JobProposal, ProposeError, ProviderEndpoint, WorkRefusal,
-    WorkService, propose_work,
-};
-use hellas_rpc::work_close::{
-    BlockSourceError, CatchUpError, FinalizedBlocks, FinalizedWork, observe,
-};
-use hellas_rpc::work_store::{
-    ChannelRecord, ChannelState, ChannelStore, JobPhase, JobState, Role, SetupOrigin,
-    TerminalOutcome,
-};
 use hellas_rpc::{
     Application, Assurance, CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR, ContentId, Evaluate,
     EvaluateRequest, ProgramManifest, PublicKey,
 };
-use hellas_wire::mux::{MessagePipe, MuxConfig, MuxTransport, Role as MuxRole};
-use hellas_wire::{DefaultClock, Dispatcher, ServiceMarker, StreamTransport};
-use tokio::sync::mpsc;
+use hellas_wire::mux::MuxTransport;
+use hellas_wire::{Dispatcher, ServiceMarker, StreamTransport};
+use hellas_work::work::{
+    ClientEndpoint, EndpointError, JobProposal, ProposeError, ProviderEndpoint, WorkRefusal,
+    WorkService, propose_work,
+};
+use hellas_work::work_close::{BlockSourceError, CatchUpError, FinalizedBlocks, FinalizedWork};
+use hellas_work::work_store::{
+    ChannelRecord, ChannelState, ChannelStore, JobPhase, JobState, Role, SetupOrigin,
+    TerminalOutcome,
+};
+
+mod support;
+use support::{
+    advance, bond_edge, client, network, payload_at, payment_edge, provider, signer, temp,
+};
 
 // ── Fixture ───────────────────────────────────────────────────────────
 
@@ -71,39 +69,9 @@ const SALT: [u8; 32] = [0x5a; 32];
 /// The finalized block both endpoints have processed through.
 const CURSOR: u64 = 10;
 
-fn network() -> NetworkId {
-    let Some(network) = NetworkId::new("hellas-test") else {
-        panic!("a short ascii id is a legal network id");
-    };
-    network
-}
-
-fn client() -> Secp256k1Signer {
-    signer(0x21)
-}
-
-fn provider() -> Secp256k1Signer {
-    signer(0x22)
-}
-
 /// A third party with no role on this channel.
 fn stranger() -> Secp256k1Signer {
     signer(0x23)
-}
-
-fn signer(byte: u8) -> Secp256k1Signer {
-    let Ok(signer) = Secp256k1Signer::from_secret_scalar([byte; 32]) else {
-        panic!("a fixed scalar is a key");
-    };
-    signer
-}
-
-fn bond_edge() -> EdgeId {
-    EdgeId::from_bytes([0x11; EdgeId::LENGTH])
-}
-
-fn payment_edge() -> EdgeId {
-    EdgeId::from_bytes([0x22; EdgeId::LENGTH])
 }
 
 fn channel_policy() -> PaidChannelPolicyV1 {
@@ -204,13 +172,6 @@ fn settlement() -> WorkPaymentSettlement {
     settlement
 }
 
-fn temp() -> tempfile::TempDir {
-    match tempfile::tempdir() {
-        Ok(dir) => dir,
-        Err(error) => panic!("a temporary directory: {error}"),
-    }
-}
-
 fn store(root: &std::path::Path, role: Role) -> ChannelStore {
     store_with(root, role, settlement())
 }
@@ -244,22 +205,7 @@ fn at_height(mut store: ChannelStore, height: u64) -> ChannelStore {
     store
 }
 
-/// The payload digest of the synthetic block at `height`.
-///
-/// A cursor is contiguous, so a fixture that moves it has to name a
-/// chain rather than repeat one digest: each block's parent is the last
-/// block's payload, and the watcher refuses anything else.
-fn payload_at(height: u64) -> [u8; 32] {
-    let mut payload = [0xc0; 32];
-    for (slot, byte) in payload.iter_mut().zip(height.to_be_bytes()) {
-        *slot = byte;
-    }
-    payload
-}
-
-/// Where the fixture channel was opened: the genesis block of the
-/// synthetic chain above, so a store starts with a clock and `advance`
-/// reads block one next.
+/// The fixture channel starts at the synthetic chain genesis.
 fn origin() -> SetupOrigin {
     SetupOrigin {
         payment_edge: payment_edge(),
@@ -274,22 +220,6 @@ fn origin() -> SetupOrigin {
 ///
 /// The same call the settlement loop makes, so a fixture cursor is a
 /// cursor this endpoint could have reached.
-fn advance(store: &mut ChannelStore, height: u64) {
-    let mut next = store.state().cursor().0.saturating_add(1);
-    while next <= height {
-        let block = FinalizedWork {
-            height: next,
-            parent: payload_at(next.saturating_sub(1)),
-            payload: payload_at(next),
-            txs: Vec::new(),
-        };
-        if let Err(error) = observe(store, &block, &Secp256k1Verifier::new()) {
-            panic!("the fixture block applies: {error}");
-        }
-        next = next.saturating_add(1);
-    }
-}
-
 fn client_endpoint(root: &std::path::Path) -> ClientEndpoint {
     match ClientEndpoint::new(ready(), store_at_cursor(root, Role::Client), client()) {
         Ok(endpoint) => endpoint,
@@ -472,6 +402,18 @@ impl EdgeBytes {
     }
 }
 
+fn lease_over(bond: EdgeId, payment: EdgeId) -> LeaseSlots {
+    support::lease_over(
+        bond,
+        payment,
+        payment_terms_hash(payment_terms()).as_bytes(),
+        &payment_terms().private_policy_commitment,
+        HORIZON,
+        FORMAT_VERSION,
+        TAG_BOND_LEASE,
+    )
+}
+
 fn bond_object() -> Edge {
     EdgeBytes {
         value: STAKE,
@@ -494,30 +436,6 @@ fn payment_object() -> Edge {
         allowed: WORK_PAYMENT_CLOSES,
     }
     .build()
-}
-
-fn lease_over(bond: EdgeId, payment: EdgeId) -> LeaseSlots {
-    let mut value = vec![FORMAT_VERSION, TAG_BOND_LEASE, 2];
-    value.extend_from_slice(&bond.to_bytes());
-    value.extend_from_slice(&payment.to_bytes());
-    value.extend_from_slice(payment_terms_hash(payment_terms()).as_bytes());
-    value.extend_from_slice(&payment_terms().private_policy_commitment);
-    value.extend_from_slice(&HORIZON.to_be_bytes());
-
-    let slots = [0, 1].map(|index| {
-        RegistryChunk::split(
-            RegistryNamespace::BondLease,
-            RegistryRecordTag::BondLease,
-            &value,
-            index,
-        )
-    });
-    let parsed = hellas_kernel::parse_bond_lease(slots, bond);
-    assert!(
-        matches!(parsed, LeaseSlots::Present(_)),
-        "the hand-written lease is readable, got {parsed:?}",
-    );
-    parsed
 }
 
 // ── Reading answers ───────────────────────────────────────────────────
@@ -553,67 +471,9 @@ fn refusal_text(response: &AcceptWorkResponse) -> String {
 
 // ── An in-memory pipe pair, so the wire is a real wire ────────────────
 
-struct Pipe {
-    out: mpsc::UnboundedSender<Bytes>,
-    inbox: mpsc::UnboundedReceiver<Bytes>,
-}
-
-impl MessagePipe for Pipe {
-    type SendError = std::io::Error;
-    type RecvError = std::io::Error;
-
-    async fn send_message(&mut self, bytes: Bytes) -> Result<(), Self::SendError> {
-        let _ = self.out.send(bytes);
-        Ok(())
-    }
-
-    async fn recv_message(&mut self) -> Result<Option<Bytes>, Self::RecvError> {
-        Ok(self.inbox.recv().await)
-    }
-}
-
-/// What the two ends of one live session both know.
-///
-/// A mux over a pair of in-memory pipes has no TLS of its own, so the
-/// exporter is supplied here — which is what a QUIC connection does for
-/// itself. Both halves are handed the same value, because that is the
-/// one property the delivery binding rests on: the number is known to
-/// exactly the two ends of one connection.
-fn session() -> hellas_wire::TransportContext {
-    hellas_wire::TransportContext {
-        open_exporter: Some(EXPORTER),
-        ..hellas_wire::TransportContext::default()
-    }
-}
-
-/// The exporter the fixture session exports.
-const EXPORTER: [u8; 32] = [0x5e; 32];
-
-fn transport_pair() -> (MuxTransport, MuxTransport) {
-    let (to_server, server_inbox) = mpsc::unbounded_channel();
-    let (to_client, client_inbox) = mpsc::unbounded_channel();
-    let client = MuxTransport::spawn::<8, _, _>(
-        MuxRole::Client,
-        DefaultClock,
-        MuxConfig::default(),
-        Pipe {
-            out: to_server,
-            inbox: client_inbox,
-        },
-        session(),
-    );
-    let server = MuxTransport::spawn::<8, _, _>(
-        MuxRole::Server,
-        DefaultClock,
-        MuxConfig::default(),
-        Pipe {
-            out: to_client,
-            inbox: server_inbox,
-        },
-        session(),
-    );
-    (client, server)
-}
+#[path = "support/transport.rs"]
+mod transport;
+use transport::transport_pair;
 
 /// Serves one provider endpoint over one transport until the caller
 /// drops the returned handle.
@@ -658,7 +518,7 @@ async fn an_accepted_exchange_leaves_both_signatures_on_both_disks() {
         ("client", client_store.state()),
         ("provider", provider_store.state()),
     ] {
-        let Some(job) = state.job() else {
+        let Some(job) = state.jobs().next() else {
             panic!("the {side} journal holds the accepted job");
         };
         assert_eq!(job.work_id(), work_id, "{side} names the same job");
@@ -1040,7 +900,7 @@ fn terminated_provider(root: &std::path::Path, outcome: TerminalOutcome) -> (Wor
 
     let service = WorkService::new(provider_endpoint(root));
     let ended = service
-        .with_state(|state| state.job().is_none() && state.terminal().is_some())
+        .with_state(|state| state.jobs().next().is_none() && state.terminals().next().is_some())
         .expect("the endpoint is reachable");
     assert!(
         ended,
@@ -1136,7 +996,7 @@ async fn a_proposal_is_answered_while_a_close_drive_waits_on_the_chain() {
     };
     assert_eq!(
         progress,
-        hellas_rpc::work_close::CloseProgress::Nothing,
+        hellas_work::work_close::CloseProgress::Nothing,
         "this channel has no contest and no retained start, so nothing was sent",
     );
     assert_eq!(
@@ -1158,7 +1018,7 @@ struct NoSink {
     taken: AtomicUsize,
 }
 
-impl hellas_rpc::work_close::TxSink for NoSink {
+impl hellas_work::work_close::TxSink for NoSink {
     async fn submit(
         &self,
         _tx: hellas_kernel::Tx,
@@ -1199,7 +1059,7 @@ fn a_client_journals_its_signature_before_the_request_leaves() {
     drop(endpoint);
 
     let reopened = store(root.path(), Role::Client);
-    let Some(job) = reopened.state().job() else {
+    let Some(job) = reopened.state().jobs().next() else {
         panic!("the journal holds the proposal the caller was handed");
     };
     assert_eq!(job.phase(), JobPhase::HalfSigned);
@@ -1231,9 +1091,15 @@ fn a_proposal_refused_before_signing_leaves_no_job() {
         matches!(refused, Err(ProposeError::Setup(_))),
         "an unreachable terminal deadline is refused, got {refused:?}",
     );
-    assert!(endpoint.state().job().is_none());
+    assert!(endpoint.state().jobs().next().is_none());
     drop(endpoint);
-    assert!(store(root.path(), Role::Client).state().job().is_none());
+    assert!(
+        store(root.path(), Role::Client)
+            .state()
+            .jobs()
+            .next()
+            .is_none()
+    );
 }
 
 #[test]
@@ -1384,7 +1250,7 @@ fn accepted_response(signature: Sig) -> AcceptWorkResponse {
 }
 
 fn phase_of(state: &ChannelState) -> Option<JobPhase> {
-    state.job().map(JobState::phase)
+    state.jobs().next().map(JobState::phase)
 }
 
 // ── What the provider puts on its disk, and when ──────────────────────
@@ -1398,7 +1264,7 @@ fn the_co_signature_is_on_the_disk_before_it_is_answered() {
     drop(endpoint);
 
     let reopened = store(root.path(), Role::Provider);
-    let Some(job) = reopened.state().job() else {
+    let Some(job) = reopened.state().jobs().next() else {
         panic!("the journal holds the job it answered for");
     };
     assert_eq!(job.phase(), JobPhase::Accepted);
@@ -1409,7 +1275,7 @@ fn the_co_signature_is_on_the_disk_before_it_is_answered() {
 fn nothing_is_journaled_for_a_proposal_that_is_refused() {
     let root = temp();
     let mut endpoint = provider_endpoint(root.path());
-    let before = endpoint.state().job().is_none();
+    let before = endpoint.state().jobs().next().is_none();
     // Another channel's authorization: the channel id is the first
     // thing `check_authorization` compares.
     let mut foreign = authorization(1, 1);
@@ -1418,9 +1284,15 @@ fn nothing_is_journaled_for_a_proposal_that_is_refused() {
     let response = endpoint.accept(&request(&foreign, signature, 1));
 
     assert_eq!(refusal_code(&response), WorkRefusalCode::Invalid);
-    assert!(before && endpoint.state().job().is_none());
+    assert!(before && endpoint.state().jobs().next().is_none());
     drop(endpoint);
-    assert!(store(root.path(), Role::Provider).state().job().is_none());
+    assert!(
+        store(root.path(), Role::Provider)
+            .state()
+            .jobs()
+            .next()
+            .is_none()
+    );
 }
 
 /// A proposal the journal's own rules would take, refused by the rules
@@ -1447,9 +1319,15 @@ fn a_price_the_policy_does_not_fix_is_refused_before_anything_is_journaled() {
         "{}",
         refusal_text(&response),
     );
-    assert!(endpoint.state().job().is_none());
+    assert!(endpoint.state().jobs().next().is_none());
     drop(endpoint);
-    assert!(store(root.path(), Role::Provider).state().job().is_none());
+    assert!(
+        store(root.path(), Role::Provider)
+            .state()
+            .jobs()
+            .next()
+            .is_none()
+    );
 }
 
 #[test]
@@ -1576,7 +1454,7 @@ async fn acceptance_workflow_catches_up_before_committing_the_signature() {
     assert_eq!(refusal_code(&response), WorkRefusalCode::Expired);
     assert!(
         service
-            .with_state(|state| state.job().is_none())
+            .with_state(|state| state.jobs().next().is_none())
             .expect("the endpoint is readable")
     );
 }
@@ -1590,7 +1468,7 @@ fn a_bundle_that_is_not_the_committed_one_is_invalid() {
     let signature = client().sign(signing_hash(work_id(ready().channel(), &authorization)));
     let response = endpoint.accept(&request(&authorization, signature, 2));
     assert_eq!(refusal_code(&response), WorkRefusalCode::Invalid);
-    assert!(endpoint.state().job().is_none());
+    assert!(endpoint.state().jobs().next().is_none());
 }
 
 /// A bundle that hashes to its own authorization and still breaks the
@@ -1669,7 +1547,10 @@ fn a_bundle_the_policy_does_not_allow_is_refused_though_its_digest_matches() {
             "{what}: {}",
             refusal_text(&response),
         );
-        assert!(endpoint.state().job().is_none(), "{what} reserved nothing");
+        assert!(
+            endpoint.state().jobs().next().is_none(),
+            "{what} reserved nothing"
+        );
     }
 }
 
@@ -1682,7 +1563,7 @@ fn a_forged_client_signature_is_invalid() {
     let response = endpoint.accept(&request(&authorization, forged, 1));
     assert_eq!(refusal_code(&response), WorkRefusalCode::Invalid);
     assert!(
-        endpoint.state().job().is_none(),
+        endpoint.state().jobs().next().is_none(),
         "a proposal nobody signed reserves nothing",
     );
 }
@@ -1722,7 +1603,10 @@ fn a_signature_of_any_other_length_is_not_a_signature() {
             WorkRefusalCode::Invalid,
             "{what} is refused",
         );
-        assert!(endpoint.state().job().is_none(), "{what} reserved nothing");
+        assert!(
+            endpoint.state().jobs().next().is_none(),
+            "{what} reserved nothing"
+        );
     }
 }
 
@@ -1764,7 +1648,10 @@ fn the_measured_margins_separate_a_late_job_from_a_malformed_one() {
             "{what}: {}",
             refusal_text(&response),
         );
-        assert!(endpoint.state().job().is_none(), "{what} reserved nothing",);
+        assert!(
+            endpoint.state().jobs().next().is_none(),
+            "{what} reserved nothing",
+        );
     }
 }
 

@@ -107,10 +107,6 @@ the verified read-only descriptor and detects path/inode replacement; it does
 not defend against a separate local process that already holds a writable
 descriptor to the same inode and mutates it concurrently.
 
-The [SmolLM2 tutorial](docs/tutorials/smollm2.md) covers pinned acquisition,
-environment construction, local and remote execution, resident reuse, the
-HTTP gateway, NixOS serving, and the larger Qwen3 compile-only check.
-
 ## Sealed Fetch
 
 Fetch route names are operator-defined routing labels. The sealed destination
@@ -305,10 +301,9 @@ cargo run --no-default-features --features chain -- \
 
 The main outputs are `.#cli` (network client/node/gateway), `.#cli-catena`
 (x86_64 Linux plus the Catena safe GPU runtime), and `.#cli-validator`.
-Hellas imports only `catena-lang` from the Catena workspace. During tandem
-development the flake uses its committed-only sibling Git branch; no build
-archives the sibling's `target/` tree. This becomes a published Git pin before
-a remote release.
+Hellas imports only `catena-lang` from the Catena workspace, pinned to a
+published Git revision in `Cargo.toml` and `Cargo.lock`. Nix vendors the same
+locked dependency; a sibling Catena checkout is not required.
 
 Enter the x86_64 Linux ROCm development shell with:
 

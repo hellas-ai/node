@@ -2,6 +2,8 @@
 //! environment. This is intentionally separate from the OpenAI Responses
 //! projector: the two endpoints expose different lifecycle contracts.
 
+use super::stream::{project_events, push_sse};
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use hellas_adaptors::{
@@ -15,9 +17,7 @@ use hellas_executor::{
     FetchRequestView, PreparedFetchRequest, ProjectedFetch,
 };
 use hellas_rpc::JsonBytes;
-use hellas_rpc::fetch::{
-    MAX_FETCH_REQUEST_BODY_BYTES, encode_fetch_event_payload, encode_fetch_terminal_payload,
-};
+use hellas_rpc::fetch::{MAX_FETCH_REQUEST_BODY_BYTES, encode_fetch_terminal_payload};
 use serde::{
     Deserialize, Serialize,
     de::{DeserializeOwned, IgnoredAny},
@@ -2057,17 +2057,6 @@ impl CodexProjector {
         self.server_model = Some(model);
         Ok(())
     }
-
-    fn project_events(events: Vec<OutputEvent>) -> Result<Vec<ProjectedFetch>, FetchAdaptorError> {
-        events
-            .iter()
-            .map(|event| {
-                encode_fetch_event_payload(event)
-                    .map(ProjectedFetch::Event)
-                    .map_err(payload_error)
-            })
-            .collect()
-    }
 }
 
 impl FetchProjector for CodexProjector {
@@ -2089,28 +2078,12 @@ impl FetchProjector for CodexProjector {
         if self.terminal.is_some() && !bytes.is_empty() {
             return Err(failed("Codex stream contained bytes after completion"));
         }
-        let before = self.decoder.frame_count();
-        let ignored_before = self.decoder.ignored_line_count();
-        let noncanonical_before = self.decoder.noncanonical_line_count();
-        let frames = self
-            .decoder
-            .push(bytes)
-            .map_err(|error| failed(error.to_string()))?;
-        let consumed = self.decoder.frame_count() - before;
-        if consumed != frames.len() as u64 {
-            return Err(failed("Codex stream contained a non-data SSE frame"));
-        }
-        if self.decoder.ignored_line_count() != ignored_before {
-            return Err(failed("Codex stream contained non-canonical SSE lines"));
-        }
-        if self.decoder.noncanonical_line_count() != noncanonical_before {
-            return Err(failed("Codex stream contained non-canonical SSE framing"));
-        }
+        let frames = push_sse(&mut self.decoder, bytes, "Codex").map_err(failed)?;
         let events = self.decode_frames(frames)?;
         if self.terminal.is_some() && !self.decoder.pending_bytes().is_empty() {
             return Err(failed("Codex stream contained bytes after completion"));
         }
-        Self::project_events(events)
+        project_events(&events).map_err(payload_error)
     }
 
     fn finish(&mut self) -> Result<Vec<ProjectedFetch>, FetchAdaptorError> {
@@ -2122,38 +2095,20 @@ impl FetchProjector for CodexProjector {
                 "Codex SSE stream ended without a blank-line frame delimiter",
             ));
         }
-        let before = self.decoder.frame_count();
-        let ignored_before = self.decoder.ignored_line_count();
-        let noncanonical_before = self.decoder.noncanonical_line_count();
-        let frames = self
-            .decoder
-            .finish()
-            .map_err(|error| failed(error.to_string()))?;
-        let consumed = self.decoder.frame_count() - before;
-        if consumed != frames.len() as u64 {
-            return Err(failed("Codex stream contained a non-data SSE frame"));
-        }
-        if self.decoder.ignored_line_count() != ignored_before {
-            return Err(failed("Codex stream contained non-canonical SSE lines"));
-        }
-        if self.decoder.noncanonical_line_count() != noncanonical_before {
-            return Err(failed("Codex stream contained non-canonical SSE framing"));
-        }
-        let events = self.decode_frames(frames)?;
-        let mut projected = Self::project_events(events)?;
+        // Complete frames were consumed by project(); an empty buffer has no tail to decode.
         let (usage, stop_reason) = self
             .terminal
             .take()
             .ok_or_else(|| failed("Codex stream ended without response.completed"))?;
-        projected.push(ProjectedFetch::Terminal(
+        let projected = ProjectedFetch::Terminal(
             encode_fetch_terminal_payload(&OutputEvent::Finished {
                 stop_reason,
                 usage: Some(usage),
             })
             .map_err(payload_error)?,
-        ));
+        );
         self.finished = true;
-        Ok(projected)
+        Ok(vec![projected])
     }
 }
 
