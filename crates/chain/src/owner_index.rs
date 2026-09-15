@@ -38,6 +38,7 @@ pub struct OwnerCursor {
 pub enum ApplyOutcome {
     Applied,
     Duplicate,
+    Stale,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -158,6 +159,24 @@ impl OwnerIndex {
         (state.cursor, coins)
     }
 
+    /// Deterministic owner holdings for rebuilding the authenticated native proof snapshot.
+    #[cfg(feature = "explorer-origin")]
+    pub(crate) fn holdings_snapshot(&self) -> Vec<(SettlementKey, ObjectId, u8, u64)> {
+        let state = self.inner.read().expect("owner index lock poisoned");
+        let mut holdings = Vec::new();
+        for (id, coin) in &state.coins {
+            holdings.push((coin.owner, *id, 0, coin.value));
+        }
+        for (id, edge) in &state.edges {
+            holdings.push((edge.maker, *id, 1, 0));
+            if edge.taker != edge.maker {
+                holdings.push((edge.taker, *id, 1, 0));
+            }
+        }
+        holdings.sort();
+        holdings
+    }
+
     #[cfg(test)]
     pub(crate) fn all_coins_for_test(&self) -> BTreeMap<ObjectId, Coin> {
         self.inner
@@ -242,13 +261,13 @@ impl State {
             return Ok(Some(*coin));
         }
         match self.kind_of(id) {
-            Some(actual @ (ObjectKind::Edge | ObjectKind::RegistryChunk)) => {
-                Err(OwnerIndexError::WrongObjectKind {
-                    id: *id,
-                    expected: ObjectKind::Coin,
-                    actual,
-                })
-            }
+            Some(
+                actual @ (ObjectKind::Edge | ObjectKind::RegistryChunk | ObjectKind::OwnerData),
+            ) => Err(OwnerIndexError::WrongObjectKind {
+                id: *id,
+                expected: ObjectKind::Coin,
+                actual,
+            }),
             Some(ObjectKind::Coin) | None => Ok(None),
         }
     }
@@ -261,6 +280,16 @@ impl State {
                 return Ok(ApplyOutcome::Duplicate);
             }
             return Err(OwnerIndexError::ConflictingHeight { height });
+        }
+        // Finalized delivery is at-least-once: marshal resumes from its own
+        // durable acknowledgement, which may sit below the height this index
+        // reached by replaying the finalized-block archive. Below the
+        // finalized tip there are no forks, so a redelivery under the cursor
+        // is the block already folded in and nothing else. It cannot be
+        // payload-checked — only the cursor payload is retained — and it must
+        // not be reapplied, so it is acknowledged and dropped.
+        if height < self.cursor.height {
+            return Ok(ApplyOutcome::Stale);
         }
         let next_height = self.cursor.height.saturating_add(1);
         if height != next_height {
@@ -522,13 +551,15 @@ impl State {
             Some(edge) => edge,
             None => {
                 return match self.kind_of(id) {
-                    Some(actual @ (ObjectKind::Coin | ObjectKind::RegistryChunk)) => {
-                        Err(OwnerIndexError::WrongObjectKind {
-                            id: *id,
-                            expected: ObjectKind::Edge,
-                            actual,
-                        })
-                    }
+                    Some(
+                        actual @ (ObjectKind::Coin
+                        | ObjectKind::RegistryChunk
+                        | ObjectKind::OwnerData),
+                    ) => Err(OwnerIndexError::WrongObjectKind {
+                        id: *id,
+                        expected: ObjectKind::Edge,
+                        actual,
+                    }),
                     Some(ObjectKind::Edge) | None => {
                         Err(OwnerIndexError::ObjectNotFound { id: *id })
                     }

@@ -25,7 +25,7 @@ use commonware_consensus::{
         standard::{Deferred, Standard},
     },
     simplex::{self, config::ForwardingPolicy, elector::RoundRobin},
-    types::{Epoch, FixedEpocher, ViewDelta},
+    types::{Epoch, FixedEpocher, Height, ViewDelta},
 };
 use commonware_cryptography::bls12381::dkg::feldman_desmedt::deal;
 use commonware_cryptography::certificate::ConstantProvider;
@@ -36,7 +36,9 @@ use commonware_glue::stateful::{
 };
 use commonware_p2p::{AddressableManager, authenticated::lookup};
 use commonware_parallel::Sequential;
-use commonware_runtime::{Metrics, Quota, Runner, Spawner, Supervisor as _, tokio};
+use commonware_runtime::{
+    BufferPooler, Clock, Metrics, Quota, Runner, Spawner, Storage, Supervisor as _, tokio,
+};
 use commonware_storage::{
     archive::{Archive as _, Identifier as ArchiveIdentifier},
     mmr,
@@ -133,6 +135,10 @@ pub enum ValidatorError {
 
 #[derive(Debug)]
 pub enum Command {
+    ExportTrust {
+        config: PathBuf,
+        genesis: PathBuf,
+    },
     GenerateNetwork {
         network_id: String,
         validators: u32,
@@ -167,6 +173,12 @@ pub enum Command {
 
 pub fn run_command(command: Command) -> Result<(), ValidatorError> {
     match command {
+        Command::ExportTrust { config, genesis } => {
+            let config: ValidatorConfig = toml::from_str(&std::fs::read_to_string(config)?)?;
+            let trust = export_trust(&config, &std::fs::read(genesis)?)?;
+            println!("{}", serde_json::to_string_pretty(&trust)?);
+            Ok(())
+        }
         Command::GenerateNetwork {
             network_id,
             validators,
@@ -546,6 +558,50 @@ mod genesis_allocation_tests {
     use crate::domain::{SettlementKey, addr_from_signing_key, secp256r1_key_from_seed};
 
     #[test]
+    fn generated_network_exports_public_trust_bound_to_exact_genesis() {
+        use commonware_cryptography::{Hasher as _, Sha256};
+        let directory = tempfile::tempdir().unwrap();
+        let output_dir = directory.path().join("network");
+        generate_network(GenerateNetworkArgs {
+            network_id: hellas_genesis::HELLAS_DEVNET_1_ID.into(),
+            validators: 1,
+            labels: vec!["demo".into()],
+            addresses: vec!["127.0.0.1".into()],
+            start_port: 3000,
+            metrics_base_port: 9090,
+            relay_urls: vec![],
+            genesis_allocations: vec![],
+            treasury_balance: Some(100),
+            output_dir: output_dir.clone(),
+        })
+        .unwrap();
+        let config: ValidatorConfig =
+            toml::from_str(&std::fs::read_to_string(output_dir.join("validator-0.toml")).unwrap())
+                .unwrap();
+        let document = std::fs::read(output_dir.join("genesis.json")).unwrap();
+        let trust = export_trust(&config, &document).unwrap();
+        assert_eq!(trust.genesis_sha256, hex::encode(Sha256::hash(&document)));
+        assert_eq!(trust.epochs[0].threshold_identity.len(), 96);
+        #[cfg(feature = "verified-explorer")]
+        assert!(
+            crate::verified_explorer::ExplorerVerifier::with_genesis(trust.clone(), &document)
+                .is_ok()
+        );
+        let public = serde_json::to_string(&trust).unwrap();
+        assert!(!public.contains(&config.private_key));
+        assert!(!public.contains(&config.threshold_share));
+        let mut changed = document.clone();
+        changed.push(b'\n');
+        assert_ne!(
+            trust.genesis_sha256,
+            export_trust(&config, &changed).unwrap().genesis_sha256
+        );
+        let mut wrong = config.genesis.clone();
+        wrong.validators[0].label = "other".into();
+        assert!(export_trust(&config, &serde_json::to_vec(&wrong).unwrap()).is_err());
+    }
+
+    #[test]
     fn rejects_settlement_key_valid_on_neither_curve() {
         let key = SettlementKey::from_bytes([0xa5; SettlementKey::LENGTH]);
         let err = match parse_genesis_allocation(&format!("{key}:10")) {
@@ -569,6 +625,91 @@ mod genesis_allocation_tests {
             parse_genesis_allocation(&format!("{key}:10")).expect("valid P-256 genesis owner");
         assert_eq!(entry.address, key.to_string());
         assert_eq!(entry.balance, 10);
+    }
+}
+
+#[cfg(test)]
+mod owner_index_replay_tests {
+    use super::*;
+    use crate::HellasBlock;
+    use crate::execution::test_support::{index_block, index_genesis};
+    use commonware_consensus::Heightable as _;
+    use commonware_cryptography::{Digest as _, sha256::Digest};
+    use commonware_runtime::deterministic;
+
+    /// Builds a chain of `len` empty blocks above genesis and stores every
+    /// height except those in `skip`.
+    async fn archive(
+        context: deterministic::Context,
+        genesis: &HellasBlock,
+        len: u64,
+        skip: &[u64],
+    ) -> (BlockStore<deterministic::Context>, Vec<HellasBlock>) {
+        let mut store = init_block_store(context, "replay", &Config::default()).await;
+        let mut chain = vec![genesis.clone()];
+        for _ in 0..len {
+            let next = index_block(chain.last().unwrap(), Digest::EMPTY, Vec::new());
+            chain.push(next);
+        }
+        for block in &chain {
+            let height = block.height().get();
+            if skip.contains(&height) {
+                continue;
+            }
+            store
+                .put(height, block.digest(), block.clone())
+                .await
+                .expect("put");
+        }
+        store.sync().await.expect("sync");
+        (store, chain)
+    }
+
+    #[test]
+    fn owner_index_replay_stops_at_archive_hole() {
+        deterministic::Runner::default().start(|context| async move {
+            let genesis = index_genesis();
+            let (store, chain) = archive(context, &genesis, 6, &[3, 4]).await;
+            assert_eq!(store.ranges().collect::<Vec<_>>(), vec![(0, 2), (5, 6)]);
+            let index = OwnerIndex::new(crate::domain::TEST_NETWORK, &genesis, Vec::new());
+
+            replay_owner_index(&index, &store).await.expect("replay");
+
+            let cursor = index.cursor();
+            assert_eq!(cursor.height, 2);
+            assert_eq!(cursor.payload, chain[2].digest());
+        });
+    }
+
+    #[test]
+    fn owner_index_replay_covers_contiguous_archive() {
+        deterministic::Runner::default().start(|context| async move {
+            let genesis = index_genesis();
+            let (store, chain) = archive(context, &genesis, 6, &[]).await;
+            let index = OwnerIndex::new(crate::domain::TEST_NETWORK, &genesis, Vec::new());
+
+            replay_owner_index(&index, &store).await.expect("replay");
+
+            let cursor = index.cursor();
+            assert_eq!(cursor.height, 6);
+            assert_eq!(cursor.payload, chain[6].digest());
+        });
+    }
+
+    #[test]
+    fn owner_index_must_reach_marshal_processed_height() {
+        assert!(check_owner_index_reaches_marshal(2, None).is_ok());
+        assert!(check_owner_index_reaches_marshal(2, Some(Height::new(1))).is_ok());
+        assert!(check_owner_index_reaches_marshal(2, Some(Height::new(2))).is_ok());
+        let err = check_owner_index_reaches_marshal(2, Some(Height::new(5)))
+            .expect_err("processed height above the replayed prefix");
+        assert!(matches!(
+            err,
+            ValidatorError::OwnerIndex(ref message)
+                if message.contains("processed finalized height 5")
+                    && message.contains("through height 2")
+                    && message.contains("3..=5")
+        ));
     }
 }
 
@@ -825,11 +966,26 @@ async fn graceful_stop(context: tokio::Context, monitor_second_signal: bool) {
     }
 }
 
-async fn replay_owner_index(
+/// Replays the contiguous prefix of the archive. The index needs every block
+/// in order from genesis, so a range beyond a hole is left for marshal, which
+/// backfills the hole and delivers it in order.
+async fn replay_owner_index<E>(
     indexer: &OwnerIndex,
-    finalized_blocks: &BlockStore,
-) -> Result<(), ValidatorError> {
+    finalized_blocks: &BlockStore<E>,
+) -> Result<(), ValidatorError>
+where
+    E: BufferPooler + Clock + Metrics + Storage,
+{
     for (start, end) in finalized_blocks.ranges() {
+        let cursor = indexer.cursor().height;
+        if start > cursor.saturating_add(1) {
+            warn!(
+                missing_from = cursor + 1,
+                missing_to = start - 1,
+                "finalized block archive has a hole; owner index replay stops before it",
+            );
+            break;
+        }
         for height in start..=end {
             let block = finalized_blocks
                 .get(ArchiveIdentifier::Index(height))
@@ -850,6 +1006,29 @@ async fn replay_owner_index(
         }
     }
     Ok(())
+}
+
+/// Marshal resumes delivery above its processed height and never refetches
+/// below it, so an index that stops short of that height can never be
+/// completed and must not run.
+fn check_owner_index_reaches_marshal(
+    indexed: u64,
+    processed: Option<Height>,
+) -> Result<(), ValidatorError> {
+    let Some(processed) = processed.map(|height| height.get()) else {
+        return Ok(());
+    };
+    if processed <= indexed {
+        return Ok(());
+    }
+    Err(ValidatorError::OwnerIndex(format!(
+        "marshal has already processed finalized height {processed} but the finalized \
+         block archive is only contiguous from genesis through height {indexed}; the owner \
+         index needs every finalized block and heights {}..={processed} cannot be recovered \
+         from peers. Restore the finalized block archive from a complete copy or resync this \
+         validator from genesis.",
+        indexed + 1,
+    )))
 }
 
 /// Run all `ValidatorConfig` validations the runtime would perform at startup.
@@ -875,6 +1054,44 @@ fn validate_relay_urls(
         }
     }
     Ok(())
+}
+
+/// Export epoch-zero trust from a provisioned validator config, bound to exact genesis bytes.
+/// Only public data is returned. Authenticate this output independently before deployment.
+pub fn export_trust(
+    config: &ValidatorConfig,
+    genesis_json: &[u8],
+) -> Result<hellas_genesis::TrustDocument, ValidatorError> {
+    use commonware_cryptography::{Hasher as _, Sha256};
+    let genesis: Genesis = serde_json::from_slice(genesis_json)?;
+    config.validate_genesis()?;
+    if genesis != config.genesis || genesis.network_id != hellas_genesis::HELLAS_DEVNET_1_ID {
+        return Err(ValidatorError::InvalidSetup(
+            "genesis file must match the validator's devnet genesis".into(),
+        ));
+    }
+    let scheme = Scheme::signer(
+        NAMESPACE,
+        config.participants()?,
+        config.decode_threshold_polynomial()?,
+        config.decode_threshold_share()?,
+    )
+    .ok_or_else(|| ValidatorError::Scheme("threshold share does not match polynomial".into()))?;
+    let trust = hellas_genesis::TrustDocument {
+        schema_version: hellas_genesis::TRUST_SCHEMA_VERSION,
+        network_id: genesis.network_id,
+        genesis_sha256: hex::encode(Sha256::hash(genesis_json)),
+        epochs: vec![hellas_genesis::TrustEpoch {
+            epoch: 0,
+            start_height: 0,
+            end_height: None,
+            threshold_identity: hex::encode(scheme.identity().encode()),
+        }],
+    };
+    trust
+        .validate()
+        .map_err(|error| ValidatorError::InvalidSetup(error.to_string()))?;
+    Ok(trust)
 }
 
 fn check_config(config_path: PathBuf) -> Result<(), ValidatorError> {
@@ -1094,7 +1311,7 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
             max_pending_acks,
             strategy: Sequential,
         };
-        let (marshal_actor, marshal_mailbox, _last_height) =
+        let (marshal_actor, marshal_mailbox, marshal_processed_height) =
             MarshalActor::<_, Standard<crate::HellasBlock>, _, _, _, _, _>::init(
                 context.child("marshal"),
                 finalizations_by_height,
@@ -1102,6 +1319,12 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
                 marshal_config,
             )
             .await;
+        if let Err(err) =
+            check_owner_index_reaches_marshal(owner_index_cursor.height, marshal_processed_height)
+        {
+            error!(?err, "owner index cannot reach marshal's processed height");
+            panic!("{err}");
+        }
 
         let broadcast_config = buffered::Config {
             public_key: me.clone(),
